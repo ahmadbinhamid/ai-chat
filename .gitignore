@@ -1,0 +1,14 @@
+# Go
+backend/tmp/
+backend/build-errors.log
+*.exe
+
+# Env
+.env
+backend/.env
+
+# Node (root package.json has no real deps today, but keep this ready)
+node_modules/
+
+# OS
+.DS_Store

@@ -1,0 +1,14 @@
+{
+  "name": "ai-chat",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Standalone Go backend for the AI theme-builder chat feature — no frontend of its own (consumed by tenant-dashboard). This package.json exists only so `npm run dev` works uniformly across the flowPOS monorepo's polyglot projects; there is no Node runtime dependency.",
+  "scripts": {
+    "dev": "cd backend && (command -v air >/dev/null 2>&1 && air || go run ./cmd/server)",
+    "build": "cd backend && go build -o ./tmp/main ./cmd/server",
+    "migrate": "cd backend && go run ./cmd/migration run",
+    "migrate:fresh": "cd backend && go run ./cmd/migration fresh",
+    "test": "cd backend && go test ./...",
+    "lint": "cd backend && golangci-lint run ./..."
+  }
+}
