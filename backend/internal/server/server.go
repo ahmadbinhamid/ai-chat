@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/auth"
 	"ai-chat/internal/config"
 	"ai-chat/internal/logging"
 	"ai-chat/internal/modules/chat"
@@ -25,8 +26,9 @@ import (
 )
 
 type Server struct {
-	cfg    config.Config
-	engine *gin.Engine
+	cfg       config.Config
+	engine    *gin.Engine
+	authCache *auth.MemoryCache
 }
 
 // New builds the router and mounts every route. AI generation being
@@ -53,6 +55,9 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	chatHandler := handlers.NewChatHandler(chatSvc, buildSvc)
 	messageHandler := handlers.NewMessageHandler(buildSvc, limiter)
 
+	flowposClient := auth.NewClient(cfg.FlowposAPIBase, cfg.FlowposHTTPTimeout)
+	authCache := auth.NewMemoryCache()
+
 	r := gin.New()
 	r.Use(gin.Recovery(), logging.Middleware(logger))
 
@@ -66,10 +71,10 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 		r.Use(cors.New(cors.Config{
 			AllowOrigins: cfg.CORSAllowedOrigins,
 			AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete},
-			// X-Tenant-Id/X-User-Id/X-User-Name: the identity headers
-			// IdentityMiddleware reads (see identity.go) — this service
-			// does its own auth via neither Authorization nor a cookie.
-			AllowHeaders:     []string{"Content-Type", "X-Tenant-Id", "X-User-Id", "X-User-Name"},
+			// Authorization carries the FlowPOS bearer token internal/auth
+			// forwards upstream; X-Tenant-Id is the optional tenant-switch
+			// header (see internal/auth's Middleware).
+			AllowHeaders:     []string{"Content-Type", "Authorization", "X-Tenant-Id"},
 			ExposeHeaders:    []string{"X-Request-Id"},
 			AllowCredentials: false,
 			MaxAge:           12 * time.Hour,
@@ -88,17 +93,22 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 
 	api := r.Group("/api/v1")
 
-	// This service authenticates nothing itself — see identity.go — it
-	// trusts the X-Tenant-Id/X-User-Id/X-User-Name headers a trusted caller
-	// sets, which today is the tenant dashboard's own backend, standing in
-	// ahead of the real flowPOS-bearer verification to come later.
+	// Every route here authenticates by delegating to FlowPOS — see
+	// internal/auth's package doc comment. There is no local auth system.
 	identified := api.Group("")
-	identified.Use(handlers.IdentityMiddleware())
+	identified.Use(auth.Middleware(flowposClient, authCache, cfg.AuthCacheTTL, cfg.AuthNegativeCacheTTL))
 
 	identified.GET("/chat", chatHandler.Get)
 	identified.POST("/chats/messages", messageHandler.Send)
 
-	return &Server{cfg: cfg, engine: r}, nil
+	return &Server{cfg: cfg, engine: r, authCache: authCache}, nil
+}
+
+// Close releases resources the server started that outlive a single
+// request — currently just the auth cache's background sweep goroutine.
+// Called during graceful shutdown (see cmd/server/main.go).
+func (s *Server) Close() {
+	s.authCache.Close()
 }
 
 // Handler exposes the underlying http.Handler — used both by Run (wrapped

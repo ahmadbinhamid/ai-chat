@@ -68,15 +68,43 @@ func (s *Store) ReadFile(themeSlug, relPath string) (string, error) {
 
 // WriteFile writes content to a theme file, creating parent directories as
 // needed (a brand-new page's directory may not exist yet).
+//
+// Writes via a temp file + rename rather than os.WriteFile directly:
+// os.WriteFile truncates the target before writing its new content, so a
+// write that fails partway through (disk full, process killed) would
+// destroy a previously-good, working file — not just fail to create a new
+// one. Writing to a sibling temp file first and renaming over the target
+// only replaces it once the new content is fully and successfully on disk;
+// rename is atomic on the same filesystem, so the target is always either
+// the old content or the new content, never a truncated mix of both.
 func (s *Store) WriteFile(themeSlug, relPath, content string) error {
 	abs, err := s.resolve(themeSlug, relPath)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	dir := filepath.Dir(abs)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create parent directory for %s: %w", relPath, err)
 	}
-	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file for %s: %w", relPath, err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once the rename below succeeds
+
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write %s: %w", relPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write %s: %w", relPath, err)
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", relPath, err)
+	}
+	if err := os.Rename(tmpPath, abs); err != nil {
 		return fmt.Errorf("write %s: %w", relPath, err)
 	}
 	return nil

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"unicode/utf8"
 )
 
 // allowedGeneratedExtensions is deliberately narrow: pages.json is never
@@ -29,6 +30,30 @@ var allowedGeneratedExtensions = map[string]bool{
 	".js":     true,
 }
 
+// maxPathLen matches chat_generated_files.file_path's column width
+// (VARCHAR(500)) — counted in runes, like MySQL's utf8mb4 VARCHAR does,
+// not bytes; a path with many multi-byte characters could fit the column
+// but fail a byte-length check, or vice versa. Checked before any other
+// rule, and without echoing the value back — a model proposal that goes
+// badly wrong can put an entire file's content where a path belongs (seen
+// in practice: a multi-KB JS blob in the path field), and nothing
+// downstream (the DB write, the merchant-facing error, this log line)
+// should have to hold that just to say "this path is broken".
+const maxPathLen = 500
+
+// previewLen bounds how much of an untrusted path gets echoed back in the
+// remaining error messages below, for the same reason — a bad path can
+// still be under maxPathLen and worth showing, just not showing all of.
+const previewLen = 120
+
+func preview(s string) string {
+	r := []rune(s)
+	if len(r) <= previewLen {
+		return s
+	}
+	return string(r[:previewLen]) + "…"
+}
+
 // ValidatePathSafety rejects anything that isn't a plain, theme-root-relative
 // path: no absolute paths, no ".." traversal (including a disguised
 // backslash variant), nothing that escapes the theme root once cleaned.
@@ -40,15 +65,18 @@ func ValidatePathSafety(relPath string) error {
 	if relPath == "" {
 		return fmt.Errorf("file path must not be empty")
 	}
+	if n := utf8.RuneCountInString(relPath); n > maxPathLen {
+		return fmt.Errorf("file path is too long (%d characters, max %d) — this usually means content ended up where a path belongs", n, maxPathLen)
+	}
 	if path.IsAbs(relPath) || strings.HasPrefix(relPath, "/") {
-		return fmt.Errorf("file path must be theme-relative, got absolute path %q", relPath)
+		return fmt.Errorf("file path must be theme-relative, got absolute path %q", preview(relPath))
 	}
 	if strings.Contains(relPath, "\\") {
-		return fmt.Errorf("file path must not contain backslashes: %q", relPath)
+		return fmt.Errorf("file path must not contain backslashes: %q", preview(relPath))
 	}
 	cleaned := path.Clean(relPath)
 	if cleaned != relPath || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return fmt.Errorf("file path escapes the theme root: %q", relPath)
+		return fmt.Errorf("file path escapes the theme root: %q", preview(relPath))
 	}
 	return nil
 }
@@ -63,7 +91,7 @@ func ValidateGeneratedFilePath(relPath string) error {
 	}
 	ext := path.Ext(path.Clean(relPath))
 	if !allowedGeneratedExtensions[ext] {
-		return fmt.Errorf("file extension %q is not allowed for a generated file (only .liquid, .css, .js)", ext)
+		return fmt.Errorf("file extension %q is not allowed for a generated file (only .liquid, .css, .js): %q", ext, preview(relPath))
 	}
 	return nil
 }
@@ -76,7 +104,7 @@ func ValidateThemeSlug(slug string) error {
 		return fmt.Errorf("theme slug must not be empty")
 	}
 	if slug != path.Clean(slug) || strings.ContainsAny(slug, "/\\") {
-		return fmt.Errorf("invalid theme slug: %q", slug)
+		return fmt.Errorf("invalid theme slug: %q", preview(slug))
 	}
 	return nil
 }

@@ -17,11 +17,15 @@ const (
 	RoleSystem    Role = "system"
 )
 
+// MessageStatus exists for a possible future state beyond "it happened" —
+// today every persisted message is MessageStatusCompleted, since a failed
+// generation is never written as a turn at all (see
+// themebuild.Service.Generate and its package-level doc comment on why
+// errors are request-scoped, not chat history).
 type MessageStatus string
 
 const (
 	MessageStatusCompleted MessageStatus = "completed"
-	MessageStatusFailed    MessageStatus = "failed"
 )
 
 // ApplyStatus records whether an assistant turn's proposed changes were
@@ -64,7 +68,6 @@ type Message struct {
 	UserName     *string       `json:"user_name"`
 	Content      string        `json:"content"`
 	Status       MessageStatus `json:"status"`
-	ErrorMessage *string       `json:"error_message"`
 	InputTokens  int64         `json:"input_tokens"`
 	OutputTokens int64         `json:"output_tokens"`
 	ApplyStatus  ApplyStatus   `json:"apply_status"`

@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"ai-chat/internal/httpresponse"
+	"ai-chat/internal/logging"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/modules/themebuild"
 	"ai-chat/internal/themefs"
@@ -16,6 +18,14 @@ import (
 // respondErr maps domain errors to HTTP status codes. Shared by every
 // handler in this package — add a new module's sentinel errors here as
 // features grow, rather than status-coding them ad hoc per handler.
+//
+// The default branch is the only place an error this codebase didn't
+// anticipate ends up — a raw DB error, a filesystem error, anything not
+// explicitly mapped above. That's exactly the kind of error that can leak
+// internal detail (table/column names, filesystem paths) if sent to the
+// client verbatim, and — until this fix — it was also never logged
+// anywhere server-side, meaning the HTTP response was the *only* record of
+// it ever happening. Log the real error here, return a generic one.
 func respondErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, chat.ErrNotFound), errors.Is(err, themebuild.ErrNotFound):
@@ -23,7 +33,8 @@ func respondErr(c *gin.Context, err error) {
 	case errors.Is(err, themefs.ErrSlugAlreadyRegistered):
 		httpresponse.Error(c, http.StatusConflict, err.Error(), "SLUG_ALREADY_REGISTERED")
 	default:
-		httpresponse.Error(c, http.StatusInternalServerError, err.Error(), "")
+		slog.Default().Error("unhandled request error", "error", err.Error(), "request_id", logging.RequestID(c))
+		httpresponse.Error(c, http.StatusInternalServerError, "an unexpected error occurred", "")
 	}
 }
 

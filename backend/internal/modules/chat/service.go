@@ -5,8 +5,13 @@ import (
 	"errors"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 )
+
+// mysqlDuplicateEntry is MySQL error 1062 (ER_DUP_ENTRY) — a unique/primary
+// key violation.
+const mysqlDuplicateEntry = 1062
 
 // Service holds the chat/message business rules — ownership scoping and
 // keeping a chat's running token totals in sync — and delegates persistence
@@ -25,10 +30,27 @@ func NewService(repo *Repository) *Service {
 // this package usable for an unrelated chat use case on the same tenant later.
 func (s *Service) GetOrCreateChat(ctx context.Context, tenantID uint64, chatType string) (Chat, error) {
 	c, err := s.repo.GetChatByTenantAndType(ctx, tenantID, chatType)
-	if errors.Is(err, ErrNotFound) {
-		return s.createChat(ctx, tenantID, chatType)
+	if err == nil {
+		return c, nil
 	}
-	return c, err
+	if !errors.Is(err, ErrNotFound) {
+		return Chat{}, err
+	}
+
+	c, err = s.createChat(ctx, tenantID, chatType)
+	if err == nil {
+		return c, nil
+	}
+	// Two concurrent first messages for the same tenant (two tabs, a
+	// client retry racing the original) can both miss the lookup above and
+	// race to insert — uniq_chats_tenant_type means exactly one wins. The
+	// loser isn't a real failure, it's just "the chat already exists", so
+	// re-read it rather than surfacing the raw duplicate-key error.
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlDuplicateEntry {
+		return s.repo.GetChatByTenantAndType(ctx, tenantID, chatType)
+	}
+	return Chat{}, err
 }
 
 func (s *Service) createChat(ctx context.Context, tenantID uint64, chatType string) (Chat, error) {
@@ -71,11 +93,22 @@ func (s *Service) GetChat(ctx context.Context, tenantID uint64, chatID string) (
 }
 
 // ListMessages returns a chat's full turn history, after verifying
-// ownership.
+// ownership. Costs an extra GetChatByID query beyond the list itself — if
+// the caller already holds a chat it fetched (and tenant-verified) moments
+// ago in the same request, prefer ListMessagesForVerifiedChat instead of
+// paying for that re-check twice.
 func (s *Service) ListMessages(ctx context.Context, tenantID uint64, chatID string) ([]Message, error) {
 	if _, err := s.GetChat(ctx, tenantID, chatID); err != nil {
 		return nil, err
 	}
+	return s.repo.ListMessagesByChat(ctx, chatID)
+}
+
+// ListMessagesForVerifiedChat returns a chat's full turn history without
+// re-verifying ownership — only for a caller that has already confirmed
+// chatID belongs to the requesting tenant in this same request (e.g.
+// ChatHandler.Get, right after its own GetChatForTenant call).
+func (s *Service) ListMessagesForVerifiedChat(ctx context.Context, chatID string) ([]Message, error) {
 	return s.repo.ListMessagesByChat(ctx, chatID)
 }
 
@@ -116,10 +149,7 @@ func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64,
 		ApplyStatus: ApplyStatusNotApplicable,
 		CreatedAt:   now,
 	}
-	if err := s.repo.CreateMessage(ctx, m); err != nil {
-		return Message{}, err
-	}
-	if err := s.repo.TouchChatUsage(ctx, c.ID, 0, 0, now); err != nil {
+	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, 0, 0, now); err != nil {
 		return Message{}, err
 	}
 	return m, nil
@@ -128,8 +158,10 @@ func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64,
 // RecordAssistantMessage appends the model's reply, rolling its token usage
 // into the chat's running totals. applyStatus should be ApplyStatusApplied
 // when the turn's proposed changes were already written to the real theme,
-// ApplyStatusNotApplicable otherwise.
-func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content string, status MessageStatus, errMsg *string, inputTokens, outputTokens int64, applyStatus ApplyStatus) (Message, error) {
+// ApplyStatusNotApplicable otherwise. Only ever called for a turn that
+// actually completed — a failed generation is never persisted (see
+// themebuild.Service.Generate), so there is no "failed" status to pass here.
+func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus) (Message, error) {
 	now := time.Now().UTC()
 	m := Message{
 		ID:           uuid.NewString(),
@@ -138,16 +170,15 @@ func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content st
 		Role:         RoleAssistant,
 		Content:      content,
 		Status:       status,
-		ErrorMessage: errMsg,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
 		ApplyStatus:  applyStatus,
 		CreatedAt:    now,
 	}
-	if err := s.repo.CreateMessage(ctx, m); err != nil {
-		return Message{}, err
+	if applyStatus == ApplyStatusApplied {
+		m.AppliedAt = &now
 	}
-	if err := s.repo.TouchChatUsage(ctx, c.ID, inputTokens, outputTokens, now); err != nil {
+	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, inputTokens, outputTokens, now); err != nil {
 		return Message{}, err
 	}
 	return m, nil

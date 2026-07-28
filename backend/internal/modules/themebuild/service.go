@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
@@ -25,20 +27,27 @@ const (
 	// tenant's theme-builder thread apart from any future, unrelated chat
 	// use case sharing the same tenant.
 	ChatType = "builder"
+
+	// generateTimeout bounds Generate's own work once it's decided to
+	// proceed (see workContext) — independent of the caller's request
+	// context, but not unbounded either. Matches the HTTP server's own
+	// writeTimeout (cmd/server/main.go).
+	generateTimeout = 5 * time.Minute
 )
 
 // Service is the AI theme builder's orchestration: turn a prompt into
 // proposed changes and write them straight to the real theme filesystem
 // (see Generate) — there is no separate review/apply step.
 type Service struct {
-	repo  *Repository
-	chats *chat.Service
-	gen   *ai.Generator
-	store *themefs.Store
+	repo       *Repository
+	chats      *chat.Service
+	gen        *ai.Generator
+	store      *themefs.Store
+	themeLocks *keyedMutex
 }
 
 func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store *themefs.Store) *Service {
-	return &Service{repo: repo, chats: chats, gen: gen, store: store}
+	return &Service{repo: repo, chats: chats, gen: gen, store: store, themeLocks: newKeyedMutex()}
 }
 
 // GenerateInput is one merchant prompt, always against the tenant's one
@@ -52,11 +61,16 @@ type GenerateInput struct {
 }
 
 // GenerateOutcome is everything a generation call produced, for the handler
-// to render back to the client.
+// to render back to the client. AssistantMessage is nil when Generate
+// returns an error: a failed turn is never persisted (see Generate's doc
+// comment), so there is nothing to point it at. Chat and UserMessage are
+// still populated on most failures, since the user's own prompt is recorded
+// before anything that can fail — the caller can still refresh history to
+// show it, even though there's no reply to go with it yet.
 type GenerateOutcome struct {
 	Chat             chat.Chat
 	UserMessage      chat.Message
-	AssistantMessage chat.Message
+	AssistantMessage *chat.Message
 	Files            []GeneratedFile
 }
 
@@ -64,47 +78,62 @@ type GenerateOutcome struct {
 // for the resulting file changes, and — unlike an earlier pending/apply
 // design — writes them to the real theme filesystem immediately, in the
 // same request: there is no "Apply to theme" step for the merchant to
-// trigger separately. A model/infra failure, or a failure while writing to
-// disk, still returns a GenerateOutcome (the failed assistant turn is
-// recorded so it shows up in history) alongside a non-nil error — callers
-// should render the outcome either way and use the error only to pick the
-// HTTP status.
+// trigger separately.
+//
+// A model/infra failure, a rejected proposal, or a failure while writing to
+// disk is never persisted as a chat turn — errors are request-scoped, not
+// chat history. This is deliberate, not an oversight: an error message is
+// only useful at the moment it happens, and a chat shared by everyone on the
+// tenant (see chat.Service.GetOrCreateChat) shouldn't accumulate every
+// transient failure any of them ever hit as permanent, re-displayed-forever
+// history. The caller renders the error from the HTTP response itself
+// (ephemeral, e.g. a toast) rather than from anything stored in the
+// database — see the frontend's ai-chatbot page for where that's shown.
 func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutcome, error) {
 	if in.ThemeSlug == "" {
 		return GenerateOutcome{}, errors.New("theme_slug is required")
 	}
-	c, err := s.chats.GetOrCreateChat(ctx, in.TenantID, ChatType)
+
+	// Detached from the caller's own request lifecycle, but not unbounded:
+	// once a merchant kicks off a generation, closing the tab or a flaky
+	// mobile connection shouldn't sever a multi-minute Claude call and
+	// silently orphan whatever it was about to write to the real theme —
+	// the outcome should be a real, recorded one either way, not something
+	// that depends on the browser staying connected for the whole call.
+	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generateTimeout)
+	defer cancel()
+
+	c, err := s.chats.GetOrCreateChat(workCtx, in.TenantID, ChatType)
 	if err != nil {
 		return GenerateOutcome{}, err
 	}
 
-	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
+	priorMessages, err := s.chats.ListMessages(workCtx, in.TenantID, c.ID)
 	if err != nil {
 		return GenerateOutcome{}, fmt.Errorf("load chat history: %w", err)
 	}
 
-	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.Prompt)
+	userMsg, err := s.chats.RecordUserMessage(workCtx, c, in.UserID, in.UserName, in.Prompt)
 	if err != nil {
 		return GenerateOutcome{}, fmt.Errorf("record user message: %w", err)
 	}
+	// From here on, any failure still returns this much: the user's prompt
+	// really was recorded, so the caller has something to refresh to even
+	// though there's no assistant reply to go with it.
+	outcome := GenerateOutcome{Chat: c, UserMessage: userMsg}
 
 	tc, err := s.buildThemeContext(in.ThemeSlug)
 	if err != nil {
-		return GenerateOutcome{}, fmt.Errorf("load theme context: %w", err)
+		return outcome, fmt.Errorf("load theme context: %w", err)
 	}
-	tc.EditingFiles, err = s.buildEditingFilesContext(ctx, in.ThemeSlug, c.ID)
+	tc.EditingFiles, err = s.buildEditingFilesContext(workCtx, in.ThemeSlug, c.ID)
 	if err != nil {
-		return GenerateOutcome{}, fmt.Errorf("load editing-files context: %w", err)
+		return outcome, fmt.Errorf("load editing-files context: %w", err)
 	}
 
-	result, genErr := s.gen.Generate(ctx, tc, toTurns(priorMessages), in.Prompt, nil)
+	result, genErr := s.gen.Generate(workCtx, tc, toTurns(priorMessages), in.Prompt, nil)
 	if genErr != nil {
-		errMsg := genErr.Error()
-		assistantMsg, recErr := s.chats.RecordAssistantMessage(ctx, c, "", chat.MessageStatusFailed, &errMsg, 0, 0, chat.ApplyStatusNotApplicable)
-		if recErr != nil {
-			return GenerateOutcome{}, fmt.Errorf("record failed turn: %w (generation error: %w)", recErr, genErr)
-		}
-		return GenerateOutcome{Chat: c, UserMessage: userMsg, AssistantMessage: assistantMsg}, genErr
+		return outcome, genErr
 	}
 
 	if result.NeedsClarification {
@@ -118,29 +147,36 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	}
 
 	if err := validateProposal(result); err != nil {
-		errMsg := fmt.Sprintf("model proposed an invalid change and was rejected: %v", err)
-		assistantMsg, recErr := s.chats.RecordAssistantMessage(ctx, c, "", chat.MessageStatusFailed, &errMsg, result.InputTokens, result.OutputTokens, chat.ApplyStatusNotApplicable)
-		if recErr != nil {
-			return GenerateOutcome{}, fmt.Errorf("record rejected turn: %w (validation error: %w)", recErr, err)
-		}
-		return GenerateOutcome{Chat: c, UserMessage: userMsg, AssistantMessage: assistantMsg}, fmt.Errorf("invalid model proposal: %w", err)
+		return outcome, fmt.Errorf("invalid model proposal: %w", err)
 	}
 
 	hasChanges := len(result.Files) > 0 || result.PageRegistryEntry != nil || len(result.LayoutLinksToAdd) > 0 || len(result.LayoutScriptsToAdd) > 0
 
 	var written []writtenFile
 	if hasChanges {
-		written, err = s.applyFilesToDisk(in.ThemeSlug, result.Files)
-		if err == nil {
-			err = s.applyRegistryAndLinks(in.ThemeSlug, result)
-		}
+		// Serializes the read-modify-write critical section below per
+		// theme: two concurrent requests for the same theme (two tabs, a
+		// client retry racing the original) must not interleave reads and
+		// writes of pages.json/the layout files, or one's registration can
+		// silently clobber the other's (a lost update). Scoped tightly to
+		// just this section, not the whole request — the Claude call above
+		// can take minutes, and a second tab's edit shouldn't queue behind
+		// that, only behind the fast disk work.
+		unlock := s.themeLocks.Lock(in.ThemeSlug)
+		defer unlock()
+
+		// Computed entirely in memory first, nothing written yet: a
+		// failure here (e.g. a duplicate page slug) leaves the real theme
+		// completely untouched, rather than a validation error arriving
+		// after some files already landed on disk with nothing recording
+		// that they did.
+		plan, err := s.buildWritePlan(in.ThemeSlug, result)
 		if err != nil {
-			errMsg := fmt.Sprintf("model generated a valid change, but writing it to the theme failed: %v", err)
-			assistantMsg, recErr := s.chats.RecordAssistantMessage(ctx, c, "", chat.MessageStatusFailed, &errMsg, result.InputTokens, result.OutputTokens, chat.ApplyStatusNotApplicable)
-			if recErr != nil {
-				return GenerateOutcome{}, fmt.Errorf("record failed turn: %w (apply error: %w)", recErr, err)
-			}
-			return GenerateOutcome{Chat: c, UserMessage: userMsg, AssistantMessage: assistantMsg}, fmt.Errorf("apply to theme: %w", err)
+			return outcome, fmt.Errorf("apply to theme: %w", err)
+		}
+		written, err = s.commitWritePlan(in.ThemeSlug, plan)
+		if err != nil {
+			return outcome, fmt.Errorf("apply to theme: %w", err)
 		}
 	}
 
@@ -149,17 +185,32 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		applyStatus = chat.ApplyStatusApplied
 	}
 
-	assistantMsg, err := s.chats.RecordAssistantMessage(ctx, c, result.Summary, chat.MessageStatusCompleted, nil, result.InputTokens, result.OutputTokens, applyStatus)
-	if err != nil {
-		return GenerateOutcome{}, fmt.Errorf("record assistant message: %w", err)
+	// The schema requires "summary" as a key but not a non-empty one, so an
+	// empty string is a valid (if unhelpful) reply the model can return. A
+	// "completed" turn with empty content isn't just a bland reply, though —
+	// it's a landmine: internal/ai applies a prompt-cache breakpoint to the
+	// last history turn on every subsequent call, and Anthropic rejects
+	// cache_control on an empty text block outright (400), which would take
+	// down every future message in this chat, not just this one. Never
+	// persist that state.
+	summary := result.Summary
+	if summary == "" {
+		summary = "Done."
 	}
 
-	files, err := s.persistFileRecords(ctx, c, assistantMsg.ID, written)
+	assistantMsg, err := s.chats.RecordAssistantMessage(workCtx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
 	if err != nil {
-		return GenerateOutcome{}, fmt.Errorf("persist generated-file audit rows: %w", err)
+		return outcome, fmt.Errorf("record assistant message: %w", err)
 	}
+	outcome.AssistantMessage = &assistantMsg
 
-	return GenerateOutcome{Chat: c, UserMessage: userMsg, AssistantMessage: assistantMsg, Files: files}, nil
+	files, err := s.persistFileRecords(workCtx, c, assistantMsg.ID, written)
+	if err != nil {
+		return outcome, fmt.Errorf("persist generated-file audit rows: %w", err)
+	}
+	outcome.Files = files
+
+	return outcome, nil
 }
 
 func (s *Service) buildThemeContext(themeSlug string) (ai.ThemeContext, error) {
@@ -239,16 +290,45 @@ func (s *Service) buildEditingFilesContext(ctx context.Context, themeSlug, chatI
 			content = latest[path].content
 		}
 		if len(content) > maxEditingFileBytes {
-			content = content[:maxEditingFileBytes] + fmt.Sprintf("\n<!-- truncated: %d more bytes omitted -->", len(content)-maxEditingFileBytes)
+			truncated := truncateAtRuneBoundary(content, maxEditingFileBytes)
+			content = truncated + fmt.Sprintf("\n<!-- truncated: %d more bytes omitted -->", len(content)-len(truncated))
 		}
 		editing[path] = content
 	}
 	return editing, nil
 }
 
+// truncateAtRuneBoundary truncates s to at most maxBytes bytes, backing up
+// to the nearest rune boundary if the naive cut point would split a
+// multi-byte UTF-8 character — generated theme content (page copy, brand
+// names) can legitimately contain non-ASCII text, and a raw byte slice here
+// could otherwise hand the model invalid UTF-8.
+func truncateAtRuneBoundary(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// toTurns replays a chat's history as message turns for the model. Anthropic
+// rejects an empty text content block outright ("text content blocks must
+// be non-empty") — not just for the cache_control breakpoint, for any
+// message anywhere in the request — so an empty turn is skipped rather than
+// replayed, regardless of role or status. This also self-heals any chat
+// that already has an empty "completed" turn sitting in its history from
+// before the fix that stops persisting one (see Generate): the bad row
+// stays in the database, but it's excluded here every time history gets
+// rebuilt, so it can't keep breaking every future message in that chat.
 func toTurns(messages []chat.Message) []ai.Turn {
 	turns := make([]ai.Turn, 0, len(messages))
 	for _, m := range messages {
+		if strings.TrimSpace(m.Content) == "" {
+			continue
+		}
 		switch m.Role {
 		case chat.RoleUser:
 			turns = append(turns, ai.Turn{Role: "user", Content: m.Content})
@@ -267,8 +347,14 @@ func toTurns(messages []chat.Message) []ai.Turn {
 // automatically safe just because it was asked nicely.
 func validateProposal(r *ai.Result) error {
 	for _, f := range r.Files {
+		// Not re-embedding f.Path here: themefs' error already includes a
+		// bounded preview of it. A proposal gone badly wrong can put an
+		// entire file's content where a path belongs, and doubling that
+		// blob into an outer wrapper is exactly the duplication that made
+		// an earlier version of this error unreadable (and huge) in the
+		// chat UI.
 		if err := themefs.ValidateGeneratedFilePath(f.Path); err != nil {
-			return fmt.Errorf("file %q: %w", f.Path, err)
+			return fmt.Errorf("proposed file rejected: %w", err)
 		}
 		if f.Action != "create" && f.Action != "update" {
 			return fmt.Errorf("file %q: invalid action %q", f.Path, f.Action)
@@ -276,12 +362,12 @@ func validateProposal(r *ai.Result) error {
 	}
 	for _, p := range r.LayoutLinksToAdd {
 		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
-			return fmt.Errorf("layout css link %q: %w", p, err)
+			return fmt.Errorf("proposed layout css link rejected: %w", err)
 		}
 	}
 	for _, p := range r.LayoutScriptsToAdd {
 		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
-			return fmt.Errorf("layout js link %q: %w", p, err)
+			return fmt.Errorf("proposed layout js link rejected: %w", err)
 		}
 	}
 	return nil
@@ -296,83 +382,142 @@ type writtenFile struct {
 	previous  *string
 }
 
-// applyFilesToDisk re-validates and writes every proposed file to the real
-// theme filesystem, stopping at the first failure — the caller is
-// responsible for surfacing a partial-write error as a failed turn rather
-// than silently losing which files did and didn't make it.
-func (s *Service) applyFilesToDisk(themeSlug string, proposed []ai.GeneratedFile) ([]writtenFile, error) {
-	written := make([]writtenFile, 0, len(proposed))
-	for _, f := range proposed {
-		if err := themefs.ValidateGeneratedFilePath(f.Path); err != nil {
-			return written, fmt.Errorf("file %q failed re-validation before write: %w", f.Path, err)
-		}
+// planFile is one file a writePlan will commit — either a proposed file
+// (action/content straight from the model) or the recomputed content of a
+// shared file (pages.json, a layout file) after folding in this turn's
+// merge/splice. previous is only meaningful for proposed files (see
+// writtenFile) and is nil otherwise.
+type planFile struct {
+	path     string
+	action   FileAction
+	content  string
+	previous *string
+}
+
+// writePlan is everything one turn needs to commit to the real theme,
+// computed entirely in memory before anything is written — see
+// buildWritePlan/commitWritePlan.
+type writePlan struct {
+	files       []planFile
+	pagesJSON   *planFile
+	layoutStart *planFile
+	layoutEnd   *planFile
+}
+
+// buildWritePlan computes every file this turn would write — proposed
+// files verbatim, plus the pages.json merge and layout-file splices — using
+// only reads, never a write. Nothing lands on disk until commitWritePlan
+// runs, so a failure here (a duplicate page slug, a layout file missing its
+// insertion marker) leaves the real theme completely untouched instead of
+// partially, silently modified.
+func (s *Service) buildWritePlan(themeSlug string, result *ai.Result) (writePlan, error) {
+	var plan writePlan
+
+	for _, f := range result.Files {
 		previous, err := s.store.ReadFile(themeSlug, f.Path)
 		if err != nil {
-			return written, err
+			return writePlan{}, fmt.Errorf("read %q: %w", f.Path, err)
 		}
 		var previousPtr *string
 		if previous != "" {
 			previousPtr = &previous
 		}
-		if err := s.store.WriteFile(themeSlug, f.Path, f.Content); err != nil {
-			return written, fmt.Errorf("write %q: %w", f.Path, err)
-		}
-		written = append(written, writtenFile{generated: f, previous: previousPtr})
+		plan.files = append(plan.files, planFile{
+			path:     f.Path,
+			action:   FileAction(f.Action),
+			content:  f.Content,
+			previous: previousPtr,
+		})
 	}
-	return written, nil
-}
 
-// applyRegistryAndLinks performs the non-file side effects a proposal can
-// include: merging a new pages.json entry, and splicing a new
-// <link>/<script> tag into the layout files. These are structured
-// merges/splices against files shared across the whole theme, never a
-// plain overwrite (see THEME_ENGINE_SPEC.md).
-func (s *Service) applyRegistryAndLinks(themeSlug string, result *ai.Result) error {
 	if result.PageRegistryEntry != nil {
 		entry := *result.PageRegistryEntry
 		entry.PublishedAt = time.Now().UTC().Format(time.RFC3339)
 		current, err := s.store.ReadFile(themeSlug, pathPagesJSON)
 		if err != nil {
-			return fmt.Errorf("register page: %w", err)
+			return writePlan{}, fmt.Errorf("register page: %w", err)
 		}
 		merged, err := themefs.MergePageRegistration([]byte(current), entry)
 		if err != nil {
-			return fmt.Errorf("register page: %w", err)
+			return writePlan{}, fmt.Errorf("register page: %w", err)
 		}
-		if err := s.store.WriteFile(themeSlug, pathPagesJSON, string(merged)); err != nil {
-			return fmt.Errorf("register page: %w", err)
+		plan.pagesJSON = &planFile{path: pathPagesJSON, content: string(merged)}
+	}
+
+	if len(result.LayoutLinksToAdd) > 0 {
+		current, err := s.store.ReadFile(themeSlug, pathLayoutStart)
+		if err != nil {
+			return writePlan{}, fmt.Errorf("add layout css links: %w", err)
+		}
+		changedAny := false
+		for _, path := range result.LayoutLinksToAdd {
+			updated, changed, err := themefs.AddStylesheetLink(current, path)
+			if err != nil {
+				return writePlan{}, fmt.Errorf("add layout css link %q: %w", path, err)
+			}
+			if changed {
+				current = updated // so a second link in the same turn splices against the first
+				changedAny = true
+			}
+		}
+		if changedAny {
+			plan.layoutStart = &planFile{path: pathLayoutStart, content: current}
 		}
 	}
-	for _, path := range result.LayoutLinksToAdd {
-		if err := s.spliceLayoutLink(themeSlug, pathLayoutStart, path, themefs.AddStylesheetLink); err != nil {
-			return fmt.Errorf("add layout css link %q: %w", path, err)
+
+	if len(result.LayoutScriptsToAdd) > 0 {
+		current, err := s.store.ReadFile(themeSlug, pathLayoutEnd)
+		if err != nil {
+			return writePlan{}, fmt.Errorf("add layout js links: %w", err)
+		}
+		changedAny := false
+		for _, path := range result.LayoutScriptsToAdd {
+			updated, changed, err := themefs.AddDeferredScript(current, path)
+			if err != nil {
+				return writePlan{}, fmt.Errorf("add layout js link %q: %w", path, err)
+			}
+			if changed {
+				current = updated
+				changedAny = true
+			}
+		}
+		if changedAny {
+			plan.layoutEnd = &planFile{path: pathLayoutEnd, content: current}
 		}
 	}
-	for _, path := range result.LayoutScriptsToAdd {
-		if err := s.spliceLayoutLink(themeSlug, pathLayoutEnd, path, themefs.AddDeferredScript); err != nil {
-			return fmt.Errorf("add layout js link %q: %w", path, err)
-		}
-	}
-	return nil
+
+	return plan, nil
 }
 
-func (s *Service) spliceLayoutLink(themeSlug, layoutPath, linkPath string, splice func(string, string) (string, bool, error)) error {
-	current, err := s.store.ReadFile(themeSlug, layoutPath)
-	if err != nil {
-		return err
+// commitWritePlan writes everything in plan to disk (each individual write
+// already atomic — see themefs.Store.WriteFile). Only the proposed files
+// (plan.files) get an audit trail (see persistFileRecords) — pages.json and
+// the layout files are shared, structurally-merged config, not "generated
+// files" in their own right.
+func (s *Service) commitWritePlan(themeSlug string, plan writePlan) ([]writtenFile, error) {
+	written := make([]writtenFile, 0, len(plan.files))
+	for _, f := range plan.files {
+		if err := s.store.WriteFile(themeSlug, f.path, f.content); err != nil {
+			return written, fmt.Errorf("write %q: %w", f.path, err)
+		}
+		written = append(written, writtenFile{
+			generated: ai.GeneratedFile{Path: f.path, Action: string(f.action), Content: f.content},
+			previous:  f.previous,
+		})
 	}
-	updated, changed, err := splice(current, linkPath)
-	if err != nil {
-		return err
+	for _, f := range []*planFile{plan.pagesJSON, plan.layoutStart, plan.layoutEnd} {
+		if f == nil {
+			continue
+		}
+		if err := s.store.WriteFile(themeSlug, f.path, f.content); err != nil {
+			return written, fmt.Errorf("write %q: %w", f.path, err)
+		}
 	}
-	if !changed {
-		return nil
-	}
-	return s.store.WriteFile(themeSlug, layoutPath, updated)
+	return written, nil
 }
 
 // persistFileRecords writes the audit row for each file already written to
-// disk (see applyFilesToDisk) — done after the assistant message exists
+// disk (see commitWritePlan) — done after the assistant message exists
 // since chat_generated_files.message_id is a foreign key into it.
 func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID string, written []writtenFile) ([]GeneratedFile, error) {
 	files := make([]GeneratedFile, 0, len(written))
@@ -418,4 +563,32 @@ func languageFor(path string) string {
 	default:
 		return ""
 	}
+}
+
+// keyedMutex hands out one mutex per key, created lazily — same shape as
+// ratelimit.PerTenantLimiter, minus the token-bucket part. The map grows by
+// one entry per distinct theme_slug ever seen by this process, not per
+// request — bounded by how many themes actually exist, unlike a per-token
+// cache, so no sweep/eviction is needed here.
+type keyedMutex struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func newKeyedMutex() *keyedMutex {
+	return &keyedMutex{locks: make(map[string]*sync.Mutex)}
+}
+
+// Lock blocks until key's lock is held, and returns the func to release it.
+func (k *keyedMutex) Lock(key string) func() {
+	k.mu.Lock()
+	lock, ok := k.locks[key]
+	if !ok {
+		lock = &sync.Mutex{}
+		k.locks[key] = lock
+	}
+	k.mu.Unlock()
+
+	lock.Lock()
+	return lock.Unlock
 }

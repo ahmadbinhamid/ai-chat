@@ -156,8 +156,17 @@ var resultSchema = map[string]any{
 // to a live SSE response is a caller-side addition, not required for
 // Generate to work.
 func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string)) (*Result, error) {
+	// Anthropic rejects any empty text content block outright ("text content
+	// blocks must be non-empty") — not just for the cache_control
+	// breakpoint below, for any message anywhere in the request — so an
+	// empty turn is skipped rather than replayed. The caller (themebuild)
+	// already filters these out of history itself; this is defense in depth
+	// for any other caller of Generate, present or future.
 	messages := make([]anthropic.MessageParam, 0, len(history)+1)
 	for _, t := range history {
+		if strings.TrimSpace(t.Content) == "" {
+			continue
+		}
 		if strings.EqualFold(t.Role, "assistant") {
 			messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(t.Content)))
 		} else {
@@ -169,12 +178,26 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	// to the previous call, so Anthropic serves it from cache instead of
 	// reprocessing the whole conversation-so-far on every single message. Only
 	// the new prompt below (appended without cache_control) is genuinely new.
+	// The empty-text filter above already guarantees this block is
+	// non-empty; the OfText nil-check here is just defensive.
 	if last := len(messages) - 1; last >= 0 {
-		cacheControl := anthropic.NewCacheControlEphemeralParam()
-		cacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
-		messages[last].Content[len(messages[last].Content)-1].OfText.CacheControl = cacheControl
+		lastBlock := messages[last].Content[len(messages[last].Content)-1]
+		if lastBlock.OfText != nil && lastBlock.OfText.Text != "" {
+			cacheControl := anthropic.NewCacheControlEphemeralParam()
+			cacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
+			lastBlock.OfText.CacheControl = cacheControl
+		}
 	}
-	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)))
+	// EditingFiles rides along with the new prompt, not the system block —
+	// see editingFilesBlock's doc comment for why that matters for caching.
+	promptWithContext := prompt
+	if len(tc.EditingFiles) > 0 {
+		promptWithContext = fmt.Sprintf(
+			"## Files this request can reference (real current content of every file this chat has touched before)\n%s\n\n%s",
+			editingFilesBlock(tc.EditingFiles), prompt,
+		)
+	}
+	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(promptWithContext)))
 
 	stream := g.client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
 		Model:     g.model,
@@ -263,10 +286,9 @@ Rules for every request:
 }
 
 // dynamicSystemPrompt is the per-request grounding that varies on every call
-// — which theme, its current route registry, its brand defaults, and the
-// real current content of any file this chat has touched before — so it
+// — which theme, its current route registry, and its brand defaults — so it
 // carries no cache_control (see staticSystemPromptBlock for the part that
-// does).
+// does). EditingFiles deliberately isn't here — see editingFilesBlock.
 func dynamicSystemPrompt(tc ThemeContext) string {
 	pagesJSON := tc.PagesJSON
 	if pagesJSON == "" {
@@ -277,30 +299,42 @@ func dynamicSystemPrompt(tc ThemeContext) string {
 		defaultsJSON = "{}"
 	}
 
-	var editing strings.Builder
-	if len(tc.EditingFiles) == 0 {
-		editing.WriteString("(none yet — this chat hasn't touched any existing file)")
-	} else {
-		paths := make([]string, 0, len(tc.EditingFiles))
-		for path := range tc.EditingFiles {
-			paths = append(paths, path)
-		}
-		sort.Strings(paths)
-		for _, path := range paths {
-			fmt.Fprintf(&editing, "\n### %s\n%s\n", path, tc.EditingFiles[path])
-		}
-	}
-
 	return fmt.Sprintf(`## Theme being edited
 - Theme slug: %s
 - Current pages.json (existing routes — never register a slug that's already here):
 %s
 - Current defaults.json (brand colors, fonts, menu, footer — match this, don't invent a different palette):
 %s
+`, tc.ThemeSlug, pagesJSON, defaultsJSON)
+}
 
-## Files this request can reference (real current content of every file this chat has touched before)
-%s
-`, tc.ThemeSlug, pagesJSON, defaultsJSON, editing.String())
+// editingFilesBlock formats the "files this request can reference" section
+// — appended to the new user turn (see Generate) rather than kept in the
+// system prompt, where it used to live alongside dynamicSystemPrompt.
+// That mattered for more than tidiness: the system blocks precede the
+// messages array, so anything in them is part of the byte-for-byte prefix
+// the history cache breakpoint (the last message in a replayed
+// conversation) depends on matching. EditingFiles reflects whatever the
+// *previous* turn just wrote, so it changes on nearly every call in the
+// normal "merchant iterates on their theme" flow — keeping it in the system
+// prompt meant that breakpoint's cached prefix was invalidated almost every
+// time, even though pagesJSON/defaultsJSON (still in dynamicSystemPrompt)
+// change far less often. Moving it here means a multi-turn conversation
+// actually gets the incremental-caching benefit that breakpoint was for.
+func editingFilesBlock(editingFiles map[string]string) string {
+	if len(editingFiles) == 0 {
+		return "(none yet — this chat hasn't touched any existing file)"
+	}
+	paths := make([]string, 0, len(editingFiles))
+	for path := range editingFiles {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	var b strings.Builder
+	for _, path := range paths {
+		fmt.Fprintf(&b, "\n### %s\n%s\n", path, editingFiles[path])
+	}
+	return b.String()
 }
 
 // currentText concatenates the accumulated text blocks of a (possibly

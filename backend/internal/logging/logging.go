@@ -11,6 +11,8 @@ import (
 	"os"
 	"time"
 
+	"ai-chat/internal/auth"
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
@@ -40,13 +42,19 @@ func Middleware(logger *slog.Logger) gin.HandlerFunc {
 		start := time.Now()
 		c.Next()
 
+		// auth.Middleware runs downstream of this one (mounted only on the
+		// authenticated route group) and has already set the tenant by the
+		// time c.Next() returns here — reading it via auth.TenantID rather
+		// than a raw context key keeps this in sync with wherever auth
+		// actually stores it. 0 for routes with no auth (health check) or a
+		// request that never got past authentication.
 		logger.Info("request",
 			"request_id", id,
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
 			"status", c.Writer.Status(),
 			"duration_ms", time.Since(start).Milliseconds(),
-			"tenant_id", c.GetUint64("tenant_id"),
+			"tenant_id", auth.TenantID(c),
 		)
 	}
 }

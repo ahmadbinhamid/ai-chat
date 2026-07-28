@@ -54,6 +54,7 @@ func main() {
 		logger.Error("server initialization failed", "error", err)
 		os.Exit(1)
 	}
+	defer srv.Close()
 
 	httpServer := &http.Server{
 		Addr:              srv.Addr(),

@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 
+	"ai-chat/internal/auth"
 	"ai-chat/internal/httpresponse"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/modules/themebuild"
@@ -44,7 +45,7 @@ type chatDetail struct {
 // hasn't sent a first message yet has no chat row — that's a normal state
 // (200 with a null chat), not a 404.
 func (h *ChatHandler) Get(c *gin.Context) {
-	ch, err := h.chats.GetChatForTenant(c.Request.Context(), TenantID(c), themebuild.ChatType)
+	ch, err := h.chats.GetChatForTenant(c.Request.Context(), auth.TenantID(c), themebuild.ChatType)
 	if errors.Is(err, chat.ErrNotFound) {
 		httpresponse.OK(c, chatDetail{Chat: nil, Messages: []messageWithFiles{}})
 		return
@@ -54,7 +55,9 @@ func (h *ChatHandler) Get(c *gin.Context) {
 		return
 	}
 
-	messages, err := h.chats.ListMessages(c.Request.Context(), TenantID(c), ch.ID)
+	// ch was already tenant-scoped by GetChatForTenant above — no need to
+	// pay for a second ownership-verifying query for the same chat.
+	messages, err := h.chats.ListMessagesForVerifiedChat(c.Request.Context(), ch.ID)
 	if err != nil {
 		respondErr(c, err)
 		return

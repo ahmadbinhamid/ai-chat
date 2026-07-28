@@ -23,6 +23,11 @@ func init() {
 // constraint. apply_status is set directly to applied/not_applicable at
 // generation time now (see themebuild.Service.Generate) — there is no
 // pending state to wait on, generation writes to the real theme immediately.
+//
+// There is deliberately no error_message column: a failed generation is
+// never persisted as a turn at all (see Service.Generate) — errors are
+// request-scoped and returned directly in the HTTP response, not stored as
+// chat history. A row existing here at all means it completed.
 func Up_20260727000002(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chat_messages (
@@ -34,7 +39,6 @@ func Up_20260727000002(db *sql.DB) error {
 		  user_name      VARCHAR(255)    NULL,
 		  content        LONGTEXT        NOT NULL,
 		  status         VARCHAR(20)     NOT NULL DEFAULT 'completed',
-		  error_message  TEXT            NULL,
 		  input_tokens   INT UNSIGNED    NOT NULL DEFAULT 0,
 		  output_tokens  INT UNSIGNED    NOT NULL DEFAULT 0,
 		  apply_status   VARCHAR(20)     NOT NULL DEFAULT 'not_applicable',
