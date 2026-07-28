@@ -17,6 +17,7 @@ import (
 
 const (
 	ctxIdentityKey = "auth_identity"
+	ctxTokenKey    = "auth_token"
 	hdrTenantID    = "X-Tenant-Id"
 	bearerPrefix   = "Bearer "
 )
@@ -65,6 +66,7 @@ func Middleware(client *Client, cache Cache, positiveTTL, negativeTTL time.Durat
 			return
 		}
 
+		c.Set(ctxTokenKey, token)
 		c.Set(ctxIdentityKey, Identity{
 			UserID:      entry.UserID,
 			Name:        entry.Name,
@@ -211,4 +213,17 @@ func UserID(c *gin.Context) *uint64 {
 func UserName(c *gin.Context) string {
 	identity, _ := FromContext(c)
 	return identity.Name
+}
+
+// Token returns the raw bearer token this request was authenticated with —
+// for the rare caller that needs to forward the caller's own identity to
+// another FlowPOS-authenticated API on their behalf (see
+// internal/themefs.Store, which calls flowpos-backend's theme-file API as
+// the same user). Prefer FromContext/TenantID/UserID for anything else —
+// this exists only for that one forwarding use case, not as a general
+// convenience accessor.
+func Token(c *gin.Context) string {
+	v, _ := c.Get(ctxTokenKey)
+	token, _ := v.(string)
+	return token
 }

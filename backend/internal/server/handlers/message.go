@@ -65,6 +65,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		TenantID:  tenantID,
 		UserID:    auth.UserID(c),
 		UserName:  auth.UserName(c),
+		Token:     auth.Token(c),
 		ThemeSlug: in.ThemeSlug,
 		Prompt:    in.Prompt,
 	})

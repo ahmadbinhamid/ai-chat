@@ -42,7 +42,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	if err != nil {
 		return nil, err
 	}
-	store := themefs.NewStore(cfg.ThemeStorageRoot)
+	store := themefs.NewStore(cfg.FlowposAPIBase)
 
 	chatRepo := chat.NewRepository(conn)
 	chatSvc := chat.NewService(chatRepo)

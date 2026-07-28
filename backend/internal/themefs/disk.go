@@ -1,111 +1,191 @@
 package themefs
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 )
 
-// Store reads and writes theme files under a single configured root — one
-// subdirectory per theme_slug, matching THEME_ENGINE_SPEC.md's layout. It is
-// the only part of this package that touches disk; everything else
-// (pathsafety.go, pages.go, layout.go) is pure and can be tested without one.
+// Store reads and writes the tenant's active theme's files through
+// flowpos-backend's own theme-file API (store/themes/active/files/...) —
+// see ThemeFileController/ThemeFileService in flowpos-backend. This service
+// never touches theme files on local disk: it doesn't assume it shares a
+// filesystem mount with flowpos-backend, so the two can run on separate
+// hosts. Every call authenticates as the same user who made the original
+// request (see RequestAuth) — flowpos-backend applies its own ownership
+// checks (ActorGate) on every file access, the same as it would for a
+// request from the dashboard's own Editor page.
 type Store struct {
-	root string
+	baseURL string
+	client  *http.Client
 }
 
-// NewStore builds a Store rooted at root (config.ThemeStorageRoot).
-func NewStore(root string) *Store {
-	return &Store{root: root}
-}
-
-// resolve validates themeSlug and relPath, then returns the absolute path —
-// re-checking with filepath.Rel afterwards as defense in depth, in case a
-// future change to ValidatePathSafety's rules ever misses a traversal
-// variant. Deliberately uses the extension-agnostic ValidatePathSafety, not
-// ValidateGeneratedFilePath: Store is used for legitimate internal reads/
-// writes of pages.json and defaults.json too, not just AI-generated
-// .liquid/.css/.js files — callers that need the stricter, AI-proposal-only
-// extension check apply it themselves before calling in (see
-// themebuild.validateProposal / applyFiles).
-func (s *Store) resolve(themeSlug, relPath string) (string, error) {
-	if err := ValidateThemeSlug(themeSlug); err != nil {
-		return "", err
+// NewStore builds a Store calling baseURL (config.FlowposAPIBase) — the same
+// root internal/auth.Client calls /user against.
+func NewStore(baseURL string) *Store {
+	return &Store{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		client:  &http.Client{},
 	}
+}
+
+// RequestAuth is the caller identity Store forwards on every call — the
+// same bearer token and resolved tenant ID this service's own auth
+// middleware already validated for the current request (see auth.Token,
+// auth.TenantID). Token authenticates as that user; TenantID is sent as the
+// TID header flowpos-backend's own SetActorMiddleware requires to select
+// which of that user's tenants the request acts as — the same purpose this
+// service's own X-Tenant-Id header serves, just a different header name on
+// flowpos-backend's side.
+type RequestAuth struct {
+	Token    string
+	TenantID uint64
+}
+
+// PageMeta is the subset of pages.json fields ai-chat can set when writing
+// a page file — flowpos-backend's own store() endpoint upserts pages.json
+// itself from these (see ThemeFileService::save / ThemePagesManifest)
+// whenever the path matches pages/*.liquid, so this service no longer
+// merges pages.json itself. published_at is deliberately not sent:
+// flowpos-backend stamps it itself when Status is "published" and it's
+// omitted, which is the same "just-published" semantics this service used
+// to set explicitly. requires_auth is a known gap: flowpos-backend's store()
+// endpoint doesn't currently forward it from this API (only title/slug/
+// type/status/seo_*/og_* — see ThemeFileController::store), so a page the
+// model wants gated can't be expressed through this path yet.
+type PageMeta struct {
+	Title          string `json:"title,omitempty"`
+	Slug           string `json:"slug,omitempty"`
+	Type           string `json:"type,omitempty"`
+	Status         string `json:"status,omitempty"`
+	SEOTitle       string `json:"seo_title,omitempty"`
+	SEODescription string `json:"seo_description,omitempty"`
+	SEOKeywords    string `json:"seo_keywords,omitempty"`
+	OGTitle        string `json:"og_title,omitempty"`
+	OGDescription  string `json:"og_description,omitempty"`
+	OGImagePath    string `json:"og_image_path,omitempty"`
+}
+
+type themeFileEnvelope struct {
+	Data struct {
+		Path     string `json:"path"`
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	} `json:"data"`
+}
+
+// ReadFile returns a theme file's current content, or ("", nil) if it
+// doesn't exist yet (e.g. reading pages.json for a theme with no custom
+// pages registered yet is a normal, empty case, not an error).
+func (s *Store) ReadFile(ctx context.Context, auth RequestAuth, relPath string) (string, error) {
 	if err := ValidatePathSafety(relPath); err != nil {
 		return "", err
 	}
 
-	themeRoot := filepath.Join(s.root, themeSlug)
-	abs := filepath.Join(themeRoot, relPath)
-
-	rel, err := filepath.Rel(themeRoot, abs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
-		return "", fmt.Errorf("resolved path escapes theme root: %q", relPath)
-	}
-	return abs, nil
-}
-
-// ReadFile returns a theme file's current content, or ("", nil) if it
-// doesn't exist yet (e.g. reading pages.json for a theme that has none of
-// its own custom pages registered yet is a normal, empty-registry case, not
-// an error).
-func (s *Store) ReadFile(themeSlug, relPath string) (string, error) {
-	abs, err := s.resolve(themeSlug, relPath)
+	req, err := s.newRequest(ctx, auth, http.MethodGet, relPath, nil)
 	if err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(abs)
-	if os.IsNotExist(err) {
-		return "", nil
-	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", relPath, err)
 	}
-	return string(data), nil
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("read %s: %s", relPath, statusErr(resp))
+	}
+
+	var out themeFileEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("read %s: decode response: %w", relPath, err)
+	}
+	if out.Data.Encoding == "base64" {
+		decoded, err := base64.StdEncoding.DecodeString(out.Data.Content)
+		if err != nil {
+			return "", fmt.Errorf("read %s: decode base64 content: %w", relPath, err)
+		}
+		return string(decoded), nil
+	}
+	return out.Data.Content, nil
 }
 
-// WriteFile writes content to a theme file, creating parent directories as
-// needed (a brand-new page's directory may not exist yet).
-//
-// Writes via a temp file + rename rather than os.WriteFile directly:
-// os.WriteFile truncates the target before writing its new content, so a
-// write that fails partway through (disk full, process killed) would
-// destroy a previously-good, working file — not just fail to create a new
-// one. Writing to a sibling temp file first and renaming over the target
-// only replaces it once the new content is fully and successfully on disk;
-// rename is atomic on the same filesystem, so the target is always either
-// the old content or the new content, never a truncated mix of both.
-func (s *Store) WriteFile(themeSlug, relPath, content string) error {
-	abs, err := s.resolve(themeSlug, relPath)
+// WriteFile upserts a theme file's content. meta is only meaningful for a
+// pages/*.liquid path — see PageMeta — and nil otherwise.
+func (s *Store) WriteFile(ctx context.Context, auth RequestAuth, relPath, content string, meta *PageMeta) error {
+	if err := ValidatePathSafety(relPath); err != nil {
+		return err
+	}
+
+	body := map[string]any{"content": content}
+	if meta != nil {
+		metaJSON, err := json.Marshal(meta)
+		if err != nil {
+			return fmt.Errorf("write %s: encode page meta: %w", relPath, err)
+		}
+		if err := json.Unmarshal(metaJSON, &body); err != nil {
+			return fmt.Errorf("write %s: encode page meta: %w", relPath, err)
+		}
+		body["content"] = content
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("write %s: encode request: %w", relPath, err)
+	}
+
+	req, err := s.newRequest(ctx, auth, http.MethodPost, relPath, bytes.NewReader(encoded))
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(abs)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create parent directory for %s: %w", relPath, err)
-	}
+	req.Header.Set("Content-Type", "application/json")
 
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("create temp file for %s: %w", relPath, err)
+		return fmt.Errorf("write %s: %w", relPath, err)
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath) // no-op once the rename below succeeds
+	defer resp.Body.Close()
 
-	if _, err := tmp.WriteString(content); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write %s: %w", relPath, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("write %s: %w", relPath, err)
-	}
-	if err := os.Chmod(tmpPath, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", relPath, err)
-	}
-	if err := os.Rename(tmpPath, abs); err != nil {
-		return fmt.Errorf("write %s: %w", relPath, err)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("write %s: %s", relPath, statusErr(resp))
 	}
 	return nil
+}
+
+func (s *Store) newRequest(ctx context.Context, auth RequestAuth, method, relPath string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, s.baseURL+"/store/themes/active/files/"+encodePathSegments(relPath), body)
+	if err != nil {
+		return nil, fmt.Errorf("build request for %s: %w", relPath, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+auth.Token)
+	req.Header.Set("TID", strconv.FormatUint(auth.TenantID, 10))
+	return req, nil
+}
+
+// encodePathSegments percent-encodes each "/"-separated segment of relPath
+// individually, so the literal "/" separators survive in the URL — matches
+// the tenant-dashboard's own encodeThemeFilePath (src/store-builder/api/
+// editor.ts), which calls this exact same route.
+func encodePathSegments(relPath string) string {
+	segments := strings.Split(relPath, "/")
+	for i, seg := range segments {
+		segments[i] = url.PathEscape(seg)
+	}
+	return strings.Join(segments, "/")
+}
+
+func statusErr(resp *http.Response) string {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+	return fmt.Sprintf("unexpected status %d: %s", resp.StatusCode, string(body))
 }

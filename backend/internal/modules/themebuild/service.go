@@ -53,9 +53,13 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 // GenerateInput is one merchant prompt, always against the tenant's one
 // ongoing "builder" chat (see chat.Service.GetOrCreateChat).
 type GenerateInput struct {
-	TenantID  uint64
-	UserID    *uint64
-	UserName  string
+	TenantID uint64
+	UserID   *uint64
+	UserName string
+	// Token is the caller's own bearer token, forwarded to flowpos-backend's
+	// theme-file API (see internal/themefs.Store) so every read/write acts
+	// as this same user, subject to flowpos-backend's own ownership checks.
+	Token     string
 	ThemeSlug string
 	Prompt    string
 }
@@ -103,6 +107,8 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generateTimeout)
 	defer cancel()
 
+	storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
+
 	c, err := s.chats.GetOrCreateChat(workCtx, in.TenantID, ChatType)
 	if err != nil {
 		return GenerateOutcome{}, err
@@ -122,11 +128,11 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	// though there's no assistant reply to go with it.
 	outcome := GenerateOutcome{Chat: c, UserMessage: userMsg}
 
-	tc, err := s.buildThemeContext(in.ThemeSlug)
+	tc, err := s.buildThemeContext(workCtx, storeAuth, in.ThemeSlug)
 	if err != nil {
 		return outcome, fmt.Errorf("load theme context: %w", err)
 	}
-	tc.EditingFiles, err = s.buildEditingFilesContext(workCtx, in.ThemeSlug, c.ID)
+	tc.EditingFiles, err = s.buildEditingFilesContext(workCtx, storeAuth, c.ID)
 	if err != nil {
 		return outcome, fmt.Errorf("load editing-files context: %w", err)
 	}
@@ -170,11 +176,11 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		// completely untouched, rather than a validation error arriving
 		// after some files already landed on disk with nothing recording
 		// that they did.
-		plan, err := s.buildWritePlan(in.ThemeSlug, result)
+		plan, err := s.buildWritePlan(workCtx, storeAuth, result)
 		if err != nil {
 			return outcome, fmt.Errorf("apply to theme: %w", err)
 		}
-		written, err = s.commitWritePlan(in.ThemeSlug, plan)
+		written, err = s.commitWritePlan(workCtx, storeAuth, plan)
 		if err != nil {
 			return outcome, fmt.Errorf("apply to theme: %w", err)
 		}
@@ -213,12 +219,12 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	return outcome, nil
 }
 
-func (s *Service) buildThemeContext(themeSlug string) (ai.ThemeContext, error) {
-	pagesJSON, err := s.store.ReadFile(themeSlug, pathPagesJSON)
+func (s *Service) buildThemeContext(ctx context.Context, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
+	pagesJSON, err := s.store.ReadFile(ctx, storeAuth, pathPagesJSON)
 	if err != nil {
 		return ai.ThemeContext{}, err
 	}
-	defaultsJSON, err := s.store.ReadFile(themeSlug, "defaults.json")
+	defaultsJSON, err := s.store.ReadFile(ctx, storeAuth, "defaults.json")
 	if err != nil {
 		return ai.ThemeContext{}, err
 	}
@@ -248,7 +254,7 @@ const maxEditingFileBytes = 40_000
 // current file to edit. Only the maxEditingFiles most recently touched
 // paths are kept, most recent first by touch order, so a long-running
 // chat's context stays bounded.
-func (s *Service) buildEditingFilesContext(ctx context.Context, themeSlug, chatID string) (map[string]string, error) {
+func (s *Service) buildEditingFilesContext(ctx context.Context, storeAuth themefs.RequestAuth, chatID string) (map[string]string, error) {
 	files, err := s.repo.ListFilesByChat(ctx, chatID)
 	if err != nil {
 		return nil, err
@@ -281,7 +287,7 @@ func (s *Service) buildEditingFilesContext(ctx context.Context, themeSlug, chatI
 
 	editing := make(map[string]string, len(paths))
 	for _, path := range paths {
-		current, err := s.store.ReadFile(themeSlug, path)
+		current, err := s.store.ReadFile(ctx, storeAuth, path)
 		if err != nil {
 			return nil, err
 		}
@@ -384,14 +390,18 @@ type writtenFile struct {
 
 // planFile is one file a writePlan will commit — either a proposed file
 // (action/content straight from the model) or the recomputed content of a
-// shared file (pages.json, a layout file) after folding in this turn's
-// merge/splice. previous is only meaningful for proposed files (see
-// writtenFile) and is nil otherwise.
+// shared file (a layout file) after folding in this turn's splice. previous
+// is only meaningful for proposed files (see writtenFile) and is nil
+// otherwise. pageMeta is set only when this file is the page.liquid file
+// PageRegistryEntry describes — flowpos-backend's own theme-file API upserts
+// pages.json itself from these fields (see themefs.Store.WriteFile), so this
+// service no longer computes pages.json content directly.
 type planFile struct {
 	path     string
 	action   FileAction
 	content  string
 	previous *string
+	pageMeta *themefs.PageMeta
 }
 
 // writePlan is everything one turn needs to commit to the real theme,
@@ -399,22 +409,22 @@ type planFile struct {
 // buildWritePlan/commitWritePlan.
 type writePlan struct {
 	files       []planFile
-	pagesJSON   *planFile
 	layoutStart *planFile
 	layoutEnd   *planFile
 }
 
 // buildWritePlan computes every file this turn would write — proposed
-// files verbatim, plus the pages.json merge and layout-file splices — using
-// only reads, never a write. Nothing lands on disk until commitWritePlan
-// runs, so a failure here (a duplicate page slug, a layout file missing its
-// insertion marker) leaves the real theme completely untouched instead of
-// partially, silently modified.
-func (s *Service) buildWritePlan(themeSlug string, result *ai.Result) (writePlan, error) {
+// files verbatim (with page metadata attached to the one matching
+// PageRegistryEntry, if any), plus the layout-file splices — using only
+// reads, never a write. Nothing is committed until commitWritePlan runs, so
+// a failure here (a layout file missing its insertion marker, a page
+// registry entry with no matching file) leaves the real theme completely
+// untouched instead of partially, silently modified.
+func (s *Service) buildWritePlan(ctx context.Context, storeAuth themefs.RequestAuth, result *ai.Result) (writePlan, error) {
 	var plan writePlan
 
 	for _, f := range result.Files {
-		previous, err := s.store.ReadFile(themeSlug, f.Path)
+		previous, err := s.store.ReadFile(ctx, storeAuth, f.Path)
 		if err != nil {
 			return writePlan{}, fmt.Errorf("read %q: %w", f.Path, err)
 		}
@@ -431,21 +441,34 @@ func (s *Service) buildWritePlan(themeSlug string, result *ai.Result) (writePlan
 	}
 
 	if result.PageRegistryEntry != nil {
-		entry := *result.PageRegistryEntry
-		entry.PublishedAt = time.Now().UTC().Format(time.RFC3339)
-		current, err := s.store.ReadFile(themeSlug, pathPagesJSON)
-		if err != nil {
-			return writePlan{}, fmt.Errorf("register page: %w", err)
+		entry := result.PageRegistryEntry
+		matched := false
+		for i := range plan.files {
+			if plan.files[i].path != entry.Path {
+				continue
+			}
+			plan.files[i].pageMeta = &themefs.PageMeta{
+				Title:          entry.Title,
+				Slug:           entry.Slug,
+				Type:           entry.Type,
+				Status:         entry.Status,
+				SEOTitle:       entry.SEOTitle,
+				SEODescription: entry.SEODescription,
+				SEOKeywords:    entry.SEOKeywords,
+				OGTitle:        entry.OGTitle,
+				OGDescription:  entry.OGDescription,
+				OGImagePath:    entry.OGImagePath,
+			}
+			matched = true
+			break
 		}
-		merged, err := themefs.MergePageRegistration([]byte(current), entry)
-		if err != nil {
-			return writePlan{}, fmt.Errorf("register page: %w", err)
+		if !matched {
+			return writePlan{}, fmt.Errorf("register page: page_registry_entry.path %q has no matching proposed file", entry.Path)
 		}
-		plan.pagesJSON = &planFile{path: pathPagesJSON, content: string(merged)}
 	}
 
 	if len(result.LayoutLinksToAdd) > 0 {
-		current, err := s.store.ReadFile(themeSlug, pathLayoutStart)
+		current, err := s.store.ReadFile(ctx, storeAuth, pathLayoutStart)
 		if err != nil {
 			return writePlan{}, fmt.Errorf("add layout css links: %w", err)
 		}
@@ -466,7 +489,7 @@ func (s *Service) buildWritePlan(themeSlug string, result *ai.Result) (writePlan
 	}
 
 	if len(result.LayoutScriptsToAdd) > 0 {
-		current, err := s.store.ReadFile(themeSlug, pathLayoutEnd)
+		current, err := s.store.ReadFile(ctx, storeAuth, pathLayoutEnd)
 		if err != nil {
 			return writePlan{}, fmt.Errorf("add layout js links: %w", err)
 		}
@@ -489,15 +512,15 @@ func (s *Service) buildWritePlan(themeSlug string, result *ai.Result) (writePlan
 	return plan, nil
 }
 
-// commitWritePlan writes everything in plan to disk (each individual write
-// already atomic — see themefs.Store.WriteFile). Only the proposed files
-// (plan.files) get an audit trail (see persistFileRecords) — pages.json and
-// the layout files are shared, structurally-merged config, not "generated
-// files" in their own right.
-func (s *Service) commitWritePlan(themeSlug string, plan writePlan) ([]writtenFile, error) {
+// commitWritePlan writes everything in plan through flowpos-backend's own
+// theme-file API (each individual write already atomic on its side — see
+// themefs.Store.WriteFile). Only the proposed files (plan.files) get an
+// audit trail (see persistFileRecords) — the layout files are shared,
+// structurally-spliced config, not "generated files" in their own right.
+func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.RequestAuth, plan writePlan) ([]writtenFile, error) {
 	written := make([]writtenFile, 0, len(plan.files))
 	for _, f := range plan.files {
-		if err := s.store.WriteFile(themeSlug, f.path, f.content); err != nil {
+		if err := s.store.WriteFile(ctx, storeAuth, f.path, f.content, f.pageMeta); err != nil {
 			return written, fmt.Errorf("write %q: %w", f.path, err)
 		}
 		written = append(written, writtenFile{
@@ -505,11 +528,11 @@ func (s *Service) commitWritePlan(themeSlug string, plan writePlan) ([]writtenFi
 			previous:  f.previous,
 		})
 	}
-	for _, f := range []*planFile{plan.pagesJSON, plan.layoutStart, plan.layoutEnd} {
+	for _, f := range []*planFile{plan.layoutStart, plan.layoutEnd} {
 		if f == nil {
 			continue
 		}
-		if err := s.store.WriteFile(themeSlug, f.path, f.content); err != nil {
+		if err := s.store.WriteFile(ctx, storeAuth, f.path, f.content, nil); err != nil {
 			return written, fmt.Errorf("write %q: %w", f.path, err)
 		}
 	}

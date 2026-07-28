@@ -9,7 +9,6 @@ import (
 	"ai-chat/internal/logging"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/modules/themebuild"
-	"ai-chat/internal/themefs"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
@@ -30,8 +29,6 @@ func respondErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, chat.ErrNotFound), errors.Is(err, themebuild.ErrNotFound):
 		httpresponse.Error(c, http.StatusNotFound, err.Error(), "NOT_FOUND")
-	case errors.Is(err, themefs.ErrSlugAlreadyRegistered):
-		httpresponse.Error(c, http.StatusConflict, err.Error(), "SLUG_ALREADY_REGISTERED")
 	default:
 		slog.Default().Error("unhandled request error", "error", err.Error(), "request_id", logging.RequestID(c))
 		httpresponse.Error(c, http.StatusInternalServerError, "an unexpected error occurred", "")

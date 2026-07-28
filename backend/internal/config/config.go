@@ -22,16 +22,13 @@ type Config struct {
 	DBUsername string
 	DBPassword string
 
-	// ThemeStorageRoot is the filesystem root under which every theme's
-	// folder lives (one subdirectory per theme_slug), matching the layout
-	// documented in THEME_ENGINE_SPEC.md. Required — every generation and
-	// apply operation is rooted here.
-	ThemeStorageRoot string
-
 	// FlowposAPIBase is the tenant-dashboard API this service delegates all
 	// authentication to (see internal/auth) — GET {FlowposAPIBase}/user
 	// verifies every incoming bearer token. Required: there is no local
-	// fallback identity provider, by design.
+	// fallback identity provider, by design. Also the base URL for
+	// flowpos-backend's theme-file API (see internal/themefs.Store) — theme
+	// content lives and is written there, not on a filesystem this service
+	// shares with it.
 	FlowposAPIBase string
 	// AuthCacheTTL / AuthNegativeCacheTTL bound how long a verified (or
 	// rejected) token is trusted before internal/auth calls FlowPOS again —
@@ -69,11 +66,6 @@ type Config struct {
 // this package does not read .env itself so it stays testable without
 // filesystem side effects.
 func Load() Config {
-	themeRoot := os.Getenv("THEME_STORAGE_ROOT")
-	if themeRoot == "" {
-		log.Fatal("THEME_STORAGE_ROOT is required — it is the filesystem root containing every tenant's theme folder")
-	}
-
 	flowposAPIBase := os.Getenv("FLOWPOS_API_BASE")
 	if flowposAPIBase == "" {
 		log.Fatal("FLOWPOS_API_BASE is required — every request is authenticated by delegating to it, there is no local fallback")
@@ -87,8 +79,6 @@ func Load() Config {
 		DBDatabase: os.Getenv("DB_DATABASE"),
 		DBUsername: os.Getenv("DB_USERNAME"),
 		DBPassword: os.Getenv("DB_PASSWORD"),
-
-		ThemeStorageRoot: themeRoot,
 
 		FlowposAPIBase:       flowposAPIBase,
 		AuthCacheTTL:         time.Duration(getenvInt("AUTH_CACHE_TTL_SECONDS", 60)) * time.Second,
