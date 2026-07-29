@@ -25,6 +25,8 @@ import (
 type Store struct {
 	baseURL string
 	client  *http.Client
+	// manifests caches GetOrGenerateManifest's results — see manifest.go.
+	manifests manifestCache
 }
 
 // NewStore builds a Store calling baseURL (config.FlowposAPIBase) — the same
@@ -159,6 +161,37 @@ func (s *Store) WriteFile(ctx context.Context, auth RequestAuth, relPath, conten
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return fmt.Errorf("write %s: %s", relPath, statusErr(resp))
+	}
+	return nil
+}
+
+// DeleteFile removes a theme file — used by revert (see themebuild's
+// RevertToMessage) to undo a file that didn't exist yet at the point being
+// reverted to. A no-op (not an error) if the file is already gone.
+// flowpos-backend's own delete endpoint un-registers the pages.json entry
+// too when relPath is a pages/*.liquid file (see ThemeFileService::delete),
+// so a reverted new page is fully removed, not just its file.
+func (s *Store) DeleteFile(ctx context.Context, auth RequestAuth, relPath string) error {
+	if err := ValidatePathSafety(relPath); err != nil {
+		return err
+	}
+
+	req, err := s.newRequest(ctx, auth, http.MethodDelete, relPath, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("delete %s: %w", relPath, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("delete %s: %s", relPath, statusErr(resp))
 	}
 	return nil
 }

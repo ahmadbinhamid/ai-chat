@@ -59,6 +59,15 @@ type Config struct {
 	// breaks the feature, it doesn't open a hole, so unlike JWT_SECRET this
 	// one degrades instead of failing the process at startup.
 	CORSAllowedOrigins []string
+
+	// RedisURL backs cross-replica generation-event pub/sub (phase 3b/3c —
+	// see themebuild's event log and GET /chats/:chatId/stream). Optional:
+	// empty means events still land in generation_events, just without
+	// live delivery to a WebSocket connected to a different replica than
+	// the one running the generation — a real limitation on more than one
+	// instance, but not a reason to fail startup on a single-instance
+	// deployment that doesn't have Redis yet.
+	RedisURL string
 }
 
 // Load reads configuration from the process environment. Callers are
@@ -92,6 +101,8 @@ func Load() Config {
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 
 		CORSAllowedOrigins: getenvList("CORS_ALLOWED_ORIGINS"),
+
+		RedisURL: os.Getenv("REDIS_URL"),
 	}
 }
 

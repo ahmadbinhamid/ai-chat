@@ -1,0 +1,218 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"ai-chat/internal/auth"
+	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/modules/themebuild"
+
+	"github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+)
+
+func getenvOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func openStreamTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=UTC&clientFoundRows=true",
+		getenvOr("DB_USERNAME", "root"), os.Getenv("DB_PASSWORD"),
+		getenvOr("DB_HOST", "127.0.0.1"), getenvOr("DB_PORT", "3306"), getenvOr("DB_DATABASE", "ai_chat"))
+	conn, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Skipf("skipping: could not open test database: %v", err)
+	}
+	if err := conn.Ping(); err != nil {
+		_ = conn.Close()
+		t.Skipf("skipping: test database not reachable: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+// fakeAuthMiddleware stands in for auth.Middleware: it sets the same
+// context key auth.Middleware sets (auth.Identity, under Gin key
+// "auth_identity" — see internal/auth/middleware.go's ctxIdentityKey),
+// without a real FlowPOS server to introspect a token against. Every
+// request in this test is "authenticated" as tenantID.
+func fakeAuthMiddleware(tenantID uint64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set("auth_identity", auth.Identity{TenantID: tenantID, UserID: 1})
+		c.Next()
+	}
+}
+
+func TestStreamHandler_ReplaysThenDeliversLiveThenClosesOnDone(t *testing.T) {
+	conn := openStreamTestDB(t)
+	rdb, err := themebuild.NewRedisClient(getenvOr("REDIS_URL", "redis://127.0.0.1:6379"))
+	if err != nil {
+		t.Fatalf("invalid test REDIS_URL: %v", err)
+	}
+	if pingErr := rdb.Ping(context.Background()).Err(); pingErr != nil {
+		t.Skipf("skipping: test redis not reachable: %v", pingErr)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	chatRepo := chat.NewRepository(conn)
+	chatSvc := chat.NewService(chatRepo)
+	buildRepo := themebuild.NewRepository(conn)
+	buildSvc := themebuild.NewService(buildRepo, chatSvc, nil, nil, rdb)
+
+	// A fresh tenant ID per run: chats are keyed on (tenant_id, type), so a
+	// fixed constant would reuse the same chat (and its generation rows)
+	// across repeated test runs, tripping the "one running generation per
+	// chat" constraint on a chat a previous run left running.
+	tenantID := uint64(time.Now().UnixNano())
+	ctx := context.Background()
+	ch, err := chatSvc.GetOrCreateChat(ctx, tenantID, themebuild.ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	genID := uuid.NewString()
+	if err := buildRepo.StartGeneration(ctx, genID, ch.ID, tenantID); err != nil {
+		t.Fatalf("StartGeneration failed: %v", err)
+	}
+	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 1, themebuild.EventTypeStarted, struct{}{})
+	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 2, themebuild.EventTypeChecking, map[string]int{"attempt": 1})
+
+	router := gin.New()
+	router.Use(fakeAuthMiddleware(tenantID))
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc).Stream)
+	ts := httptest.NewServer(router)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/chats/" + ch.ID + "/stream"
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	// Dial's own doc comment: "You never need to close resp.Body yourself" —
+	// it's already closed internally by the time Dial returns.
+	wsConn, _, err := websocket.Dial(dialCtx, wsURL, nil) //nolint:bodyclose
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v", err)
+	}
+	defer func() { _ = wsConn.CloseNow() }()
+
+	// Replay: both pre-existing events, in order.
+	readEvent(t, wsConn, themebuild.EventTypeStarted, 1)
+	readEvent(t, wsConn, themebuild.EventTypeChecking, 2)
+
+	// Live delivery: publish a third event via Redis (as the real
+	// eventEmitter would) and confirm it arrives without a second connect.
+	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 3, themebuild.EventTypeRepairing, map[string]int{"attempt": 1})
+	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
+		GenerationID: genID, ChatID: ch.ID, Seq: 3, Type: themebuild.EventTypeRepairing,
+		Payload: json.RawMessage(`{"attempt":1}`), CreatedAt: time.Now().UTC(),
+	})
+	readEvent(t, wsConn, themebuild.EventTypeRepairing, 3)
+
+	// A "done" event closes the connection from the server side.
+	if err := buildRepo.EndGeneration(ctx, ch.ID, nil); err != nil {
+		t.Fatalf("EndGeneration failed: %v", err)
+	}
+	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 4, themebuild.EventTypeDone, map[string]string{"summary": "ok"})
+	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
+		GenerationID: genID, ChatID: ch.ID, Seq: 4, Type: themebuild.EventTypeDone,
+		Payload: json.RawMessage(`{"summary":"ok"}`), CreatedAt: time.Now().UTC(),
+	})
+	readEvent(t, wsConn, themebuild.EventTypeDone, 4)
+
+	readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer readCancel()
+	if _, _, err := wsConn.Read(readCtx); err == nil {
+		t.Error("expected the connection to be closed by the server after the done event")
+	}
+}
+
+func TestStreamHandler_UnknownChatRejectedBeforeUpgrade(t *testing.T) {
+	conn := openStreamTestDB(t)
+	chatRepo := chat.NewRepository(conn)
+	chatSvc := chat.NewService(chatRepo)
+	buildRepo := themebuild.NewRepository(conn)
+	buildSvc := themebuild.NewService(buildRepo, chatSvc, nil, nil, nil)
+
+	router := gin.New()
+	router.Use(fakeAuthMiddleware(999002))
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc).Stream)
+	ts := httptest.NewServer(router)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/chats/" + uuid.NewString() + "/stream"
+	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// See the other Dial call in this file re: not needing to close resp.Body.
+	_, resp, err := websocket.Dial(dialCtx, wsURL, nil) //nolint:bodyclose
+	if err == nil {
+		t.Error("expected the dial to fail for a chat that doesn't belong to this tenant")
+	} else if resp != nil && resp.StatusCode != 404 {
+		t.Errorf("expected a 404, got %d", resp.StatusCode)
+	}
+}
+
+func mustAppendEvent(t *testing.T, ctx context.Context, repo *themebuild.Repository, genID, chatID string, seq int64, typ string, payload any) {
+	t.Helper()
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("failed to marshal event payload: %v", err)
+	}
+	err = repo.AppendGenerationEvent(ctx, themebuild.GenerationEvent{
+		ID: uuid.NewString(), GenerationID: genID, ChatID: chatID, Seq: seq,
+		Type: typ, Payload: encoded, CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("AppendGenerationEvent failed: %v", err)
+	}
+}
+
+// publishRaw publishes ev to the same Redis channel the real eventEmitter
+// uses ("gen:{chat_id}" — see themebuild's unexported redisChannelForChat,
+// mirrored here since it isn't exported outside that package).
+func publishRaw(t *testing.T, rdb *redis.Client, chatID string, ev themebuild.GenerationEvent) {
+	t.Helper()
+	encoded, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("failed to marshal event: %v", err)
+	}
+	if err := rdb.Publish(context.Background(), "gen:"+chatID, encoded).Err(); err != nil {
+		t.Fatalf("failed to publish event: %v", err)
+	}
+}
+
+func readEvent(t *testing.T, conn *websocket.Conn, wantType string, wantSeq int64) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	typ, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if typ != websocket.MessageText {
+		t.Fatalf("expected a text message, got %v", typ)
+	}
+	var got struct {
+		Seq  int64  `json:"seq"`
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("failed to decode event: %v (%s)", err, data)
+	}
+	if got.Type != wantType || got.Seq != wantSeq {
+		t.Fatalf("expected type=%q seq=%d, got type=%q seq=%d", wantType, wantSeq, got.Type, got.Seq)
+	}
+}

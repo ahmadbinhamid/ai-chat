@@ -84,6 +84,6 @@ func (h *ChatHandler) Get(c *gin.Context) {
 		withFiles[i] = messageWithFiles{Message: m, GeneratedFiles: filesByMessage[m.ID]}
 	}
 
-	generating, genErr := h.builder.GenerationStatus(ch.ID)
+	generating, genErr := h.builder.GenerationStatus(c.Request.Context(), ch.ID)
 	httpresponse.OK(c, chatDetail{Chat: &ch, Messages: withFiles, Generating: generating, GenerationError: genErr})
 }

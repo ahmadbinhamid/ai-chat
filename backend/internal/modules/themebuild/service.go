@@ -2,14 +2,16 @@ package themebuild
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
@@ -17,6 +19,7 @@ import (
 	"ai-chat/internal/themefs"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -51,37 +54,41 @@ const (
 // calls per turn). *ai.Generator satisfies this today with no changes on
 // its side; callers passing one continue to work unchanged.
 type generator interface {
-	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string)) (*ai.Result, error)
+	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string), toolExec ai.ToolExecutor) (*ai.Result, error)
 }
 
 // Service is the AI theme builder's orchestration: turn a prompt into
 // proposed changes and write them straight to the real theme filesystem
 // (see Generate) — there is no separate review/apply step.
 type Service struct {
-	repo        *Repository
-	chats       *chat.Service
-	gen         generator
-	store       *themefs.Store
-	themeLocks  *keyedMutex
-	generations *generationTracker
+	repo       *Repository
+	chats      *chat.Service
+	gen        generator
+	store      *themefs.Store
+	themeLocks *keyedMutex
+	redis      *redis.Client // nil if REDIS_URL wasn't configured — see eventEmitter
 }
 
-func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store *themefs.Store) *Service {
+// NewService wires the service's dependencies. rdb may be nil (see
+// NewRedisClient) — generation events are then still durably written to
+// generation_events, just never published live to Redis.
+func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store *themefs.Store, rdb *redis.Client) *Service {
 	return &Service{
-		repo:        repo,
-		chats:       chats,
-		gen:         gen,
-		store:       store,
-		themeLocks:  newKeyedMutex(),
-		generations: newGenerationTracker(),
+		repo:       repo,
+		chats:      chats,
+		gen:        gen,
+		store:      store,
+		themeLocks: newKeyedMutex(),
+		redis:      rdb,
 	}
 }
 
 // ErrGenerationInProgress means the tenant's chat already has a background
-// generation running — see generationTracker. The caller should reject the
-// new request (409) rather than starting a second concurrent Claude call
-// for the same chat, which would race the first one's disk writes and
-// double-bill the tenant for one prompt.
+// generation running — see the generations table (phase 3a) and
+// Repository.StartGeneration. The caller should reject the new request
+// (409) rather than starting a second concurrent Claude call for the same
+// chat, which would race the first one's disk writes and double-bill the
+// tenant for one prompt.
 var ErrGenerationInProgress = errors.New("a generation is already in progress for this chat")
 
 // GenerateInput is one merchant prompt, always against the tenant's one
@@ -130,8 +137,8 @@ type GenerateOutcome struct {
 //
 // A model/infra failure, a rejected proposal, or a failure while writing to
 // the theme is never persisted as a chat turn — errors are request-scoped,
-// not chat history (see generationTracker) — same reasoning as before this
-// became async, just recorded in memory instead of in the HTTP response.
+// not chat history (see the generations table, phase 3a) — same reasoning
+// as before this became async, just durable now instead of in-memory.
 func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutcome, error) {
 	if in.ThemeSlug == "" {
 		return GenerateOutcome{}, errors.New("theme_slug is required")
@@ -142,42 +149,73 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		return GenerateOutcome{}, err
 	}
 
-	if !s.generations.start(c.ID) {
-		return GenerateOutcome{}, ErrGenerationInProgress
+	genID := uuid.NewString()
+	if err := s.repo.StartGeneration(ctx, genID, c.ID, in.TenantID); err != nil {
+		if errors.Is(err, ErrGenerationInProgress) {
+			return GenerateOutcome{}, ErrGenerationInProgress
+		}
+		return GenerateOutcome{}, fmt.Errorf("start generation: %w", err)
 	}
 
 	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.Prompt)
 	if err != nil {
-		s.generations.finish(c.ID, nil) // release the slot — nothing actually started
+		// Release the slot — nothing actually started. Best-effort: if this
+		// itself fails, the reaper cleans it up within a minute rather than
+		// leaving it stuck "running" forever.
+		if endErr := s.repo.EndGeneration(ctx, c.ID, nil); endErr != nil {
+			slog.Error("failed to release generation slot after a failed RecordUserMessage", "chat_id", c.ID, "error", endErr)
+		}
 		return GenerateOutcome{}, fmt.Errorf("record user message: %w", err)
 	}
 
 	// Detached from the caller's own request lifecycle (which is about to
 	// end the moment this function returns) but not unbounded: bounded by
 	// generateTimeout, matching the HTTP server's own writeTimeout.
-	go s.runGeneration(context.WithoutCancel(ctx), in, c)
+	go s.runGeneration(context.WithoutCancel(ctx), in, c, genID)
 
 	return GenerateOutcome{Chat: c, UserMessage: userMsg}, nil
 }
 
 // runGeneration is Generate's actual work, run in the background — see
 // Generate's doc comment. Any error here is only ever recorded in the
-// in-memory generationTracker (see GenerationStatus), never the database:
-// errors are transient/request-scoped, not chat history, the same rule as
-// before this became async.
-func (s *Service) runGeneration(ctx context.Context, in GenerateInput, c chat.Chat) {
+// generations table (see GenerationStatus), never as chat history: errors
+// are transient/request-scoped, same rule as before this became async.
+func (s *Service) runGeneration(ctx context.Context, in GenerateInput, c chat.Chat, genID string) {
 	workCtx, cancel := context.WithTimeout(ctx, generateTimeout)
 	defer cancel()
 
-	err := s.doGenerate(workCtx, in, c)
-	s.generations.finish(c.ID, err)
+	err := s.doGenerate(workCtx, in, c, genID)
+
+	// A deliberately fresh, short-lived context for this one bookkeeping
+	// write: workCtx may already be expired (a generation that hit
+	// generateTimeout), and the outcome still needs recording either way.
+	endCtx, endCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer endCancel()
+	if endErr := s.repo.EndGeneration(endCtx, c.ID, err); endErr != nil {
+		slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
+	}
 }
 
 // doGenerate is the part of generation that used to be Generate's entire
 // body before it became async: ask Claude for the resulting file changes
 // and — unlike an earlier pending/apply design — write them to the real
 // theme filesystem immediately, with no separate "Apply to theme" step.
-func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat) error {
+func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat, genID string) (retErr error) {
+	emitter := newEventEmitter(s.repo, s.redis, genID, c.ID)
+	emitter.emit(ctx, EventTypeStarted, struct{}{})
+
+	// summary is declared here (not with := at its point of use below) so
+	// this defer's closure captures the same variable and sees its final
+	// value — a "done" event needs the actual summary, not a placeholder.
+	var summary string
+	defer func() {
+		if retErr != nil {
+			emitter.emit(ctx, EventTypeFailed, map[string]string{"message": retErr.Error()})
+		} else {
+			emitter.emit(ctx, EventTypeDone, map[string]string{"summary": summary})
+		}
+	}()
+
 	storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
 
 	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
@@ -189,19 +227,17 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat)
 	if err != nil {
 		return fmt.Errorf("load theme context: %w", err)
 	}
-	tc.EditingFiles, err = s.buildEditingFilesContext(ctx, storeAuth, c.ID)
-	if err != nil {
-		return fmt.Errorf("load editing-files context: %w", err)
-	}
+
+	toolExec := s.buildToolExecutor(storeAuth)
 
 	turns := toTurns(priorMessages)
-	result, genErr := s.gen.Generate(ctx, tc, turns, in.Prompt, nil)
+	result, genErr := s.gen.Generate(ctx, tc, turns, in.Prompt, nil, toolExec)
 	if genErr != nil {
 		return genErr
 	}
 
 	clearIfNeedsClarification(result)
-	if err := validateProposal(result); err != nil {
+	if err := validateProposal(result, tc.GenerationMode); err != nil {
 		return fmt.Errorf("invalid model proposal: %w", err)
 	}
 
@@ -211,7 +247,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat)
 		if err != nil {
 			return fmt.Errorf("build theme snapshot: %w", err)
 		}
-		result, warnings, err = s.checkAndRepair(ctx, in, tc, turns, result, snap)
+		result, warnings, err = s.checkAndRepair(ctx, in, c.ID, tc, turns, result, snap, toolExec, emitter)
 		if err != nil {
 			return err
 		}
@@ -260,7 +296,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat)
 	// cache_control on an empty text block outright (400), which would take
 	// down every future message in this chat, not just this one. Never
 	// persist that state.
-	summary := result.Summary
+	summary = result.Summary
 	if summary == "" {
 		summary = "Done."
 	}
@@ -280,12 +316,24 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat)
 
 // GenerationStatus reports whether chatID currently has a background
 // Generate call running, and the error from the most recently finished one
-// if it failed (cleared as soon as the next generation starts) — see
-// generationTracker. Purely in-memory: restarting this process (a deploy)
-// loses in-flight status, same tradeoff already accepted for the rate
-// limiter and per-theme locks.
-func (s *Service) GenerationStatus(chatID string) (generating bool, errMsg string) {
-	return s.generations.get(chatID)
+// if it failed (cleared as soon as the next generation starts) — backed by
+// the generations table (phase 3a), so this survives a pod restart and is
+// correct with more than one replica, unlike the in-memory tracker it
+// replaced. A chat with no generation row yet (never sent a first message)
+// reports not-generating, no error — a normal state, not an error itself.
+func (s *Service) GenerationStatus(ctx context.Context, chatID string) (generating bool, errMsg string) {
+	g, err := s.repo.GetGeneration(ctx, chatID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return false, ""
+		}
+		slog.Error("failed to load generation status", "chat_id", chatID, "error", err)
+		return false, ""
+	}
+	if g.Status != GenerationStatusRunning && g.Error != nil {
+		return false, *g.Error
+	}
+	return g.Status == GenerationStatusRunning, ""
 }
 
 func (s *Service) buildThemeContext(ctx context.Context, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
@@ -297,11 +345,193 @@ func (s *Service) buildThemeContext(ctx context.Context, storeAuth themefs.Reque
 	if err != nil {
 		return ai.ThemeContext{}, err
 	}
+	tree, err := s.store.ListFiles(ctx, storeAuth)
+	if err != nil {
+		return ai.ThemeContext{}, err
+	}
+	manifest, err := s.store.GetOrGenerateManifest(ctx, storeAuth)
+	if err != nil {
+		return ai.ThemeContext{}, fmt.Errorf("build manifest: %w", err)
+	}
 	return ai.ThemeContext{
 		ThemeSlug:    themeSlug,
 		PagesJSON:    pagesJSON,
 		DefaultsJSON: defaultsJSON,
+		FileTree:     tree,
+		Manifest:     &manifest,
 	}, nil
+}
+
+// maxToolReadPaths/maxToolReadBytes bound read_theme_file's own single-call
+// footprint — independent of maxEditingFiles-style history bounds (there
+// are none anymore, see doc comment on the deleted buildEditingFilesContext):
+// the model now asks for exactly the files it wants, so the only thing to
+// bound is one call's own size.
+const (
+	maxToolReadPaths    = 10
+	maxToolReadBytes    = 40_000
+	maxGrepMatches      = 200
+	maxGrepFilesScanned = 500
+)
+
+// grepThemeSearchableExt is the set of file types grep_theme will search —
+// theme-relative text files only; images/fonts etc. are never candidates.
+var grepThemeSearchableExt = map[string]bool{".liquid": true, ".css": true, ".js": true, ".json": true}
+
+// buildToolExecutor returns the ai.ToolExecutor this generation call uses
+// to read the real theme — the only place ai.Generate ever reaches
+// themefs, and only through this closure (see ai.ToolExecutor's doc
+// comment): package ai never imports themefs's Store directly.
+func (s *Service) buildToolExecutor(storeAuth themefs.RequestAuth) ai.ToolExecutor {
+	return func(ctx context.Context, name string, input json.RawMessage) (string, error) {
+		switch name {
+		case "list_theme_files":
+			return s.execListThemeFiles(ctx, storeAuth)
+		case "read_theme_file":
+			return s.execReadThemeFile(ctx, storeAuth, input)
+		case "grep_theme":
+			return s.execGrepTheme(ctx, storeAuth, input)
+		default:
+			return "", fmt.Errorf("unknown tool %q", name)
+		}
+	}
+}
+
+func (s *Service) execListThemeFiles(ctx context.Context, storeAuth themefs.RequestAuth) (string, error) {
+	tree, err := s.store.ListFiles(ctx, storeAuth)
+	if err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(tree)
+	if err != nil {
+		return "", fmt.Errorf("encode file tree: %w", err)
+	}
+	return string(encoded), nil
+}
+
+type readThemeFileInput struct {
+	Paths []string `json:"paths"`
+}
+
+// execReadThemeFile reads up to maxToolReadPaths files, capping the total
+// content returned at maxToolReadBytes — a model asking for several large
+// files in one call gets a clear truncation marker rather than a silently
+// cut-off response it might mistake for the whole file.
+func (s *Service) execReadThemeFile(ctx context.Context, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
+	var args readThemeFileInput
+	if err := json.Unmarshal(input, &args); err != nil {
+		return "", fmt.Errorf("invalid read_theme_file input: %w", err)
+	}
+	if len(args.Paths) == 0 {
+		return "", fmt.Errorf("paths must not be empty")
+	}
+	if len(args.Paths) > maxToolReadPaths {
+		args.Paths = args.Paths[:maxToolReadPaths]
+	}
+
+	var b strings.Builder
+	total := 0
+	for _, p := range args.Paths {
+		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
+			fmt.Fprintf(&b, "### %s\nERROR: %s\n\n", p, err.Error())
+			continue
+		}
+		content, err := s.store.ReadFile(ctx, storeAuth, p)
+		if err != nil {
+			fmt.Fprintf(&b, "### %s\nERROR: %s\n\n", p, err.Error())
+			continue
+		}
+		if content == "" {
+			fmt.Fprintf(&b, "### %s\n(does not exist yet)\n\n", p)
+			continue
+		}
+		if total+len(content) > maxToolReadBytes {
+			fmt.Fprintf(&b, "(remaining files omitted — total content capped at %d bytes per call; read fewer files per call)\n", maxToolReadBytes)
+			break
+		}
+		total += len(content)
+		fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
+	}
+	return b.String(), nil
+}
+
+type grepThemeInput struct {
+	Pattern  string `json:"pattern"`
+	PathGlob string `json:"path_glob"`
+}
+
+// execGrepTheme searches every searchable theme file for a regular
+// expression (RE2 — Go's regexp package, not a plain substring; see
+// grepThemeTool's description) matched line-by-line, optionally restricted
+// to paths matching path_glob (path.Match — one wildcard segment, no "**").
+func (s *Service) execGrepTheme(ctx context.Context, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
+	var args grepThemeInput
+	if err := json.Unmarshal(input, &args); err != nil {
+		return "", fmt.Errorf("invalid grep_theme input: %w", err)
+	}
+	if args.Pattern == "" {
+		return "", fmt.Errorf("pattern must not be empty")
+	}
+	re, err := regexp.Compile(args.Pattern)
+	if err != nil {
+		return "", fmt.Errorf("invalid pattern: %w", err)
+	}
+
+	tree, err := s.store.ListFiles(ctx, storeAuth)
+	if err != nil {
+		return "", err
+	}
+	paths := make(map[string]bool)
+	flattenFileTree(tree, paths)
+
+	candidates := make([]string, 0, len(paths))
+	for p := range paths {
+		if !grepThemeSearchableExt[path.Ext(p)] {
+			continue
+		}
+		if args.PathGlob != "" {
+			matched, globErr := path.Match(args.PathGlob, p)
+			if globErr != nil {
+				return "", fmt.Errorf("invalid path_glob: %w", globErr)
+			}
+			if !matched {
+				continue
+			}
+		}
+		candidates = append(candidates, p)
+	}
+	sort.Strings(candidates)
+	if len(candidates) > maxGrepFilesScanned {
+		candidates = candidates[:maxGrepFilesScanned]
+	}
+
+	var b strings.Builder
+	matches := 0
+	for _, p := range candidates {
+		if matches >= maxGrepMatches {
+			break
+		}
+		content, err := s.store.ReadFile(ctx, storeAuth, p)
+		if err != nil || content == "" {
+			continue
+		}
+		for i, line := range strings.Split(content, "\n") {
+			if matches >= maxGrepMatches {
+				break
+			}
+			if re.MatchString(line) {
+				fmt.Fprintf(&b, "%s:%d: %s\n", p, i+1, strings.TrimSpace(line))
+				matches++
+			}
+		}
+	}
+	if matches == 0 {
+		return "(no matches)", nil
+	}
+	if matches >= maxGrepMatches {
+		fmt.Fprintf(&b, "(stopped at %d matches — narrow your pattern/path_glob)\n", maxGrepMatches)
+	}
+	return b.String(), nil
 }
 
 // buildSnapshot fetches the current theme's full file-path listing (every
@@ -395,15 +625,29 @@ func clearIfNeedsClarification(result *ai.Result) {
 func (s *Service) checkAndRepair(
 	ctx context.Context,
 	in GenerateInput,
+	chatID string,
 	tc ai.ThemeContext,
 	history []ai.Turn,
 	result *ai.Result,
 	snap themecheck.Snapshot,
+	toolExec ai.ToolExecutor,
+	emitter *eventEmitter,
 ) (*ai.Result, []themecheck.Finding, error) {
 	turns := append([]ai.Turn(nil), history...)
 	totalInput, totalOutput := result.InputTokens, result.OutputTokens
 
 	for attempt := 1; ; attempt++ {
+		// Best-effort: recorded so retry frequency is measurable via the
+		// generations table, not just logs — never worth failing the whole
+		// generation over. s.repo is nil only in tests that construct a
+		// Service directly around a fake generator (see check_and_repair_test.go).
+		if s.repo != nil {
+			if err := s.repo.SetGenerationAttempts(ctx, chatID, attempt); err != nil {
+				slog.Warn("failed to record generation attempt count", "chat_id", chatID, "error", err)
+			}
+		}
+
+		emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": attempt})
 		findings := themecheck.Check(toProposal(result), snap)
 		errorFindings, warningFindings := splitFindings(findings)
 
@@ -419,16 +663,18 @@ func (s *Service) checkAndRepair(
 		slog.Warn("themecheck rejected proposal",
 			"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt,
 			"error_count", len(errorFindings), "rules", findingRules(errorFindings))
+		emitter.emit(ctx, EventTypeCheckFailed, map[string]any{"findings": errorFindings, "attempt": attempt})
 
 		if attempt > maxThemeCheckRetries {
 			return nil, nil, fmt.Errorf("the generated changes didn't pass validation after %d attempts: %s",
 				attempt, summarizeFindings(errorFindings))
 		}
 
+		emitter.emit(ctx, EventTypeRepairing, map[string]int{"attempt": attempt})
 		turns = append(turns, ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)})
 		repair := repairPrompt(errorFindings)
 
-		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, nil)
+		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, nil, toolExec)
 		if genErr != nil {
 			return nil, nil, fmt.Errorf("retry generation: %w", genErr)
 		}
@@ -437,7 +683,7 @@ func (s *Service) checkAndRepair(
 		turns = append(turns, ai.Turn{Role: "user", Content: repair})
 
 		clearIfNeedsClarification(retried)
-		if err := validateProposal(retried); err != nil {
+		if err := validateProposal(retried, tc.GenerationMode); err != nil {
 			return nil, nil, fmt.Errorf("invalid model proposal (retry %d): %w", attempt, err)
 		}
 		result = retried
@@ -534,91 +780,6 @@ func appendWarningsNote(summary string, warnings []themecheck.Finding) string {
 	return b.String()
 }
 
-// maxEditingFiles bounds how many distinct files' full content get sent as
-// grounding on every call — this block isn't cached (it changes per request),
-// so an unbounded chat history touching dozens of pages would otherwise cost
-// more tokens on every single turn as the chat gets older.
-const maxEditingFiles = 25
-
-// maxEditingFileBytes caps a single file's contribution to that grounding.
-// Liquid pages/components are normally a few KB; this only bites a
-// pathological outlier, and truncating (with a clear marker) rather than
-// silently sending a full huge file keeps a single oversized page from
-// dominating the prompt's token budget.
-const maxEditingFileBytes = 40_000
-
-// buildEditingFilesContext gathers every distinct path this chat has ever
-// written a file for, and reads each one's real on-disk content — so an
-// incremental request ("add a subtitle to our-story") gets the actual
-// current file to edit. Only the maxEditingFiles most recently touched
-// paths are kept, most recent first by touch order, so a long-running
-// chat's context stays bounded.
-func (s *Service) buildEditingFilesContext(ctx context.Context, storeAuth themefs.RequestAuth, chatID string) (map[string]string, error) {
-	files, err := s.repo.ListFilesByChat(ctx, chatID)
-	if err != nil {
-		return nil, err
-	}
-	if len(files) == 0 {
-		return nil, nil
-	}
-
-	// files is ordered oldest-first; walking it in order and overwriting per
-	// path keeps both the latest content for that path and the index of its
-	// most recent touch, so trimming to maxEditingFiles below keeps the
-	// paths the merchant is still actively iterating on.
-	type touched struct {
-		content string
-		lastIdx int
-	}
-	latest := make(map[string]touched, len(files))
-	for i, f := range files {
-		latest[f.FilePath] = touched{content: f.Content, lastIdx: i}
-	}
-
-	paths := make([]string, 0, len(latest))
-	for path := range latest {
-		paths = append(paths, path)
-	}
-	sort.Slice(paths, func(i, j int) bool { return latest[paths[i]].lastIdx > latest[paths[j]].lastIdx })
-	if len(paths) > maxEditingFiles {
-		paths = paths[:maxEditingFiles]
-	}
-
-	editing := make(map[string]string, len(paths))
-	for _, path := range paths {
-		current, err := s.store.ReadFile(ctx, storeAuth, path)
-		if err != nil {
-			return nil, err
-		}
-		content := current
-		if content == "" {
-			content = latest[path].content
-		}
-		if len(content) > maxEditingFileBytes {
-			truncated := truncateAtRuneBoundary(content, maxEditingFileBytes)
-			content = truncated + fmt.Sprintf("\n<!-- truncated: %d more bytes omitted -->", len(content)-len(truncated))
-		}
-		editing[path] = content
-	}
-	return editing, nil
-}
-
-// truncateAtRuneBoundary truncates s to at most maxBytes bytes, backing up
-// to the nearest rune boundary if the naive cut point would split a
-// multi-byte UTF-8 character — generated theme content (page copy, brand
-// names) can legitimately contain non-ASCII text, and a raw byte slice here
-// could otherwise hand the model invalid UTF-8.
-func truncateAtRuneBoundary(s string, maxBytes int) string {
-	if len(s) <= maxBytes {
-		return s
-	}
-	cut := maxBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
-}
-
 // toTurns replays a chat's history as message turns for the model. Anthropic
 // rejects an empty text content block outright ("text content blocks must
 // be non-empty") — not just for the cache_control breakpoint, for any
@@ -649,8 +810,12 @@ func toTurns(messages []chat.Message) []ai.Turn {
 // validateProposal re-checks every path the model proposed against the same
 // rules internal/ai's system prompt already asked it to follow — defense in
 // depth against a model mistake, never trusting model output as
-// automatically safe just because it was asked nicely.
-func validateProposal(r *ai.Result) error {
+// automatically safe just because it was asked nicely. mode restricts what's
+// allowed further — see validateBrandModeProposal.
+func validateProposal(r *ai.Result, mode string) error {
+	if mode == ai.GenerationModeBrand {
+		return validateBrandModeProposal(r)
+	}
 	for _, f := range r.Files {
 		// Not re-embedding f.Path here: themefs' error already includes a
 		// bounded preview of it. A proposal gone badly wrong can put an
@@ -674,6 +839,28 @@ func validateProposal(r *ai.Result) error {
 		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
 			return fmt.Errorf("proposed layout js link rejected: %w", err)
 		}
+	}
+	return nil
+}
+
+// validateBrandModeProposal enforces phase 7's brand-turn restriction: this
+// turn may only ever update defaults.json — never a .liquid/.css/.js file,
+// a page registration, or a layout link/script, all of which are
+// structural decisions the brand turn was never asked to make.
+func validateBrandModeProposal(r *ai.Result) error {
+	for _, f := range r.Files {
+		if f.Path != pathDefaultsJSON {
+			return fmt.Errorf("brand mode may only propose %q, got %q", pathDefaultsJSON, f.Path)
+		}
+		if f.Action != "update" {
+			return fmt.Errorf("brand mode: %q action must be \"update\", got %q", pathDefaultsJSON, f.Action)
+		}
+	}
+	if r.PageRegistryEntry != nil {
+		return fmt.Errorf("brand mode must not register a page")
+	}
+	if len(r.LayoutLinksToAdd) > 0 || len(r.LayoutScriptsToAdd) > 0 {
+		return fmt.Errorf("brand mode must not register layout links/scripts")
 	}
 	return nil
 }
@@ -878,8 +1065,60 @@ func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID
 // shows each turn's "Generated files" card, not just the most recent one.
 // Does not check ownership itself; the caller (the chat handler) has
 // already scoped the chat to the requesting tenant.
+// LoadThemeFiles fetches every .liquid template's content in the active
+// theme, keyed by theme-relative path — used by the render preview (phase
+// 5), which needs the whole theme available so {% render %} can resolve
+// any component/partial the previewed page composes, not just the one
+// entry file. CSS/JS/JSON/image paths are skipped: nothing but a template
+// is ever a render target.
+func (s *Service) LoadThemeFiles(ctx context.Context, storeAuth themefs.RequestAuth) (map[string]string, error) {
+	tree, err := s.store.ListFiles(ctx, storeAuth)
+	if err != nil {
+		return nil, fmt.Errorf("list theme files: %w", err)
+	}
+	paths := make(map[string]bool)
+	flattenFileTree(tree, paths)
+
+	files := make(map[string]string, len(paths))
+	for path := range paths {
+		if !strings.HasSuffix(path, ".liquid") {
+			continue
+		}
+		content, err := s.store.ReadFile(ctx, storeAuth, path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", path, err)
+		}
+		files[path] = content
+	}
+	return files, nil
+}
+
 func (s *Service) FilesForChat(ctx context.Context, chatID string) ([]GeneratedFile, error) {
 	return s.repo.ListFilesByChat(ctx, chatID)
+}
+
+// LatestGeneration returns chatID's most recently started generation — see
+// GET /chats/:chatId/stream (phase 3c), which needs to know which
+// generation_id to replay events for and whether it's still running.
+func (s *Service) LatestGeneration(ctx context.Context, chatID string) (Generation, error) {
+	return s.repo.GetGeneration(ctx, chatID)
+}
+
+// EventsSince returns generationID's events after sinceSeq — what the
+// stream handler replays before subscribing to live Redis delivery.
+func (s *Service) EventsSince(ctx context.Context, generationID string, sinceSeq int64) ([]GenerationEvent, error) {
+	return s.repo.GetEventsSince(ctx, generationID, sinceSeq)
+}
+
+// SubscribeToGenerationEvents subscribes to chatID's live event channel, or
+// returns nil if Redis isn't configured (see config.Config.RedisURL) — the
+// stream handler then has nothing live to wait on beyond what it already
+// replayed from generation_events.
+func (s *Service) SubscribeToGenerationEvents(ctx context.Context, chatID string) *redis.PubSub {
+	if s.redis == nil {
+		return nil
+	}
+	return s.redis.Subscribe(ctx, redisChannelForChat(chatID))
 }
 
 func languageFor(path string) string {
@@ -890,6 +1129,8 @@ func languageFor(path string) string {
 		return "CSS"
 	case strings.HasSuffix(path, ".js"):
 		return "JS"
+	case strings.HasSuffix(path, ".json"):
+		return "JSON"
 	default:
 		return ""
 	}
@@ -921,72 +1162,4 @@ func (k *keyedMutex) Lock(key string) func() {
 
 	lock.Lock()
 	return lock.Unlock
-}
-
-// generationState is one chat's most recent async generation outcome — see
-// generationTracker.
-type generationState struct {
-	generating bool
-	err        string
-}
-
-// generationTracker holds one generationState per chat ID, purely in
-// memory — this is how a caller polling GET /chat learns when a background
-// Generate call (see runGeneration) finishes and whether it failed, since
-// the original POST /chats/messages already returned long before that
-// happens. Never persisted: same "errors are transient, not chat history"
-// rule this service already followed before generation became async.
-// Bounded by how many chats actually exist (one per tenant), same reasoning
-// as keyedMutex, so no sweep/eviction is needed.
-type generationTracker struct {
-	mu     sync.Mutex
-	states map[string]*generationState
-}
-
-func newGenerationTracker() *generationTracker {
-	return &generationTracker{states: make(map[string]*generationState)}
-}
-
-// start marks chatID as generating and returns true, or returns false
-// without changing anything if a generation is already in flight for it —
-// the caller should reject a second concurrent request for the same chat
-// (see ErrGenerationInProgress) rather than racing a redundant Claude call
-// against the first one.
-func (t *generationTracker) start(chatID string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if s, ok := t.states[chatID]; ok && s.generating {
-		return false
-	}
-	t.states[chatID] = &generationState{generating: true}
-	return true
-}
-
-// finish records chatID's generation as no longer running, with err (or
-// nil for success) as the outcome a subsequent GenerationStatus call will
-// see until the next generation starts.
-func (t *generationTracker) finish(chatID string, err error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	s := t.states[chatID]
-	if s == nil {
-		s = &generationState{}
-		t.states[chatID] = s
-	}
-	s.generating = false
-	if err != nil {
-		s.err = err.Error()
-	} else {
-		s.err = ""
-	}
-}
-
-func (t *generationTracker) get(chatID string) (generating bool, errMsg string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	s := t.states[chatID]
-	if s == nil {
-		return false, ""
-	}
-	return s.generating, s.err
 }

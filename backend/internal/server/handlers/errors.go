@@ -29,6 +29,8 @@ func respondErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, chat.ErrNotFound), errors.Is(err, themebuild.ErrNotFound):
 		httpresponse.Error(c, http.StatusNotFound, err.Error(), "NOT_FOUND")
+	case errors.Is(err, themebuild.ErrGenerationInProgress), errors.Is(err, themebuild.ErrRevertBlockedByRunningGeneration):
+		httpresponse.Error(c, http.StatusConflict, err.Error(), "GENERATION_IN_PROGRESS")
 	default:
 		slog.Default().Error("unhandled request error", "error", err.Error(), "request_id", logging.RequestID(c))
 		httpresponse.Error(c, http.StatusInternalServerError, "an unexpected error occurred", "")

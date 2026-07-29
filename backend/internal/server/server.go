@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"log/slog"
 	"net/http"
@@ -26,9 +27,10 @@ import (
 )
 
 type Server struct {
-	cfg       config.Config
-	engine    *gin.Engine
-	authCache *auth.MemoryCache
+	cfg          config.Config
+	engine       *gin.Engine
+	authCache    *auth.MemoryCache
+	reaperCancel context.CancelFunc
 }
 
 // New builds the router and mounts every route. AI generation being
@@ -44,16 +46,28 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	}
 	store := themefs.NewStore(cfg.FlowposAPIBase)
 
+	rdb, err := themebuild.NewRedisClient(cfg.RedisURL)
+	if err != nil {
+		return nil, err
+	}
+	if rdb == nil {
+		logger.Warn("REDIS_URL is not set — generation events still persist to generation_events, " +
+			"but won't publish live to a WebSocket connected to a different replica than the one running the generation")
+	}
+
 	chatRepo := chat.NewRepository(conn)
 	chatSvc := chat.NewService(chatRepo)
 
 	buildRepo := themebuild.NewRepository(conn)
-	buildSvc := themebuild.NewService(buildRepo, chatSvc, generator, store)
+	buildSvc := themebuild.NewService(buildRepo, chatSvc, generator, store, rdb)
 
 	limiter := ratelimit.NewPerTenantLimiter(cfg.GenerationRateLimitPerMinute)
 
 	chatHandler := handlers.NewChatHandler(chatSvc, buildSvc)
 	messageHandler := handlers.NewMessageHandler(buildSvc, limiter)
+	streamHandler := handlers.NewStreamHandler(chatSvc, buildSvc)
+	revertHandler := handlers.NewRevertHandler(buildSvc)
+	previewHandler := handlers.NewPreviewHandler(buildSvc)
 
 	flowposClient := auth.NewClient(cfg.FlowposAPIBase, cfg.FlowposHTTPTimeout)
 	authCache := auth.NewMemoryCache()
@@ -100,15 +114,28 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 
 	identified.GET("/chat", chatHandler.Get)
 	identified.POST("/chats/messages", messageHandler.Send)
+	// GET /chat (above) stays as the polling fallback for a client whose
+	// WebSocket can't connect (corporate proxy, etc.) — this doesn't
+	// replace it.
+	identified.GET("/chats/:chatId/stream", streamHandler.Stream)
+	identified.POST("/chats/:chatId/messages/:messageId/revert", revertHandler.Revert)
+	identified.POST("/themes/:slug/preview", previewHandler.Preview)
 
-	return &Server{cfg: cfg, engine: r, authCache: authCache}, nil
+	// Runs immediately and then every minute until Close cancels it (see
+	// themebuild.Service.RunReaper) — independent of any single request's
+	// lifecycle, so it needs its own long-lived context.
+	reaperCtx, reaperCancel := context.WithCancel(context.Background())
+	go buildSvc.RunReaper(reaperCtx)
+
+	return &Server{cfg: cfg, engine: r, authCache: authCache, reaperCancel: reaperCancel}, nil
 }
 
 // Close releases resources the server started that outlive a single
-// request — currently just the auth cache's background sweep goroutine.
-// Called during graceful shutdown (see cmd/server/main.go).
+// request — the auth cache's background sweep goroutine and the stale-
+// generation reaper. Called during graceful shutdown (see cmd/server/main.go).
 func (s *Server) Close() {
 	s.authCache.Close()
+	s.reaperCancel()
 }
 
 // Handler exposes the underlying http.Handler — used both by Run (wrapped

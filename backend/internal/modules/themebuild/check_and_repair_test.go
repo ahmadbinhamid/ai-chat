@@ -18,7 +18,7 @@ type fakeGenerator struct {
 	results []*ai.Result // returned in order; the last one repeats once exhausted
 }
 
-func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ func(string)) (*ai.Result, error) {
+func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ func(string), _ ai.ToolExecutor) (*ai.Result, error) {
 	f.calls++
 	idx := f.calls - 1
 	if idx >= len(f.results) {
@@ -65,7 +65,7 @@ func TestCheckAndRepair_AcceptsCleanProposalWithoutRetrying(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, ai.ThemeContext{}, nil, goodResult(), testSnapshot())
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, goodResult(), testSnapshot(), nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestCheckAndRepair_RetriesOnceThenSucceeds(t *testing.T) {
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
 	bad := badResult()
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, ai.ThemeContext{}, nil, bad, testSnapshot())
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, bad, testSnapshot(), nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestCheckAndRepair_ExhaustsRetriesAndFails(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	_, _, err := svc.checkAndRepair(context.Background(), in, ai.ThemeContext{}, nil, badResult(), testSnapshot())
+	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil)
 	if err == nil {
 		t.Fatal("expected an error once retries are exhausted")
 	}
@@ -138,7 +138,7 @@ func TestCheckAndRepair_WarningsPassThroughOnAccept(t *testing.T) {
 	})
 	result.LayoutLinksToAdd = []string{"components/css/testimonials.css"}
 
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, ai.ThemeContext{}, nil, result, testSnapshot())
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, result, testSnapshot(), nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
