@@ -163,6 +163,54 @@ func (s *Store) WriteFile(ctx context.Context, auth RequestAuth, relPath, conten
 	return nil
 }
 
+// FileTreeEntry is one node of the theme's file tree, as returned by
+// flowpos-backend's GET store/themes/active/files
+// (ThemeFileController::index -> ThemeFileService::listTree) — a directory
+// carries Children (recursively, the whole subtree), a file doesn't.
+type FileTreeEntry struct {
+	Name     string          `json:"name"`
+	Path     string          `json:"path"`
+	Type     string          `json:"type"` // "directory" | "file"
+	Children []FileTreeEntry `json:"children,omitempty"`
+}
+
+type fileTreeEnvelope struct {
+	Data struct {
+		Files []FileTreeEntry `json:"files"`
+	} `json:"data"`
+}
+
+// ListFiles returns the active theme's full file tree (names and paths
+// only, no content) — the same data flowpos-backend's dashboard Editor
+// sidebar renders from. One shared method: themebuild's Check() snapshot
+// (phase 1) and the AI tool loop's list_theme_files tool (phase 2) both call
+// this rather than each hitting the endpoint their own way.
+func (s *Store) ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntry, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/store/themes/active/files", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list files: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+auth.Token)
+	req.Header.Set("TID", strconv.FormatUint(auth.TenantID, 10))
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list files: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list files: %s", statusErr(resp))
+	}
+
+	var out fileTreeEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("list files: decode response: %w", err)
+	}
+	return out.Data.Files, nil
+}
+
 func (s *Store) newRequest(ctx context.Context, auth RequestAuth, method, relPath string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, s.baseURL+"/store/themes/active/files/"+encodePathSegments(relPath), body)
 	if err != nil {

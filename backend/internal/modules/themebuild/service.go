@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
 
 	"github.com/google/uuid"
@@ -33,7 +35,24 @@ const (
 	// context, but not unbounded either. Matches the HTTP server's own
 	// writeTimeout (cmd/server/main.go).
 	generateTimeout = 5 * time.Minute
+
+	// maxThemeCheckRetries bounds how many times a proposal themecheck
+	// rejects is sent back to the model with its findings before doGenerate
+	// gives up — up to maxThemeCheckRetries+1 total Generate calls (the
+	// original attempt plus this many retries).
+	maxThemeCheckRetries = 2
+
+	pathDefaultsJSON = "defaults.json"
 )
+
+// generator is the subset of *ai.Generator's behavior Service depends on —
+// letting tests substitute a fake that never calls the real Claude API,
+// which matters most for checkAndRepair's retry loop (multiple Generate
+// calls per turn). *ai.Generator satisfies this today with no changes on
+// its side; callers passing one continue to work unchanged.
+type generator interface {
+	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string)) (*ai.Result, error)
+}
 
 // Service is the AI theme builder's orchestration: turn a prompt into
 // proposed changes and write them straight to the real theme filesystem
@@ -41,7 +60,7 @@ const (
 type Service struct {
 	repo        *Repository
 	chats       *chat.Service
-	gen         *ai.Generator
+	gen         generator
 	store       *themefs.Store
 	themeLocks  *keyedMutex
 	generations *generationTracker
@@ -175,26 +194,30 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat)
 		return fmt.Errorf("load editing-files context: %w", err)
 	}
 
-	result, genErr := s.gen.Generate(ctx, tc, toTurns(priorMessages), in.Prompt, nil)
+	turns := toTurns(priorMessages)
+	result, genErr := s.gen.Generate(ctx, tc, turns, in.Prompt, nil)
 	if genErr != nil {
 		return genErr
 	}
 
-	if result.NeedsClarification {
-		// Defensive: even if the model attached files to a clarification
-		// reply despite the system prompt's instruction not to, never write
-		// them — a clarification turn has nothing to apply.
-		result.Files = nil
-		result.PageRegistryEntry = nil
-		result.LayoutLinksToAdd = nil
-		result.LayoutScriptsToAdd = nil
-	}
-
+	clearIfNeedsClarification(result)
 	if err := validateProposal(result); err != nil {
 		return fmt.Errorf("invalid model proposal: %w", err)
 	}
 
-	hasChanges := len(result.Files) > 0 || result.PageRegistryEntry != nil || len(result.LayoutLinksToAdd) > 0 || len(result.LayoutScriptsToAdd) > 0
+	var warnings []themecheck.Finding
+	if proposalHasChanges(result) {
+		snap, err := s.buildSnapshot(ctx, storeAuth)
+		if err != nil {
+			return fmt.Errorf("build theme snapshot: %w", err)
+		}
+		result, warnings, err = s.checkAndRepair(ctx, in, tc, turns, result, snap)
+		if err != nil {
+			return err
+		}
+	}
+
+	hasChanges := proposalHasChanges(result)
 
 	var written []writtenFile
 	if hasChanges {
@@ -241,6 +264,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat)
 	if summary == "" {
 		summary = "Done."
 	}
+	summary = appendWarningsNote(summary, warnings)
 
 	assistantMsg, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
 	if err != nil {
@@ -269,7 +293,7 @@ func (s *Service) buildThemeContext(ctx context.Context, storeAuth themefs.Reque
 	if err != nil {
 		return ai.ThemeContext{}, err
 	}
-	defaultsJSON, err := s.store.ReadFile(ctx, storeAuth, "defaults.json")
+	defaultsJSON, err := s.store.ReadFile(ctx, storeAuth, pathDefaultsJSON)
 	if err != nil {
 		return ai.ThemeContext{}, err
 	}
@@ -278,6 +302,236 @@ func (s *Service) buildThemeContext(ctx context.Context, storeAuth themefs.Reque
 		PagesJSON:    pagesJSON,
 		DefaultsJSON: defaultsJSON,
 	}, nil
+}
+
+// buildSnapshot fetches the current theme's full file-path listing (every
+// path that exists, for rule 4's render-target-exists check — see
+// themecheck.Snapshot.Paths) plus real content for the handful of files
+// themecheck actually reads (pages.json, defaults.json, the two layout
+// files). Called once per doGenerate call, before the check-and-repair
+// loop: nothing is written to the theme until after that loop accepts a
+// proposal, so the same snapshot is valid across every retry within one
+// call — no need to refetch it per attempt.
+func (s *Service) buildSnapshot(ctx context.Context, storeAuth themefs.RequestAuth) (themecheck.Snapshot, error) {
+	tree, err := s.store.ListFiles(ctx, storeAuth)
+	if err != nil {
+		return themecheck.Snapshot{}, fmt.Errorf("list theme files: %w", err)
+	}
+	paths := make(map[string]bool)
+	flattenFileTree(tree, paths)
+
+	files := make(map[string]string, 4)
+	for _, path := range []string{pathPagesJSON, pathDefaultsJSON, pathLayoutStart, pathLayoutEnd} {
+		content, err := s.store.ReadFile(ctx, storeAuth, path)
+		if err != nil {
+			return themecheck.Snapshot{}, fmt.Errorf("read %s: %w", path, err)
+		}
+		files[path] = content
+	}
+
+	return themecheck.Snapshot{Files: files, Paths: paths}, nil
+}
+
+// flattenFileTree walks a theme's file tree (see themefs.Store.ListFiles),
+// recording every FILE path (not directories) into paths.
+func flattenFileTree(entries []themefs.FileTreeEntry, paths map[string]bool) {
+	for _, e := range entries {
+		if e.Type == "file" {
+			paths[e.Path] = true
+		}
+		if len(e.Children) > 0 {
+			flattenFileTree(e.Children, paths)
+		}
+	}
+}
+
+// toProposal maps ai.Result into the minimal shape themecheck.Check needs —
+// PageRegistryEntry carries over unchanged since ai.Result already types it
+// as *themefs.PageEntry (see themecheck.Proposal's doc comment).
+func toProposal(r *ai.Result) themecheck.Proposal {
+	files := make([]themecheck.ProposedFile, len(r.Files))
+	for i, f := range r.Files {
+		files[i] = themecheck.ProposedFile{Path: f.Path, Action: f.Action, Content: f.Content}
+	}
+	return themecheck.Proposal{
+		Files:              files,
+		PageRegistryEntry:  r.PageRegistryEntry,
+		LayoutLinksToAdd:   r.LayoutLinksToAdd,
+		LayoutScriptsToAdd: r.LayoutScriptsToAdd,
+	}
+}
+
+// proposalHasChanges reports whether result proposes anything to write —
+// shared by doGenerate (deciding whether to run themecheck/buildWritePlan at
+// all) and its post-repair recheck (a retry that ends in NeedsClarification
+// legitimately has nothing left to write).
+func proposalHasChanges(result *ai.Result) bool {
+	return len(result.Files) > 0 || result.PageRegistryEntry != nil ||
+		len(result.LayoutLinksToAdd) > 0 || len(result.LayoutScriptsToAdd) > 0
+}
+
+// clearIfNeedsClarification defensively drops any changes the model
+// proposed despite the system prompt's instruction not to when asking a
+// clarifying question — a clarification turn has nothing to apply.
+func clearIfNeedsClarification(result *ai.Result) {
+	if !result.NeedsClarification {
+		return
+	}
+	result.Files = nil
+	result.PageRegistryEntry = nil
+	result.LayoutLinksToAdd = nil
+	result.LayoutScriptsToAdd = nil
+}
+
+// checkAndRepair validates result against snap via themecheck.Check. A
+// blocking (error-severity) finding is fed back to the model as a new
+// assistant/user turn pair and retried, up to maxThemeCheckRetries times;
+// a proposal that never passes fails the generation with a merchant-
+// friendly message. Token usage from every retry is folded into the
+// accepted result's totals, so RecordAssistantMessage still bills/records
+// the full cost of this turn, not just its last attempt. The accepted
+// result's warning findings are returned alongside it — never blocking,
+// just surfaced (see doGenerate's appendWarningsNote).
+func (s *Service) checkAndRepair(
+	ctx context.Context,
+	in GenerateInput,
+	tc ai.ThemeContext,
+	history []ai.Turn,
+	result *ai.Result,
+	snap themecheck.Snapshot,
+) (*ai.Result, []themecheck.Finding, error) {
+	turns := append([]ai.Turn(nil), history...)
+	totalInput, totalOutput := result.InputTokens, result.OutputTokens
+
+	for attempt := 1; ; attempt++ {
+		findings := themecheck.Check(toProposal(result), snap)
+		errorFindings, warningFindings := splitFindings(findings)
+
+		if len(errorFindings) == 0 {
+			if attempt > 1 {
+				slog.Info("themecheck accepted proposal after retry",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "warning_count", len(warningFindings))
+			}
+			result.InputTokens, result.OutputTokens = totalInput, totalOutput
+			return result, warningFindings, nil
+		}
+
+		slog.Warn("themecheck rejected proposal",
+			"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt,
+			"error_count", len(errorFindings), "rules", findingRules(errorFindings))
+
+		if attempt > maxThemeCheckRetries {
+			return nil, nil, fmt.Errorf("the generated changes didn't pass validation after %d attempts: %s",
+				attempt, summarizeFindings(errorFindings))
+		}
+
+		turns = append(turns, ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)})
+		repair := repairPrompt(errorFindings)
+
+		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, nil)
+		if genErr != nil {
+			return nil, nil, fmt.Errorf("retry generation: %w", genErr)
+		}
+		totalInput += retried.InputTokens
+		totalOutput += retried.OutputTokens
+		turns = append(turns, ai.Turn{Role: "user", Content: repair})
+
+		clearIfNeedsClarification(retried)
+		if err := validateProposal(retried); err != nil {
+			return nil, nil, fmt.Errorf("invalid model proposal (retry %d): %w", attempt, err)
+		}
+		result = retried
+	}
+}
+
+func splitFindings(findings []themecheck.Finding) (errorFindings, warningFindings []themecheck.Finding) {
+	for _, f := range findings {
+		if f.Severity == themecheck.SeverityError {
+			errorFindings = append(errorFindings, f)
+		} else {
+			warningFindings = append(warningFindings, f)
+		}
+	}
+	return errorFindings, warningFindings
+}
+
+func findingRules(findings []themecheck.Finding) []string {
+	rules := make([]string, len(findings))
+	for i, f := range findings {
+		rules[i] = f.Rule
+	}
+	return rules
+}
+
+func summarizeFindings(findings []themecheck.Finding) string {
+	parts := make([]string, len(findings))
+	for i, f := range findings {
+		if f.Path != "" {
+			parts[i] = fmt.Sprintf("[%s] %s: %s", f.Rule, f.Path, f.Message)
+		} else {
+			parts[i] = fmt.Sprintf("[%s] %s", f.Rule, f.Message)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// recapAssistantTurn replays a rejected proposal's file content back to the
+// model as its own prior turn. Without this the model retrying would have
+// no memory of what it just wrote: a rejected proposal is never written to
+// disk or the chat_generated_files audit trail (Check runs before
+// buildWritePlan), so buildEditingFilesContext's real-file grounding won't
+// have it either.
+func recapAssistantTurn(result *ai.Result) string {
+	var b strings.Builder
+	if result.Summary != "" {
+		fmt.Fprintf(&b, "%s\n\n", result.Summary)
+	}
+	for _, f := range result.Files {
+		fmt.Fprintf(&b, "### %s (%s)\n%s\n\n", f.Path, f.Action, f.Content)
+	}
+	out := strings.TrimSpace(b.String())
+	if out == "" {
+		out = "(no files proposed)"
+	}
+	return out
+}
+
+// repairPrompt is the new user turn sent back to the model after a rejected
+// proposal — every error finding, since those are what actually blocked the
+// write (warnings are surfaced to the merchant, never fed back for a retry).
+func repairPrompt(errorFindings []themecheck.Finding) string {
+	var b strings.Builder
+	b.WriteString("Your last proposal failed validation against the theme engine spec. Fix these specific problems " +
+		"and resubmit the complete corrected set of files (not a diff):\n\n")
+	for _, f := range errorFindings {
+		if f.Path != "" {
+			fmt.Fprintf(&b, "- [%s] %s: %s\n", f.Rule, f.Path, f.Message)
+		} else {
+			fmt.Fprintf(&b, "- [%s] %s\n", f.Rule, f.Message)
+		}
+	}
+	return b.String()
+}
+
+// appendWarningsNote appends a short, merchant-readable note listing any
+// warning-severity findings to summary. Rides on the existing summary text
+// rather than a new chat_messages column — see phase 1 wiring notes; phase
+// 3's generation_events log is the intended home for this once it exists.
+func appendWarningsNote(summary string, warnings []themecheck.Finding) string {
+	if len(warnings) == 0 {
+		return summary
+	}
+	var b strings.Builder
+	b.WriteString(summary)
+	fmt.Fprintf(&b, "\n\nNote: %d warning(s):", len(warnings))
+	for _, f := range warnings {
+		if f.Path != "" {
+			fmt.Fprintf(&b, "\n- %s: %s", f.Path, f.Message)
+		} else {
+			fmt.Fprintf(&b, "\n- %s", f.Message)
+		}
+	}
+	return b.String()
 }
 
 // maxEditingFiles bounds how many distinct files' full content get sent as
