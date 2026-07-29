@@ -487,9 +487,17 @@ func (s *Service) buildWritePlan(ctx context.Context, storeAuth themefs.RequestA
 
 	if result.PageRegistryEntry != nil {
 		entry := result.PageRegistryEntry
+		// entry.Path is the route prefix ("/pages" or "/pages/auth"), never a
+		// file path — the proposed file's actual theme-relative path has to be
+		// derived from it the same way §5 requires: page == the .liquid file's
+		// basename.
+		wantPath := "pages/" + entry.Page + ".liquid"
+		if entry.Path == "/pages/auth" {
+			wantPath = "pages/auth/" + entry.Page + ".liquid"
+		}
 		matched := false
 		for i := range plan.files {
-			if plan.files[i].path != entry.Path {
+			if plan.files[i].path != wantPath {
 				continue
 			}
 			plan.files[i].pageMeta = &themefs.PageMeta{
@@ -508,7 +516,7 @@ func (s *Service) buildWritePlan(ctx context.Context, storeAuth themefs.RequestA
 			break
 		}
 		if !matched {
-			return writePlan{}, fmt.Errorf("register page: page_registry_entry.path %q has no matching proposed file", entry.Path)
+			return writePlan{}, fmt.Errorf("register page: page_registry_entry (page %q, path %q) has no matching proposed file at %q", entry.Page, entry.Path, wantPath)
 		}
 	}
 

@@ -118,12 +118,24 @@ var resultSchema = map[string]any{
 				},
 			},
 		},
+		// page_registry_entry deliberately has no requires_auth property.
+		// Per theme_engine_spec.md §5, requires_auth: true only applies to
+		// my_account/my_orders/change_password — fixed system route types this
+		// service is forbidden from ever (re-)registering. Every page ai-chat
+		// can legitimately create is type "custom", which never needs it.
+		// Asking the model for a value that's always false, and on top of that
+		// silently discarded by flowpos-backend's StoreThemeFileRequest /
+		// ThemeFileController today, just invites the model (and future
+		// readers) to believe gating works through this path. If a merchant
+		// ever needs a gated custom page, that's a spec change plus a
+		// flowpos-backend change, decided then — not a field carried
+		// speculatively now.
 		"page_registry_entry": map[string]any{
 			"anyOf": []any{
 				map[string]any{
 					"type":                 "object",
 					"additionalProperties": false,
-					"required":             []string{"title", "slug", "path", "type", "page", "seo_title", "seo_description", "seo_keywords", "og_title", "og_description", "og_image_path", "status", "requires_auth"},
+					"required":             []string{"title", "slug", "path", "type", "page", "seo_title", "seo_description", "seo_keywords", "og_title", "og_description", "og_image_path", "status"},
 					"properties": map[string]any{
 						"title":           map[string]any{"type": "string"},
 						"slug":            map[string]any{"type": "string"},
@@ -137,7 +149,6 @@ var resultSchema = map[string]any{
 						"og_description":  map[string]any{"type": "string"},
 						"og_image_path":   map[string]any{"type": "string"},
 						"status":          map[string]any{"type": "string", "enum": []string{"draft", "published"}},
-						"requires_auth":   map[string]any{"type": "boolean"},
 					},
 				},
 				map[string]any{"type": "null"},

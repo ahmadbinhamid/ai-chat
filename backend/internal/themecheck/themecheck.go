@@ -110,6 +110,7 @@ func Check(proposal Proposal, snap Snapshot) []Finding {
 	findings = append(findings, checkRenderTargetExists(proposal, snap)...)
 	findings = append(findings, checkAssetRegistered(proposal, snap)...)
 	findings = append(findings, checkPageRoute(proposal, snap)...)
+	findings = append(findings, checkPageRequiresAuth(proposal, snap)...)
 	findings = append(findings, checkSEOFilled(proposal, snap)...)
 	findings = append(findings, checkThemeToken(proposal, snap)...)
 	findings = append(findings, checkBoolGuard(proposal, snap)...)
