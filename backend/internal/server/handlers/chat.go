@@ -33,10 +33,16 @@ type messageWithFiles struct {
 // chatDetail is the chat plus its full message log. Chat is a pointer so a
 // tenant with no chat yet gets the same shape back (chat: null, messages:
 // []) instead of a differently-shaped response the frontend would need to
-// special-case.
+// special-case. Generating/GenerationError are how the caller learns the
+// outcome of a POST /chats/messages call after the fact — that endpoint now
+// returns as soon as the prompt is accepted, not once Claude has replied
+// (see themebuild.Service.Generate) — so the frontend polls this endpoint
+// until Generating flips back to false.
 type chatDetail struct {
-	Chat     *chat.Chat         `json:"chat"`
-	Messages []messageWithFiles `json:"messages"`
+	Chat            *chat.Chat         `json:"chat"`
+	Messages        []messageWithFiles `json:"messages"`
+	Generating      bool               `json:"generating"`
+	GenerationError string             `json:"generation_error,omitempty"`
 }
 
 // Get returns the tenant's one chat and its full transcript, with each
@@ -78,5 +84,6 @@ func (h *ChatHandler) Get(c *gin.Context) {
 		withFiles[i] = messageWithFiles{Message: m, GeneratedFiles: filesByMessage[m.ID]}
 	}
 
-	httpresponse.OK(c, chatDetail{Chat: &ch, Messages: withFiles})
+	generating, genErr := h.builder.GenerationStatus(ch.ID)
+	httpresponse.OK(c, chatDetail{Chat: &ch, Messages: withFiles, Generating: generating, GenerationError: genErr})
 }

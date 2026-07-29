@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"ai-chat/internal/auth"
@@ -41,10 +42,13 @@ type sendMessageResponse struct {
 	Files any `json:"generated_files"`
 }
 
-// Send calls Claude with the merchant's prompt and returns the resulting
-// turn — this is the only route in the service with a per-tenant rate limit
-// (see internal/ratelimit): every other endpoint is a cheap DB read/write,
-// this one costs real money and multi-second latency per call.
+// Send accepts the merchant's prompt and returns immediately — the actual
+// Claude call and (if the model proposes changes) the write to the real
+// theme happen in the background (see themebuild.Service.Generate); the
+// caller learns the outcome by polling GET /chat's generating/
+// generation_error fields, not from this response. This is still the only
+// route with a per-tenant rate limit (see internal/ratelimit): it's the one
+// place that ever calls Claude, even though the HTTP call itself is now fast.
 func (h *MessageHandler) Send(c *gin.Context) {
 	// Bind first: a malformed, oversized, or empty body is the caller's
 	// mistake and was never going to reach Claude — it shouldn't also cost
@@ -70,23 +74,15 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		Prompt:    in.Prompt,
 	})
 	if err != nil {
-		// The user's prompt is recorded before anything that can fail (see
-		// themebuild.Service.Generate), so there's still a chat/user_message
-		// to hand back even on failure — enough for the caller to refresh
-		// history and see their own message, even though assistant_message
-		// will be null (a failed turn is never persisted as one).
-		if outcome.Chat.ID != "" {
-			c.JSON(http.StatusBadGateway, gin.H{
-				"error": err.Error(),
-				"data":  toResponse(outcome),
-			})
+		if errors.Is(err, themebuild.ErrGenerationInProgress) {
+			httpresponse.Error(c, http.StatusConflict, "a generation is already in progress for this chat", "GENERATION_IN_PROGRESS")
 			return
 		}
 		respondErr(c, err)
 		return
 	}
 
-	httpresponse.OK(c, toResponse(outcome))
+	httpresponse.Accepted(c, toResponse(outcome))
 }
 
 func toResponse(o themebuild.GenerateOutcome) sendMessageResponse {

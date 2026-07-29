@@ -19,6 +19,13 @@ func Created(c *gin.Context, data any) {
 	c.JSON(http.StatusCreated, gin.H{"data": data})
 }
 
+// Accepted writes a 202 with the given payload wrapped in {"data": ...} —
+// for an endpoint that has queued work rather than finished it (see
+// themebuild.Service.Generate).
+func Accepted(c *gin.Context, data any) {
+	c.JSON(http.StatusAccepted, gin.H{"data": data})
+}
+
 // NoContent writes a bare 204.
 func NoContent(c *gin.Context) {
 	c.Status(http.StatusNoContent)

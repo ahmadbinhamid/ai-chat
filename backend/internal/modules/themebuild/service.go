@@ -39,16 +39,31 @@ const (
 // proposed changes and write them straight to the real theme filesystem
 // (see Generate) — there is no separate review/apply step.
 type Service struct {
-	repo       *Repository
-	chats      *chat.Service
-	gen        *ai.Generator
-	store      *themefs.Store
-	themeLocks *keyedMutex
+	repo        *Repository
+	chats       *chat.Service
+	gen         *ai.Generator
+	store       *themefs.Store
+	themeLocks  *keyedMutex
+	generations *generationTracker
 }
 
 func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store *themefs.Store) *Service {
-	return &Service{repo: repo, chats: chats, gen: gen, store: store, themeLocks: newKeyedMutex()}
+	return &Service{
+		repo:        repo,
+		chats:       chats,
+		gen:         gen,
+		store:       store,
+		themeLocks:  newKeyedMutex(),
+		generations: newGenerationTracker(),
+	}
 }
+
+// ErrGenerationInProgress means the tenant's chat already has a background
+// generation running — see generationTracker. The caller should reject the
+// new request (409) rather than starting a second concurrent Claude call
+// for the same chat, which would race the first one's disk writes and
+// double-bill the tenant for one prompt.
+var ErrGenerationInProgress = errors.New("a generation is already in progress for this chat")
 
 // GenerateInput is one merchant prompt, always against the tenant's one
 // ongoing "builder" chat (see chat.Service.GetOrCreateChat).
@@ -64,13 +79,15 @@ type GenerateInput struct {
 	Prompt    string
 }
 
-// GenerateOutcome is everything a generation call produced, for the handler
-// to render back to the client. AssistantMessage is nil when Generate
-// returns an error: a failed turn is never persisted (see Generate's doc
-// comment), so there is nothing to point it at. Chat and UserMessage are
-// still populated on most failures, since the user's own prompt is recorded
-// before anything that can fail — the caller can still refresh history to
-// show it, even though there's no reply to go with it yet.
+// GenerateOutcome is the immediate (synchronous) result of accepting a
+// prompt: the chat and the user's own recorded message. AssistantMessage
+// and Files are always nil here — Generate now returns as soon as the
+// prompt is recorded and a background generation has been kicked off (see
+// Generate's doc comment), not once Claude has actually replied. The real
+// outcome (a new assistant message, generated files, or an error) arrives
+// later — the caller polls GET /chat, which reports whether a generation
+// is still running (see GenerationStatus) and surfaces the new history once
+// it's done.
 type GenerateOutcome struct {
 	Chat             chat.Chat
 	UserMessage      chat.Message
@@ -78,68 +95,89 @@ type GenerateOutcome struct {
 	Files            []GeneratedFile
 }
 
-// Generate resolves (or creates) the chat, records the prompt, asks Claude
-// for the resulting file changes, and — unlike an earlier pending/apply
-// design — writes them to the real theme filesystem immediately, in the
-// same request: there is no "Apply to theme" step for the merchant to
-// trigger separately.
+// Generate resolves (or creates) the chat, records the prompt, and returns
+// immediately — the actual Claude call, proposal validation, and (if the
+// model proposed changes) write to the real theme filesystem all happen in
+// a background goroutine (see runGeneration), not before this returns.
+//
+// This is deliberately async, not a synchronous call the client awaits:
+// a full generation can legitimately take several minutes, and no
+// intermediary in a real deployment — a CDN proxy, a corporate firewall, a
+// flaky mobile connection, even the browser backgrounding the tab — can be
+// trusted to keep one HTTP request alive that long. Every request this
+// service handles now finishes in milliseconds; the caller learns the
+// actual result by polling GET /chat's `generating`/`generation_error`
+// fields (see GenerationStatus) instead of waiting on this call's response.
 //
 // A model/infra failure, a rejected proposal, or a failure while writing to
-// disk is never persisted as a chat turn — errors are request-scoped, not
-// chat history. This is deliberate, not an oversight: an error message is
-// only useful at the moment it happens, and a chat shared by everyone on the
-// tenant (see chat.Service.GetOrCreateChat) shouldn't accumulate every
-// transient failure any of them ever hit as permanent, re-displayed-forever
-// history. The caller renders the error from the HTTP response itself
-// (ephemeral, e.g. a toast) rather than from anything stored in the
-// database — see the frontend's ai-chatbot page for where that's shown.
+// the theme is never persisted as a chat turn — errors are request-scoped,
+// not chat history (see generationTracker) — same reasoning as before this
+// became async, just recorded in memory instead of in the HTTP response.
 func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutcome, error) {
 	if in.ThemeSlug == "" {
 		return GenerateOutcome{}, errors.New("theme_slug is required")
 	}
 
-	// Detached from the caller's own request lifecycle, but not unbounded:
-	// once a merchant kicks off a generation, closing the tab or a flaky
-	// mobile connection shouldn't sever a multi-minute Claude call and
-	// silently orphan whatever it was about to write to the real theme —
-	// the outcome should be a real, recorded one either way, not something
-	// that depends on the browser staying connected for the whole call.
-	workCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), generateTimeout)
-	defer cancel()
-
-	storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
-
-	c, err := s.chats.GetOrCreateChat(workCtx, in.TenantID, ChatType)
+	c, err := s.chats.GetOrCreateChat(ctx, in.TenantID, ChatType)
 	if err != nil {
 		return GenerateOutcome{}, err
 	}
 
-	priorMessages, err := s.chats.ListMessages(workCtx, in.TenantID, c.ID)
-	if err != nil {
-		return GenerateOutcome{}, fmt.Errorf("load chat history: %w", err)
+	if !s.generations.start(c.ID) {
+		return GenerateOutcome{}, ErrGenerationInProgress
 	}
 
-	userMsg, err := s.chats.RecordUserMessage(workCtx, c, in.UserID, in.UserName, in.Prompt)
+	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.Prompt)
 	if err != nil {
+		s.generations.finish(c.ID, nil) // release the slot — nothing actually started
 		return GenerateOutcome{}, fmt.Errorf("record user message: %w", err)
 	}
-	// From here on, any failure still returns this much: the user's prompt
-	// really was recorded, so the caller has something to refresh to even
-	// though there's no assistant reply to go with it.
-	outcome := GenerateOutcome{Chat: c, UserMessage: userMsg}
 
-	tc, err := s.buildThemeContext(workCtx, storeAuth, in.ThemeSlug)
+	// Detached from the caller's own request lifecycle (which is about to
+	// end the moment this function returns) but not unbounded: bounded by
+	// generateTimeout, matching the HTTP server's own writeTimeout.
+	go s.runGeneration(context.WithoutCancel(ctx), in, c)
+
+	return GenerateOutcome{Chat: c, UserMessage: userMsg}, nil
+}
+
+// runGeneration is Generate's actual work, run in the background — see
+// Generate's doc comment. Any error here is only ever recorded in the
+// in-memory generationTracker (see GenerationStatus), never the database:
+// errors are transient/request-scoped, not chat history, the same rule as
+// before this became async.
+func (s *Service) runGeneration(ctx context.Context, in GenerateInput, c chat.Chat) {
+	workCtx, cancel := context.WithTimeout(ctx, generateTimeout)
+	defer cancel()
+
+	err := s.doGenerate(workCtx, in, c)
+	s.generations.finish(c.ID, err)
+}
+
+// doGenerate is the part of generation that used to be Generate's entire
+// body before it became async: ask Claude for the resulting file changes
+// and — unlike an earlier pending/apply design — write them to the real
+// theme filesystem immediately, with no separate "Apply to theme" step.
+func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat) error {
+	storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
+
+	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
-		return outcome, fmt.Errorf("load theme context: %w", err)
-	}
-	tc.EditingFiles, err = s.buildEditingFilesContext(workCtx, storeAuth, c.ID)
-	if err != nil {
-		return outcome, fmt.Errorf("load editing-files context: %w", err)
+		return fmt.Errorf("load chat history: %w", err)
 	}
 
-	result, genErr := s.gen.Generate(workCtx, tc, toTurns(priorMessages), in.Prompt, nil)
+	tc, err := s.buildThemeContext(ctx, storeAuth, in.ThemeSlug)
+	if err != nil {
+		return fmt.Errorf("load theme context: %w", err)
+	}
+	tc.EditingFiles, err = s.buildEditingFilesContext(ctx, storeAuth, c.ID)
+	if err != nil {
+		return fmt.Errorf("load editing-files context: %w", err)
+	}
+
+	result, genErr := s.gen.Generate(ctx, tc, toTurns(priorMessages), in.Prompt, nil)
 	if genErr != nil {
-		return outcome, genErr
+		return genErr
 	}
 
 	if result.NeedsClarification {
@@ -153,7 +191,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	}
 
 	if err := validateProposal(result); err != nil {
-		return outcome, fmt.Errorf("invalid model proposal: %w", err)
+		return fmt.Errorf("invalid model proposal: %w", err)
 	}
 
 	hasChanges := len(result.Files) > 0 || result.PageRegistryEntry != nil || len(result.LayoutLinksToAdd) > 0 || len(result.LayoutScriptsToAdd) > 0
@@ -165,7 +203,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		// client retry racing the original) must not interleave reads and
 		// writes of pages.json/the layout files, or one's registration can
 		// silently clobber the other's (a lost update). Scoped tightly to
-		// just this section, not the whole request — the Claude call above
+		// just this section, not the whole call — the Claude call above
 		// can take minutes, and a second tab's edit shouldn't queue behind
 		// that, only behind the fast disk work.
 		unlock := s.themeLocks.Lock(in.ThemeSlug)
@@ -176,13 +214,13 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		// completely untouched, rather than a validation error arriving
 		// after some files already landed on disk with nothing recording
 		// that they did.
-		plan, err := s.buildWritePlan(workCtx, storeAuth, result)
+		plan, err := s.buildWritePlan(ctx, storeAuth, result)
 		if err != nil {
-			return outcome, fmt.Errorf("apply to theme: %w", err)
+			return fmt.Errorf("apply to theme: %w", err)
 		}
-		written, err = s.commitWritePlan(workCtx, storeAuth, plan)
+		written, err = s.commitWritePlan(ctx, storeAuth, plan)
 		if err != nil {
-			return outcome, fmt.Errorf("apply to theme: %w", err)
+			return fmt.Errorf("apply to theme: %w", err)
 		}
 	}
 
@@ -204,19 +242,26 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		summary = "Done."
 	}
 
-	assistantMsg, err := s.chats.RecordAssistantMessage(workCtx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
+	assistantMsg, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
 	if err != nil {
-		return outcome, fmt.Errorf("record assistant message: %w", err)
+		return fmt.Errorf("record assistant message: %w", err)
 	}
-	outcome.AssistantMessage = &assistantMsg
 
-	files, err := s.persistFileRecords(workCtx, c, assistantMsg.ID, written)
-	if err != nil {
-		return outcome, fmt.Errorf("persist generated-file audit rows: %w", err)
+	if _, err := s.persistFileRecords(ctx, c, assistantMsg.ID, written); err != nil {
+		return fmt.Errorf("persist generated-file audit rows: %w", err)
 	}
-	outcome.Files = files
 
-	return outcome, nil
+	return nil
+}
+
+// GenerationStatus reports whether chatID currently has a background
+// Generate call running, and the error from the most recently finished one
+// if it failed (cleared as soon as the next generation starts) — see
+// generationTracker. Purely in-memory: restarting this process (a deploy)
+// loses in-flight status, same tradeoff already accepted for the rate
+// limiter and per-theme locks.
+func (s *Service) GenerationStatus(chatID string) (generating bool, errMsg string) {
+	return s.generations.get(chatID)
 }
 
 func (s *Service) buildThemeContext(ctx context.Context, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
@@ -614,4 +659,72 @@ func (k *keyedMutex) Lock(key string) func() {
 
 	lock.Lock()
 	return lock.Unlock
+}
+
+// generationState is one chat's most recent async generation outcome — see
+// generationTracker.
+type generationState struct {
+	generating bool
+	err        string
+}
+
+// generationTracker holds one generationState per chat ID, purely in
+// memory — this is how a caller polling GET /chat learns when a background
+// Generate call (see runGeneration) finishes and whether it failed, since
+// the original POST /chats/messages already returned long before that
+// happens. Never persisted: same "errors are transient, not chat history"
+// rule this service already followed before generation became async.
+// Bounded by how many chats actually exist (one per tenant), same reasoning
+// as keyedMutex, so no sweep/eviction is needed.
+type generationTracker struct {
+	mu     sync.Mutex
+	states map[string]*generationState
+}
+
+func newGenerationTracker() *generationTracker {
+	return &generationTracker{states: make(map[string]*generationState)}
+}
+
+// start marks chatID as generating and returns true, or returns false
+// without changing anything if a generation is already in flight for it —
+// the caller should reject a second concurrent request for the same chat
+// (see ErrGenerationInProgress) rather than racing a redundant Claude call
+// against the first one.
+func (t *generationTracker) start(chatID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if s, ok := t.states[chatID]; ok && s.generating {
+		return false
+	}
+	t.states[chatID] = &generationState{generating: true}
+	return true
+}
+
+// finish records chatID's generation as no longer running, with err (or
+// nil for success) as the outcome a subsequent GenerationStatus call will
+// see until the next generation starts.
+func (t *generationTracker) finish(chatID string, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := t.states[chatID]
+	if s == nil {
+		s = &generationState{}
+		t.states[chatID] = s
+	}
+	s.generating = false
+	if err != nil {
+		s.err = err.Error()
+	} else {
+		s.err = ""
+	}
+}
+
+func (t *generationTracker) get(chatID string) (generating bool, errMsg string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := t.states[chatID]
+	if s == nil {
+		return false, ""
+	}
+	return s.generating, s.err
 }
