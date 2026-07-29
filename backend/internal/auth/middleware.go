@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -44,7 +45,14 @@ func Middleware(client *Client, cache Cache, positiveTTL, negativeTTL time.Durat
 		if err != nil {
 			// Upstream unreachable/erroring and nothing usable was cached —
 			// this must never look like an invalid token (401), or an
-			// upstream blip logs out every user.
+			// upstream blip logs out every user. The client only ever gets
+			// the generic message below (never err.Error(), which could
+			// echo upstream response detail) — but without logging err
+			// somewhere, a real outage is undiagnosable from server logs
+			// alone. err is safe to log verbatim: Client.Introspect never
+			// wraps the raw token or a /user response body into it, only
+			// network/status detail (see internal/auth/client.go).
+			slog.Default().Error("identity provider unavailable", "error", err.Error(), "request_id", c.GetString("request_id"))
 			httpresponse.Error(c, http.StatusServiceUnavailable, "identity provider unavailable, try again shortly", "IDENTITY_UNAVAILABLE")
 			c.Abort()
 			return
