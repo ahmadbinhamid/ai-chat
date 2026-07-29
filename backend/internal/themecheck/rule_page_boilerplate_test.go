@@ -1,0 +1,113 @@
+package themecheck
+
+import "testing"
+
+const validBoilerplateMultiline = `{% render 'liquid/layout-start',
+  page: page,
+  store: store,
+  menu: menu,
+  path: path,
+  theme: theme,
+  customer: customer,
+  customer_authenticated: auth_check,
+  environment: environment,
+  csrf_token: csrf_token
+%}
+<section>hi</section>
+{% render 'liquid/layout-end', theme: theme, store: store %}`
+
+const validBoilerplateInline = `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
+<section>hi</section>
+{% render 'liquid/layout-end', theme: theme, store: store %}`
+
+func TestCheckPageBoilerplate_ValidMultiline(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: validBoilerplateMultiline}}}
+	if got := checkPageBoilerplate(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected no findings for valid multiline boilerplate, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_ValidInline(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "pages/home.liquid", Action: "update", Content: validBoilerplateInline}}}
+	if got := checkPageBoilerplate(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected no findings for valid inline boilerplate, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_ValidAuthSubdir(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "pages/auth/login.liquid", Action: "create", Content: validBoilerplateInline}}}
+	if got := checkPageBoilerplate(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected no findings for valid pages/auth file, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_MissingLayoutStart(t *testing.T) {
+	content := `<section>hi</section>
+{% render 'liquid/layout-end', theme: theme, store: store %}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+	got := checkPageBoilerplate(p, Snapshot{})
+	if len(got) != 1 || got[0].Severity != SeverityError {
+		t.Fatalf("expected 1 error finding, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_MissingLayoutEnd(t *testing.T) {
+	content := `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
+<section>hi</section>`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+	got := checkPageBoilerplate(p, Snapshot{})
+	if len(got) != 1 || got[0].Severity != SeverityError {
+		t.Fatalf("expected 1 error finding, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_MissingParam(t *testing.T) {
+	content := `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, environment: environment, csrf_token: csrf_token %}
+<section>hi</section>
+{% render 'liquid/layout-end', theme: theme, store: store %}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+	got := checkPageBoilerplate(p, Snapshot{})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 error finding for a dropped param, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_ReorderedParams(t *testing.T) {
+	content := `{% render 'liquid/layout-start', store: store, page: page, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
+{% render 'liquid/layout-end', theme: theme, store: store %}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+	got := checkPageBoilerplate(p, Snapshot{})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 error finding for reordered params, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_WrongCustomerAuthValue(t *testing.T) {
+	content := `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: customer_authenticated, environment: environment, csrf_token: csrf_token %}
+{% render 'liquid/layout-end', theme: theme, store: store %}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+	got := checkPageBoilerplate(p, Snapshot{})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 error finding for wrong customer_authenticated value, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_ExtraLayoutEndParam(t *testing.T) {
+	content := `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
+{% render 'liquid/layout-end', theme: theme, store: store, extra: extra %}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+	got := checkPageBoilerplate(p, Snapshot{})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 error finding for an extra layout-end param, got %+v", got)
+	}
+}
+
+func TestCheckPageBoilerplate_IgnoresNonPageFiles(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{
+		{Path: "components/testimonials.liquid", Action: "update", Content: "no boilerplate here at all"},
+		{Path: "pages/css/offers.css", Action: "create", Content: ".x { color: red; }"},
+	}}
+	if got := checkPageBoilerplate(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected non-page files to be ignored, got %+v", got)
+	}
+}
