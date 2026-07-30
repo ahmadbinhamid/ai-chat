@@ -152,8 +152,17 @@ func extractBearerToken(header string) (string, bool) {
 // 403. Absent, it falls back to defaultTenant, itself re-validated against
 // the same list.
 func resolveTenant(c *gin.Context, entry CacheEntry) (Tenant, int, bool) {
-	if raw := c.GetHeader(hdrTenantID); raw != "" {
-		id, err := strconv.ParseUint(raw, 10, 64)
+	return resolveTenantID(c.GetHeader(hdrTenantID), entry)
+}
+
+// resolveTenantID is resolveTenant's header-independent core, shared with
+// WebSocketAuth (see websocket.go), which has no X-Tenant-Id header to read
+// — its caller-supplied tenant ID comes from a WebSocket subprotocol
+// instead. Same validation either way: an explicit ID must be one of the
+// user's own tenants (rawTenantID == "" falls back to DefaultTenantID).
+func resolveTenantID(rawTenantID string, entry CacheEntry) (Tenant, int, bool) {
+	if rawTenantID != "" {
+		id, err := strconv.ParseUint(rawTenantID, 10, 64)
 		if err != nil {
 			return Tenant{}, http.StatusBadRequest, false
 		}

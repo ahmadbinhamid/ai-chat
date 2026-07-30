@@ -1,4 +1,4 @@
-.PHONY: run build migrate fresh create tidy test lint
+.PHONY: run build migrate fresh create tidy test lint eval
 
 # Start the HTTP API server (live reload via `air` if installed — see
 # .air.toml; falls back to a plain `go run` if air isn't on PATH).
@@ -32,6 +32,12 @@ test:
 # Static analysis — requires golangci-lint (https://golangci-lint.run/welcome/install/).
 lint:
 	golangci-lint run ./...
+
+# Run the fixed eval task list against the real pipeline (Claude + flowpos-backend + DB).
+# Requires EVAL_BEARER_TOKEN and EVAL_TENANT_ID (a real, already logged-in test tenant
+# user) — see cmd/eval/main.go's package doc comment.
+eval:
+	go run ./cmd/eval
 
 # Catch-all so a positional migration name (`make create foo`) isn't treated
 # as its own target.

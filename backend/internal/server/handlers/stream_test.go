@@ -3,10 +3,13 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,11 +53,49 @@ func openStreamTestDB(t *testing.T) *sql.DB {
 // context key auth.Middleware sets (auth.Identity, under Gin key
 // "auth_identity" — see internal/auth/middleware.go's ctxIdentityKey),
 // without a real FlowPOS server to introspect a token against. Every
-// request in this test is "authenticated" as tenantID.
+// request in this test is "authenticated" as tenantID. Used by handlers
+// still behind auth.Middleware (see preview_test.go) — the Stream handler
+// itself no longer is, see fakeFlowposServer below.
 func fakeAuthMiddleware(tenantID uint64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Set("auth_identity", auth.Identity{TenantID: tenantID, UserID: 1})
 		c.Next()
+	}
+}
+
+// fakeFlowposServer stands in for the real FlowPOS /user endpoint that
+// auth.WebSocketAuth introspects against — the Stream handler now
+// authenticates itself (see auth.WebSocketAuth), unlike the rest of this
+// package's handlers, which sit behind auth.Middleware and can be tested
+// against a fake gin.HandlerFunc instead. Every token this server sees
+// resolves to one active user belonging to exactly one tenant, tenantID.
+func fakeFlowposServer(t *testing.T, tenantID uint64) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{
+			"status": true,
+			"data": {
+				"user": {
+					"id": 1, "name": "Test User", "email": "test@example.com", "is_active": true,
+					"tenants": [{"id": %d, "slug": "test", "business_name": "Test", "role": {"id": 1, "name": "owner", "permissions": []}}]
+				},
+				"defaultTenant": {"id": %d}
+			}
+		}`, tenantID, tenantID)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// authSubprotocols builds the Sec-WebSocket-Protocol entries a real browser
+// client sends (see auth.WebSocketAuth / auth.parseWebSocketSubprotocols) —
+// the token is base64url-encoded since it's carried as a subprotocol, not a
+// header.
+func authSubprotocols(token string, tenantID uint64) []string {
+	return []string{
+		"bearer." + base64.RawURLEncoding.EncodeToString([]byte(token)),
+		"tenant." + strconv.FormatUint(tenantID, 10),
 	}
 }
 
@@ -92,9 +133,13 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenClosesOnDone(t *testing.T) {
 	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 1, themebuild.EventTypeStarted, struct{}{})
 	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 2, themebuild.EventTypeChecking, map[string]int{"attempt": 1})
 
+	flowpos := fakeFlowposServer(t, tenantID)
+	authClient := auth.NewClient(flowpos.URL, 5*time.Second)
+	authCache := auth.NewMemoryCache()
+	t.Cleanup(authCache.Close)
+
 	router := gin.New()
-	router.Use(fakeAuthMiddleware(tenantID))
-	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc).Stream)
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute).Stream)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
@@ -103,7 +148,9 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenClosesOnDone(t *testing.T) {
 	defer dialCancel()
 	// Dial's own doc comment: "You never need to close resp.Body yourself" —
 	// it's already closed internally by the time Dial returns.
-	wsConn, _, err := websocket.Dial(dialCtx, wsURL, nil) //nolint:bodyclose
+	wsConn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
+		Subprotocols: authSubprotocols("test-token", tenantID),
+	}) //nolint:bodyclose
 	if err != nil {
 		t.Fatalf("websocket dial failed: %v", err)
 	}
@@ -147,9 +194,14 @@ func TestStreamHandler_UnknownChatRejectedBeforeUpgrade(t *testing.T) {
 	buildRepo := themebuild.NewRepository(conn)
 	buildSvc := themebuild.NewService(buildRepo, chatSvc, nil, nil, nil)
 
+	tenantID := uint64(999002)
+	flowpos := fakeFlowposServer(t, tenantID)
+	authClient := auth.NewClient(flowpos.URL, 5*time.Second)
+	authCache := auth.NewMemoryCache()
+	t.Cleanup(authCache.Close)
+
 	router := gin.New()
-	router.Use(fakeAuthMiddleware(999002))
-	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc).Stream)
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute).Stream)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
@@ -157,7 +209,9 @@ func TestStreamHandler_UnknownChatRejectedBeforeUpgrade(t *testing.T) {
 	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// See the other Dial call in this file re: not needing to close resp.Body.
-	_, resp, err := websocket.Dial(dialCtx, wsURL, nil) //nolint:bodyclose
+	_, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
+		Subprotocols: authSubprotocols("test-token", tenantID),
+	}) //nolint:bodyclose
 	if err == nil {
 		t.Error("expected the dial to fail for a chat that doesn't belong to this tenant")
 	} else if resp != nil && resp.StatusCode != 404 {

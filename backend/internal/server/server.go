@@ -63,14 +63,15 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 
 	limiter := ratelimit.NewPerTenantLimiter(cfg.GenerationRateLimitPerMinute)
 
-	chatHandler := handlers.NewChatHandler(chatSvc, buildSvc)
-	messageHandler := handlers.NewMessageHandler(buildSvc, limiter)
-	streamHandler := handlers.NewStreamHandler(chatSvc, buildSvc)
-	revertHandler := handlers.NewRevertHandler(buildSvc)
-	previewHandler := handlers.NewPreviewHandler(buildSvc)
-
 	flowposClient := auth.NewClient(cfg.FlowposAPIBase, cfg.FlowposHTTPTimeout)
 	authCache := auth.NewMemoryCache()
+
+	chatHandler := handlers.NewChatHandler(chatSvc, buildSvc)
+	messageHandler := handlers.NewMessageHandler(buildSvc, limiter)
+	streamHandler := handlers.NewStreamHandler(chatSvc, buildSvc, flowposClient, authCache, cfg.AuthCacheTTL, cfg.AuthNegativeCacheTTL)
+	revertHandler := handlers.NewRevertHandler(buildSvc)
+	previewHandler := handlers.NewPreviewHandler(buildSvc)
+	themeHandler := handlers.NewThemeHandler(buildSvc)
 
 	r := gin.New()
 	r.Use(gin.Recovery(), logging.Middleware(logger))
@@ -114,12 +115,17 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 
 	identified.GET("/chat", chatHandler.Get)
 	identified.POST("/chats/messages", messageHandler.Send)
-	// GET /chat (above) stays as the polling fallback for a client whose
-	// WebSocket can't connect (corporate proxy, etc.) — this doesn't
-	// replace it.
-	identified.GET("/chats/:chatId/stream", streamHandler.Stream)
 	identified.POST("/chats/:chatId/messages/:messageId/revert", revertHandler.Revert)
 	identified.POST("/themes/:slug/preview", previewHandler.Preview)
+	identified.POST("/themes", themeHandler.Create)
+
+	// Not in the `identified` group: a browser WebSocket can't set an
+	// Authorization header, so this route authenticates itself via
+	// auth.WebSocketAuth (Sec-WebSocket-Protocol subprotocols) instead — see
+	// StreamHandler's doc comment. GET /chat (above) stays as the polling
+	// fallback for a client whose WebSocket can't connect (corporate proxy,
+	// etc.) — this doesn't replace it.
+	api.GET("/chats/:chatId/stream", streamHandler.Stream)
 
 	// Runs immediately and then every minute until Close cancels it (see
 	// themebuild.Service.RunReaper) — independent of any single request's

@@ -22,13 +22,29 @@ import (
 // instead of (or alongside) polling GET /chat. Server -> client only: the
 // client never sends commands over this connection, prompts still go
 // through POST /chats/messages (see message.go).
+//
+// This route is deliberately NOT mounted behind the shared auth.Middleware
+// (see server.go) — a browser's native WebSocket constructor can't set an
+// Authorization header, so it authenticates via auth.WebSocketAuth instead
+// (bearer token + tenant ID carried as Sec-WebSocket-Protocol subprotocols).
 type StreamHandler struct {
-	chats   *chat.Service
-	builder *themebuild.Service
+	chats                *chat.Service
+	builder              *themebuild.Service
+	authClient           *auth.Client
+	authCache            auth.Cache
+	authCacheTTL         time.Duration
+	authNegativeCacheTTL time.Duration
 }
 
-func NewStreamHandler(chats *chat.Service, builder *themebuild.Service) *StreamHandler {
-	return &StreamHandler{chats: chats, builder: builder}
+func NewStreamHandler(chats *chat.Service, builder *themebuild.Service, authClient *auth.Client, authCache auth.Cache, authCacheTTL, authNegativeCacheTTL time.Duration) *StreamHandler {
+	return &StreamHandler{
+		chats:                chats,
+		builder:              builder,
+		authClient:           authClient,
+		authCache:            authCache,
+		authCacheTTL:         authCacheTTL,
+		authNegativeCacheTTL: authNegativeCacheTTL,
+	}
 }
 
 // pingInterval matches the brief's "ping every 30 seconds" — keeps
@@ -51,9 +67,9 @@ type streamEventMessage struct {
 // WebSocket, replays generation_events after the client's last_seq (if
 // given), and — if the generation is still running — subscribes to its
 // live Redis channel until it finishes or the connection drops. Auth is
-// the same bearer token as every other route (see auth.Middleware, mounted
-// on this route's group in server.go) — verified before the upgrade, since
-// a 401 can't be expressed cleanly on an already-upgraded connection.
+// the same bearer token every other route uses, just carried differently
+// (see auth.WebSocketAuth) — verified before the upgrade, since a 401 can't
+// be expressed cleanly on an already-upgraded connection.
 //
 // last_seq travels as a query parameter (?last_seq=N), not a post-upgrade
 // WebSocket message: coder/websocket closes the whole connection the
@@ -65,7 +81,12 @@ type streamEventMessage struct {
 // before the upgrade even happens, and the connection is genuinely
 // server -> client only from byte zero.
 func (h *StreamHandler) Stream(c *gin.Context) {
-	tenantID := auth.TenantID(c)
+	identity, ok := auth.WebSocketAuth(c, h.authClient, h.authCache, h.authCacheTTL, h.authNegativeCacheTTL)
+	if !ok {
+		// WebSocketAuth has already written the appropriate error response.
+		return
+	}
+	tenantID := identity.TenantID
 	chatID := c.Param("chatId")
 
 	if _, err := h.chats.GetChat(c.Request.Context(), tenantID, chatID); err != nil {

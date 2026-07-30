@@ -197,6 +197,14 @@ var resultSchema = map[string]any{
 	},
 }
 
+// modelSupportsAdaptiveThinking reports whether model accepts
+// thinking: {type: "adaptive"} and output_config.effort — Haiku-tier models
+// reject both with a 400 ("adaptive thinking is not supported on this
+// model"), unlike every Opus/Sonnet-tier model this service targets.
+func modelSupportsAdaptiveThinking(model anthropic.Model) bool {
+	return !strings.Contains(strings.ToLower(string(model)), "haiku")
+}
+
 // maxToolIterations bounds the read/explore loop before Generate gives up —
 // generous enough for "list, read three files, grep once, propose" with
 // room to spare, tight enough that a model stuck re-reading the same file
@@ -252,16 +260,23 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 	var totalInputTokens, totalOutputTokens int64
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
-		stream := g.client.Messages.NewStreaming(ctx, anthropic.MessageNewParams{
-			Model:        g.model,
-			MaxTokens:    32000,
-			Thinking:     anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}},
-			OutputConfig: anthropic.OutputConfigParam{Effort: g.effort},
-			System:       system,
-			Messages:     messages,
-			Tools:        tools,
-			ToolChoice:   anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}},
-		})
+		params := anthropic.MessageNewParams{
+			Model:      g.model,
+			MaxTokens:  32000,
+			System:     system,
+			Messages:   messages,
+			Tools:      tools,
+			ToolChoice: anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}},
+		}
+		// Adaptive thinking and output_config.effort are both rejected outright
+		// (400) on Haiku-tier models — leave both fields zero-valued (omitted
+		// from the request, see their "omitzero" json tags) rather than
+		// sending a value that model can't accept.
+		if modelSupportsAdaptiveThinking(g.model) {
+			params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}}
+			params.OutputConfig = anthropic.OutputConfigParam{Effort: g.effort}
+		}
+		stream := g.client.Messages.NewStreaming(ctx, params)
 
 		message := anthropic.Message{}
 		emitted := 0

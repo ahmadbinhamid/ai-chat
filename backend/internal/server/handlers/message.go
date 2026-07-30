@@ -30,6 +30,12 @@ type sendMessageRequest struct {
 	// enough to reject an accidental paste of an entire document before it
 	// burns input tokens on a request nobody meant to send.
 	Prompt string `json:"prompt" binding:"required,max=6000"`
+	// Mode is optional and empty by default (full edit, no restriction) —
+	// only the guided "start a theme from scratch" flow should ever send
+	// "brand" or "copy" here, and only for that flow's own first two turns.
+	// See themebuild.GenerateInput.Mode's doc comment for why this must be
+	// explicit rather than inferred from the chat's turn count.
+	Mode string `json:"mode" binding:"omitempty,oneof=brand copy edit pages"`
 }
 
 type sendMessageResponse struct {
@@ -72,6 +78,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		Token:     auth.Token(c),
 		ThemeSlug: in.ThemeSlug,
 		Prompt:    in.Prompt,
+		Mode:      in.Mode,
 	})
 	if err != nil {
 		if errors.Is(err, themebuild.ErrGenerationInProgress) {

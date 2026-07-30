@@ -103,6 +103,19 @@ type GenerateInput struct {
 	Token     string
 	ThemeSlug string
 	Prompt    string
+	// Mode restricts what this one turn may touch — see the
+	// ai.GenerationMode* constants. Empty (the default, and what every
+	// caller sends today) behaves as ai.GenerationModeEdit: the full
+	// read/write tool loop, no restriction. This must be explicit, set only
+	// by a caller deliberately running the guided "start a theme from
+	// scratch" flow (turn 1 brand-only, turn 2 copy-only) — inferring it
+	// from the chat's turn count instead was tried and reverted: a chat's
+	// turn count says nothing about whether this is a fresh onboarding
+	// sequence or an ordinary chat on an already-established theme, and
+	// forcing the latter's first two turns into brand/copy-only mode is a
+	// regression, not a feature (it silently refuses everyday requests like
+	// "create a page").
+	Mode string
 }
 
 // GenerateOutcome is the immediate (synchronous) result of accepting a
@@ -227,6 +240,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	if err != nil {
 		return fmt.Errorf("load theme context: %w", err)
 	}
+	tc.GenerationMode = in.Mode
 
 	toolExec := s.buildToolExecutor(storeAuth)
 
@@ -1071,6 +1085,18 @@ func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID
 // any component/partial the previewed page composes, not just the one
 // entry file. CSS/JS/JSON/image paths are skipped: nothing but a template
 // is ever a render target.
+// CreateThemeFromBase creates a brand-new theme for the tenant from
+// flowpos-backend's base-theme catalog entry and returns its slug — the
+// entry point for the "start a theme from scratch" flow, before any chat
+// message exists for it (see themefs.Store.CreateThemeFromBase).
+func (s *Service) CreateThemeFromBase(ctx context.Context, tenantID uint64, token string) (string, error) {
+	slug, err := s.store.CreateThemeFromBase(ctx, themefs.RequestAuth{Token: token, TenantID: tenantID})
+	if err != nil {
+		return "", fmt.Errorf("create theme from base: %w", err)
+	}
+	return slug, nil
+}
+
 func (s *Service) LoadThemeFiles(ctx context.Context, storeAuth themefs.RequestAuth) (map[string]string, error) {
 	tree, err := s.store.ListFiles(ctx, storeAuth)
 	if err != nil {
