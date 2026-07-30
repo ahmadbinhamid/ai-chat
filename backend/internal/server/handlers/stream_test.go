@@ -139,7 +139,7 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenClosesOnDone(t *testing.T) {
 	t.Cleanup(authCache.Close)
 
 	router := gin.New()
-	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute).Stream)
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute, nil).Stream)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
@@ -201,7 +201,7 @@ func TestStreamHandler_UnknownChatRejectedBeforeUpgrade(t *testing.T) {
 	t.Cleanup(authCache.Close)
 
 	router := gin.New()
-	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute).Stream)
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute, nil).Stream)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 

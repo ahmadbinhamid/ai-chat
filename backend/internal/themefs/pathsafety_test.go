@@ -41,6 +41,10 @@ func TestValidateGeneratedFilePath_Allowed(t *testing.T) {
 		"pages/css/offers.css",
 		"js/offers-filter.js",
 		"components/header.liquid",
+		// A known, singular config file — see allowedGeneratedFullPaths —
+		// allowed by exact path despite its .json extension, unlike
+		// pages.json (still rejected below: structural merge only).
+		"defaults.json",
 	} {
 		if err := ValidateGeneratedFilePath(p); err != nil {
 			t.Errorf("expected %q to be allowed, got error: %v", p, err)
@@ -55,10 +59,11 @@ func TestValidateGeneratedFilePath_Rejected(t *testing.T) {
 		"../../../etc/passwd",
 		"pages/../../../etc/passwd",
 		"pages\\offers.liquid",
-		// json must go through a register_page apply action's structural
-		// merge, never a raw AI-generated file write.
+		// pages.json must go through a register_page apply action's
+		// structural merge, never a raw AI-generated file write — unlike
+		// defaults.json (see TestValidateGeneratedFilePath_Allowed), which
+		// has no such merge step and is safe to overwrite wholesale.
 		"pages.json",
-		"defaults.json",
 		"pages/offers.liquid/../../secret.js",
 		"pages/offers", // no extension
 		"pages/offers.php",

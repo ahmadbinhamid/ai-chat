@@ -45,6 +45,17 @@ type Config struct {
 	AnthropicAPIKey string
 	AnthropicModel  string
 	AnthropicEffort string
+	// FakeAIMode, when true, skips the real Claude API entirely — see
+	// ai.NewFake. For debugging the surrounding plumbing (the async
+	// generation lifecycle, the stream WebSocket, the dashboard) without
+	// spending real API tokens while that plumbing is broken. Never leave
+	// this on — nothing gets written to the theme while it's set. Also
+	// makes ANTHROPIC_API_KEY optional, since it's never actually used.
+	FakeAIMode bool
+	// FakeAIDelay simulates real generation latency in fake mode — long
+	// enough that a client watching the stream WebSocket live still sees a
+	// realistic "generating" window instead of an instant no-op.
+	FakeAIDelay time.Duration
 
 	// GenerationRateLimitPerMinute caps how many /messages (generation)
 	// calls a single tenant can make per minute — see internal/ratelimit.
@@ -97,6 +108,8 @@ func Load() Config {
 		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
 		AnthropicModel:  getenv("ANTHROPIC_MODEL", "claude-opus-5"),
 		AnthropicEffort: getenv("ANTHROPIC_EFFORT", "xhigh"),
+		FakeAIMode:      getenvBool("AI_CHAT_FAKE_MODE", false),
+		FakeAIDelay:     time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 
@@ -128,6 +141,19 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getenvBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Printf("WARNING: invalid %s=%q, using default %v", key, v, fallback)
+		return fallback
+	}
+	return b
 }
 
 func getenvInt(key string, fallback int) int {

@@ -40,9 +40,17 @@ type Server struct {
 func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) {
 	useJSONFieldNames()
 
-	generator, err := ai.New(cfg.AnthropicAPIKey, cfg.AnthropicModel, cfg.AnthropicEffort)
-	if err != nil {
-		return nil, err
+	var generator *ai.Generator
+	if cfg.FakeAIMode {
+		logger.Warn("AI_CHAT_FAKE_MODE is enabled — every generation returns a canned no-op result, " +
+			"Claude is never called, and nothing is ever written to a theme. Do not leave this on.")
+		generator = ai.NewFake(cfg.FakeAIDelay)
+	} else {
+		var err error
+		generator, err = ai.New(cfg.AnthropicAPIKey, cfg.AnthropicModel, cfg.AnthropicEffort)
+		if err != nil {
+			return nil, err
+		}
 	}
 	store := themefs.NewStore(cfg.FlowposAPIBase)
 
@@ -68,7 +76,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 
 	chatHandler := handlers.NewChatHandler(chatSvc, buildSvc)
 	messageHandler := handlers.NewMessageHandler(buildSvc, limiter)
-	streamHandler := handlers.NewStreamHandler(chatSvc, buildSvc, flowposClient, authCache, cfg.AuthCacheTTL, cfg.AuthNegativeCacheTTL)
+	streamHandler := handlers.NewStreamHandler(chatSvc, buildSvc, flowposClient, authCache, cfg.AuthCacheTTL, cfg.AuthNegativeCacheTTL, cfg.CORSAllowedOrigins)
 	revertHandler := handlers.NewRevertHandler(buildSvc)
 	previewHandler := handlers.NewPreviewHandler(buildSvc)
 	themeHandler := handlers.NewThemeHandler(buildSvc)

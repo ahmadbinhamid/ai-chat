@@ -30,6 +30,24 @@ var allowedGeneratedExtensions = map[string]bool{
 	".js":     true,
 }
 
+// allowedGeneratedFullPaths is a small allowlist of known, singular
+// theme-root config files the AI may propose a full-content update to,
+// bypassing the extension check above — currently just defaults.json,
+// checked by exact theme-root path (not a directory/glob). pages.json is
+// deliberately NOT here: it's a structured registry the AI registers pages
+// into via page_registry_entry (see propose_changes' schema), never a raw
+// overwrite target — a full-file replacement there would silently drop
+// every other page's registration. Without this, a brand/color/font
+// request has no valid mode to run in: GenerationModeBrand's own validator
+// (validateBrandModeProposal) is the only other place that allows
+// defaults.json, but nothing sets that mode automatically (see
+// themebuild.GenerateInput.Mode's doc comment on why it must be explicit),
+// so nothing besides this allowlist made defaults.json reachable at all in
+// the default (empty/edit) mode every existing chat actually runs in.
+var allowedGeneratedFullPaths = map[string]bool{
+	"defaults.json": true,
+}
+
 // maxPathLen matches chat_generated_files.file_path's column width
 // (VARCHAR(500)) — counted in runes, like MySQL's utf8mb4 VARCHAR does,
 // not bytes; a path with many multi-byte characters could fit the column
@@ -88,6 +106,9 @@ func ValidatePathSafety(relPath string) error {
 func ValidateGeneratedFilePath(relPath string) error {
 	if err := ValidatePathSafety(relPath); err != nil {
 		return err
+	}
+	if allowedGeneratedFullPaths[relPath] {
+		return nil
 	}
 	ext := path.Ext(path.Clean(relPath))
 	if !allowedGeneratedExtensions[ext] {

@@ -86,6 +86,71 @@ func checkPageBoilerplate(p Proposal, _ Snapshot) []Finding {
 	return findings
 }
 
+// layoutStartRenderTag/layoutEndRenderTag are §3's exact boilerplate, spelled
+// out literally so AutoFixMissingBoilerplate's output is byte-for-byte what
+// checkPageBoilerplate itself accepts (see wantLayoutStartParams/
+// wantLayoutEndParams above — these two must stay in sync with those).
+const layoutStartRenderTag = `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}`
+const layoutEndRenderTag = `{% render 'liquid/layout-end', theme: theme, store: store %}`
+
+// AutoFixMissingBoilerplate deterministically repairs the one page-
+// boilerplate failure mode that's mechanical rather than a real judgment
+// call: a pages/*.liquid file that's missing the layout-start/layout-end
+// render entirely (in practice, the model regenerating an existing page's
+// full content and simply dropping the wrapper — observed repeatedly even
+// after the model was told to re-read the file first). A render call
+// present with the WRONG params is deliberately left alone — that's a
+// different, more ambiguous failure this function doesn't try to guess how
+// to fix — the retry-with-model-repair path (see themebuild's
+// checkAndRepair) still handles that case.
+//
+// Returns the patched content for every file that needed a fix, keyed by
+// path — callers apply it to their own copy of the proposal/result; this
+// function never mutates p.
+func AutoFixMissingBoilerplate(p Proposal) (fixed map[string]string, anyFixed bool) {
+	fixed = make(map[string]string)
+	for _, f := range p.Files {
+		if !isPagesLiquidFile(f.Path) {
+			continue
+		}
+
+		tags := ScanTags(f.Content)
+		var renders []struct {
+			target string
+			params []RenderParam
+		}
+		for _, t := range tags {
+			if t.Name != "render" {
+				continue
+			}
+			target, params, ok := ParseRenderTag(t.Raw)
+			if !ok {
+				continue
+			}
+			renders = append(renders, struct {
+				target string
+				params []RenderParam
+			}{target, params})
+		}
+
+		content := f.Content
+		changed := false
+		if findRenderCall(renders, "liquid/layout-start") == nil {
+			content = layoutStartRenderTag + "\n" + content
+			changed = true
+		}
+		if findRenderCall(renders, "liquid/layout-end") == nil {
+			content = strings.TrimRight(content, "\n") + "\n" + layoutEndRenderTag + "\n"
+			changed = true
+		}
+		if changed {
+			fixed[f.Path] = content
+			anyFixed = true
+		}
+	}
+	return fixed, anyFixed
+}
+
 func isPagesLiquidFile(path string) bool {
 	return strings.HasPrefix(path, "pages/") && strings.HasSuffix(path, ".liquid") &&
 		!strings.HasPrefix(path, "pages/css/")

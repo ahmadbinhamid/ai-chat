@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"ai-chat/internal/themefs"
 
@@ -101,6 +102,11 @@ type Generator struct {
 	client anthropic.Client
 	model  anthropic.Model
 	effort anthropic.OutputConfigEffort
+	// fake, when true, makes Generate return a canned Result after
+	// fakeDelay — no Anthropic API call, no tokens spent — see NewFake and
+	// its doc comment for what this is for.
+	fake      bool
+	fakeDelay time.Duration
 }
 
 // New constructs the Claude client. apiKey empty is a configuration error
@@ -115,6 +121,42 @@ func New(apiKey, model, effort string) (*Generator, error) {
 		client: anthropic.NewClient(),
 		model:  anthropic.Model(model),
 		effort: anthropic.OutputConfigEffort(effort),
+	}, nil
+}
+
+// NewFake builds a Generator that never calls Claude — Generate instead
+// waits fakeDelay (simulating real generation latency, so a caller watching
+// the stream WebSocket live still sees a realistic "generating" window
+// rather than an instant no-op) and returns a canned, no-op Result: a fixed
+// summary, no proposed file changes. That means checkAndRepair's themecheck
+// pass is skipped entirely (see proposalHasChanges in themebuild/service.go)
+// and nothing is ever written to the real theme — this is for exercising
+// the surrounding plumbing (WebSocket delivery, the async generation
+// lifecycle, the dashboard's UI) without spending real API tokens while
+// that plumbing is still being debugged. Swap back to New(...) once done —
+// see config.Config.FakeAIMode / the AI_CHAT_FAKE_MODE env var.
+func NewFake(fakeDelay time.Duration) *Generator {
+	return &Generator{fake: true, fakeDelay: fakeDelay}
+}
+
+// fakeGenerate is NewFake's whole implementation — see its doc comment.
+// Deliberately proposes zero file changes: a fixed placeholder path/content
+// would risk actually corrupting a real theme (wrong file, wrong shape) the
+// moment a caller forgets fake mode is on, and there's no safe way to
+// synthesize a real edit without reading the current file first (which
+// would need a real tool-use loop, defeating the point of not spending
+// tokens). No changes proposed means checkAndRepair's themecheck pass never
+// runs and nothing is ever written — this exercises the async generation
+// lifecycle and the stream WebSocket end to end, just never the file-write
+// path.
+func (g *Generator) fakeGenerate(ctx context.Context, prompt string) (*Result, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(g.fakeDelay):
+	}
+	return &Result{
+		Summary: fmt.Sprintf("[fake mode] Received: %q. No changes were made — ANTHROPIC_API_KEY was never called.", prompt),
 	}, nil
 }
 
@@ -221,6 +263,9 @@ const maxToolIterations = 8
 // (thinking-style narration, not the proposal itself) across every
 // iteration — mainly useful for a live "..." progress indicator.
 func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string), toolExec ToolExecutor) (*Result, error) {
+	if g.fake {
+		return g.fakeGenerate(ctx, prompt)
+	}
 	// Anthropic rejects any empty text content block outright ("text content
 	// blocks must be non-empty") — not just for the cache_control
 	// breakpoint below, for any message anywhere in the request — so an
@@ -256,7 +301,22 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)))
 
 	tools := toolsForMode(tc.GenerationMode)
-	system := []anthropic.TextBlockParam{staticSystemPromptBlock(), {Text: dynamicSystemPrompt(tc)}}
+	// The dynamic block (pages.json, defaults.json, file tree, manifest —
+	// often several thousand tokens on a theme with many pages) is
+	// byte-identical across every iteration of THIS call's tool loop and
+	// every checkAndRepair retry that reuses the same tc — only the
+	// replayed history and the new prompt/repair message change between
+	// those. Without its own breakpoint it was being resent and
+	// reprocessed at full price on every single one of those calls; this
+	// makes iteration 2+ of the same turn (and any retry) read it from
+	// cache instead (~10% of the cost). Safe to always set: prompt caching
+	// requires a minimum prefix length (512-4096 tokens depending on
+	// model) below which this silently doesn't cache rather than erroring.
+	dynamicBlock := anthropic.TextBlockParam{Text: dynamicSystemPrompt(tc)}
+	dynamicCacheControl := anthropic.NewCacheControlEphemeralParam()
+	dynamicCacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
+	dynamicBlock.CacheControl = dynamicCacheControl
+	system := []anthropic.TextBlockParam{staticSystemPromptBlock(), dynamicBlock}
 
 	var totalInputTokens, totalOutputTokens int64
 	for iteration := 0; iteration < maxToolIterations; iteration++ {

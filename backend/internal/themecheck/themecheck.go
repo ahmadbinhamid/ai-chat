@@ -105,6 +105,7 @@ func (p Proposal) fileByPath(path string) (ProposedFile, bool) {
 func Check(proposal Proposal, snap Snapshot) []Finding {
 	var findings []Finding
 	findings = append(findings, checkPageBoilerplate(proposal, snap)...)
+	findings = append(findings, checkPlaceholderBody(proposal, snap)...)
 	findings = append(findings, checkAllowedSyntax(proposal, snap)...)
 	findings = append(findings, checkBalancedTags(proposal, snap)...)
 	findings = append(findings, checkRenderTargetExists(proposal, snap)...)

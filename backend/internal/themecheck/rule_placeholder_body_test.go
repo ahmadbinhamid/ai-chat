@@ -1,0 +1,70 @@
+package themecheck
+
+import "testing"
+
+func TestCheckPlaceholderBody_RejectsLiteralPlaceholder(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "update", Content: validBoilerplateInlineWithBody("placeholder")}}}
+	got := checkPlaceholderBody(p, Snapshot{})
+	if len(got) != 1 || got[0].Rule != ruleIDPlaceholderBody {
+		t.Fatalf("expected one placeholder-body finding, got %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_RejectsEmptyBody(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "update", Content: validBoilerplateInlineWithBody("")}}}
+	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 1 {
+		t.Fatalf("expected one finding for an empty body, got %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_AllowsShortRealBody(t *testing.T) {
+	// Short but genuine content (e.g. a promotional banner page) must never
+	// be flagged — there's no length heuristic, only the exact-phrase match.
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update", Content: validBoilerplateInlineWithBody("Sale!")}}}
+	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected short real content to be accepted, got findings: %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_AllowsRealProse(t *testing.T) {
+	body := "<h1>FAQ</h1><p>Do you ship internationally? Yes, we ship worldwide.</p>"
+	p := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "update", Content: validBoilerplateInlineWithBody(body)}}}
+	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected real prose to be accepted, got findings: %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_AllowsDynamicBinding(t *testing.T) {
+	// A page whose only "content" is a {{ }} output expression (e.g.
+	// displaying a live product name) is real, page-specific content —
+	// must never be flagged just because it has no static prose.
+	body := "<p>{{ product.name }}</p>"
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update", Content: validBoilerplateInlineWithBody(body)}}}
+	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected a dynamic binding to be accepted, got findings: %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_AllowsComponentOnlyPage(t *testing.T) {
+	// A page composed entirely of real component renders, with no prose of
+	// its own — the spec's own preferred "compose from components" pattern
+	// — must never be flagged, regardless of how little literal text it has.
+	body := "{% render 'components/store-hero-banner' %}\n{% render 'components/testimonials' %}"
+	p := Proposal{Files: []ProposedFile{{Path: "pages/home.liquid", Action: "update", Content: validBoilerplateInlineWithBody(body)}}}
+	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected a component-composed page to be accepted, got findings: %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_IgnoresNonPageFiles(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "components/header.liquid", Action: "update", Content: "placeholder"}}}
+	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected non-page files to be ignored, got findings: %+v", got)
+	}
+}
+
+func validBoilerplateInlineWithBody(body string) string {
+	return "{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}\n" +
+		body +
+		"\n{% render 'liquid/layout-end', theme: theme, store: store %}"
+}

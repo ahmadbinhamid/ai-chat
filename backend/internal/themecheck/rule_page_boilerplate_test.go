@@ -34,6 +34,39 @@ func TestCheckPageBoilerplate_ValidInline(t *testing.T) {
 	}
 }
 
+func TestAutoFixMissingBoilerplate_AddsBothMissingRenders(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "update", Content: "<section>hi</section>\n"}}}
+
+	fixed, any := AutoFixMissingBoilerplate(p)
+	if !any {
+		t.Fatal("expected a fix to be applied")
+	}
+	patched, ok := fixed["pages/faq.liquid"]
+	if !ok {
+		t.Fatal("expected a patched entry for pages/faq.liquid")
+	}
+
+	// The patched content must itself pass the same rule it just fixed.
+	p2 := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "update", Content: patched}}}
+	if got := checkPageBoilerplate(p2, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected patched content to pass checkPageBoilerplate, got findings: %+v", got)
+	}
+}
+
+func TestAutoFixMissingBoilerplate_LeavesValidFileAlone(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "pages/home.liquid", Action: "update", Content: validBoilerplateInline}}}
+	if _, any := AutoFixMissingBoilerplate(p); any {
+		t.Error("expected no fix for a file that already has both renders")
+	}
+}
+
+func TestAutoFixMissingBoilerplate_IgnoresNonPageFiles(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{{Path: "components/header.liquid", Action: "update", Content: "<div>no boilerplate needed here</div>"}}}
+	if _, any := AutoFixMissingBoilerplate(p); any {
+		t.Error("expected no fix for a non-pages/*.liquid file")
+	}
+}
+
 func TestCheckPageBoilerplate_ValidAuthSubdir(t *testing.T) {
 	p := Proposal{Files: []ProposedFile{{Path: "pages/auth/login.liquid", Action: "create", Content: validBoilerplateInline}}}
 	if got := checkPageBoilerplate(p, Snapshot{}); len(got) != 0 {

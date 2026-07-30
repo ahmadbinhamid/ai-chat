@@ -665,6 +665,26 @@ func (s *Service) checkAndRepair(
 		findings := themecheck.Check(toProposal(result), snap)
 		errorFindings, warningFindings := splitFindings(findings)
 
+		// A missing layout-start/layout-end render is mechanical, not a
+		// judgment call — the required text is fixed and known, so patch it
+		// in directly rather than spending a whole model round-trip asking
+		// for something it has already failed to add correctly at least
+		// twice in production (see AutoFixMissingBoilerplate's doc comment).
+		// Free (no extra Generate call): just re-run Check on the patched
+		// content before deciding whether a real repair round-trip is
+		// needed at all.
+		if len(errorFindings) > 0 {
+			if fixedContent, any := themecheck.AutoFixMissingBoilerplate(toProposal(result)); any {
+				for i, f := range result.Files {
+					if patched, ok := fixedContent[f.Path]; ok {
+						result.Files[i].Content = patched
+					}
+				}
+				findings = themecheck.Check(toProposal(result), snap)
+				errorFindings, warningFindings = splitFindings(findings)
+			}
+		}
+
 		if len(errorFindings) == 0 {
 			if attempt > 1 {
 				slog.Info("themecheck accepted proposal after retry",
@@ -770,6 +790,14 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 			fmt.Fprintf(&b, "- [%s] %s\n", f.Rule, f.Message)
 		}
 	}
+	// A rejection on an existing file is often a sign the resubmitted
+	// content was reconstructed from memory rather than the real file —
+	// e.g. dropping the mandatory layout-start/layout-end boilerplate when
+	// regenerating a page you were only asked to make a small change to.
+	// The tool loop is still available on this retry; use it.
+	b.WriteString("\nIf you're unsure of a file's exact current content, call read_theme_file on it again " +
+		"before resubmitting — don't reconstruct it from memory, that's how boilerplate like the layout " +
+		"renders above gets silently dropped.")
 	return b.String()
 }
 

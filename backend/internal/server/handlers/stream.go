@@ -34,9 +34,20 @@ type StreamHandler struct {
 	authCache            auth.Cache
 	authCacheTTL         time.Duration
 	authNegativeCacheTTL time.Duration
+	// corsAllowedOrigins is reused as the WebSocket handshake's origin
+	// allow-list (see websocket.AcceptOptions.OriginPatterns below) — the
+	// same set of dashboard origins CORS already trusts for every other
+	// route. websocket.Accept enforces same-origin ONLY by default (see
+	// coder/websocket's authenticateOrigin) — gin-contrib/cors's headers
+	// never apply to this handshake at all (CORS is a fetch/XHR concept;
+	// a WS upgrade doesn't go through a preflight or carry Access-Control-*
+	// response headers), so without this, every cross-origin dashboard
+	// (the normal case: the dashboard and this API are different origins)
+	// gets its handshake rejected before the Stream handler ever runs.
+	corsAllowedOrigins []string
 }
 
-func NewStreamHandler(chats *chat.Service, builder *themebuild.Service, authClient *auth.Client, authCache auth.Cache, authCacheTTL, authNegativeCacheTTL time.Duration) *StreamHandler {
+func NewStreamHandler(chats *chat.Service, builder *themebuild.Service, authClient *auth.Client, authCache auth.Cache, authCacheTTL, authNegativeCacheTTL time.Duration, corsAllowedOrigins []string) *StreamHandler {
 	return &StreamHandler{
 		chats:                chats,
 		builder:              builder,
@@ -44,6 +55,7 @@ func NewStreamHandler(chats *chat.Service, builder *themebuild.Service, authClie
 		authCache:            authCache,
 		authCacheTTL:         authCacheTTL,
 		authNegativeCacheTTL: authNegativeCacheTTL,
+		corsAllowedOrigins:   corsAllowedOrigins,
 	}
 }
 
@@ -104,7 +116,9 @@ func (h *StreamHandler) Stream(c *gin.Context) {
 		return
 	}
 
-	conn, err := websocket.Accept(c.Writer, c.Request, nil)
+	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
+		OriginPatterns: h.corsAllowedOrigins,
+	})
 	if err != nil {
 		// Accept has already written the appropriate HTTP error response.
 		return

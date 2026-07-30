@@ -14,10 +14,15 @@ func TestValidateProposal_EditModeAllowsLiquidFiles(t *testing.T) {
 	}
 }
 
-func TestValidateProposal_EditModeRejectsDefaultsJSON(t *testing.T) {
+func TestValidateProposal_EditModeAllowsDefaultsJSON(t *testing.T) {
+	// defaults.json is a known, singular config file (see
+	// themefs.allowedGeneratedFullPaths) — a brand/color/font request must
+	// work in the default edit mode every chat actually runs in, not just
+	// the brand mode nothing currently sets automatically (see
+	// GenerateInput.Mode's doc comment).
 	r := &ai.Result{Files: []ai.GeneratedFile{{Path: "defaults.json", Action: "update", Content: "{}"}}}
-	if err := validateProposal(r, ""); err == nil {
-		t.Error("expected defaults.json to be rejected outside brand mode")
+	if err := validateProposal(r, ""); err != nil {
+		t.Errorf("expected defaults.json update to be allowed in edit mode, got: %v", err)
 	}
 }
 
