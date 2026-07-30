@@ -30,25 +30,87 @@ var outputExpressionRe = regexp.MustCompile(`(?s)\{\{.*?\}\}`)
 // they're not static text.
 var liquidOrHTMLTagRe = regexp.MustCompile(`(?s)\{%.*?%\}|<[^>]*>`)
 
+// minPriorSignalForShrinkCheck / maxShrinkRatio: an "update" whose new
+// contentSignal is under maxShrinkRatio of the real previous file's signal
+// is flagged — but only when the previous file's signal was already at
+// least minPriorSignalForShrinkCheck, so editing an already-small page
+// never trips this. This is a distinct, broader check from
+// placeholderBodyRe's exact-phrase match below — it catches a
+// page-destroying edit even when the replacement text doesn't match any
+// *known* placeholder phrase (observed in practice: a single stray
+// character "x" isn't a recognized placeholder word, but replacing a real
+// multi-paragraph FAQ page with it is exactly the destructive pattern this
+// whole rule exists to catch).
+const minPriorSignalForShrinkCheck = 100
+const maxShrinkRatio = 0.35
+
+// renderSignalWeight/bindingSignalWeight let a component- or binding-driven
+// page register a substantial contentSignal even with little or no static
+// prose of its own — matching hasNonLayoutRender/outputExpressionRe's
+// exemptions below, just as a comparable magnitude instead of a bypass, so
+// the shrink comparison stays meaningful for pages built that way too.
+const renderSignalWeight = 200
+const bindingSignalWeight = 50
+
+// contentSignal is a rough, comparable measure of "how much real content is
+// here" — stripped prose length, plus credit for real (non-layout)
+// component/page renders and {{ }} dynamic bindings. Used only for the
+// shrink comparison above; the exact-phrase/empty checks below use the
+// stripped prose and the raw renders/bindings checks directly.
+func contentSignal(content string) int {
+	prose := strings.TrimSpace(strings.Join(strings.Fields(liquidOrHTMLTagRe.ReplaceAllString(content, " ")), " "))
+	signal := len(prose)
+	signal += renderSignalWeight * nonLayoutRenderCount(content)
+	if outputExpressionRe.MatchString(content) {
+		signal += bindingSignalWeight
+	}
+	return signal
+}
+
 // checkPlaceholderBody enforces: a proposed pages/*.liquid file's actual
 // content must be real — literal prose (any non-empty amount; a
 // short-but-genuine body like "Sale!" is not this rule's business), a
 // dynamic {{ }} binding, or composed from at least one real component/page
-// render beyond the mandatory layout wrapper. A file satisfying none of
-// those is either a fully empty stub or, per the case this rule exists
-// for, real content that got silently destroyed and replaced with an
-// exact placeholder phrase. Deliberately no minimum-length heuristic
-// beyond non-empty: length alone can't distinguish a stub from genuinely
-// terse real content, and a wrong guess there means silently blocking a
-// legitimate short page.
-func checkPlaceholderBody(p Proposal, _ Snapshot) []Finding {
+// render beyond the mandatory layout wrapper — and an "update" must not
+// drastically shrink a real previous file (see the constants above). A
+// file satisfying none of those is either a fully empty stub or, per the
+// cases this rule exists for, real content that got silently destroyed.
+// Deliberately no minimum-length heuristic on the new content alone beyond
+// non-empty: length alone can't distinguish a stub from genuinely terse
+// real content, and a wrong guess there means silently blocking a
+// legitimate short page — the shrink check below is what catches a tiny
+// replacement without that false-positive risk, by comparing against what
+// was really there before rather than judging the new content in isolation.
+func checkPlaceholderBody(p Proposal, snap Snapshot) []Finding {
 	var findings []Finding
 	for _, f := range p.Files {
 		if !isPagesLiquidFile(f.Path) {
 			continue
 		}
 
-		if hasNonLayoutRender(f.Content) || outputExpressionRe.MatchString(f.Content) {
+		if prev, ok := snap.Files[f.Path]; f.Action == "update" && ok {
+			prevSignal := contentSignal(prev)
+			if prevSignal >= minPriorSignalForShrinkCheck {
+				newSignal := contentSignal(f.Content)
+				if float64(newSignal) < float64(prevSignal)*maxShrinkRatio {
+					findings = append(findings, Finding{
+						Path:     f.Path,
+						Rule:     ruleIDPlaceholderBody,
+						Severity: SeverityError,
+						Message: fmt.Sprintf(
+							"this update drastically shrinks %s's real content (roughly %d%% of what was there before) — "+
+								"looks like real content may have been replaced with a stub rather than edited. If a large "+
+								"removal is genuinely intended, keep the rest of the page's real content and say so "+
+								"explicitly in your summary; otherwise rewrite this file preserving its existing content "+
+								"plus the requested change.",
+							f.Path, newSignal*100/prevSignal),
+					})
+					continue
+				}
+			}
+		}
+
+		if nonLayoutRenderCount(f.Content) > 0 || outputExpressionRe.MatchString(f.Content) {
 			continue
 		}
 
@@ -60,8 +122,9 @@ func checkPlaceholderBody(p Proposal, _ Snapshot) []Finding {
 				Severity: SeverityError,
 				Message: fmt.Sprintf(
 					// body is always short by construction here: every branch
-					// that reaches this Sprintf requires len(body) < minPageBodyTextLen
-					// or an exact placeholder-phrase match, so no truncation needed.
+					// that reaches this Sprintf requires an exact
+					// placeholder-phrase match or an empty string, so no
+					// truncation is needed.
 					"the page body looks like placeholder/stub content (%q) rather than real content answering the merchant's "+
 						"request — write actual content (prose, or renders of real existing components), and if the request is "+
 						"too vague to know what content to write, use needs_clarification instead of guessing.",
@@ -72,19 +135,20 @@ func checkPlaceholderBody(p Proposal, _ Snapshot) []Finding {
 	return findings
 }
 
-// hasNonLayoutRender reports whether content renders anything besides the
-// mandatory liquid/layout-start / liquid/layout-end wrapper — a page
-// composed of real component renders (even with little or no prose of its
-// own) counts as real content, not a placeholder.
-func hasNonLayoutRender(content string) bool {
+// nonLayoutRenderCount counts renders of anything besides the mandatory
+// liquid/layout-start / liquid/layout-end wrapper — a page composed of real
+// component renders (even with little or no prose of its own) counts as
+// real content, not a placeholder.
+func nonLayoutRenderCount(content string) int {
+	count := 0
 	for _, t := range ScanTags(content) {
 		if t.Name != "render" {
 			continue
 		}
 		target, _, ok := ParseRenderTag(t.Raw)
 		if ok && target != "liquid/layout-start" && target != "liquid/layout-end" {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
 }

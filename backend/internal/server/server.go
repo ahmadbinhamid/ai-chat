@@ -122,6 +122,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	identified.Use(auth.Middleware(flowposClient, authCache, cfg.AuthCacheTTL, cfg.AuthNegativeCacheTTL))
 
 	identified.GET("/chat", chatHandler.Get)
+	identified.GET("/chat/status", chatHandler.Status)
 	identified.POST("/chats/messages", messageHandler.Send)
 	identified.POST("/chats/:chatId/messages/:messageId/revert", revertHandler.Revert)
 	identified.POST("/themes/:slug/preview", previewHandler.Preview)

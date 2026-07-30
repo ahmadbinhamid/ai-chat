@@ -257,7 +257,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	var warnings []themecheck.Finding
 	if proposalHasChanges(result) {
-		snap, err := s.buildSnapshot(ctx, storeAuth)
+		snap, err := s.buildSnapshot(ctx, storeAuth, result)
 		if err != nil {
 			return fmt.Errorf("build theme snapshot: %w", err)
 		}
@@ -552,11 +552,19 @@ func (s *Service) execGrepTheme(ctx context.Context, storeAuth themefs.RequestAu
 // path that exists, for rule 4's render-target-exists check — see
 // themecheck.Snapshot.Paths) plus real content for the handful of files
 // themecheck actually reads (pages.json, defaults.json, the two layout
-// files). Called once per doGenerate call, before the check-and-repair
+// files) — plus, for every file result proposes to "update", that file's
+// real current content too (see themecheck.checkPlaceholderBody's
+// content-shrink check, which needs a real "before" to compare the
+// proposal's "after" against — a page's prior content was never loaded
+// into the snapshot before this, so that check had nothing to compare
+// with). Called once per doGenerate call, before the check-and-repair
 // loop: nothing is written to the theme until after that loop accepts a
 // proposal, so the same snapshot is valid across every retry within one
-// call — no need to refetch it per attempt.
-func (s *Service) buildSnapshot(ctx context.Context, storeAuth themefs.RequestAuth) (themecheck.Snapshot, error) {
+// call — no need to refetch it per attempt, even though result itself may
+// be replaced by a retried proposal (checkAndRepair keeps re-using this
+// same snapshot; only fresh update paths that first appear on a retry
+// would miss a "before" here, same as before this change for any path).
+func (s *Service) buildSnapshot(ctx context.Context, storeAuth themefs.RequestAuth, result *ai.Result) (themecheck.Snapshot, error) {
 	tree, err := s.store.ListFiles(ctx, storeAuth)
 	if err != nil {
 		return themecheck.Snapshot{}, fmt.Errorf("list theme files: %w", err)
@@ -571,6 +579,19 @@ func (s *Service) buildSnapshot(ctx context.Context, storeAuth themefs.RequestAu
 			return themecheck.Snapshot{}, fmt.Errorf("read %s: %w", path, err)
 		}
 		files[path] = content
+	}
+	for _, f := range result.Files {
+		if f.Action != "update" {
+			continue
+		}
+		if _, ok := files[f.Path]; ok {
+			continue
+		}
+		content, err := s.store.ReadFile(ctx, storeAuth, f.Path)
+		if err != nil {
+			return themecheck.Snapshot{}, fmt.Errorf("read %s: %w", f.Path, err)
+		}
+		files[f.Path] = content
 	}
 
 	return themecheck.Snapshot{Files: files, Paths: paths}, nil
@@ -708,10 +729,21 @@ func (s *Service) checkAndRepair(
 		turns = append(turns, ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)})
 		repair := repairPrompt(errorFindings)
 
+		repairStart := time.Now()
 		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, nil, toolExec)
+		repairElapsed := time.Since(repairStart)
 		if genErr != nil {
+			// Surfaced distinctly from the generic reaper cleanup: without
+			// this, a repair call that runs out the remaining generateTimeout
+			// budget (ctx canceled mid-call) produces no log of its own —
+			// the chat just sits on "repairing" until the reaper's 1-minute
+			// sweep marks it failed, with nothing in the logs explaining why.
+			slog.Error("repair generation failed", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+				"attempt", attempt, "elapsed", repairElapsed, "error", genErr)
 			return nil, nil, fmt.Errorf("retry generation: %w", genErr)
 		}
+		slog.Info("repair generation completed", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+			"attempt", attempt, "elapsed", repairElapsed, "input_tokens", retried.InputTokens, "output_tokens", retried.OutputTokens)
 		totalInput += retried.InputTokens
 		totalOutput += retried.OutputTokens
 		turns = append(turns, ai.Turn{Role: "user", Content: repair})

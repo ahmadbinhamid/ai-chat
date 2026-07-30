@@ -1,6 +1,9 @@
 package themecheck
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCheckPlaceholderBody_RejectsLiteralPlaceholder(t *testing.T) {
 	p := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "update", Content: validBoilerplateInlineWithBody("placeholder")}}}
@@ -53,6 +56,47 @@ func TestCheckPlaceholderBody_AllowsComponentOnlyPage(t *testing.T) {
 	p := Proposal{Files: []ProposedFile{{Path: "pages/home.liquid", Action: "update", Content: validBoilerplateInlineWithBody(body)}}}
 	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 0 {
 		t.Errorf("expected a component-composed page to be accepted, got findings: %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_RejectsDrasticShrinkEvenWithoutKnownPhrase(t *testing.T) {
+	// The exact bug this was added for: a single stray character ("x")
+	// isn't a *known* placeholder phrase and would pass every other check
+	// in this file, but replacing a real, substantial page with it is
+	// exactly the destructive pattern this rule exists to catch.
+	prev := validBoilerplateInlineWithBody(strings.Repeat("Real FAQ content. ", 20)) // well over 200 chars
+	p := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "update", Content: validBoilerplateInlineWithBody("x")}}}
+	snap := Snapshot{Files: map[string]string{"pages/faq.liquid": prev}}
+
+	got := checkPlaceholderBody(p, snap)
+	if len(got) != 1 || got[0].Rule != ruleIDPlaceholderBody {
+		t.Fatalf("expected one placeholder-body finding for a drastic shrink, got %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_ShrinkCheckIgnoresAlreadySmallPages(t *testing.T) {
+	// A previously tiny page (under the shrink-check's own floor) being
+	// replaced with something else tiny is not this check's business —
+	// it's the exact-phrase/empty check below that covers that case, and
+	// only if the new content is itself a known placeholder or empty.
+	prev := validBoilerplateInlineWithBody("Sale!") // well under 200 chars
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update", Content: validBoilerplateInlineWithBody("New sale!")}}}
+	snap := Snapshot{Files: map[string]string{"pages/offers.liquid": prev}}
+
+	if got := checkPlaceholderBody(p, snap); len(got) != 0 {
+		t.Errorf("expected no finding when the previous page was already small, got %+v", got)
+	}
+}
+
+func TestCheckPlaceholderBody_ShrinkCheckIgnoresCreateAction(t *testing.T) {
+	// A brand-new page has no "before" to shrink from — the shrink check
+	// must only ever apply to "update".
+	prev := validBoilerplateInlineWithBody(strings.Repeat("Real content. ", 20))
+	p := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "create", Content: validBoilerplateInlineWithBody("Hi")}}}
+	snap := Snapshot{Files: map[string]string{"pages/faq.liquid": prev}}
+
+	if got := checkPlaceholderBody(p, snap); len(got) != 0 {
+		t.Errorf("expected the shrink check to be skipped for a create action, got %+v", got)
 	}
 }
 

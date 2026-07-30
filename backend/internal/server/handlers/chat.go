@@ -45,6 +45,36 @@ type chatDetail struct {
 	GenerationError string             `json:"generation_error,omitempty"`
 }
 
+// chatStatus is the lightweight poll shape — just enough to answer "is it
+// still generating," without the full transcript/files Get returns. Exists
+// because the frontend's poll fallback (used only while its WebSocket
+// stream is unavailable — see ai-chat-stream.ts) was re-fetching Get's
+// entire payload (tens of KB: full message history + every generated file's
+// before/after content) every 3 seconds just to check one boolean, which
+// scales badly with a chat's length for zero benefit — the poll only ever
+// cares whether generating flipped false.
+type chatStatus struct {
+	Generating      bool   `json:"generating"`
+	GenerationError string `json:"generation_error,omitempty"`
+}
+
+// Status returns just {generating, generation_error} for the tenant's chat
+// — see chatStatus's doc comment. A tenant with no chat yet reports
+// not-generating, same as Get.
+func (h *ChatHandler) Status(c *gin.Context) {
+	ch, err := h.chats.GetChatForTenant(c.Request.Context(), auth.TenantID(c), themebuild.ChatType)
+	if errors.Is(err, chat.ErrNotFound) {
+		httpresponse.OK(c, chatStatus{})
+		return
+	}
+	if err != nil {
+		respondErr(c, err)
+		return
+	}
+	generating, genErr := h.builder.GenerationStatus(c.Request.Context(), ch.ID)
+	httpresponse.OK(c, chatStatus{Generating: generating, GenerationError: genErr})
+}
+
 // Get returns the tenant's one chat and its full transcript, with each
 // turn's generated files attached so reopening the page still shows every
 // past "Generated files" card, not just the most recent one. A tenant that
