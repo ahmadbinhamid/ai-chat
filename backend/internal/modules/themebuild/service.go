@@ -55,6 +55,13 @@ const (
 // its side; callers passing one continue to work unchanged.
 type generator interface {
 	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string), toolExec ai.ToolExecutor) (*ai.Result, error)
+	// Summarize is used by summarizeOldTurns to collapse old chat history
+	// into one synthetic turn instead of resending it verbatim on every
+	// call — see summarizeOldTurns's doc comment. *ai.Generator's fake mode
+	// (see ai.NewFake) implements this with a cheap deterministic string
+	// and never calls the real API, matching Generate's own fake-mode
+	// convention.
+	Summarize(ctx context.Context, turns []ai.Turn) (string, error)
 }
 
 // Service is the AI theme builder's orchestration: turn a prompt into
@@ -66,20 +73,28 @@ type Service struct {
 	gen        generator
 	store      *themefs.Store
 	themeLocks *keyedMutex
-	redis      *redis.Client // nil if REDIS_URL wasn't configured — see eventEmitter
+	bus        eventBus // redisEventBus if REDIS_URL was configured, inProcessEventBus otherwise — see eventEmitter
 }
 
 // NewService wires the service's dependencies. rdb may be nil (see
 // NewRedisClient) — generation events are then still durably written to
-// generation_events, just never published live to Redis.
+// generation_events, and live delivery falls back to an in-process fan-out
+// (see eventbus.go) that only reaches a WebSocket connected to this same
+// replica.
 func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store *themefs.Store, rdb *redis.Client) *Service {
+	var bus eventBus
+	if rdb != nil {
+		bus = newRedisEventBus(rdb)
+	} else {
+		bus = newInProcessEventBus()
+	}
 	return &Service{
 		repo:       repo,
 		chats:      chats,
 		gen:        gen,
 		store:      store,
 		themeLocks: newKeyedMutex(),
-		redis:      rdb,
+		bus:        bus,
 	}
 }
 
@@ -214,7 +229,7 @@ func (s *Service) runGeneration(ctx context.Context, in GenerateInput, c chat.Ch
 // and — unlike an earlier pending/apply design — write them to the real
 // theme filesystem immediately, with no separate "Apply to theme" step.
 func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat, genID string) (retErr error) {
-	emitter := newEventEmitter(s.repo, s.redis, genID, c.ID)
+	emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
 	emitter.emit(ctx, EventTypeStarted, struct{}{})
 
 	// summary is declared here (not with := at its point of use below) so
@@ -222,10 +237,29 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// value — a "done" event needs the actual summary, not a placeholder.
 	var summary string
 	defer func() {
+		// A deliberately fresh, short-lived context for this defer's own
+		// writes — mirrors runGeneration's endCtx pattern. ctx itself may
+		// already be expired here (the common failure case this defer
+		// exists for: a generation that hit generateTimeout, or whose
+		// caller's context was canceled) — emitting on a dead ctx makes
+		// AppendGenerationEvent (and RecordAssistantMessage below) silently
+		// no-op, which is exactly the bug this fixes: a timed-out
+		// generation with a dead ctx would emit nothing and leave the
+		// WebSocket (and the chat) with no record of why it failed.
+		emitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if retErr != nil {
-			emitter.emit(ctx, EventTypeFailed, map[string]string{"message": retErr.Error()})
+			message := retErr.Error()
+			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
+			if message == "" {
+				message = "Something went wrong while generating your changes."
+			}
+			if _, err := s.chats.RecordAssistantMessage(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
+				slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
+			}
 		} else {
-			emitter.emit(ctx, EventTypeDone, map[string]string{"summary": summary})
+			emitter.emit(emitCtx, EventTypeDone, map[string]string{"summary": summary})
 		}
 	}()
 
@@ -244,15 +278,10 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	toolExec := s.buildToolExecutor(storeAuth)
 
-	turns := toTurns(priorMessages)
-	result, genErr := s.gen.Generate(ctx, tc, turns, in.Prompt, nil, toolExec)
-	if genErr != nil {
-		return genErr
-	}
-
-	clearIfNeedsClarification(result)
-	if err := validateProposal(result, tc.GenerationMode); err != nil {
-		return fmt.Errorf("invalid model proposal: %w", err)
+	turns := summarizeOldTurns(ctx, s.gen, toTurns(priorMessages))
+	result, turns, err := s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, emitter, in)
+	if err != nil {
+		return err
 	}
 
 	var warnings []themecheck.Finding
@@ -648,6 +677,60 @@ func clearIfNeedsClarification(result *ai.Result) {
 	result.LayoutScriptsToAdd = nil
 }
 
+// generateValidProposal makes doGenerate's very first Generate call and
+// retries it, up to maxThemeCheckRetries times, if the reply fails
+// validateProposal — the same bounded treatment checkAndRepair's own retry
+// loop applies to a malformed *repair* reply (see its invalid-proposal
+// branch), now covering the first attempt too: a garbled first reply (a bad
+// path, a corrupted field) is model flakiness observed in production, not a
+// reason to hard-fail the whole generation with zero retries. Returns the
+// (possibly extended) turns history so a later checkAndRepair call sees any
+// corrective exchange that happened here, instead of silently dropping it.
+func (s *Service) generateValidProposal(
+	ctx context.Context,
+	tc ai.ThemeContext,
+	turns []ai.Turn,
+	prompt string,
+	toolExec ai.ToolExecutor,
+	emitter *eventEmitter,
+	in GenerateInput,
+) (*ai.Result, []ai.Turn, error) {
+	nextPrompt := prompt
+
+	// attempt counts total Generate calls made here, including the first —
+	// mirrors checkAndRepair's own budget: maxThemeCheckRetries+1 total
+	// calls (the original attempt plus this many retries), independent of
+	// checkAndRepair's own separate retry budget for themecheck rejections
+	// (see doGenerate's structure: these are two distinct stages).
+	for attempt := 1; ; attempt++ {
+		result, genErr := s.gen.Generate(ctx, tc, turns, nextPrompt, nil, toolExec)
+		if genErr != nil {
+			// A hard API/transport error is a different failure mode from an
+			// invalid proposal — already handled by the caller/reaper, not
+			// retried here.
+			return nil, turns, genErr
+		}
+
+		clearIfNeedsClarification(result)
+		if err := validateProposal(result, tc.GenerationMode); err == nil {
+			return result, turns, nil
+		} else if attempt >= maxThemeCheckRetries+1 {
+			return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
+		} else {
+			slog.Warn("initial generation produced an invalid proposal, retrying if budget remains",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+				"attempt": attempt, "message": "invalid model proposal: " + err.Error(),
+			})
+			turns = append(turns,
+				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
+				ai.Turn{Role: "user", Content: "That reply wasn't valid — resubmit a corrected, complete proposal (not a diff), following the earlier instructions exactly."},
+			)
+			nextPrompt = "Please resubmit a corrected, complete proposal as instructed above."
+		}
+	}
+}
+
 // checkAndRepair validates result against snap via themecheck.Check. A
 // blocking (error-severity) finding is fed back to the model as a new
 // assistant/user turn pair and retried, up to maxThemeCheckRetries times;
@@ -695,12 +778,24 @@ func (s *Service) checkAndRepair(
 		// content before deciding whether a real repair round-trip is
 		// needed at all.
 		if len(errorFindings) > 0 {
+			fixedAny := false
 			if fixedContent, any := themecheck.AutoFixMissingBoilerplate(toProposal(result)); any {
 				for i, f := range result.Files {
 					if patched, ok := fixedContent[f.Path]; ok {
 						result.Files[i].Content = patched
 					}
 				}
+				fixedAny = true
+			}
+			// A proposed css/js file with no matching <link>/<script>
+			// registration is equally mechanical — see
+			// themecheck.AutoFixMissingAssetRegistration's doc comment.
+			if links, scripts, any := themecheck.AutoFixMissingAssetRegistration(toProposal(result), snap); any {
+				result.LayoutLinksToAdd = append(result.LayoutLinksToAdd, links...)
+				result.LayoutScriptsToAdd = append(result.LayoutScriptsToAdd, scripts...)
+				fixedAny = true
+			}
+			if fixedAny {
 				findings = themecheck.Check(toProposal(result), snap)
 				errorFindings, warningFindings = splitFindings(findings)
 			}
@@ -750,7 +845,26 @@ func (s *Service) checkAndRepair(
 
 		clearIfNeedsClarification(retried)
 		if err := validateProposal(retried, tc.GenerationMode); err != nil {
-			return nil, nil, fmt.Errorf("invalid model proposal (retry %d): %w", attempt, err)
+			// A malformed repair reply (garbled path, corrupted JSON field,
+			// etc.) is model flakiness, not necessarily a dead end — the
+			// SAME retry budget that governs themecheck rejections should
+			// cover this too, instead of burning the whole generation on
+			// one bad roll of the dice. `result` (the last themecheck-
+			// rejected-but-well-formed proposal) is deliberately left
+			// unchanged here so the next loop iteration re-runs Check on
+			// it, which reproduces the original rejection and asks for
+			// another repair — this is the same bounded loop, not a new one.
+			slog.Warn("repair produced an invalid proposal, discarding and retrying if budget remains",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+			if attempt >= maxThemeCheckRetries {
+				return nil, nil, fmt.Errorf("invalid model proposal (retry %d): %w", attempt, err)
+			}
+			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+				"attempt": attempt, "message": "repair produced an invalid proposal: " + err.Error(),
+			})
+			turns = append(turns, ai.Turn{Role: "user",
+				Content: "That reply wasn't valid — resubmit a corrected, complete proposal (not a diff), following the earlier instructions exactly."})
+			continue
 		}
 		result = retried
 	}
@@ -1190,21 +1304,20 @@ func (s *Service) LatestGeneration(ctx context.Context, chatID string) (Generati
 	return s.repo.GetGeneration(ctx, chatID)
 }
 
-// EventsSince returns generationID's events after sinceSeq — what the
-// stream handler replays before subscribing to live Redis delivery.
-func (s *Service) EventsSince(ctx context.Context, generationID string, sinceSeq int64) ([]GenerationEvent, error) {
-	return s.repo.GetEventsSince(ctx, generationID, sinceSeq)
+// EventsSince returns chatID's events after sinceSeq — what the stream
+// handler replays before subscribing to live Redis delivery. See
+// Repository.GetEventsSince's doc comment for why this is chat-scoped
+// rather than tied to one generation.
+func (s *Service) EventsSince(ctx context.Context, chatID string, sinceSeq int64) ([]GenerationEvent, error) {
+	return s.repo.GetEventsSince(ctx, chatID, sinceSeq)
 }
 
-// SubscribeToGenerationEvents subscribes to chatID's live event channel, or
-// returns nil if Redis isn't configured (see config.Config.RedisURL) — the
-// stream handler then has nothing live to wait on beyond what it already
-// replayed from generation_events.
-func (s *Service) SubscribeToGenerationEvents(ctx context.Context, chatID string) *redis.PubSub {
-	if s.redis == nil {
-		return nil
-	}
-	return s.redis.Subscribe(ctx, redisChannelForChat(chatID))
+// SubscribeToGenerationEvents subscribes to chatID's live event bus — see
+// eventBus's doc comment for the Redis-vs-in-process distinction, which is
+// invisible to this method's caller (the stream handler): either way it
+// gets a channel of live events and a cancel func to release it.
+func (s *Service) SubscribeToGenerationEvents(ctx context.Context, chatID string) (<-chan GenerationEvent, func()) {
+	return s.bus.Subscribe(ctx, chatID)
 }
 
 func languageFor(path string) string {

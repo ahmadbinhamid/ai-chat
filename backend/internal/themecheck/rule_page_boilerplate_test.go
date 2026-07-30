@@ -1,6 +1,9 @@
 package themecheck
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 const validBoilerplateMultiline = `{% render 'liquid/layout-start',
   page: page,
@@ -57,6 +60,82 @@ func TestAutoFixMissingBoilerplate_LeavesValidFileAlone(t *testing.T) {
 	p := Proposal{Files: []ProposedFile{{Path: "pages/home.liquid", Action: "update", Content: validBoilerplateInline}}}
 	if _, any := AutoFixMissingBoilerplate(p); any {
 		t.Error("expected no fix for a file that already has both renders")
+	}
+}
+
+func TestAutoFixMissingBoilerplate_ReplacesWrongParamsLayoutStart(t *testing.T) {
+	// Reordered params: present but not the exact §3 call — the "page-creation
+	// composed from scratch" failure mode this fix now also covers.
+	content := `{% render 'liquid/layout-start', store: store, page: page, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
+<section>hi</section>
+{% render 'liquid/layout-end', theme: theme, store: store %}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+
+	fixed, any := AutoFixMissingBoilerplate(p)
+	if !any {
+		t.Fatal("expected a fix to be applied for wrong layout-start params")
+	}
+	patched, ok := fixed["pages/offers.liquid"]
+	if !ok {
+		t.Fatal("expected a patched entry for pages/offers.liquid")
+	}
+	if !strings.Contains(patched, layoutStartRenderTag) {
+		t.Errorf("expected patched content to contain the canonical layout-start tag, got:\n%s", patched)
+	}
+
+	p2 := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update", Content: patched}}}
+	if got := checkPageBoilerplate(p2, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected patched content to pass checkPageBoilerplate, got findings: %+v", got)
+	}
+}
+
+func TestAutoFixMissingBoilerplate_ReplacesMissingParamLayoutEnd(t *testing.T) {
+	// layout-end present but missing the store param.
+	content := layoutStartRenderTag + `
+<section>hi</section>
+{% render 'liquid/layout-end', theme: theme %}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+
+	fixed, any := AutoFixMissingBoilerplate(p)
+	if !any {
+		t.Fatal("expected a fix to be applied for a layout-end call missing a param")
+	}
+	patched, ok := fixed["pages/offers.liquid"]
+	if !ok {
+		t.Fatal("expected a patched entry for pages/offers.liquid")
+	}
+	if !strings.Contains(patched, layoutEndRenderTag) {
+		t.Errorf("expected patched content to contain the canonical layout-end tag, got:\n%s", patched)
+	}
+
+	p2 := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update", Content: patched}}}
+	if got := checkPageBoilerplate(p2, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected patched content to pass checkPageBoilerplate, got findings: %+v", got)
+	}
+}
+
+func TestAutoFixMissingBoilerplate_FixesBothWrongParamsAtOnce(t *testing.T) {
+	// Both render calls present but both malformed — a single call must fix both.
+	content := `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: customer_authenticated, environment: environment, csrf_token: csrf_token %}
+<section>hi</section>
+{% render 'liquid/layout-end', store: store %}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "create", Content: content}}}
+
+	fixed, any := AutoFixMissingBoilerplate(p)
+	if !any {
+		t.Fatal("expected a fix to be applied when both renders have wrong params")
+	}
+	patched, ok := fixed["pages/offers.liquid"]
+	if !ok {
+		t.Fatal("expected a patched entry for pages/offers.liquid")
+	}
+	if !strings.Contains(patched, layoutStartRenderTag) || !strings.Contains(patched, layoutEndRenderTag) {
+		t.Errorf("expected patched content to contain both canonical tags, got:\n%s", patched)
+	}
+
+	p2 := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update", Content: patched}}}
+	if got := checkPageBoilerplate(p2, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected patched content to pass checkPageBoilerplate, got findings: %+v", got)
 	}
 }
 

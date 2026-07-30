@@ -27,6 +27,13 @@ func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Tu
 	return f.results[idx], nil
 }
 
+// Summarize satisfies the generator interface's history-summarization hook
+// (see history_summary.go) — this fake never needs it for real, since
+// these tests' history never exceeds summarizeHistoryThreshold turns.
+func (f *fakeGenerator) Summarize(_ context.Context, turns []ai.Turn) (string, error) {
+	return "", nil
+}
+
 const goodPageContent = `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
 <p>{{ product.name }}</p>
 {% render 'liquid/layout-end', theme: theme, store: store %}`
@@ -115,6 +122,58 @@ func TestCheckAndRepair_ExhaustsRetriesAndFails(t *testing.T) {
 	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil)
 	if err == nil {
 		t.Fatal("expected an error once retries are exhausted")
+	}
+	if fg.calls != maxThemeCheckRetries {
+		t.Errorf("expected exactly %d retry Generate calls, got %d", maxThemeCheckRetries, fg.calls)
+	}
+}
+
+// invalidResult mimics a garbled/corrupted repair reply — e.g. the model's
+// proposed path field coming back mangled — which validateProposal rejects
+// outright (see service.go's checkAndRepair: a validateProposal failure
+// during a retry must not immediately kill the whole generation, it should
+// consume one of the same maxThemeCheckRetries slots as a themecheck
+// rejection does).
+func invalidResult() *ai.Result {
+	return &ai.Result{
+		Summary:      "garbled",
+		Files:        []ai.GeneratedFile{{Path: "pages/offers.liquid", Action: "not-a-real-action", Content: badPageContent}},
+		InputTokens:  30,
+		OutputTokens: 15,
+	}
+}
+
+func TestCheckAndRepair_RetriesPastAnInvalidRepairReply(t *testing.T) {
+	// First repair attempt comes back malformed (rejected by validateProposal,
+	// not themecheck); the second repair attempt is clean. With
+	// maxThemeCheckRetries == 2, this must still succeed — the malformed
+	// reply consumes a retry slot rather than hard-failing the generation.
+	fg := &fakeGenerator{results: []*ai.Result{invalidResult(), goodResult()}}
+	svc := &Service{gen: fg}
+	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
+
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil)
+	if err != nil {
+		t.Fatalf("expected the generation to recover after the invalid reply, got error: %v", err)
+	}
+	if fg.calls != 2 {
+		t.Errorf("expected exactly 2 retry Generate calls (1 invalid + 1 good), got %d", fg.calls)
+	}
+	if got.Summary != "good" {
+		t.Fatalf("expected the eventually-good result to be returned, got %+v", got)
+	}
+}
+
+func TestCheckAndRepair_FailsWhenInvalidReplyExhaustsRetries(t *testing.T) {
+	// Every repair attempt comes back malformed — must still fail cleanly
+	// once the retry budget is exhausted, same as a themecheck rejection would.
+	fg := &fakeGenerator{results: []*ai.Result{invalidResult()}}
+	svc := &Service{gen: fg}
+	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
+
+	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil)
+	if err == nil {
+		t.Fatal("expected an error once retries are exhausted on repeated invalid replies")
 	}
 	if fg.calls != maxThemeCheckRetries {
 		t.Errorf("expected exactly %d retry Generate calls, got %d", maxThemeCheckRetries, fg.calls)

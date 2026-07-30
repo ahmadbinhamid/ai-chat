@@ -11,13 +11,16 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"ai-chat/internal/themefs"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
 // themeEngineSpec is THEME_ENGINE_SPEC.md, embedded at build time so this
@@ -107,20 +110,27 @@ type Generator struct {
 	// its doc comment for what this is for.
 	fake      bool
 	fakeDelay time.Duration
+	// maxTokens is the Claude call's max_tokens — see defaultMaxTokens and
+	// config.Config.AnthropicMaxTokens (ANTHROPIC_MAX_TOKENS env var).
+	maxTokens int64
 }
 
 // New constructs the Claude client. apiKey empty is a configuration error
 // the caller should surface at startup (this service has no "run without AI"
 // mode — generation is the entire product), not something to silently
-// degrade around.
-func New(apiKey, model, effort string) (*Generator, error) {
+// degrade around. maxTokens <= 0 falls back to defaultMaxTokens.
+func New(apiKey, model, effort string, maxTokens int64) (*Generator, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("ANTHROPIC_API_KEY is not set")
 	}
+	if maxTokens <= 0 {
+		maxTokens = defaultMaxTokens
+	}
 	return &Generator{
-		client: anthropic.NewClient(),
-		model:  anthropic.Model(model),
-		effort: anthropic.OutputConfigEffort(effort),
+		client:    anthropic.NewClient(option.WithAPIKey(apiKey)),
+		model:     anthropic.Model(model),
+		effort:    anthropic.OutputConfigEffort(effort),
+		maxTokens: maxTokens,
 	}, nil
 }
 
@@ -165,7 +175,7 @@ func (g *Generator) fakeGenerate(ctx context.Context, prompt string) (*Result, e
 // this package's own tests, which need to drive the tool loop against a
 // fake server rather than the real Claude API.
 func newTestGenerator(client anthropic.Client, model string) *Generator {
-	return &Generator{client: client, model: model, effort: anthropic.OutputConfigEffortMedium}
+	return &Generator{client: client, model: model, effort: anthropic.OutputConfigEffortMedium, maxTokens: defaultMaxTokens}
 }
 
 // resultSchema is propose_changes' input_schema (see tools.go) — the same
@@ -248,10 +258,36 @@ func modelSupportsAdaptiveThinking(model anthropic.Model) bool {
 }
 
 // maxToolIterations bounds the read/explore loop before Generate gives up —
-// generous enough for "list, read three files, grep once, propose" with
-// room to spare, tight enough that a model stuck re-reading the same file
-// fails fast instead of burning the caller's timeout budget.
-const maxToolIterations = 8
+// raised from 8, then from 20: a real page-creation prompt ("design an
+// our-story page") was observed spending all 20 iterations on distinct,
+// purposeful reads/greps (not stuck looping) and never reaching
+// propose_changes, failing the whole generation despite real API cost
+// already spent gathering context. See forceProposeAtIteration below for
+// the complementary fix — pushing the model to commit near the ceiling
+// rather than relying on the ceiling alone to be big enough.
+const maxToolIterations = 28
+
+// forceProposeWithinLastN is how close to maxToolIterations the loop gets
+// before it stops offering the model a free choice of tool and instead
+// forces propose_changes specifically (see the ToolChoice branch in
+// Generate) — pushing it to commit to a proposal using whatever context
+// it's already gathered, rather than reading indefinitely and running out
+// the budget with nothing to show for it.
+const forceProposeWithinLastN = 3
+
+// defaultMaxTokens is used when ANTHROPIC_MAX_TOKENS is unset — comfortably
+// below Opus-tier's real ceiling (per Anthropic's docs, 64000 is nowhere
+// near the effective context/output limit for claude-opus-* models) while
+// still well above the prior fixed 32000, which was observed truncating
+// large page-generation proposals mid-JSON.
+const defaultMaxTokens = 64000
+
+// errMaxTokensTruncated is returned instead of attempting to json.Unmarshal
+// a propose_changes input that Claude's own StopReason says was cut off
+// mid-stream — unmarshaling truncated JSON either errors confusingly or,
+// worse, could succeed on a coincidentally-valid prefix and silently accept
+// a partial proposal.
+var errMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
 
 // Generate asks Claude for the file changes implementing prompt, given the
 // theme context and prior conversation turns. The model drives a tool loop:
@@ -320,13 +356,27 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 	var totalInputTokens, totalOutputTokens int64
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
+		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
+		if iteration >= maxToolIterations-forceProposeWithinLastN {
+			// Near the ceiling: stop offering read/explore tools as an equally
+			// valid choice and force propose_changes specifically, so the model
+			// commits to a proposal from whatever it's already gathered instead
+			// of spending its last few iterations reading more and running out
+			// the clock with nothing produced. If it still doesn't call
+			// propose_changes (calls something else anyway, or errors), the loop
+			// falls through to the usual "did not call propose_changes" failure
+			// below — no special handling needed beyond making this attempt happen.
+			toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
+			slog.Info("ai: forcing propose_changes near tool-loop budget ceiling",
+				"iteration", iteration, "max_tool_iterations", maxToolIterations)
+		}
 		params := anthropic.MessageNewParams{
 			Model:      g.model,
-			MaxTokens:  32000,
+			MaxTokens:  g.maxTokens,
 			System:     system,
 			Messages:   messages,
 			Tools:      tools,
-			ToolChoice: anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}},
+			ToolChoice: toolChoice,
 		}
 		// Adaptive thinking and output_config.effort are both rejected outright
 		// (400) on Haiku-tier models — leave both fields zero-valued (omitted
@@ -369,6 +419,22 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			}
 		}
 
+		toolNames := make([]string, len(toolUses))
+		for i, tu := range toolUses {
+			toolNames[i] = tu.Name
+		}
+		slog.Info("ai: tool-loop iteration", "iteration", iteration, "tools_called", toolNames, "stop_reason", message.StopReason)
+
+		// StopReason == "max_tokens" means Claude was cut off mid-stream —
+		// propose_changes' input (if any tool_use block even parsed as valid
+		// JSON that far) is truncated, not a real proposal. Unmarshaling it
+		// anyway either fails confusingly or, worse, could succeed against a
+		// coincidentally well-formed prefix and silently accept a partial
+		// result — fail explicitly instead.
+		if message.StopReason == anthropic.StopReasonMaxTokens {
+			return nil, errMaxTokensTruncated
+		}
+
 		if proposeInput != nil {
 			var result Result
 			if err := json.Unmarshal(proposeInput, &result); err != nil {
@@ -407,6 +473,50 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}
 
 	return nil, fmt.Errorf("model did not call propose_changes within %d tool-loop iterations", maxToolIterations)
+}
+
+// summarizeMaxTokens caps the summary completion — this is a cheap plain-
+// text call (no tools, no thinking), so it needs nowhere near g.maxTokens;
+// a few paragraphs of prose fits comfortably within this.
+const summarizeMaxTokens = 1024
+
+// Summarize asks Claude for a concise prose summary of turns, framed as
+// prior context for continuing the same theme-editing conversation — used
+// by themebuild's history-summarization pass (see service.go's
+// summarizeOldTurns) to collapse old turns into one synthetic turn instead
+// of resending them verbatim on every call. No tools, no thinking, no
+// system prompt beyond the instruction below — this is a plain completion,
+// not a generation call, so it doesn't touch toolsForMode/dynamicSystemPrompt
+// at all.
+func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error) {
+	if g.fake {
+		return fmt.Sprintf("[fake mode summary of %d turns]", len(turns)), nil
+	}
+
+	var transcript strings.Builder
+	for _, t := range turns {
+		if strings.TrimSpace(t.Content) == "" {
+			continue
+		}
+		fmt.Fprintf(&transcript, "%s: %s\n\n", strings.ToUpper(t.Role), t.Content)
+	}
+
+	instruction := "Summarize the conversation below in a few short paragraphs (no more than a few paragraphs " +
+		"total). This is prior context for continuing the SAME theme-editing conversation — write it as a working " +
+		"summary an assistant could use to keep working coherently, not a transcript. Cover what was discussed, " +
+		"what was built or changed, and any decisions made. Do not include a preamble or restate this instruction.\n\n" +
+		"<conversation>\n" + transcript.String() + "</conversation>"
+
+	params := anthropic.MessageNewParams{
+		Model:     g.model,
+		MaxTokens: summarizeMaxTokens,
+		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(instruction))},
+	}
+	message, err := g.client.Messages.New(ctx, params)
+	if err != nil {
+		return "", fmt.Errorf("summarize turns: %w", err)
+	}
+	return currentText(*message), nil
 }
 
 // staticSystemPromptBlock is the theme-engine spec plus the fixed generation

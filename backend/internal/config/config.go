@@ -45,6 +45,11 @@ type Config struct {
 	AnthropicAPIKey string
 	AnthropicModel  string
 	AnthropicEffort string
+	// AnthropicMaxTokens is the Claude call's max_tokens (see
+	// ai.defaultMaxTokens for the fallback when unset/invalid). Raise this if
+	// a generation is failing with "truncated at the max_tokens limit" more
+	// than occasionally on complex prompts.
+	AnthropicMaxTokens int64
 	// FakeAIMode, when true, skips the real Claude API entirely — see
 	// ai.NewFake. For debugging the surrounding plumbing (the async
 	// generation lifecycle, the stream WebSocket, the dashboard) without
@@ -105,9 +110,10 @@ func Load() Config {
 		AuthNegativeCacheTTL: time.Duration(getenvInt("AUTH_NEGATIVE_CACHE_TTL_SECONDS", 10)) * time.Second,
 		FlowposHTTPTimeout:   time.Duration(getenvInt("FLOWPOS_HTTP_TIMEOUT_MS", 2000)) * time.Millisecond,
 
-		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
-		AnthropicModel:  getenv("ANTHROPIC_MODEL", "claude-opus-5"),
-		AnthropicEffort: getenv("ANTHROPIC_EFFORT", "xhigh"),
+		AnthropicAPIKey:    os.Getenv("ANTHROPIC_API_KEY"),
+		AnthropicModel:     getenv("ANTHROPIC_MODEL", "claude-opus-5"),
+		AnthropicEffort:    getenv("ANTHROPIC_EFFORT", "xhigh"),
+		AnthropicMaxTokens: int64(getenvInt("ANTHROPIC_MAX_TOKENS", 64000)),
 		FakeAIMode:      getenvBool("AI_CHAT_FAKE_MODE", false),
 		FakeAIDelay:     time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 

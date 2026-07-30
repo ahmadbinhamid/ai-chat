@@ -99,7 +99,80 @@ func authSubprotocols(token string, tenantID uint64) []string {
 	}
 }
 
-func TestStreamHandler_ReplaysThenDeliversLiveThenClosesOnDone(t *testing.T) {
+// readReady reads one frame and asserts it's the {"type":"ready"} frame
+// marking the end of replay (see streamReadyMessage).
+func readReady(t *testing.T, conn *websocket.Conn, wantLastSeq int64) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	typ, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if typ != websocket.MessageText {
+		t.Fatalf("expected a text message, got %v", typ)
+	}
+	var got struct {
+		Type    string `json:"type"`
+		LastSeq int64  `json:"last_seq"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("failed to decode ready frame: %v (%s)", err, data)
+	}
+	if got.Type != "ready" || got.LastSeq != wantLastSeq {
+		t.Fatalf("expected ready frame with last_seq=%d, got %+v", wantLastSeq, got)
+	}
+}
+
+func TestStreamHandler_EchoesOfferedSubprotocolOnAccept(t *testing.T) {
+	conn := openStreamTestDB(t)
+	chatRepo := chat.NewRepository(conn)
+	chatSvc := chat.NewService(chatRepo)
+	buildRepo := themebuild.NewRepository(conn)
+	buildSvc := themebuild.NewService(buildRepo, chatSvc, nil, nil, nil)
+
+	tenantID := uint64(time.Now().UnixNano())
+	ctx := context.Background()
+	ch, err := chatSvc.GetOrCreateChat(ctx, tenantID, themebuild.ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	flowpos := fakeFlowposServer(t, tenantID)
+	authClient := auth.NewClient(flowpos.URL, 5*time.Second)
+	authCache := auth.NewMemoryCache()
+	t.Cleanup(authCache.Close)
+
+	router := gin.New()
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute, nil).Stream)
+	ts := httptest.NewServer(router)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/chats/" + ch.ID + "/stream"
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+
+	offered := authSubprotocols("test-token", tenantID)
+	wsConn, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{ //nolint:bodyclose // Dial closes resp.Body internally; see its doc comment.
+		Subprotocols: offered,
+	})
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v", err)
+	}
+	defer func() { _ = wsConn.CloseNow() }()
+
+	// The 101 response must echo back exactly the "bearer.<...>" subprotocol
+	// the client offered — a real browser's WebSocket constructor treats a
+	// missing/mismatched Sec-WebSocket-Protocol response header as a failed
+	// handshake, even though coder/websocket's own client (used everywhere
+	// else in this file) doesn't check for it. See stream.go's Accept call.
+	got := resp.Header.Get("Sec-WebSocket-Protocol")
+	if got != offered[0] {
+		t.Errorf("expected Sec-WebSocket-Protocol %q echoed back, got %q", offered[0], got)
+	}
+}
+
+func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T) {
 	conn := openStreamTestDB(t)
 	rdb, err := themebuild.NewRedisClient(getenvOr("REDIS_URL", "redis://127.0.0.1:6379"))
 	if err != nil {
@@ -148,17 +221,19 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenClosesOnDone(t *testing.T) {
 	defer dialCancel()
 	// Dial's own doc comment: "You never need to close resp.Body yourself" —
 	// it's already closed internally by the time Dial returns.
-	wsConn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
+	wsConn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{ //nolint:bodyclose
 		Subprotocols: authSubprotocols("test-token", tenantID),
-	}) //nolint:bodyclose
+	})
 	if err != nil {
 		t.Fatalf("websocket dial failed: %v", err)
 	}
 	defer func() { _ = wsConn.CloseNow() }()
 
-	// Replay: both pre-existing events, in order.
+	// Replay: both pre-existing events, in order, followed by the "ready"
+	// frame marking the end of replay (see streamReadyMessage).
 	readEvent(t, wsConn, themebuild.EventTypeStarted, 1)
 	readEvent(t, wsConn, themebuild.EventTypeChecking, 2)
+	readReady(t, wsConn, 2)
 
 	// Live delivery: publish a third event via Redis (as the real
 	// eventEmitter would) and confirm it arrives without a second connect.
@@ -169,7 +244,9 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenClosesOnDone(t *testing.T) {
 	})
 	readEvent(t, wsConn, themebuild.EventTypeRepairing, 3)
 
-	// A "done" event closes the connection from the server side.
+	// A "done" event must NOT close the connection — the chat can still
+	// receive another prompt, and the client shouldn't have to reconnect
+	// for it (see Stream's doc comment / waitForLiveEvents).
 	if err := buildRepo.EndGeneration(ctx, ch.ID, nil); err != nil {
 		t.Fatalf("EndGeneration failed: %v", err)
 	}
@@ -180,11 +257,19 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenClosesOnDone(t *testing.T) {
 	})
 	readEvent(t, wsConn, themebuild.EventTypeDone, 4)
 
-	readCtx, readCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer readCancel()
-	if _, _, err := wsConn.Read(readCtx); err == nil {
-		t.Error("expected the connection to be closed by the server after the done event")
+	// Prove the connection is genuinely still open and subscribed, not just
+	// slow to close: a brand-new generation's event on the same chat must
+	// still arrive on this same connection, no reconnect needed.
+	genID2 := uuid.NewString()
+	if err := buildRepo.StartGeneration(ctx, genID2, ch.ID, tenantID); err != nil {
+		t.Fatalf("second StartGeneration failed: %v", err)
 	}
+	mustAppendEvent(t, ctx, buildRepo, genID2, ch.ID, 5, themebuild.EventTypeStarted, struct{}{})
+	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
+		GenerationID: genID2, ChatID: ch.ID, Seq: 5, Type: themebuild.EventTypeStarted,
+		Payload: json.RawMessage(`{}`), CreatedAt: time.Now().UTC(),
+	})
+	readEvent(t, wsConn, themebuild.EventTypeStarted, 5)
 }
 
 func TestStreamHandler_UnknownChatRejectedBeforeUpgrade(t *testing.T) {
@@ -209,9 +294,9 @@ func TestStreamHandler_UnknownChatRejectedBeforeUpgrade(t *testing.T) {
 	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// See the other Dial call in this file re: not needing to close resp.Body.
-	_, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
+	_, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{ //nolint:bodyclose
 		Subprotocols: authSubprotocols("test-token", tenantID),
-	}) //nolint:bodyclose
+	})
 	if err == nil {
 		t.Error("expected the dial to fail for a chat that doesn't belong to this tenant")
 	} else if resp != nil && resp.StatusCode != 404 {

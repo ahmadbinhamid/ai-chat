@@ -13,6 +13,7 @@ type Tag struct {
 	Raw   string // trimmed tag body after the name, e.g. "x == true or x == 1"
 	Line  int    // 1-based line the tag starts on
 	Start int    // byte offset of the tag's opening "{%" — lets callers interleave tags with output expressions in true document order
+	End   int    // byte offset just past the tag's closing "%}" — lets callers slice out the full verbatim "{% ... %}" text (Raw omits the name and delimiters)
 }
 
 var tagRe = regexp.MustCompile(`(?s)\{%-?\s*(\w+)(.*?)-?%\}`)
@@ -24,7 +25,7 @@ func ScanTags(content string) []Tag {
 	for _, m := range matches {
 		name := content[m[2]:m[3]]
 		raw := strings.TrimSpace(content[m[4]:m[5]])
-		tags = append(tags, Tag{Name: name, Raw: raw, Line: lineAt(content, m[0]), Start: m[0]})
+		tags = append(tags, Tag{Name: name, Raw: raw, Line: lineAt(content, m[0]), Start: m[0], End: m[1]})
 	}
 	return tags
 }

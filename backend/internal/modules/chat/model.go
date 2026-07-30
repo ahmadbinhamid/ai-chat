@@ -18,14 +18,17 @@ const (
 )
 
 // MessageStatus exists for a possible future state beyond "it happened" —
-// today every persisted message is MessageStatusCompleted, since a failed
-// generation is never written as a turn at all (see
-// themebuild.Service.Generate and its package-level doc comment on why
-// errors are request-scoped, not chat history).
+// today most persisted messages are MessageStatusCompleted.
+// MessageStatusFailed is the one exception: themebuild.Service.doGenerate
+// records one of these for a merchant-visible failure notice when a
+// generation errors out, so the chat transcript itself shows *something*
+// went wrong (see doGenerate's defer) rather than a WebSocket-only error
+// event a merchant who wasn't watching live would never see.
 type MessageStatus string
 
 const (
 	MessageStatusCompleted MessageStatus = "completed"
+	MessageStatusFailed    MessageStatus = "failed"
 )
 
 // ApplyStatus records whether an assistant turn's proposed changes were

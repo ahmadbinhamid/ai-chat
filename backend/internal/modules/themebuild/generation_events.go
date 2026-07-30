@@ -63,14 +63,20 @@ func (r *Repository) AppendGenerationEvent(ctx context.Context, ev GenerationEve
 	return err
 }
 
-// GetEventsSince returns generationID's events with seq > sinceSeq, in
-// order — what a WebSocket client passing {"last_seq": N} on connect gets
-// replayed before it subscribes to the live Redis channel.
-func (r *Repository) GetEventsSince(ctx context.Context, generationID string, sinceSeq int64) ([]GenerationEvent, error) {
+// GetEventsSince returns chatID's events with seq > sinceSeq, in order —
+// what a WebSocket client passing {"last_seq": N} on connect gets replayed
+// before it subscribes to the live Redis channel. Scoped to chat_id, not
+// generation_id: seq is chat-wide monotonic (see eventEmitter's doc
+// comment), and a client's last_seq is meant to span every generation
+// that's ever run on this chat, not just the latest one — a reconnect that
+// landed exactly as one generation finished and the next started must still
+// see any tail events of the first one it missed, which a generation_id
+// filter tied to only the latest generation would silently drop.
+func (r *Repository) GetEventsSince(ctx context.Context, chatID string, sinceSeq int64) ([]GenerationEvent, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, generation_id, chat_id, seq, type, payload, created_at
-		FROM generation_events WHERE generation_id = ? AND seq > ? ORDER BY seq ASC
-	`, generationID, sinceSeq)
+		FROM generation_events WHERE chat_id = ? AND seq > ? ORDER BY seq ASC
+	`, chatID, sinceSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -91,27 +97,70 @@ func (r *Repository) GetEventsSince(ctx context.Context, generationID string, si
 	return events, rows.Err()
 }
 
+// GetMaxSeqForChat returns the highest seq ever recorded for chatID (0 if
+// none exist yet) — what newEventEmitter uses to continue a chat's seq
+// counter across generations instead of restarting it at 1 (see
+// eventEmitter's doc comment). Uses idx_generation_events_chat_seq
+// (chat_id, seq), so this is an index-only lookup even once retention has
+// trimmed most of a chat's history away.
+func (r *Repository) GetMaxSeqForChat(ctx context.Context, chatID string) (int64, error) {
+	var maxSeq sql.NullInt64
+	err := r.db.QueryRowContext(ctx, `
+		SELECT MAX(seq) FROM generation_events WHERE chat_id = ?
+	`, chatID).Scan(&maxSeq)
+	if err != nil {
+		return 0, err
+	}
+	return maxSeq.Int64, nil
+}
+
 // redisChannelForChat is the Redis pub/sub channel a generation's events
 // are published to — see docs/AI_CHAT_IMPLEMENTATION_BRIEF.md phase 3b:
 // "gen:{chat_id}".
 func redisChannelForChat(chatID string) string { return "gen:" + chatID }
 
 // eventEmitter emits one generation's progress events: durably to
-// generation_events (always) and live to Redis (best-effort, only if a
-// client was configured — see Service.redis). A publish failure is logged
-// and otherwise ignored — Redis is the live-delivery fast path, never the
-// system of record; a WebSocket that missed a live update still catches up
-// via GetEventsSince on (re)connect.
+// generation_events (always) and live to bus (best-effort — see eventBus's
+// doc comment). A publish failure is logged and otherwise ignored — the bus
+// is the live-delivery fast path, never the system of record; a WebSocket
+// that missed a live update still catches up via GetEventsSince on
+// (re)connect.
+//
+// seq is monotonic per chat_id, not per generation_id: a WebSocket client
+// stays connected across multiple generations on one chat and tracks a
+// single last_seq for the whole chat (see stream.go's Stream handler), so a
+// second generation restarting at seq 1 would collide with the first
+// generation's seq numbers and be indistinguishable from events already
+// displayed. newEventEmitter therefore continues from the chat's current
+// max seq (see Repository.GetMaxSeqForChat) rather than always starting at
+// 1. This read-then-use is safe without extra locking because
+// StartGeneration already guarantees at most one generation — and so at
+// most one eventEmitter — runs per chat at a time (see
+// ErrGenerationInProgress).
 type eventEmitter struct {
 	repo         *Repository
-	redis        *redis.Client
+	bus          eventBus
 	generationID string
 	chatID       string
 	nextSeq      int64
 }
 
-func newEventEmitter(repo *Repository, rdb *redis.Client, generationID, chatID string) *eventEmitter {
-	return &eventEmitter{repo: repo, redis: rdb, generationID: generationID, chatID: chatID, nextSeq: 1}
+// newEventEmitter looks up chatID's current max seq (0 if this chat has
+// never emitted an event) and starts nextSeq one past it. repo may be nil
+// in tests that don't care about persistence (see emit's nil-repo doc
+// comment) — GetMaxSeqForChat is skipped in that case since there's
+// nothing to look up against.
+func newEventEmitter(ctx context.Context, repo *Repository, bus eventBus, generationID, chatID string) *eventEmitter {
+	var nextSeq int64 = 1
+	if repo != nil {
+		maxSeq, err := repo.GetMaxSeqForChat(ctx, chatID)
+		if err != nil {
+			slog.Error("failed to load chat's max event seq, starting from 1", "chat_id", chatID, "error", err)
+		} else {
+			nextSeq = maxSeq + 1
+		}
+	}
+	return &eventEmitter{repo: repo, bus: bus, generationID: generationID, chatID: chatID, nextSeq: nextSeq}
 }
 
 // emit is a no-op (never blocks the generation, never fails it) if repo is
@@ -137,15 +186,8 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 		slog.Error("failed to persist generation event", "type", eventType, "chat_id", e.chatID, "error", err)
 	}
 
-	if e.redis == nil {
-		return
-	}
-	encoded, err := json.Marshal(ev)
-	if err != nil {
-		return
-	}
-	if err := e.redis.Publish(ctx, redisChannelForChat(e.chatID), encoded).Err(); err != nil {
-		slog.Warn("failed to publish generation event to redis", "chat_id", e.chatID, "error", err)
+	if e.bus != nil {
+		e.bus.Publish(ctx, e.chatID, ev)
 	}
 }
 

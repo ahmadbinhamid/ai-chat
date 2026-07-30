@@ -70,7 +70,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	generator, err := ai.New(cfg.AnthropicAPIKey, cfg.AnthropicModel, cfg.AnthropicEffort)
+	generator, err := ai.New(cfg.AnthropicAPIKey, cfg.AnthropicModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
 	if err != nil {
 		log.Fatalf("ai.New failed: %v", err)
 	}

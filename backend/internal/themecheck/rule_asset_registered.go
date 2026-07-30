@@ -80,6 +80,44 @@ func checkAssetRegistered(p Proposal, snap Snapshot) []Finding {
 	return findings
 }
 
+// AutoFixMissingAssetRegistration deterministically repairs the "proposed a
+// css/js file but never registered it" failure mode of rule 5 — mechanical
+// because the fix is always exactly "add this path to
+// layout_links_to_add/layout_scripts_to_add", the same thing the model was
+// asked to do and simply omitted; no judgment call about content is
+// involved. The load-order violation (a script using window.StorefrontApi
+// registered before storefront-api.js) is deliberately left alone — fixing
+// that would mean moving an existing registration, an edit this function
+// doesn't attempt; that case still goes through the retry-with-model-repair
+// path (see themebuild's checkAndRepair).
+//
+// Returns the additional paths to append to the proposal's own
+// LayoutLinksToAdd/LayoutScriptsToAdd — callers apply it to their own copy
+// of the proposal/result; this function never mutates p.
+func AutoFixMissingAssetRegistration(p Proposal, snap Snapshot) (linksToAdd, scriptsToAdd []string, anyFixed bool) {
+	finalLinks := append(registeredAssetPaths(snap.LayoutStart(), linkHrefRe), p.LayoutLinksToAdd...)
+	linkSet := toSet(finalLinks)
+
+	finalScripts := append(registeredAssetPaths(snap.LayoutEnd(), scriptSrcRe), p.LayoutScriptsToAdd...)
+	scriptSet := toSet(finalScripts)
+
+	for _, f := range p.Files {
+		switch {
+		case cssPathRe.MatchString(f.Path):
+			if !linkSet[f.Path] {
+				linksToAdd = append(linksToAdd, f.Path)
+				anyFixed = true
+			}
+		case jsPathRe.MatchString(f.Path):
+			if !scriptSet[f.Path] {
+				scriptsToAdd = append(scriptsToAdd, f.Path)
+				anyFixed = true
+			}
+		}
+	}
+	return linksToAdd, scriptsToAdd, anyFixed
+}
+
 func usesStorefrontAPI(content string) bool {
 	return regexp.MustCompile(`\bStorefrontApi\b`).MatchString(content)
 }

@@ -75,10 +75,25 @@ type streamEventMessage struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+// streamReadyMessage tells the client replay has finished and it's now
+// watching the live tail — sent exactly once per connection, right before
+// this handler enters its wait loop, in every branch (no generation yet,
+// generation already finished, generation still running). A frontend
+// reconnect loop should treat this as its "transport healthy" signal,
+// distinct from the WebSocket's own onopen (which fires before replay,
+// telling the client nothing about last_seq yet).
+type streamReadyMessage struct {
+	Type    string `json:"type"`
+	LastSeq int64  `json:"last_seq"`
+}
+
 // Stream verifies the chat belongs to the caller's tenant, upgrades to a
-// WebSocket, replays generation_events after the client's last_seq (if
-// given), and — if the generation is still running — subscribes to its
-// live Redis channel until it finishes or the connection drops. Auth is
+// WebSocket, subscribes to the chat's live event bus, replays
+// generation_events after the client's last_seq (if given), then relays
+// live events for as long as the connection stays open — across an idle
+// chat with no generation yet, a finished generation, and a running one,
+// this never closes on its own; only a client disconnect or a genuine
+// internal error ends it (see writeStreamEvent's callers below). Auth is
 // the same bearer token every other route uses, just carried differently
 // (see auth.WebSocketAuth) — verified before the upgrade, since a 401 can't
 // be expressed cleanly on an already-upgraded connection.
@@ -93,7 +108,7 @@ type streamEventMessage struct {
 // before the upgrade even happens, and the connection is genuinely
 // server -> client only from byte zero.
 func (h *StreamHandler) Stream(c *gin.Context) {
-	identity, ok := auth.WebSocketAuth(c, h.authClient, h.authCache, h.authCacheTTL, h.authNegativeCacheTTL)
+	identity, matchedSubprotocol, ok := auth.WebSocketAuth(c, h.authClient, h.authCache, h.authCacheTTL, h.authNegativeCacheTTL)
 	if !ok {
 		// WebSocketAuth has already written the appropriate error response.
 		return
@@ -118,6 +133,16 @@ func (h *StreamHandler) Stream(c *gin.Context) {
 
 	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
 		OriginPatterns: h.corsAllowedOrigins,
+		// The WebSocket handshake requires the server to echo back exactly
+		// one of the subprotocols the client offered in its own
+		// Sec-WebSocket-Protocol response header — coder/websocket's own Go
+		// client never checks for this, so a test against it alone stays
+		// green even with this omitted, but a real browser's WebSocket
+		// constructor treats a 101 response missing it as a failed
+		// handshake and never fires onopen at all. matchedSubprotocol is
+		// the exact "bearer.<...>" entry auth.WebSocketAuth already parsed
+		// out of that same header.
+		Subprotocols: []string{matchedSubprotocol},
 	})
 	if err != nil {
 		// Accept has already written the appropriate HTTP error response.
@@ -133,18 +158,37 @@ func (h *StreamHandler) Stream(c *gin.Context) {
 	// on disconnect rather than lingering.
 	ctx := conn.CloseRead(context.WithoutCancel(c.Request.Context()))
 
+	// Subscribed BEFORE replay (not after): if a live event were published
+	// in between loading the generation row and subscribing, replay would
+	// never see it (it wasn't in generation_events fast enough) and the
+	// live channel wouldn't either (subscribed too late) — a silent gap.
+	// Subscribing first means the worst case is now a live event arriving
+	// during replay that duplicates one already replayed from
+	// generation_events; watermark (below) discards those instead.
+	live, cancel := h.builder.SubscribeToGenerationEvents(ctx, chatID)
+	defer cancel()
+
+	var watermark int64 // highest seq already written to this connection
+
 	gen, err := h.builder.LatestGeneration(ctx, chatID)
 	if err != nil {
-		if errors.Is(err, themebuild.ErrNotFound) {
-			closeStream(conn, websocket.StatusNormalClosure, "no generation has been started for this chat yet")
+		if !errors.Is(err, themebuild.ErrNotFound) {
+			slog.Error("stream: failed to load latest generation", "chat_id", chatID, "error", err, "request_id", logging.RequestID(c))
+			closeStream(conn, websocket.StatusInternalError, "internal error")
 			return
 		}
-		slog.Error("stream: failed to load latest generation", "chat_id", chatID, "error", err, "request_id", logging.RequestID(c))
-		closeStream(conn, websocket.StatusInternalError, "internal error")
+		// No generation has ever run for this chat yet — nothing to replay,
+		// but the connection stays open and subscribed: the merchant's very
+		// next prompt starts one, and this same connection should see it
+		// live rather than requiring a reconnect.
+		if !writeReady(ctx, conn, 0) {
+			return
+		}
+		h.waitForLiveEvents(ctx, conn, live, &watermark)
 		return
 	}
 
-	events, err := h.builder.EventsSince(ctx, gen.ID, lastSeq)
+	events, err := h.builder.EventsSince(ctx, chatID, lastSeq)
 	if err != nil {
 		slog.Error("stream: failed to load events", "chat_id", chatID, "generation_id", gen.ID, "error", err, "request_id", logging.RequestID(c))
 		closeStream(conn, websocket.StatusInternalError, "internal error")
@@ -154,23 +198,29 @@ func (h *StreamHandler) Stream(c *gin.Context) {
 		if !writeStreamEvent(ctx, conn, ev) {
 			return
 		}
+		watermark = ev.Seq
 	}
 
-	// Nothing more will ever be published for a generation that's already
-	// finished — replaying what's already in generation_events is the
-	// whole story, so close now rather than idling forever.
-	if gen.Status != themebuild.GenerationStatusRunning {
-		closeStream(conn, websocket.StatusNormalClosure, "generation already finished")
+	if !writeReady(ctx, conn, watermark) {
 		return
 	}
 
-	sub := h.builder.SubscribeToGenerationEvents(ctx, chatID)
-	if sub == nil {
-		closeStream(conn, websocket.StatusNormalClosure, "live updates unavailable (redis not configured on this instance)")
-		return
-	}
-	defer func() { _ = sub.Close() }()
+	// A generation that's already finished has nothing more coming from
+	// THIS generation, but the chat itself isn't done — the merchant can
+	// send another prompt at any time, and this connection stays open and
+	// subscribed for it rather than forcing a reconnect. EventTypeDone/
+	// EventTypeFailed are informational to the client, never a reason for
+	// this handler itself to close the socket (see waitForLiveEvents).
+	h.waitForLiveEvents(ctx, conn, live, &watermark)
+}
 
+// waitForLiveEvents is a connection's steady state after replay: ping every
+// pingInterval, write every live event whose Seq is newer than *watermark
+// (discarding the overlap-window duplicates described in Stream's doc
+// comment), and return only on client disconnect (ctx.Done) or a
+// write/ping failure. It deliberately never returns on
+// EventTypeDone/EventTypeFailed — see Stream's doc comment.
+func (h *StreamHandler) waitForLiveEvents(ctx context.Context, conn *websocket.Conn, live <-chan themebuild.GenerationEvent, watermark *int64) {
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
 
@@ -184,22 +234,21 @@ func (h *StreamHandler) Stream(c *gin.Context) {
 				return
 			}
 
-		case msg, ok := <-sub.Channel():
+		case ev, ok := <-live:
 			if !ok {
+				// The bus closed its side (e.g. a Redis connection error
+				// tearing down the subscription) — not a normal-close
+				// signal for the client. Nothing more will ever arrive on
+				// this channel, so there's nothing left to wait on.
 				return
 			}
-			var ev themebuild.GenerationEvent
-			if err := json.Unmarshal([]byte(msg.Payload), &ev); err != nil {
-				slog.Error("stream: failed to decode published event", "chat_id", chatID, "error", err)
-				continue
+			if ev.Seq <= *watermark {
+				continue // already delivered during replay — see Stream's doc comment
 			}
 			if !writeStreamEvent(ctx, conn, ev) {
 				return
 			}
-			if ev.Type == themebuild.EventTypeDone || ev.Type == themebuild.EventTypeFailed {
-				closeStream(conn, websocket.StatusNormalClosure, "generation finished")
-				return
-			}
+			*watermark = ev.Seq
 		}
 	}
 }
@@ -223,6 +272,17 @@ func writeStreamEvent(ctx context.Context, conn *websocket.Conn, ev themebuild.G
 	if err != nil {
 		slog.Error("stream: failed to encode event", "error", err)
 		return true // skip this one event, the connection itself is still fine
+	}
+	return conn.Write(ctx, websocket.MessageText, encoded) == nil
+}
+
+// writeReady sends the {"type":"ready","last_seq":N} frame marking the end
+// of replay — see streamReadyMessage's doc comment.
+func writeReady(ctx context.Context, conn *websocket.Conn, lastSeq int64) bool {
+	encoded, err := json.Marshal(streamReadyMessage{Type: "ready", LastSeq: lastSeq})
+	if err != nil {
+		slog.Error("stream: failed to encode ready frame", "error", err)
+		return true
 	}
 	return conn.Write(ctx, websocket.MessageText, encoded) == nil
 }

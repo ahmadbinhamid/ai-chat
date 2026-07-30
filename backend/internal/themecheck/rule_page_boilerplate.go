@@ -43,10 +43,7 @@ func checkPageBoilerplate(p Proposal, _ Snapshot) []Finding {
 		}
 
 		tags := ScanTags(f.Content)
-		var renders []struct {
-			target string
-			params []RenderParam
-		}
+		var renders []renderCall
 		for _, t := range tags {
 			if t.Name != "render" {
 				continue
@@ -55,10 +52,7 @@ func checkPageBoilerplate(p Proposal, _ Snapshot) []Finding {
 			if !ok {
 				continue
 			}
-			renders = append(renders, struct {
-				target string
-				params []RenderParam
-			}{target, params})
+			renders = append(renders, renderCall{target: target, params: params, raw: f.Content[t.Start:t.End]})
 		}
 
 		start := findRenderCall(renders, "liquid/layout-start")
@@ -93,16 +87,23 @@ func checkPageBoilerplate(p Proposal, _ Snapshot) []Finding {
 const layoutStartRenderTag = `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}`
 const layoutEndRenderTag = `{% render 'liquid/layout-end', theme: theme, store: store %}`
 
-// AutoFixMissingBoilerplate deterministically repairs the one page-
-// boilerplate failure mode that's mechanical rather than a real judgment
-// call: a pages/*.liquid file that's missing the layout-start/layout-end
-// render entirely (in practice, the model regenerating an existing page's
-// full content and simply dropping the wrapper — observed repeatedly even
-// after the model was told to re-read the file first). A render call
-// present with the WRONG params is deliberately left alone — that's a
-// different, more ambiguous failure this function doesn't try to guess how
-// to fix — the retry-with-model-repair path (see themebuild's
-// checkAndRepair) still handles that case.
+// AutoFixMissingBoilerplate deterministically repairs both page-boilerplate
+// failure modes that are mechanical rather than a real judgment call:
+//   - a pages/*.liquid file missing the layout-start/layout-end render
+//     entirely (in practice, the model regenerating an existing page's full
+//     content and simply dropping the wrapper — observed repeatedly even
+//     after the model was told to re-read the file first);
+//   - a layout-start/layout-end render call that IS present but whose params
+//     are wrong, reordered, or incomplete (in practice, a page-creation
+//     prompt where the model composes the whole file from scratch instead of
+//     editing something existing, and free-hands the boilerplate).
+//
+// Both are safe to fix by dumb text substitution, not just the first: §3
+// mandates exactly one byte-exact call per file (wantLayoutStartParams/
+// wantLayoutEndParams, mirrored literally in layoutStartRenderTag/
+// layoutEndRenderTag), so there's only ever one correct replacement and no
+// guessing about intent — unlike, say, a missing param elsewhere in the page
+// where the right fix depends on what the page is trying to do.
 //
 // Returns the patched content for every file that needed a fix, keyed by
 // path — callers apply it to their own copy of the proposal/result; this
@@ -115,10 +116,7 @@ func AutoFixMissingBoilerplate(p Proposal) (fixed map[string]string, anyFixed bo
 		}
 
 		tags := ScanTags(f.Content)
-		var renders []struct {
-			target string
-			params []RenderParam
-		}
+		var renders []renderCall
 		for _, t := range tags {
 			if t.Name != "render" {
 				continue
@@ -127,23 +125,16 @@ func AutoFixMissingBoilerplate(p Proposal) (fixed map[string]string, anyFixed bo
 			if !ok {
 				continue
 			}
-			renders = append(renders, struct {
-				target string
-				params []RenderParam
-			}{target, params})
+			renders = append(renders, renderCall{target: target, params: params, raw: f.Content[t.Start:t.End]})
 		}
 
 		content := f.Content
-		changed := false
-		if findRenderCall(renders, "liquid/layout-start") == nil {
-			content = layoutStartRenderTag + "\n" + content
-			changed = true
-		}
-		if findRenderCall(renders, "liquid/layout-end") == nil {
-			content = strings.TrimRight(content, "\n") + "\n" + layoutEndRenderTag + "\n"
-			changed = true
-		}
-		if changed {
+		var startChanged, endChanged bool
+		content, startChanged = fixLayoutRender(content, renders, "liquid/layout-start", wantLayoutStartParams,
+			layoutStartRenderTag, true)
+		content, endChanged = fixLayoutRender(content, renders, "liquid/layout-end", wantLayoutEndParams,
+			layoutEndRenderTag, false)
+		if startChanged || endChanged {
 			fixed[f.Path] = content
 			anyFixed = true
 		}
@@ -151,18 +142,50 @@ func AutoFixMissingBoilerplate(p Proposal) (fixed map[string]string, anyFixed bo
 	return fixed, anyFixed
 }
 
+// fixLayoutRender applies one of the two mechanical fixes described on
+// AutoFixMissingBoilerplate for a single render target: if the call is
+// altogether missing, the canonical tag is inserted at the start (prepend)
+// or end (append) of content; if it's present with the wrong params, its
+// verbatim matched text is swapped for the canonical tag in place. Returns
+// whether this target needed a fix, so the caller can OR it with the other
+// target's result.
+func fixLayoutRender(content string, renders []renderCall, target string, want []RenderParam, wantTag string,
+	prepend bool) (string, bool) {
+	call := findRenderCall(renders, target)
+	switch {
+	case call == nil:
+		if prepend {
+			content = wantTag + "\n" + content
+		} else {
+			content = strings.TrimRight(content, "\n") + "\n" + wantTag + "\n"
+		}
+		return content, true
+	case !paramsEqual(call.params, want):
+		// call.raw is this exact call's own matched "{% render ... %}" text
+		// (captured per-occurrence above), so replacing just its first
+		// occurrence can't accidentally touch an unrelated tag even if two
+		// renders elsewhere happen to share substrings.
+		return strings.Replace(content, call.raw, wantTag, 1), true
+	default:
+		return content, false
+	}
+}
+
 func isPagesLiquidFile(path string) bool {
 	return strings.HasPrefix(path, "pages/") && strings.HasSuffix(path, ".liquid") &&
 		!strings.HasPrefix(path, "pages/css/")
 }
 
-func findRenderCall(renders []struct {
+// renderCall is a parsed {% render %} tag plus its own verbatim source text,
+// so a fix can locate-and-replace exactly the occurrence that was parsed
+// rather than the first substring match against a rebuilt string.
+type renderCall struct {
 	target string
 	params []RenderParam
-}, target string) *struct {
-	target string
-	params []RenderParam
-} {
+	raw    string
+}
+
+func findRenderCall(renders []renderCall, target string) *renderCall {
 	for i := range renders {
 		if renders[i].target == target {
 			return &renders[i]

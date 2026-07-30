@@ -43,12 +43,12 @@ func TestGenerationEvents_AppendAndGetSince(t *testing.T) {
 	chatID := uuid.NewString()
 	genID := seedGeneration(t, repo, chatID)
 
-	emitter := newEventEmitter(repo, nil, genID, chatID)
+	emitter := newEventEmitter(ctx, repo, nil, genID, chatID)
 	emitter.emit(ctx, EventTypeStarted, struct{}{})
 	emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": 1})
 	emitter.emit(ctx, EventTypeDone, map[string]string{"summary": "ok"})
 
-	events, err := repo.GetEventsSince(ctx, genID, 0)
+	events, err := repo.GetEventsSince(ctx, chatID, 0)
 	if err != nil {
 		t.Fatalf("GetEventsSince failed: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestGenerationEvents_AppendAndGetSince(t *testing.T) {
 	}
 
 	// Replaying "since seq 1" should skip the first event.
-	since, err := repo.GetEventsSince(ctx, genID, 1)
+	since, err := repo.GetEventsSince(ctx, chatID, 1)
 	if err != nil {
 		t.Fatalf("GetEventsSince failed: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestGenerationEvents_RetentionTrimsToLast200PerChat(t *testing.T) {
 	chatID := uuid.NewString()
 	genID := seedGeneration(t, repo, chatID)
 
-	emitter := newEventEmitter(repo, nil, genID, chatID)
+	emitter := newEventEmitter(ctx, repo, nil, genID, chatID)
 	for i := 0; i < maxGenerationEventsPerChat+10; i++ {
 		emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": i})
 	}
@@ -93,7 +93,7 @@ func TestGenerationEvents_RetentionTrimsToLast200PerChat(t *testing.T) {
 	}
 
 	// The retained rows must be the most recent ones, not an arbitrary 200.
-	events, err := repo.GetEventsSince(ctx, genID, 0)
+	events, err := repo.GetEventsSince(ctx, chatID, 0)
 	if err != nil {
 		t.Fatalf("GetEventsSince failed: %v", err)
 	}
@@ -102,6 +102,51 @@ func TestGenerationEvents_RetentionTrimsToLast200PerChat(t *testing.T) {
 	}
 	if events[0].Seq != 11 {
 		t.Errorf("expected the oldest retained event to be seq 11 (10 trimmed), got seq %d", events[0].Seq)
+	}
+}
+
+// TestNewEventEmitter_SeqContinuesAcrossGenerationsOnSameChat is the
+// regression test for the bug where every new generation on a chat
+// restarted its seq at 1, colliding with the previous generation's seq
+// numbers — see newEventEmitter's doc comment. Two sequential generations
+// on the same chat must produce strictly increasing, non-colliding seq
+// values (1,2 then 3,4 — not 1,2 again).
+func TestNewEventEmitter_SeqContinuesAcrossGenerationsOnSameChat(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+
+	gen1 := seedGeneration(t, repo, chatID)
+	emitter1 := newEventEmitter(ctx, repo, nil, gen1, chatID)
+	emitter1.emit(ctx, EventTypeStarted, struct{}{})
+	emitter1.emit(ctx, EventTypeDone, map[string]string{"summary": "ok"})
+
+	// StartGeneration only allows one in-flight generation per chat (see
+	// ErrGenerationInProgress) — end the first before seeding the second.
+	if err := repo.EndGeneration(ctx, chatID, nil); err != nil {
+		t.Fatalf("failed to end the first generation: %v", err)
+	}
+	gen2 := seedGeneration(t, repo, chatID)
+	emitter2 := newEventEmitter(ctx, repo, nil, gen2, chatID)
+	emitter2.emit(ctx, EventTypeStarted, struct{}{})
+	emitter2.emit(ctx, EventTypeDone, map[string]string{"summary": "ok again"})
+
+	events, err := repo.GetEventsSince(ctx, chatID, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince failed: %v", err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("expected 4 events across both generations, got %d: %+v", len(events), events)
+	}
+	wantSeqs := []int64{1, 2, 3, 4}
+	for i, ev := range events {
+		if ev.Seq != wantSeqs[i] {
+			t.Errorf("event %d: expected seq %d, got %d (generation_id=%s)", i, wantSeqs[i], ev.Seq, ev.GenerationID)
+		}
+	}
+	if events[2].GenerationID != gen2 || events[2].Seq != 3 {
+		t.Errorf("expected the second generation's first event at seq 3, got %+v", events[2])
 	}
 }
 
@@ -121,7 +166,7 @@ func TestEventEmitter_PublishesToRedis(t *testing.T) {
 		t.Fatalf("subscribe failed: %v", err)
 	}
 
-	emitter := newEventEmitter(repo, rdb, genID, chatID)
+	emitter := newEventEmitter(ctx, repo, newRedisEventBus(rdb), genID, chatID)
 	emitter.emit(ctx, EventTypeDone, map[string]string{"summary": "published"})
 
 	select {
@@ -157,6 +202,6 @@ func TestEventEmitter_NilRepoIsANoOp(t *testing.T) {
 	// convenience checkAndRepair's tests already rely on.
 	emitter.emit(context.Background(), EventTypeStarted, struct{}{})
 
-	emitter2 := newEventEmitter(nil, nil, "gen", "chat")
+	emitter2 := newEventEmitter(context.Background(), nil, nil, "gen", "chat")
 	emitter2.emit(context.Background(), EventTypeStarted, struct{}{})
 }

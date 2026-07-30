@@ -156,6 +156,67 @@ func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {
 	}
 }
 
+// TestGenerate_ForcesProposeChangesNearIterationCeiling verifies the
+// budget-aware forcing added alongside the 20->28 maxToolIterations raise:
+// once the loop is within forceProposeWithinLastN iterations of the cap, the
+// request sent to Claude forces the specific propose_changes tool (not the
+// generic "any tool" choice) — so a model that's spent its budget reading
+// still gets pushed to commit to a proposal rather than reading indefinitely
+// and running out the clock with nothing produced.
+func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
+	calls := 0
+	forceBoundary := maxToolIterations - forceProposeWithinLastN // 0-indexed iteration where forcing begins
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		iteration := calls - 1 // Generate's loop is 0-indexed
+		body, _ := io.ReadAll(r.Body)
+
+		wantForced := iteration >= forceBoundary
+		gotForced := strings.Contains(string(body), `"tool_choice":{"name":"propose_changes","type":"tool"}`)
+		if wantForced != gotForced {
+			t.Errorf("iteration %d: expected forced tool_choice=%v, got forced=%v; body: %s", iteration, wantForced, gotForced, body)
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		if wantForced {
+			fmt.Fprint(w, toolUseSSEResponse(fmt.Sprintf("msg_%d", calls), fmt.Sprintf("toolu_%d", calls),
+				"propose_changes", map[string]any{
+					"summary":               "Forced proposal near the iteration ceiling.",
+					"needs_clarification":   false,
+					"files":                 []map[string]any{{"path": "defaults.json", "action": "update", "content": "{}"}},
+					"page_registry_entry":   nil,
+					"layout_links_to_add":   []string{},
+					"layout_scripts_to_add": []string{},
+				}, 10, 5))
+			return
+		}
+		fmt.Fprint(w, toolUseSSEResponse(fmt.Sprintf("msg_%d", calls), fmt.Sprintf("toolu_%d", calls),
+			"list_theme_files", map[string]any{}, 10, 5))
+	}))
+	defer ts.Close()
+
+	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
+	g := newTestGenerator(client, "claude-test")
+
+	toolExec := func(_ context.Context, name string, input json.RawMessage) (string, error) {
+		return "[]", nil
+	}
+
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, toolExec)
+	if err != nil {
+		t.Fatalf("Generate returned an error: %v", err)
+	}
+	if result.Summary != "Forced proposal near the iteration ceiling." {
+		t.Errorf("unexpected summary: %q", result.Summary)
+	}
+	// It should have taken exactly forceBoundary "list" calls before the
+	// first forced call finally proposes — confirms forcing kicked in at the
+	// expected iteration rather than earlier or never.
+	if calls != forceBoundary+1 {
+		t.Errorf("expected %d calls before the model proposed, got %d", forceBoundary+1, calls)
+	}
+}
+
 // TestGenerate_BrandModeOnlyOffersProposeChanges confirms brand mode's tool
 // restriction: even though the fake server would happily answer a
 // read_theme_file call, the model is never offered anything but

@@ -1,0 +1,115 @@
+{
+  "info": {
+    "name": "ai-chat backend",
+    "_postman_id": "b1e1c4b0-0000-4000-8000-ai-chat0001",
+    "description": "Manual test collection for the ai-chat Go backend. Set AI_CHAT_FAKE_MODE=true in your .env before starting the server to test the full pipeline (generation, events, WebSocket) with ZERO Anthropic API calls / zero token cost — every generation returns a canned no-op result almost instantly (see AI_CHAT_FAKE_DELAY_SECONDS, default 5s, to simulate latency).\n\nAuth: every REST route forwards your bearer token to FLOWPOS_API_BASE/user for verification — there is no local auth. Set {{bearer_token}} to a real FlowPOS token. The WebSocket route authenticates differently (see the Stream request) since browsers can't set an Authorization header on a WS handshake.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8080" },
+    { "key": "bearer_token", "value": "" },
+    { "key": "tenant_id", "value": "" },
+    { "key": "theme_slug", "value": "" },
+    { "key": "chat_id", "value": "" },
+    { "key": "message_id", "value": "" },
+    { "key": "last_seq", "value": "0" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/health"
+      }
+    },
+    {
+      "name": "REST",
+      "item": [
+        {
+          "name": "Get chat (transcript + generation status)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer_token}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenant_id}}", "disabled": true }
+            ],
+            "url": "{{base_url}}/api/v1/chat"
+          },
+          "description": "generating:true means a background generation is running for this chat right now — poll this after Send Message if you're not using the WebSocket, or just to sanity-check state. This route is NOT removed (it's the initial page load / post-done refetch) — only /chat/status was removed."
+        },
+        {
+          "name": "Send message (starts a generation)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer_token}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenant_id}}", "disabled": true },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/v1/chats/messages",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"theme_slug\": \"{{theme_slug}}\",\n  \"prompt\": \"design an our-story page\"\n}"
+            }
+          },
+          "description": "Returns 202 immediately with the recorded user message — the actual generation runs in the background. Open the Stream WebSocket request BEFORE or AFTER sending this; with fake mode + the fix, the socket stays open and will deliver this generation's events either way. Response body includes chat.id — copy it into {{chat_id}}."
+        },
+        {
+          "name": "Revert to message",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer_token}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenant_id}}", "disabled": true }
+            ],
+            "url": "{{base_url}}/api/v1/chats/{{chat_id}}/messages/{{message_id}}/revert"
+          }
+        },
+        {
+          "name": "Preview a page",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer_token}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenant_id}}", "disabled": true },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": "{{base_url}}/api/v1/themes/{{theme_slug}}/preview",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"page\": \"home\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Create theme from base",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{bearer_token}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenant_id}}", "disabled": true }
+            ],
+            "url": "{{base_url}}/api/v1/themes"
+          }
+        }
+      ]
+    },
+    {
+      "name": "WebSocket",
+      "item": [
+        {
+          "name": "Stream generation events",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/chats/{{chat_id}}/stream?last_seq={{last_seq}}"
+          },
+          "protocolProfileBehavior": {
+            "protocolVersion": "1.1"
+          },
+          "description": "IMPORTANT: Postman's native WebSocket request type (a separate top-level request type in Postman, not achievable inside a normal HTTP item) is what you actually want here — this HTTP item is a placeholder because collection JSON can't declare a ws request outside Postman's own UI action \"New > WebSocket Request\". Steps:\n\n1. In Postman: New -> WebSocket Request.\n2. URL: ws://localhost:8080/api/v1/chats/{{chat_id}}/stream?last_seq=0  (use wss:// against a deployed HTTPS host).\n3. Go to the request's \"Headers\" tab (Postman's WS UI lets you set handshake headers) and add:\n     Sec-WebSocket-Protocol: bearer.<BASE64URL_OF_YOUR_TOKEN>, tenant.<TENANT_ID>\n   The bearer segment is base64url (RFC4648 no-padding) of your RAW bearer token, NOT base64-of-\"Bearer x\". Example to generate it:\n     printf '%s' 'your-raw-token' | basenc --base64url | tr -d '='\n   or in Node: Buffer.from('your-raw-token').toString('base64url')\n4. Connect. If the fix is working you will see a 101 response and — check the response headers Postman shows for the handshake — Sec-WebSocket-Protocol echoed back with the exact same bearer.<...> value you sent. If that header is MISSING on the 101, that's the item-1 bug again (browsers would kill the connection here; Postman's WS client is lenient so it will still show you frames even if this header is absent — the header presence is what to check manually).\n5. You should immediately receive: {\"type\":\"ready\",\"last_seq\":0} (or whatever last_seq applies) — this frame alone proves the transport is healthy with NO generation running yet.\n6. Fire \"Send message\" (REST folder) with AI_CHAT_FAKE_MODE=true on the server — no Claude call happens, but a real generation row + real events are produced. Watch this same open socket receive, in order: {\"type\":\"started\",...} -> {\"type\":\"checking\",...} -> {\"type\":\"done\",...}.\n7. Confirm the socket does NOT close after \"done\" — send a second message and confirm its events arrive on the SAME connection without reconnecting. That is the item-4 regression check.\n8. Kill the server process (or just wait) to check the ping: every 30s you should see a WS ping frame (Postman shows this in the ws frame log) keeping the connection alive with no events."
+        }
+      ]
+    }
+  ]
+}
