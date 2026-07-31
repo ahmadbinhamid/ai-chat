@@ -724,7 +724,12 @@ func (s *Service) generateValidProposal(
 			})
 			turns = append(turns,
 				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
-				ai.Turn{Role: "user", Content: "That reply wasn't valid — resubmit a corrected, complete proposal (not a diff), following the earlier instructions exactly."},
+				ai.Turn{Role: "user", Content: fmt.Sprintf(
+					"That reply wasn't valid: %s. Resubmit a corrected, complete proposal (not a diff), "+
+						"following the earlier instructions exactly. Never invent a placeholder path or "+
+						"partial content — if you don't have a complete, verified proposal ready, call "+
+						"propose_changes with needs_clarification: true, files: [], and explain why instead "+
+						"of guessing.", err)},
 			)
 			nextPrompt = "Please resubmit a corrected, complete proposal as instructed above."
 		}
@@ -862,8 +867,12 @@ func (s *Service) checkAndRepair(
 			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
 				"attempt": attempt, "message": "repair produced an invalid proposal: " + err.Error(),
 			})
-			turns = append(turns, ai.Turn{Role: "user",
-				Content: "That reply wasn't valid — resubmit a corrected, complete proposal (not a diff), following the earlier instructions exactly."})
+			turns = append(turns, ai.Turn{Role: "user", Content: fmt.Sprintf(
+				"That reply wasn't valid: %s. Resubmit a corrected, complete proposal (not a diff), "+
+					"following the earlier instructions exactly. Never invent a placeholder path or "+
+					"partial content — if you don't have a complete, verified proposal ready, call "+
+					"propose_changes with needs_clarification: true, files: [], and explain why instead "+
+					"of guessing.", err)})
 			continue
 		}
 		result = retried

@@ -357,7 +357,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	var totalInputTokens, totalOutputTokens int64
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
-		if iteration >= maxToolIterations-forceProposeWithinLastN {
+		forcingPropose := iteration >= maxToolIterations-forceProposeWithinLastN
+		if forcingPropose {
 			// Near the ceiling: stop offering read/explore tools as an equally
 			// valid choice and force propose_changes specifically, so the model
 			// commits to a proposal from whatever it's already gathered instead
@@ -377,6 +378,27 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			Messages:   messages,
 			Tools:      tools,
 			ToolChoice: toolChoice,
+		}
+		if forcingPropose {
+			// Being forced to call propose_changes does not mean the model has
+			// a real, finished proposal — every field in a files[] entry is
+			// schema-required, and without this nudge a model forced to commit
+			// before it's ready has been observed inventing a stand-in path
+			// (e.g. "__placeholder__", no extension) rather than admitting it
+			// isn't done, which then fails ValidateGeneratedFilePath downstream.
+			// needs_clarification + an empty files array is already a valid,
+			// schema-legal way to say "not ready" — this just tells the model
+			// that escape hatch exists and should be used here instead of
+			// fabricating file content.
+			params.System = append(append([]anthropic.TextBlockParam{}, system...), anthropic.TextBlockParam{
+				Text: "You are at the tool-loop budget ceiling and must call propose_changes now. " +
+					"Only include a file in `files` if you actually read/verified its current content " +
+					"(for an update) or have real, complete content ready (for a create) — never invent " +
+					"a placeholder path or partial content to fill the array. If you do not yet have a " +
+					"complete, verified proposal, call propose_changes with needs_clarification: true, " +
+					"files: [], and a summary explaining that the request needs to be split into a " +
+					"smaller step or retried, instead of guessing.",
+			})
 		}
 		// Adaptive thinking and output_config.effort are both rejected outright
 		// (400) on Haiku-tier models — leave both fields zero-valued (omitted
