@@ -35,6 +35,10 @@ func categorizeError(raw string) string {
 		return "the account is out of credits — please contact support"
 	case strings.Contains(lower, "truncated at the max_tokens limit"):
 		return "the response was too large to complete — please try a smaller request"
+	case strings.Contains(lower, "did not call propose_changes within"):
+		return "the task was too complex to finish in one attempt — please try breaking it into smaller requests"
+	case strings.Contains(lower, "didn't pass validation after"):
+		return "the generated changes couldn't be validated after multiple attempts — please try a smaller or more specific request"
 	case strings.Contains(lower, "rate limit") || strings.Contains(lower, "429"):
 		return "too many requests right now — please try again shortly"
 	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):

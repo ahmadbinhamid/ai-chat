@@ -61,8 +61,26 @@ func NewStreamHandler(chats *chat.Service, builder *themebuild.Service, authClie
 
 // pingInterval matches the brief's "ping every 30 seconds" — keeps
 // intermediate proxies/load balancers from treating an idle (no events
-// yet) connection as dead and severing it.
-const pingInterval = 30 * time.Second
+// yet) connection as dead and severing it. A var, not a const, so
+// stream_test.go can shrink it to exercise the dead-peer path (see
+// ioTimeout's doc comment) without a real test waiting 30+ seconds.
+var pingInterval = 30 * time.Second
+
+// ioTimeout bounds every individual write and ping-wait on the connection.
+// The handler's ambient ctx (from conn.CloseRead) only cancels once the
+// socket is confirmed closed at the TCP level, which a peer that goes dark
+// without a clean FIN/RST (WiFi drop, sleeping laptop, a NAT silently
+// dropping an idle mapping) never triggers — coder/websocket's Ping and
+// Write both block on whatever context they're given with no timeout of
+// their own, so using the ambient ctx directly would let a single
+// unresponsive peer wedge this goroutine (and leak its event-bus
+// subscription) indefinitely. Deriving a short-lived timeout from ctx for
+// each individual I/O op, instead, means such a peer gets detected and
+// the connection torn down within one interval, while a genuinely closed
+// connection still short-circuits immediately via ctx.Done() inside the
+// select these derived contexts race against. A var for the same test
+// reason as pingInterval.
+var ioTimeout = 10 * time.Second
 
 // streamEventMessage is the wire shape sent to the client for every event
 // — GenerationEvent's fields, just with a lowercase-first JSON shape
@@ -230,7 +248,15 @@ func (h *StreamHandler) waitForLiveEvents(ctx context.Context, conn *websocket.C
 			return
 
 		case <-pingTicker.C:
-			if err := conn.Ping(ctx); err != nil {
+			pingCtx, cancel := context.WithTimeout(ctx, ioTimeout)
+			err := conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				// Either the connection is genuinely gone (ctx.Done()
+				// already fired, caught on the next loop iteration) or the
+				// peer is unresponsive and pingCtx's own timeout fired
+				// first — either way, nothing more can be delivered on
+				// this connection.
 				return
 			}
 
@@ -273,7 +299,7 @@ func writeStreamEvent(ctx context.Context, conn *websocket.Conn, ev themebuild.G
 		slog.Error("stream: failed to encode event", "error", err)
 		return true // skip this one event, the connection itself is still fine
 	}
-	return conn.Write(ctx, websocket.MessageText, encoded) == nil
+	return writeWithTimeout(ctx, conn, encoded)
 }
 
 // writeReady sends the {"type":"ready","last_seq":N} frame marking the end
@@ -284,7 +310,19 @@ func writeReady(ctx context.Context, conn *websocket.Conn, lastSeq int64) bool {
 		slog.Error("stream: failed to encode ready frame", "error", err)
 		return true
 	}
-	return conn.Write(ctx, websocket.MessageText, encoded) == nil
+	return writeWithTimeout(ctx, conn, encoded)
+}
+
+// writeWithTimeout bounds a single write with ioTimeout (see its doc
+// comment) rather than letting conn.Write block on ctx alone — coder/
+// websocket's Write has no timeout of its own, so a peer that stops
+// draining its TCP receive buffer (not the same as disconnecting, which
+// ctx.Done() already covers) would otherwise stall this goroutine
+// indefinitely.
+func writeWithTimeout(ctx context.Context, conn *websocket.Conn, encoded []byte) bool {
+	writeCtx, cancel := context.WithTimeout(ctx, ioTimeout)
+	defer cancel()
+	return conn.Write(writeCtx, websocket.MessageText, encoded) == nil
 }
 
 func closeStream(conn *websocket.Conn, code websocket.StatusCode, reason string) {

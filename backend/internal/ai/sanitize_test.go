@@ -38,6 +38,16 @@ func TestSanitizeError(t *testing.T) {
 			wantContain: "timed out",
 		},
 		{
+			name:        "tool-loop iterations exhausted",
+			err:         errors.New("model did not call propose_changes within 28 tool-loop iterations"),
+			wantContain: "too complex",
+		},
+		{
+			name:        "themecheck validation exhausted after repairs",
+			err:         errors.New("the generated changes didn't pass validation after 3 attempts: some_rule (2 files)"),
+			wantContain: "couldn't be validated",
+		},
+		{
 			name:        "unrecognized error falls back to generic",
 			err:         errors.New("some completely novel failure mode nobody anticipated"),
 			wantContain: "something went wrong",

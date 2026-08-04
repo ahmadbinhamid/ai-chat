@@ -272,6 +272,96 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	readEvent(t, wsConn, themebuild.EventTypeStarted, 5)
 }
 
+// TestStreamHandler_UnresponsivePeerIsClosedWithinIOTimeout guards against a
+// peer that's alive at the TCP level (no FIN/RST — a sleeping laptop, a
+// dropped WiFi association, a NAT that silently stopped forwarding) but
+// never answers a ping with a pong. Without a bounded context on
+// conn.Ping/conn.Write (see ioTimeout's doc comment in stream.go), the
+// handler's goroutine — and its event-bus subscription — would wedge
+// forever instead of detecting and closing the connection.
+func TestStreamHandler_UnresponsivePeerIsClosedWithinIOTimeout(t *testing.T) {
+	origPingInterval, origIOTimeout := pingInterval, ioTimeout
+	pingInterval = 50 * time.Millisecond
+	ioTimeout = 100 * time.Millisecond
+	t.Cleanup(func() {
+		pingInterval = origPingInterval
+		ioTimeout = origIOTimeout
+	})
+
+	conn := openStreamTestDB(t)
+	chatRepo := chat.NewRepository(conn)
+	chatSvc := chat.NewService(chatRepo)
+	buildRepo := themebuild.NewRepository(conn)
+	buildSvc := themebuild.NewService(buildRepo, chatSvc, nil, nil, nil)
+
+	tenantID := uint64(time.Now().UnixNano())
+	ctx := context.Background()
+	ch, err := chatSvc.GetOrCreateChat(ctx, tenantID, themebuild.ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	flowpos := fakeFlowposServer(t, tenantID)
+	authClient := auth.NewClient(flowpos.URL, 5*time.Second)
+	authCache := auth.NewMemoryCache()
+	t.Cleanup(authCache.Close)
+
+	router := gin.New()
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute, nil).Stream)
+	ts := httptest.NewServer(router)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/chats/" + ch.ID + "/stream"
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	wsConn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{ //nolint:bodyclose
+		Subprotocols: authSubprotocols("unresponsive-peer-token", tenantID),
+	})
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v", err)
+	}
+	defer func() { _ = wsConn.CloseNow() }()
+
+	// Drain exactly the one "ready" frame the handshake guarantees, then go
+	// silent: no CloseRead, no further Read/Reader calls of any kind.
+	// Reading again here — even just to poll for closure — would itself
+	// answer any buffered ping with a pong (see coder/websocket Reader's
+	// doc comment: "It will handle ping, pong and close frames as
+	// appropriate"), which is precisely what a genuinely unresponsive peer
+	// would not do. An earlier version of this test called Read to check
+	// for closure and, by doing so, accidentally kept the "unresponsive"
+	// peer responsive — verifying closure must avoid the read side
+	// entirely, hence the Write probe below instead.
+	readReady(t, wsConn, 0)
+
+	// Give the server more than one pingInterval + ioTimeout (150ms here)
+	// to notice and close the connection.
+	time.Sleep(pingInterval + ioTimeout + 300*time.Millisecond)
+
+	// Probe for closure with retried writes rather than a single one: raw
+	// TCP semantics mean the very first write after a peer closes can
+	// still succeed locally (the bytes are simply handed to the kernel
+	// send buffer before the resulting RST/FIN has round-tripped back) —
+	// it's typically the *next* write that surfaces the error. Retrying
+	// over a couple seconds makes the assertion robust to that, while
+	// still failing (a fix regression is a permanent, not transient,
+	// "still open") if the server never actually closed the connection.
+	deadline := time.Now().Add(2 * time.Second)
+	var probeErr error
+	for time.Now().Before(deadline) {
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		probeErr = wsConn.Write(probeCtx, websocket.MessageText, []byte("probe"))
+		probeCancel()
+		if probeErr != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if probeErr == nil {
+		t.Fatal("expected the server to have closed the connection after the peer stopped responding to pings, but writes kept succeeding")
+	}
+}
+
 func TestStreamHandler_UnknownChatRejectedBeforeUpgrade(t *testing.T) {
 	conn := openStreamTestDB(t)
 	chatRepo := chat.NewRepository(conn)
