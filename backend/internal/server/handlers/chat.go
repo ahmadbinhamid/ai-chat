@@ -87,3 +87,32 @@ func (h *ChatHandler) Get(c *gin.Context) {
 	generating, genErr := h.builder.GenerationStatus(c.Request.Context(), ch.ID)
 	httpresponse.OK(c, chatDetail{Chat: &ch, Messages: withFiles, Generating: generating, GenerationError: genErr})
 }
+
+// chatStatus is just the two fields a caller needs to know whether a
+// generation is still running — the frontend's WebSocket-unavailable poll
+// fallback (see ai-chat-stream.ts's streamGeneration / index.tsx's
+// statusQuery) hits this instead of Get so it isn't re-fetching the full
+// transcript and every generated file's before/after content every 3s.
+type chatStatus struct {
+	Generating      bool   `json:"generating"`
+	GenerationError string `json:"generation_error,omitempty"`
+}
+
+// Status returns {generating, generation_error} for the tenant's one chat.
+// A tenant with no chat yet reports generating: false rather than 404,
+// mirroring Get's own null-chat handling — there's nothing generating for
+// a chat that doesn't exist, that's not an error condition here.
+func (h *ChatHandler) Status(c *gin.Context) {
+	ch, err := h.chats.GetChatForTenant(c.Request.Context(), auth.TenantID(c), themebuild.ChatType)
+	if errors.Is(err, chat.ErrNotFound) {
+		httpresponse.OK(c, chatStatus{})
+		return
+	}
+	if err != nil {
+		respondErr(c, err)
+		return
+	}
+
+	generating, genErr := h.builder.GenerationStatus(c.Request.Context(), ch.ID)
+	httpresponse.OK(c, chatStatus{Generating: generating, GenerationError: genErr})
+}
