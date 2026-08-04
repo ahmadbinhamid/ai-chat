@@ -70,7 +70,12 @@ func main() {
 	}
 	defer conn.Close()
 
-	generator, err := ai.New(cfg.AnthropicAPIKey, cfg.AnthropicModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
+	var generator *ai.Generator
+	if cfg.AIProvider == "deepseek" {
+		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
+	} else {
+		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
+	}
 	if err != nil {
 		log.Fatalf("ai.New failed: %v", err)
 	}

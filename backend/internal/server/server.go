@@ -41,13 +41,20 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	useJSONFieldNames()
 
 	var generator *ai.Generator
-	if cfg.FakeAIMode {
+	switch {
+	case cfg.FakeAIMode:
 		logger.Warn("AI_CHAT_FAKE_MODE is enabled — every generation returns a canned no-op result, " +
-			"Claude is never called, and nothing is ever written to a theme. Do not leave this on.")
+			"the AI provider is never called, and nothing is ever written to a theme. Do not leave this on.")
 		generator = ai.NewFake(cfg.FakeAIDelay)
-	} else {
+	case cfg.AIProvider == "deepseek":
 		var err error
-		generator, err = ai.New(cfg.AnthropicAPIKey, cfg.AnthropicModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
+		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		var err error
+		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
 		if err != nil {
 			return nil, err
 		}

@@ -41,6 +41,15 @@ type Config struct {
 	// the request indefinitely.
 	FlowposHTTPTimeout time.Duration
 
+	// AIProvider selects which backing model ai.New talks to — "anthropic"
+	// (default) or "deepseek". Both speak the same Anthropic Messages API
+	// wire protocol (DeepSeek via its documented compat endpoint), so this
+	// only changes which API key/base URL/model string get used — the whole
+	// generation tool loop (internal/ai/generator.go) is unaware of which one
+	// is active. Anything else is a startup misconfiguration, not a silent
+	// fallback — see the log.Fatal in Load below.
+	AIProvider string
+
 	// Anthropic / Claude
 	AnthropicAPIKey string
 	AnthropicModel  string
@@ -48,8 +57,14 @@ type Config struct {
 	// AnthropicMaxTokens is the Claude call's max_tokens (see
 	// ai.defaultMaxTokens for the fallback when unset/invalid). Raise this if
 	// a generation is failing with "truncated at the max_tokens limit" more
-	// than occasionally on complex prompts.
+	// than occasionally on complex prompts. Reused as-is for DeepSeek too —
+	// its compat endpoint accepts the identical max_tokens/effort shape.
 	AnthropicMaxTokens int64
+
+	// DeepSeek — only read/required when AIProvider == "deepseek".
+	DeepSeekAPIKey  string
+	DeepSeekModel   string
+	DeepSeekBaseURL string
 	// FakeAIMode, when true, skips the real Claude API entirely — see
 	// ai.NewFake. For debugging the surrounding plumbing (the async
 	// generation lifecycle, the stream WebSocket, the dashboard) without
@@ -96,6 +111,11 @@ func Load() Config {
 		log.Fatal("FLOWPOS_API_BASE is required — every request is authenticated by delegating to it, there is no local fallback")
 	}
 
+	aiProvider := getenv("AI_PROVIDER", "anthropic")
+	if aiProvider != "anthropic" && aiProvider != "deepseek" {
+		log.Fatalf("AI_PROVIDER must be %q or %q, got %q", "anthropic", "deepseek", aiProvider)
+	}
+
 	return Config{
 		Port: getenv("PORT", "8080"),
 
@@ -110,12 +130,18 @@ func Load() Config {
 		AuthNegativeCacheTTL: time.Duration(getenvInt("AUTH_NEGATIVE_CACHE_TTL_SECONDS", 10)) * time.Second,
 		FlowposHTTPTimeout:   time.Duration(getenvInt("FLOWPOS_HTTP_TIMEOUT_MS", 2000)) * time.Millisecond,
 
+		AIProvider: aiProvider,
+
 		AnthropicAPIKey:    os.Getenv("ANTHROPIC_API_KEY"),
 		AnthropicModel:     getenv("ANTHROPIC_MODEL", "claude-opus-5"),
 		AnthropicEffort:    getenv("ANTHROPIC_EFFORT", "xhigh"),
 		AnthropicMaxTokens: int64(getenvInt("ANTHROPIC_MAX_TOKENS", 64000)),
-		FakeAIMode:      getenvBool("AI_CHAT_FAKE_MODE", false),
-		FakeAIDelay:     time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
+		FakeAIMode:         getenvBool("AI_CHAT_FAKE_MODE", false),
+		FakeAIDelay:        time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
+
+		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekModel:   getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+		DeepSeekBaseURL: getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 

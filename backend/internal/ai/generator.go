@@ -115,19 +115,32 @@ type Generator struct {
 	maxTokens int64
 }
 
-// New constructs the Claude client. apiKey empty is a configuration error
-// the caller should surface at startup (this service has no "run without AI"
+// New constructs the client. apiKey empty is a configuration error the
+// caller should surface at startup (this service has no "run without AI"
 // mode — generation is the entire product), not something to silently
 // degrade around. maxTokens <= 0 falls back to defaultMaxTokens.
-func New(apiKey, model, effort string, maxTokens int64) (*Generator, error) {
+//
+// baseURL empty targets Anthropic's real API, exactly as before this param
+// was added. A non-empty baseURL points the same anthropic-sdk-go client at
+// any Anthropic Messages-API-compatible endpoint instead — e.g. DeepSeek's
+// documented compat proxy (https://api.deepseek.com/anthropic, confirmed
+// live: streaming, tool_choice forcing, and thinking/effort are all
+// supported there; cache_control is silently ignored, not an error). This
+// is why Generate/tools.go/resultSchema need zero provider-specific code:
+// the wire protocol is the same, only the endpoint and model string differ.
+func New(apiKey, baseURL, model, effort string, maxTokens int64) (*Generator, error) {
 	if apiKey == "" {
-		return nil, fmt.Errorf("ANTHROPIC_API_KEY is not set")
+		return nil, fmt.Errorf("API key is not set")
 	}
 	if maxTokens <= 0 {
 		maxTokens = defaultMaxTokens
 	}
+	opts := []option.RequestOption{option.WithAPIKey(apiKey)}
+	if baseURL != "" {
+		opts = append(opts, option.WithBaseURL(baseURL))
+	}
 	return &Generator{
-		client:    anthropic.NewClient(option.WithAPIKey(apiKey)),
+		client:    anthropic.NewClient(opts...),
 		model:     anthropic.Model(model),
 		effort:    anthropic.OutputConfigEffort(effort),
 		maxTokens: maxTokens,
@@ -166,7 +179,7 @@ func (g *Generator) fakeGenerate(ctx context.Context, prompt string) (*Result, e
 	case <-time.After(g.fakeDelay):
 	}
 	return &Result{
-		Summary: fmt.Sprintf("[fake mode] Received: %q. No changes were made — ANTHROPIC_API_KEY was never called.", prompt),
+		Summary: fmt.Sprintf("[fake mode] Received: %q. No changes were made — the AI provider was never called.", prompt),
 	}, nil
 }
 

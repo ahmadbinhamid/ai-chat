@@ -250,11 +250,12 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		defer cancel()
 
 		if retErr != nil {
-			message := retErr.Error()
+			// Never surface retErr.Error() directly — it can contain the
+			// backing AI provider's name/URL/request ID (see
+			// ai.SanitizeError's doc comment). The raw error is still logged
+			// server-side above/below via slog for debugging.
+			message := ai.SanitizeError(retErr)
 			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
-			if message == "" {
-				message = "Something went wrong while generating your changes."
-			}
 			if _, err := s.chats.RecordAssistantMessage(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
 				slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
 			}

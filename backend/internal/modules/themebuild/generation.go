@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	"ai-chat/internal/ai"
+
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -66,7 +68,11 @@ func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr er
 	var errMsg *string
 	if genErr != nil {
 		status = GenerationStatusFailed
-		msg := genErr.Error()
+		// Never store the raw error — it can contain the backing AI
+		// provider's name/URL/request ID, and this column feeds
+		// GenerationStatus -> chat.go's generation_error, which a merchant
+		// can see. See ai.SanitizeError's doc comment.
+		msg := ai.SanitizeError(genErr)
 		errMsg = &msg
 	}
 	_, err := r.db.ExecContext(ctx, `

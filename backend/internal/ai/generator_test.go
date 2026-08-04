@@ -128,6 +128,42 @@ func TestGenerate_ToolLoopReadsThenProposes(t *testing.T) {
 	}
 }
 
+// TestNew_BaseURLReachesFakeServer confirms New's baseURL param actually
+// wires the SDK client at the target endpoint — this is the whole
+// DeepSeek-compatibility story (New(apiKey, baseURL, ...) pointed at
+// DeepSeek's documented Anthropic-compat endpoint instead of a fake server
+// here): if this test passes, the same tool loop already exercised above
+// works unmodified against any Anthropic Messages-API-compatible endpoint,
+// not just the real Anthropic API.
+func TestNew_BaseURLReachesFakeServer(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, toolUseSSEResponse("msg_1", "toolu_1", "propose_changes", map[string]any{
+			"summary": "no changes needed", "needs_clarification": false,
+			"files": []map[string]any{}, "page_registry_entry": nil,
+			"layout_links_to_add": []string{}, "layout_scripts_to_add": []string{},
+		}, 10, 5))
+	}))
+	defer ts.Close()
+
+	g, err := New("test-key", ts.URL, "claude-test", "", 0)
+	if err != nil {
+		t.Fatalf("New returned an error: %v", err)
+	}
+	toolExec := func(context.Context, string, json.RawMessage) (string, error) {
+		t.Fatal("no tool call expected")
+		return "", nil
+	}
+	if _, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "noop", nil, toolExec); err != nil {
+		t.Fatalf("Generate returned an error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected New's baseURL to route the request to the fake server, got %d calls", calls)
+	}
+}
+
 // TestGenerate_GivesUpAfterMaxIterations verifies the loop doesn't spin
 // forever if the model keeps calling read tools and never proposes changes.
 func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {

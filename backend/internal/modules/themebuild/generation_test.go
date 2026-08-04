@@ -86,7 +86,11 @@ func TestGenerationRepository_StartEndGetLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGeneration failed: %v", err)
 	}
-	if g.Status != GenerationStatusFailed || g.Error == nil || *g.Error != "boom" || g.FinishedAt == nil {
+	// EndGeneration sanitizes genErr before storing it (see ai.SanitizeError)
+	// — the raw "boom" never reaches this column, only its generic fallback
+	// wrapping, since "boom" matches no recognized category.
+	wantErr := "Error from AI agent: something went wrong while generating a response — please try again in a moment"
+	if g.Status != GenerationStatusFailed || g.Error == nil || *g.Error != wantErr || g.FinishedAt == nil {
 		t.Fatalf("unexpected generation state after end: %+v", g)
 	}
 }
@@ -170,8 +174,11 @@ func TestService_GenerationStatus(t *testing.T) {
 	if err := svc.repo.EndGeneration(ctx, chatID, fmt.Errorf("something went wrong")); err != nil {
 		t.Fatalf("EndGeneration failed: %v", err)
 	}
+	// EndGeneration sanitizes the error before storing it (see
+	// ai.SanitizeError) — errMsg is never the raw error text.
+	wantErr := "Error from AI agent: something went wrong while generating a response — please try again in a moment"
 	generating, errMsg = svc.GenerationStatus(ctx, chatID)
-	if generating || errMsg != "something went wrong" {
+	if generating || errMsg != wantErr {
 		t.Fatalf("expected the failure to be reported, got generating=%v errMsg=%q", generating, errMsg)
 	}
 }
