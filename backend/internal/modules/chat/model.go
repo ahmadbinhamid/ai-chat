@@ -59,9 +59,9 @@ type Chat struct {
 	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
-// Message is one append-only turn in a Chat. UserName is only ever set on
-// user-role turns (see chk_chat_messages_user_role) — an assistant turn has
-// no speaker to attribute, it's always shown as the AI.
+// Message is one append-only turn in a Chat. UserName and UserEmail are only
+// ever set on user-role turns (see chk_chat_messages_user_role) — an
+// assistant turn has no speaker to attribute, it's always shown as the AI.
 type Message struct {
 	ID           string        `json:"id"`
 	ChatID       string        `json:"chat_id"`
@@ -69,6 +69,7 @@ type Message struct {
 	Role         Role          `json:"role"`
 	UserID       *uint64       `json:"user_id"`
 	UserName     *string       `json:"user_name"`
+	UserEmail    *string       `json:"user_email"`
 	Content      string        `json:"content"`
 	Status       MessageStatus `json:"status"`
 	InputTokens  int64         `json:"input_tokens"`

@@ -129,13 +129,18 @@ func (s *Service) GetMessage(ctx context.Context, chatID, messageID string) (Mes
 // RecordUserMessage appends the merchant's prompt to the thread and folds
 // it into the chat's recency ordering (no tokens are billed for a user
 // turn, so the running totals are untouched). Since a chat is now shared by
-// every user on the tenant (see GetOrCreateChat), userName is what lets the
-// transcript attribute this turn to a person instead of a generic "You".
-func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64, userName, content string) (Message, error) {
+// every user on the tenant (see GetOrCreateChat), userName/userEmail are
+// what let the transcript attribute this turn to a person instead of a
+// generic "You".
+func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64, userName, userEmail, content string) (Message, error) {
 	now := time.Now().UTC()
 	var namePtr *string
 	if userName != "" {
 		namePtr = &userName
+	}
+	var emailPtr *string
+	if userEmail != "" {
+		emailPtr = &userEmail
 	}
 	m := Message{
 		ID:          uuid.NewString(),
@@ -144,6 +149,7 @@ func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64,
 		Role:        RoleUser,
 		UserID:      userID,
 		UserName:    namePtr,
+		UserEmail:   emailPtr,
 		Content:     content,
 		Status:      MessageStatusCompleted,
 		ApplyStatus: ApplyStatusNotApplicable,

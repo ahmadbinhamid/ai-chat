@@ -109,9 +109,10 @@ var ErrGenerationInProgress = errors.New("a generation is already in progress fo
 // GenerateInput is one merchant prompt, always against the tenant's one
 // ongoing "builder" chat (see chat.Service.GetOrCreateChat).
 type GenerateInput struct {
-	TenantID uint64
-	UserID   *uint64
-	UserName string
+	TenantID  uint64
+	UserID    *uint64
+	UserName  string
+	UserEmail string
 	// Token is the caller's own bearer token, forwarded to flowpos-backend's
 	// theme-file API (see internal/themefs.Store) so every read/write acts
 	// as this same user, subject to flowpos-backend's own ownership checks.
@@ -185,7 +186,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		return GenerateOutcome{}, fmt.Errorf("start generation: %w", err)
 	}
 
-	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.Prompt)
+	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt)
 	if err != nil {
 		// Release the slot — nothing actually started. Best-effort: if this
 		// itself fails, the reaper cleans it up within a minute rather than
