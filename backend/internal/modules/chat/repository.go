@@ -73,9 +73,9 @@ func touchChatUsage(ctx context.Context, e execer, chatID string, inputTokens, o
 
 func createMessage(ctx context.Context, e execer, m Message) error {
 	_, err := e.ExecContext(ctx, `
-		INSERT INTO chat_messages (id, chat_id, tenant_id, role, user_id, user_name, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, m.ID, m.ChatID, m.TenantID, m.Role, m.UserID, m.UserName, m.Content, m.Status, m.InputTokens, m.OutputTokens, m.ApplyStatus, m.AppliedAt, m.CreatedAt)
+		INSERT INTO chat_messages (id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, m.ID, m.ChatID, m.TenantID, m.Role, m.UserID, m.UserName, m.UserEmail, m.Content, m.Status, m.InputTokens, m.OutputTokens, m.ApplyStatus, m.AppliedAt, m.CreatedAt)
 	return err
 }
 
@@ -101,7 +101,7 @@ func (r *Repository) CreateMessageAndTouchUsage(ctx context.Context, m Message, 
 
 func (r *Repository) ListMessagesByChat(ctx context.Context, chatID string) ([]Message, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, chat_id, tenant_id, role, user_id, user_name, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at
+		SELECT id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at
 		FROM chat_messages WHERE chat_id = ? ORDER BY created_at ASC
 	`, chatID)
 	if err != nil {
@@ -122,7 +122,7 @@ func (r *Repository) ListMessagesByChat(ctx context.Context, chatID string) ([]M
 
 func (r *Repository) GetMessageByID(ctx context.Context, id string) (Message, error) {
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, chat_id, tenant_id, role, user_id, user_name, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at
+		SELECT id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at
 		FROM chat_messages WHERE id = ?
 	`, id)
 	return scanMessage(row)
@@ -145,7 +145,7 @@ func scanChat(s scanner) (Chat, error) {
 
 func scanMessage(s scanner) (Message, error) {
 	var m Message
-	err := s.Scan(&m.ID, &m.ChatID, &m.TenantID, &m.Role, &m.UserID, &m.UserName, &m.Content, &m.Status,
+	err := s.Scan(&m.ID, &m.ChatID, &m.TenantID, &m.Role, &m.UserID, &m.UserName, &m.UserEmail, &m.Content, &m.Status,
 		&m.InputTokens, &m.OutputTokens, &m.ApplyStatus, &m.AppliedAt, &m.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, ErrNotFound

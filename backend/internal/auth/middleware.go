@@ -232,6 +232,11 @@ func UserName(c *gin.Context) string {
 	return identity.Name
 }
 
+func Email(c *gin.Context) string {
+	identity, _ := FromContext(c)
+	return identity.Email
+}
+
 // Token returns the raw bearer token this request was authenticated with —
 // for the rare caller that needs to forward the caller's own identity to
 // another FlowPOS-authenticated API on their behalf (see
