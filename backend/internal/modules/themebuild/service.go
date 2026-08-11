@@ -33,11 +33,14 @@ const (
 	// use case sharing the same tenant.
 	ChatType = "builder"
 
-	// generateTimeout bounds Generate's own work once it's decided to
-	// proceed (see workContext) — independent of the caller's request
-	// context, but not unbounded either. Matches the HTTP server's own
-	// writeTimeout (cmd/server/main.go).
-	generateTimeout = 5 * time.Minute
+	// generateTimeout bounds runGeneration's background work (see Generate,
+	// which returns to the HTTP caller long before this deadline matters) —
+	// not unbounded, but generous enough for a full-site redesign at high
+	// effort, which can legitimately run close to an hour. Also reused as
+	// the staleness threshold for reaping abandoned "in progress" rows (see
+	// ReapStaleGenerations) — raising this means a truly stuck generation
+	// stays marked in-progress that much longer before being cleaned up.
+	generateTimeout = 65 * time.Minute
 
 	// maxThemeCheckRetries bounds how many times a proposal themecheck
 	// rejects is sent back to the model with its findings before doGenerate

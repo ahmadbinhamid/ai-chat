@@ -22,16 +22,16 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// writeTimeout is generous specifically because POST /chats/messages calls
-// Claude synchronously (streamed internally to avoid the SDK's own
-// timeout, but still one HTTP round trip end to end) and, since generation
-// now applies its changes to the real theme in the same request, writes
-// files before responding too. At xhigh effort with adaptive thinking, a
-// full page + CSS + JS generation can legitimately take several minutes. A
-// short WriteTimeout here would sever a successful generation right before
-// the response is written. Must stay <= the frontend's axios timeout
-// (ai-chat-client.ts) — that side needs to give this at least as long.
-const writeTimeout = 5 * time.Minute
+// writeTimeout bounds every response this server writes. POST
+// /chats/messages — the one route that used to call Claude/DeepSeek inline
+// — now only records the user message and kicks off generation in a
+// background goroutine (see themebuild.Service.Generate), returning
+// 202 Accepted in milliseconds; the actual generation is bounded separately
+// by themebuild.generateTimeout and delivered to the client over the
+// WebSocket stream or GET /chat polling, not this response. No route on
+// this server does slow synchronous work anymore, so a short timeout here
+// is safe.
+const writeTimeout = 30 * time.Second
 
 func main() {
 	if err := godotenv.Load(); err != nil {
