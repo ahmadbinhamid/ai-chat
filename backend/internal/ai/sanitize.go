@@ -43,7 +43,12 @@ func categorizeError(raw string) string {
 		return "too many requests right now — please try again shortly"
 	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
 		return "the request timed out — please try again"
-	case strings.Contains(lower, "overloaded") || strings.Contains(lower, "502") || strings.Contains(lower, "503"):
+	case strings.Contains(lower, "overloaded") || strings.Contains(lower, "502") || strings.Contains(lower, "503") ||
+		strings.Contains(lower, "521") || strings.Contains(lower, "522") || strings.Contains(lower, "523") || strings.Contains(lower, "524"):
+		// 521-524 are Cloudflare's own origin-unreachable/timeout codes (see
+		// developers.cloudflare.com/support/troubleshooting/http-status-codes) —
+		// seen in practice when buildSnapshot's read of a theme file hits a
+		// momentarily-down origin behind Cloudflare, not an AI provider issue.
 		return "temporarily unavailable — please try again shortly"
 	default:
 		return genericGenerationError
