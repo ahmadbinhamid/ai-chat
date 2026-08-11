@@ -256,8 +256,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		if retErr != nil {
 			// Never surface retErr.Error() directly — it can contain the
 			// backing AI provider's name/URL/request ID (see
-			// ai.SanitizeError's doc comment). The raw error is still logged
-			// server-side above/below via slog for debugging.
+			// ai.SanitizeError's doc comment). Log the raw error here, the one
+			// place doGenerate's failure is fully known, so a generic
+			// "something went wrong" shown to the merchant is still
+			// diagnosable server-side.
+			slog.Error("generation failed", "chat_id", c.ID, "tenant_id", in.TenantID, "error", retErr)
 			message := ai.SanitizeError(retErr)
 			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
 			if _, err := s.chats.RecordAssistantMessage(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
