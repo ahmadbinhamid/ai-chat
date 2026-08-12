@@ -186,6 +186,147 @@ func TestApplyDraft_RestoresPageMetaForPagesFile(t *testing.T) {
 	}
 }
 
+// Bug: pendingFilesToPlan's last-write-wins collapse used to replace a
+// path's whole planFile wholesale. buildWritePlan only ever sets pageMeta
+// on the turn carrying the model's PageRegistryEntry — a follow-up turn
+// editing the same page has none (the page already exists as far as the
+// model is concerned), so the older row's pageMeta was silently discarded.
+// ApplyDraft would then WriteFile the page's content with a nil pageMeta,
+// landing the .liquid file without ever registering it in pages.json — no
+// error anywhere, just a 404 the merchant discovers later. This is the
+// regression test: it must fail against the pre-fix collapse.
+func TestApplyDraft_CarriesForwardPageMetaAcrossTurns(t *testing.T) {
+	fake := newFakeApplyServer()
+	svc, chatSvc, buildRepo := newApplyTestService(t, fake)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	// Turn 1: "add an About page" — the model registers it.
+	msg1, err := chatSvc.RecordAssistantMessage(ctx, c, "turn 1", chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusPending)
+	if err != nil {
+		t.Fatalf("RecordAssistantMessage (turn 1) failed: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := buildRepo.CreateFile(ctx, GeneratedFile{
+		ID: uuid.NewString(), MessageID: msg1.ID, ChatID: c.ID, FilePath: "pages/about.liquid",
+		Action: FileActionCreate, Kind: GeneratedFileKindProposed, Content: "<p>about v1</p>",
+		PageMeta:  &themefs.PageMeta{Title: "About", Slug: "about", Type: "custom", Status: "draft"},
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateFile (turn 1) failed: %v", err)
+	}
+
+	// created_at has only second-level precision (see revert.go's own doc
+	// comment on the same hazard) — sleep past a second boundary so turn 2
+	// deterministically orders after turn 1.
+	time.Sleep(1100 * time.Millisecond)
+
+	// Turn 2: "make the heading bigger" — the page already exists, so the
+	// model sends no PageRegistryEntry this time; pageMeta is nil.
+	msg2, err := chatSvc.RecordAssistantMessage(ctx, c, "turn 2", chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusPending)
+	if err != nil {
+		t.Fatalf("RecordAssistantMessage (turn 2) failed: %v", err)
+	}
+	now2 := time.Now().UTC()
+	if err := buildRepo.CreateFile(ctx, GeneratedFile{
+		ID: uuid.NewString(), MessageID: msg2.ID, ChatID: c.ID, FilePath: "pages/about.liquid",
+		Action: FileActionUpdate, Kind: GeneratedFileKindProposed, Content: "<p>about v2</p>",
+		PageMeta:  nil,
+		CreatedAt: now2, UpdatedAt: now2,
+	}); err != nil {
+		t.Fatalf("CreateFile (turn 2) failed: %v", err)
+	}
+
+	if _, err := svc.ApplyDraft(ctx, tenantID, "tok", c.ID, "demo-theme"); err != nil {
+		t.Fatalf("ApplyDraft failed: %v", err)
+	}
+
+	body := fake.bodies["pages/about.liquid"]
+	if body == nil {
+		t.Fatal("expected a write recorded for pages/about.liquid")
+	}
+	if body["content"] != "<p>about v2</p>" {
+		t.Fatalf("expected turn 2's content to win, got %+v", body)
+	}
+	if body["title"] != "About" || body["slug"] != "about" {
+		t.Fatalf("expected turn 1's page registration to survive to the write despite turn 2 carrying no PageMeta, got %+v", body)
+	}
+}
+
+// TestPendingFilesToPlan_CollapseAcrossTurns is the table-driven unit test
+// for pendingFilesToPlan's last-write-wins collapse — pure function, no DB
+// needed. Covers the three cases the ApplyDraft-level regression test above
+// doesn't: a newer turn's own PageMeta winning over an older one's, the
+// create/update action collapse, and an update-only path staying update.
+func TestPendingFilesToPlan_CollapseAcrossTurns(t *testing.T) {
+	older := time.Now().UTC().Add(-time.Minute)
+	newer := time.Now().UTC()
+	metaV1 := &themefs.PageMeta{Title: "About", Slug: "about"}
+	metaV2 := &themefs.PageMeta{Title: "About Us", Slug: "about-us"}
+
+	tests := []struct {
+		name         string
+		files        []GeneratedFile
+		wantPageMeta *themefs.PageMeta
+		wantAction   FileAction
+	}{
+		{
+			// A newer turn's own registration data (e.g. the merchant asked
+			// to change the slug) must not be overwritten by the older
+			// turn's now-stale PageMeta.
+			name: "newer turn's own PageMeta wins over older turn's",
+			files: []GeneratedFile{
+				{FilePath: "pages/about.liquid", Action: FileActionCreate, PageMeta: metaV1, CreatedAt: older},
+				{FilePath: "pages/about.liquid", Action: FileActionUpdate, PageMeta: metaV2, CreatedAt: newer},
+			},
+			wantPageMeta: metaV2,
+			wantAction:   FileActionCreate,
+		},
+		{
+			name: "create then update collapses to create",
+			files: []GeneratedFile{
+				{FilePath: "pages/about.liquid", Action: FileActionCreate, CreatedAt: older},
+				{FilePath: "pages/about.liquid", Action: FileActionUpdate, CreatedAt: newer},
+			},
+			wantPageMeta: nil,
+			wantAction:   FileActionCreate,
+		},
+		{
+			name: "update-only path stays update",
+			files: []GeneratedFile{
+				{FilePath: "pages/about.liquid", Action: FileActionUpdate, CreatedAt: older},
+				{FilePath: "pages/about.liquid", Action: FileActionUpdate, CreatedAt: newer},
+			},
+			wantPageMeta: nil,
+			wantAction:   FileActionUpdate,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for i := range tt.files {
+				tt.files[i].Kind = GeneratedFileKindProposed
+			}
+			plan := pendingFilesToPlan(tt.files)
+			if len(plan.files) != 1 {
+				t.Fatalf("expected exactly 1 collapsed file, got %d: %+v", len(plan.files), plan.files)
+			}
+			got := plan.files[0]
+			if got.pageMeta != tt.wantPageMeta {
+				t.Errorf("pageMeta = %+v, want %+v", got.pageMeta, tt.wantPageMeta)
+			}
+			if got.action != tt.wantAction {
+				t.Errorf("action = %q, want %q", got.action, tt.wantAction)
+			}
+		})
+	}
+}
+
 // Item 8: ApplyDraft applies a kind='layout' row so the <link> tag
 // survives — a layout splice staged during generation but never separately
 // audited before this feature would otherwise be lost between staging and
@@ -213,6 +354,52 @@ func TestApplyDraft_AppliesLayoutRow(t *testing.T) {
 	}
 	if body["content"] != splicedLayout {
 		t.Fatalf("expected the spliced layout content to survive to apply, got %+v", body)
+	}
+}
+
+// Bug: AppliedPaths used to include layout splice paths (layout-start.liquid/
+// layout-end.liquid) even though DraftSummary.FilePaths excludes them (see
+// GeneratedFileKindLayout) — a merchant would see "1 unsaved change" before
+// applying and "applied 2 files" after, for the exact same draft. The
+// layout row must still be WRITTEN (a splice is real, applied work), just
+// not counted in AppliedPaths, matching DraftSummary's own exclusion.
+func TestApplyDraft_AppliedPathsExcludesLayoutRows(t *testing.T) {
+	fake := newFakeApplyServer()
+	svc, chatSvc, buildRepo := newApplyTestService(t, fake)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+	seedPendingFile(t, chatSvc, buildRepo, c, "pages/offers.liquid", "<p>offers</p>", GeneratedFileKindProposed)
+	seedPendingFile(t, chatSvc, buildRepo, c, pathLayoutStart, `<link rel="stylesheet" href="/theme-assets/css/offers.css">`, GeneratedFileKindLayout)
+
+	summary, err := svc.DraftSummary(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("DraftSummary failed: %v", err)
+	}
+	if len(summary.FilePaths) != 1 {
+		t.Fatalf("expected DraftSummary to report 1 file (layout excluded), got %+v", summary.FilePaths)
+	}
+
+	result, err := svc.ApplyDraft(ctx, tenantID, "tok", c.ID, "demo-theme")
+	if err != nil {
+		t.Fatalf("ApplyDraft failed: %v", err)
+	}
+
+	// The layout splice must still have actually been written...
+	if fake.writes[pathLayoutStart] != 1 {
+		t.Fatalf("expected the layout splice to still be written to FlowPOS, got writes=%+v", fake.writes)
+	}
+	// ...but AppliedPaths must agree with what DraftSummary told the
+	// merchant was pending, not report an extra file they never saw listed.
+	if len(result.AppliedPaths) != len(summary.FilePaths) {
+		t.Fatalf("expected AppliedPaths (%+v) to match DraftSummary.FilePaths' count (%+v)", result.AppliedPaths, summary.FilePaths)
+	}
+	if len(result.AppliedPaths) != 1 || result.AppliedPaths[0] != "pages/offers.liquid" {
+		t.Fatalf("expected AppliedPaths to contain only pages/offers.liquid, got %+v", result.AppliedPaths)
 	}
 }
 

@@ -522,6 +522,16 @@ func (s *Service) failOrphanedQueue(ctx context.Context, chatID string) {
 		// c.ID/c.TenantID, and a reaper sweep has no tenant-scoped request
 		// to look the chat up through in the first place.
 		c := chat.Chat{ID: chatID, TenantID: g.TenantID}
+		// Warn (not Error): an orphaned queue is an expected, already-
+		// handled condition on its own (see this method's own doc comment)
+		// — but see runOneQueuedGeneration's matching log line for why a
+		// SPIKE in this message specifically is worth being able to spot:
+		// before the heartbeat fix, a chat's running generation going
+		// falsely stale (see the 20260813000002 migration) is exactly what
+		// made ChatsWithOrphanedQueues see this chat as orphaned in the
+		// first place, despite its running generation completing normally
+		// moments later.
+		slog.Warn("failing an orphaned queued generation with session-expired", "chat_id", chatID, "generation_id", g.ID)
 		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
 		if endErr := s.repo.EndGeneration(ctx, chatID, errSessionExpired); endErr != nil {
 			slog.Error("failed to record generation end for an orphaned queue", "chat_id", chatID, "error", endErr)

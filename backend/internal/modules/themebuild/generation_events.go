@@ -199,6 +199,56 @@ type eventEmitter struct {
 	generationID string
 	chatID       string
 	nextSeq      int64
+	// lastHeartbeat is when this emitter last wrote last_heartbeat_at (see
+	// updateHeartbeatThrottled) — shared by emit and emitLive so the two
+	// paths' liveness signal lands in the same place instead of double-
+	// writing when they fire close together (e.g. a tool_result event
+	// immediately after a thinking delta). Same single-goroutine assumption
+	// as nextSeq above applies here, and for the same reason: onDelta and
+	// ToolProgress (see tool_progress.go) are both only ever called from
+	// doGenerate's own goroutine for the lifetime of one generation, never
+	// concurrently with each other or with a second doGenerate call sharing
+	// this emitter — this type is never shared across generations (see
+	// newEventEmitter, called fresh per call site) or handed to a second
+	// goroutine anywhere in this package. Confirmed by inspection, not
+	// merely assumed: Generate's tool loop (internal/ai/generator.go) has
+	// no `go` statement of its own, and runOneQueuedGeneration calls
+	// doGenerate synchronously from the one runGeneration goroutine started
+	// per chat. No mutex here would be needed even if it were added —
+	// match the existing nextSeq convention rather than introducing one
+	// field guarded differently from the other.
+	lastHeartbeat time.Time
+}
+
+// heartbeatThrottle bounds how often emit/emitLive write last_heartbeat_at.
+// Liveness is the point, not precision: a coalesced thinking delta alone
+// can fire several times a second (see deltaCoalescer), and turning every
+// one of those into a DB write would be pure waste for a value the reaper
+// only ever compares against a 5-minute threshold (generationHeartbeatTimeout
+// — see generation.go). 30s is comfortably under that budget so a healthy
+// generation's heartbeat never comes close to going stale, while still
+// being far enough above emit's actual call frequency to keep this a
+// liveness signal rather than a write-amplification problem.
+const heartbeatThrottle = 30 * time.Second
+
+// updateHeartbeatThrottled stamps last_heartbeat_at, skipping the write if
+// the last one landed within heartbeatThrottle — see its own doc comment.
+// A no-op if repo is nil, the same test-construction convenience emit/
+// emitLive already extend to their other repo-dependent work.
+func (e *eventEmitter) updateHeartbeatThrottled(ctx context.Context) {
+	if e.repo == nil {
+		return
+	}
+	if !e.lastHeartbeat.IsZero() && time.Since(e.lastHeartbeat) < heartbeatThrottle {
+		return
+	}
+	e.lastHeartbeat = time.Now()
+	// Best-effort and never fails the generation (see UpdateGenerationHeartbeat's
+	// doc comment) — a cheap indexed single-row UPDATE, not a reason to slow
+	// down or abort a turn that's otherwise making real progress.
+	if err := e.repo.UpdateGenerationHeartbeat(ctx, e.generationID); err != nil {
+		slog.Error("failed to update generation heartbeat", "generation_id", e.generationID, "error", err)
+	}
 }
 
 // newEventEmitter looks up chatID's current max seq (0 if this chat has
@@ -242,12 +292,7 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 		slog.Error("failed to persist generation event", "type", eventType, "chat_id", e.chatID, "error", err)
 	}
 
-	// Best-effort and never fails the generation (see UpdateGenerationHeartbeat's
-	// doc comment) — a cheap indexed single-row UPDATE, not a reason to slow
-	// down or abort a turn that's otherwise making real progress.
-	if err := e.repo.UpdateGenerationHeartbeat(ctx, e.generationID); err != nil {
-		slog.Error("failed to update generation heartbeat", "generation_id", e.generationID, "error", err)
-	}
+	e.updateHeartbeatThrottled(ctx)
 
 	if e.bus != nil {
 		e.bus.Publish(ctx, e.chatID, ev)
@@ -263,13 +308,30 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 // doc comment for why volume matters here (an insert plus a trim DELETE per
 // call, unaffordable at one call per token).
 //
-// A no-op if bus is nil (no REDIS_URL and no in-process subscriber — see
-// NewService) or if this generation has no live subscriber at all: unlike
-// emit, there's no durable fallback to fall back to, so the ephemeral text
-// is simply never seen. That's fine — a merchant not actively watching the
-// stream never sees "thinking" narration either way.
+// Also stamps the heartbeat (throttled — see updateHeartbeatThrottled),
+// unconditionally on whether bus is set: thinking deltas are the only
+// signal that arrives DURING a model call rather than at a tool-loop
+// iteration boundary (see emit's call sites — tool_call/tool_result/
+// checking/repairing), so on a slow-but-healthy turn with adaptive thinking
+// on a large context, this is what keeps the heartbeat from going stale
+// mid-call and getting reaped out from under a generation that's actually
+// fine — see the 20260813000002 migration and generationHeartbeatTimeout.
+// This liveness signal has nothing to do with whether anyone is watching
+// live, so it must not be skipped just because bus (or a subscriber) is
+// absent.
+//
+// The rest of this method — the publish itself — is still a no-op if bus
+// is nil (no REDIS_URL and no in-process subscriber — see NewService) or
+// if this generation has no live subscriber at all: unlike emit, there's
+// no durable fallback to fall back to, so the ephemeral text is simply
+// never seen. That's fine — a merchant not actively watching the stream
+// never sees "thinking" narration either way.
 func (e *eventEmitter) emitLive(ctx context.Context, eventType string, payload any) {
-	if e == nil || e.bus == nil {
+	if e == nil {
+		return
+	}
+	e.updateHeartbeatThrottled(ctx)
+	if e.bus == nil {
 		return
 	}
 	payloadJSON, err := json.Marshal(payload)

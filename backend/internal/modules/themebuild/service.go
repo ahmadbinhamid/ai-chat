@@ -77,6 +77,21 @@ var generateTimeoutNanos = func() *atomic.Int64 {
 // budget across a whole queue.
 func generateTimeout() time.Duration { return time.Duration(generateTimeoutNanos.Load()) }
 
+// heartbeatTickerNanos backs runOneQueuedGeneration's heartbeat ticker
+// interval — same atomic.Int64 reasoning as generateTimeoutNanos above:
+// production never writes it, but a test needs to shrink it far below the
+// real-world 30s (matching heartbeatThrottle — see generation_events.go) so
+// it doesn't have to wait 30 real seconds for a tick, while a concurrent
+// generation's own ticker goroutine (started on a background drain-loop
+// goroutine, not the test's) may be reading it at the same time.
+var heartbeatTickerNanos = func() *atomic.Int64 {
+	var v atomic.Int64
+	v.Store(int64(heartbeatThrottle))
+	return &v
+}()
+
+func heartbeatTickerInterval() time.Duration { return time.Duration(heartbeatTickerNanos.Load()) }
+
 // generator is the subset of *ai.Generator's behavior Service depends on —
 // letting tests substitute a fake that never calls the real Claude API,
 // which matters most for checkAndRepair's retry loop (multiple Generate
@@ -423,6 +438,17 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		// this can't run — fail it with a message the merchant can act on
 		// instead of either silently dropping it or calling FlowPOS
 		// unauthenticated.
+		//
+		// Warn (not Error): a pod restart or a reaper-restarted queue
+		// losing its token is an expected, already-handled condition, not
+		// a bug — but it should still be visible. Before the heartbeat fix
+		// (see the 20260813000002 migration), a slow-but-healthy
+		// generation could cause the reaper to spuriously mark it stale
+		// and orphan its queue, producing THIS exact message for every
+		// prompt behind it despite nothing actually being wrong — logging
+		// this is what makes a spike from that failure mode (or any other
+		// unexpectedly frequent cause) visible instead of silent.
+		slog.Warn("generation has no bearer token available; failing with session-expired", "chat_id", c.ID, "generation_id", g.ID)
 		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
 		endCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -448,6 +474,49 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	// outlives any one HTTP call without being unbounded itself.
 	workCtx, cancel := context.WithTimeout(ctx, generateTimeout())
 	defer cancel()
+
+	// Heartbeat ticker — the second of two layers keeping generations
+	// with a healthy but slow model call from being reaped mid-flight
+	// (see the 20260813000002 migration and generationHeartbeatTimeout).
+	// eventEmitter.emitLive (generation_events.go) already stamps the
+	// heartbeat on every thinking delta, throttled the same
+	// heartbeatThrottle interval — but ToolChoiceAny is forced on every
+	// tool-loop iteration (see ai.Generate), so a turn that goes straight
+	// to a tool call with no narration text produces no delta at all,
+	// and nothing durable fires until the NEXT iteration boundary either
+	// (tool_call/tool_result/checking/repairing — see emit's call sites).
+	// A single slow call in between is exactly the gap the bug report
+	// described. This ticker doesn't depend on what the model chooses to
+	// emit: it only needs this goroutine to still be alive and running,
+	// which is the actual thing the reaper cares about. It alone would
+	// already fix the reaping bug; emitLive's heartbeat stays because it
+	// reflects real progress rather than merely "the process hasn't
+	// crashed", which is the more useful signal to see when reading the
+	// generations table by hand — keeping it costs nothing once this
+	// ticker exists as the robustness backstop.
+	heartbeatTicker := time.NewTicker(heartbeatTickerInterval())
+	defer heartbeatTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-workCtx.Done():
+				return
+			case <-heartbeatTicker.C:
+				// Best-effort, matching UpdateGenerationHeartbeat's own
+				// convention (see eventEmitter.emit): a fresh, short-lived
+				// context rather than workCtx, since workCtx can already be
+				// canceled by the time a tick lands right as the
+				// generation finishes — a heartbeat write for a generation
+				// about to be marked done/failed anyway is harmless to
+				// lose, not worth erroring over.
+				hbCtx, hbCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if err := s.repo.UpdateGenerationHeartbeat(hbCtx, g.ID); err != nil {
+					slog.Error("failed to update generation heartbeat (ticker)", "generation_id", g.ID, "error", err)
+				}
+				hbCancel()
+			}
+		}
+	}()
 
 	err := s.doGenerate(workCtx, in, c, g.ID)
 

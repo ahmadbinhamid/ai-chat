@@ -2,6 +2,7 @@ package themebuild
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
@@ -259,6 +260,83 @@ func TestEmitLive_PublishesButNeverPersistsOrAdvancesSeq(t *testing.T) {
 		if ev.Type == EventTypeThinking {
 			t.Errorf("expected emitLive to never persist to generation_events, found %+v", ev)
 		}
+	}
+
+	// The one thing emitLive DOES gain (see the bug fix this test's own
+	// doc comment predates): a heartbeat UPDATE on `generations`, and
+	// nothing else — confirmed here, in the same test as the "never
+	// persists/advances seq" assertions above, so a future regression on
+	// either side shows up together.
+	if !getHeartbeat(t, conn, genID).Valid {
+		t.Error("expected emitLive to have stamped last_heartbeat_at")
+	}
+}
+
+// getHeartbeat reads generations.last_heartbeat_at directly — there is no
+// Repository getter for it (see UpdateGenerationHeartbeat's doc comment:
+// only ReapStaleGenerations' own query needs to read it back, and that's
+// SQL, not Go), so tests asserting on it go straight to the DB.
+func getHeartbeat(t *testing.T, conn *sql.DB, genID string) sql.NullTime {
+	t.Helper()
+	var hb sql.NullTime
+	if err := conn.QueryRowContext(context.Background(), `SELECT last_heartbeat_at FROM generations WHERE id = ?`, genID).Scan(&hb); err != nil {
+		t.Fatalf("failed to read back last_heartbeat_at: %v", err)
+	}
+	return hb
+}
+
+// TestEventEmitter_HeartbeatThrottled is the direct test for
+// updateHeartbeatThrottled (see its own doc comment and heartbeatThrottle's):
+// the first call in an emitter's lifetime always writes, a call inside the
+// throttle window is skipped, and emit/emitLive share the same throttle —
+// an emit immediately after an emitLive must not issue a second UPDATE.
+func TestEventEmitter_HeartbeatThrottled(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+	genID := seedGeneration(t, repo, chatID)
+
+	emitter := newEventEmitter(ctx, repo, nil, genID, chatID)
+
+	// First call: no prior heartbeat, so it must write despite lastHeartbeat
+	// being the zero value (see updateHeartbeatThrottled's IsZero check).
+	emitter.emit(ctx, EventTypeStarted, struct{}{})
+	first := getHeartbeat(t, conn, genID)
+	if !first.Valid {
+		t.Fatal("expected the first emit to stamp last_heartbeat_at")
+	}
+
+	// Immediately after, well inside heartbeatThrottle: emitLive must skip
+	// the write (shared throttle, not a per-method one) — asserted by
+	// checking the DB timestamp is byte-identical, not just "still set".
+	emitter.emitLive(ctx, EventTypeThinking, map[string]string{"text": "x"})
+	second := getHeartbeat(t, conn, genID)
+	if !second.Time.Equal(first.Time) {
+		t.Errorf("expected emitLive inside the throttle window to skip the write, first=%v second=%v", first.Time, second.Time)
+	}
+
+	// And an emit right after THAT must also skip — proving the throttle is
+	// shared state, not reset by switching which method calls it.
+	emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": 1})
+	third := getHeartbeat(t, conn, genID)
+	if !third.Time.Equal(first.Time) {
+		t.Errorf("expected emit right after emitLive (still inside the throttle window) to skip the write, first=%v third=%v", first.Time, third.Time)
+	}
+
+	// Manually age lastHeartbeat past the throttle window (real time.Sleep
+	// of heartbeatThrottle's real-world 30s has no place in a unit test) —
+	// the next call must write again. last_heartbeat_at is a DATETIME with
+	// only second-level precision (same hazard documented on created_at
+	// elsewhere in this package — see revert.go), so this also sleeps past
+	// a second boundary, or "new" and "first" could round to the same
+	// stored value despite the write actually happening.
+	emitter.lastHeartbeat = time.Now().Add(-heartbeatThrottle - time.Second)
+	time.Sleep(1100 * time.Millisecond)
+	emitter.emit(ctx, EventTypeDone, map[string]string{"summary": "ok"})
+	fourth := getHeartbeat(t, conn, genID)
+	if !fourth.Valid || fourth.Time.Equal(first.Time) {
+		t.Errorf("expected emit past the throttle window to write a new heartbeat, first=%v fourth=%v", first.Time, fourth.Time)
 	}
 }
 

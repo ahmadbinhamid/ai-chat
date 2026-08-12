@@ -24,7 +24,12 @@ var ErrApplyBlockedByRunningGeneration = errors.New("a generation is currently r
 // at nothing.
 var ErrNoPendingChanges = errors.New("this chat has no pending changes to apply")
 
-// ApplyResult summarizes what ApplyDraft wrote.
+// ApplyResult summarizes what ApplyDraft wrote. AppliedPaths deliberately
+// excludes layout splices (layout-start.liquid/layout-end.liquid), the same
+// way DraftSummaryResult.FilePaths does — a merchant sees both (the "N
+// unsaved changes" summary before applying, this list after), and the two
+// must agree on what counts as "a file" or the count visibly changes
+// between the two without anything the merchant did explaining why.
 type ApplyResult struct {
 	AppliedPaths []string `json:"applied_paths"`
 }
@@ -134,14 +139,21 @@ func (s *Service) ApplyDraft(ctx context.Context, tenantID uint64, token, chatID
 		return ApplyResult{}, fmt.Errorf("mark draft applied: %w", err)
 	}
 
+	// written only ever contains plan.files (commitWritePlan never appends
+	// layoutStart/layoutEnd to it — see its own doc comment), so this is
+	// naturally already scoped to non-layout paths; no separate filter
+	// needed the way DraftSummary needs one against PendingFiles' raw kind
+	// column. Deliberately NOT also appending plan.layoutStart/layoutEnd's
+	// paths here (a prior version of this code did): AppliedPaths and
+	// DraftSummary.FilePaths must stay consistent with each other, since a
+	// merchant sees both — DraftSummary already excludes layout splices
+	// (GeneratedFileKindLayout, "not something the merchant asked for or
+	// should see listed as 'a file'" — see its own doc comment), and
+	// AppliedPaths reporting more paths than DraftSummary staged would show
+	// as "2 unsaved changes" becoming "applied 4 files" for the same draft.
 	paths := make([]string, 0, len(written))
 	for _, w := range written {
 		paths = append(paths, w.generated.Path)
-	}
-	for _, f := range []*planFile{plan.layoutStart, plan.layoutEnd} {
-		if f != nil {
-			paths = append(paths, f.path)
-		}
 	}
 	return ApplyResult{AppliedPaths: paths}, nil
 }
@@ -192,6 +204,31 @@ func pendingFilesToPlan(files []GeneratedFile) writePlan {
 		default:
 			pf := planFile{path: f.FilePath, action: f.Action, content: f.Content, previous: f.PreviousContent, pageMeta: f.PageMeta}
 			if idx, ok := proposedByPath[f.FilePath]; ok {
+				// A later turn editing an already-staged page carries no
+				// PageRegistryEntry (the model only sends one when it's
+				// introducing the page), so its pageMeta is nil — see
+				// buildWritePlan. Replacing wholesale would drop the
+				// registration the earlier turn staged and write the file
+				// without ever registering the route. Keep whichever row
+				// actually has it; a newer turn's own non-nil pageMeta
+				// (re-registering, e.g. changing the slug) still wins.
+				if pf.pageMeta == nil {
+					pf.pageMeta = plan.files[idx].pageMeta
+				}
+				// Same reasoning for the action: a path created earlier in
+				// this draft and then edited by a later turn is still a
+				// create relative to the last-applied theme, and the audit
+				// row should say so. (WriteFile itself doesn't branch on
+				// action, so this only affects what the trail means, not
+				// what gets written.)
+				if plan.files[idx].action == FileActionCreate {
+					pf.action = FileActionCreate
+				}
+				// previous is left as the newest row's value, unlike the
+				// two fields above — it's the audit trail's "what this
+				// turn replaced", and ApplyDraft never re-persists audit
+				// rows, so nothing downstream reads it for anything but
+				// this newest write.
 				plan.files[idx] = pf
 			} else {
 				proposedByPath[f.FilePath] = len(plan.files)
