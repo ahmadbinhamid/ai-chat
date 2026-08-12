@@ -92,7 +92,7 @@ func TestGenerate_ToolLoopReadsThenProposes(t *testing.T) {
 	defer ts.Close()
 
 	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
-	g := newTestGenerator(client, "claude-test")
+	g := newTestGenerator(client)
 
 	var toolExecCalls []string
 	toolExec := func(_ context.Context, name string, input json.RawMessage) (string, error) {
@@ -177,7 +177,7 @@ func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {
 	defer ts.Close()
 
 	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
-	g := newTestGenerator(client, "claude-test")
+	g := newTestGenerator(client)
 
 	toolExec := func(_ context.Context, name string, input json.RawMessage) (string, error) {
 		return "[]", nil
@@ -232,7 +232,7 @@ func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 	defer ts.Close()
 
 	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
-	g := newTestGenerator(client, "claude-test")
+	g := newTestGenerator(client)
 
 	toolExec := func(_ context.Context, name string, input json.RawMessage) (string, error) {
 		return "[]", nil
@@ -279,7 +279,7 @@ func TestGenerate_BrandModeOnlyOffersProposeChanges(t *testing.T) {
 	defer ts.Close()
 
 	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
-	g := newTestGenerator(client, "claude-test")
+	g := newTestGenerator(client)
 
 	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo", GenerationMode: GenerationModeBrand}, nil,
 		"make the primary color blue", nil, nil, nil)

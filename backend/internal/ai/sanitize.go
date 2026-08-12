@@ -1,8 +1,15 @@
 package ai
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/shared"
 )
 
 // genericGenerationError is shown whenever the underlying error doesn't
@@ -21,20 +28,57 @@ func SanitizeError(err error) string {
 	if err == nil {
 		return ""
 	}
-	return fmt.Sprintf("Error from AI agent: %s", categorizeError(err.Error()))
+	return fmt.Sprintf("Error from AI agent: %s", categorizeError(err))
 }
 
-// categorizeError maps common, recognizable failure text to a short,
-// actionable, provider-neutral reason. Order matters: more specific matches
-// (e.g. "truncated at the max_tokens limit") are checked before broader ones
-// that could otherwise shadow them.
-func categorizeError(raw string) string {
-	lower := strings.ToLower(raw)
+// categorizeError maps err to a short, actionable, provider-neutral reason.
+// Anthropic's own SDK wraps every HTTP-level API failure in a typed
+// *anthropic.Error carrying a real StatusCode and a Type() (rate_limit_error,
+// overloaded_error, billing_error, ...) — checked first, since it's exact by
+// construction, unlike matching on err.Error()'s text. strings.Contains on
+// "502"/"521" et al. used to be the only check here, and could false-match a
+// request ID or file size that happened to contain the same digits; that
+// string-matching fallback still exists below, but now only runs when
+// there's no typed error to classify from — which covers two real cases:
+// errors this codebase generates itself (never wrapped in *anthropic.Error
+// to begin with), and the DeepSeek compat endpoint (config.AIProvider ==
+// "deepseek" — see ai.New's doc comment), which speaks the same wire
+// protocol but isn't guaranteed to always surface a typed error the SDK
+// recognizes.
+func categorizeError(err error) string {
+	var apiErr *anthropic.Error
+	if errors.As(err, &apiErr) {
+		switch {
+		case apiErr.Type() == shared.ErrorTypeBillingError:
+			return "the account is out of credits — please contact support"
+		case apiErr.Type() == shared.ErrorTypeRateLimitError || apiErr.StatusCode == http.StatusTooManyRequests:
+			return "too many requests right now — please try again shortly"
+		case apiErr.Type() == shared.ErrorTypeTimeoutError:
+			return "the request timed out — please try again"
+		case apiErr.Type() == shared.ErrorTypeOverloadedError || apiErr.StatusCode == http.StatusBadGateway ||
+			apiErr.StatusCode == http.StatusServiceUnavailable || (apiErr.StatusCode >= 520 && apiErr.StatusCode <= 524):
+			// 521-524 are Cloudflare's own origin-unreachable/timeout codes
+			// (see developers.cloudflare.com/support/troubleshooting/http-status-codes)
+			// — seen in practice when buildSnapshot's read of a theme file
+			// hits a momentarily-down origin behind Cloudflare, not an AI
+			// provider issue.
+			return "temporarily unavailable — please try again shortly"
+		}
+	}
+
+	if errors.Is(err, errMaxTokensTruncated) {
+		return "the response was too large to complete — please try a smaller request"
+	}
+
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return "the request timed out — please try again"
+	}
+
+	lower := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(lower, "credit balance") || (strings.Contains(lower, "insufficient") && strings.Contains(lower, "credit")):
 		return "the account is out of credits — please contact support"
-	case strings.Contains(lower, "truncated at the max_tokens limit"):
-		return "the response was too large to complete — please try a smaller request"
 	case strings.Contains(lower, "did not call propose_changes within"):
 		return "the task was too complex to finish in one attempt — please try breaking it into smaller requests"
 	case strings.Contains(lower, "didn't pass validation after"):
@@ -45,10 +89,6 @@ func categorizeError(raw string) string {
 		return "the request timed out — please try again"
 	case strings.Contains(lower, "overloaded") || strings.Contains(lower, "502") || strings.Contains(lower, "503") ||
 		strings.Contains(lower, "521") || strings.Contains(lower, "522") || strings.Contains(lower, "523") || strings.Contains(lower, "524"):
-		// 521-524 are Cloudflare's own origin-unreachable/timeout codes (see
-		// developers.cloudflare.com/support/troubleshooting/http-status-codes) —
-		// seen in practice when buildSnapshot's read of a theme file hits a
-		// momentarily-down origin behind Cloudflare, not an AI provider issue.
 		return "temporarily unavailable — please try again shortly"
 	default:
 		return genericGenerationError

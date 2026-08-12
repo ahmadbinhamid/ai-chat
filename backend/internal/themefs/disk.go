@@ -118,7 +118,7 @@ func (s *Store) ReadFile(ctx context.Context, auth RequestAuth, relPath string) 
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", relPath, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return "", nil
@@ -174,7 +174,7 @@ func (s *Store) WriteFile(ctx context.Context, auth RequestAuth, relPath, conten
 	if err != nil {
 		return fmt.Errorf("write %s: %w", relPath, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return fmt.Errorf("write %s: %s", relPath, statusErr(resp))
@@ -365,7 +365,7 @@ func (s *Store) doReadWithRetry(req *http.Request) (*http.Response, error) {
 		}
 		if resp.StatusCode >= 500 {
 			lastErr = fmt.Errorf("%s", statusErr(resp))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			continue
 		}
 		return resp, nil

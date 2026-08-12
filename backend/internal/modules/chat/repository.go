@@ -107,7 +107,7 @@ func (r *Repository) ListMessagesByChat(ctx context.Context, chatID string) ([]M
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var messages []Message
 	for rows.Next() {

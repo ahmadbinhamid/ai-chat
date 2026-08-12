@@ -242,6 +242,13 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 		slog.Error("failed to persist generation event", "type", eventType, "chat_id", e.chatID, "error", err)
 	}
 
+	// Best-effort and never fails the generation (see UpdateGenerationHeartbeat's
+	// doc comment) — a cheap indexed single-row UPDATE, not a reason to slow
+	// down or abort a turn that's otherwise making real progress.
+	if err := e.repo.UpdateGenerationHeartbeat(ctx, e.generationID); err != nil {
+		slog.Error("failed to update generation heartbeat", "generation_id", e.generationID, "error", err)
+	}
+
 	if e.bus != nil {
 		e.bus.Publish(ctx, e.chatID, ev)
 	}

@@ -135,7 +135,7 @@ func TestGenerationRepository_ReapStaleGenerations(t *testing.T) {
 		t.Fatalf("failed to seed a stale running generation: %v", err)
 	}
 
-	n, err := repo.ReapStaleGenerations(ctx, 5*time.Minute)
+	n, err := repo.ReapStaleGenerations(ctx, 5*time.Minute, 5*time.Minute)
 	if err != nil {
 		t.Fatalf("ReapStaleGenerations failed: %v", err)
 	}
@@ -149,6 +149,68 @@ func TestGenerationRepository_ReapStaleGenerations(t *testing.T) {
 	}
 	if g.Status != GenerationStatusFailed || g.Error == nil {
 		t.Fatalf("expected the stale generation to be marked failed, got %+v", g)
+	}
+}
+
+// TestGenerationRepository_ReapStaleGenerations_HeartbeatOverridesStartedAt
+// covers the case the 20260813000002 migration exists for: a generation
+// whose started_at is old (well past what would be a stale threshold on
+// its own) but whose last_heartbeat_at is recent must NOT be reaped — a
+// live generation still emitting progress events must survive exactly
+// because those events are stamping the heartbeat, regardless of how long
+// ago it started.
+func TestGenerationRepository_ReapStaleGenerations_HeartbeatOverridesStartedAt(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+	genID := uuid.NewString()
+
+	if _, err := conn.ExecContext(ctx, `
+		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at, last_heartbeat_at)
+		VALUES (?, ?, 1, ?, 0, ?, ?, ?)
+	`, genID, chatID, GenerationStatusRunning, "", time.Now().UTC().Add(-1*time.Hour), time.Now().UTC()); err != nil {
+		t.Fatalf("failed to seed a generation with an old started_at but fresh heartbeat: %v", err)
+	}
+
+	n, err := repo.ReapStaleGenerations(ctx, 5*time.Minute, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("ReapStaleGenerations failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("expected the fresh-heartbeat generation to survive, but %d rows were reaped", n)
+	}
+
+	g, err := repo.GetGeneration(ctx, chatID)
+	if err != nil {
+		t.Fatalf("GetGeneration failed: %v", err)
+	}
+	if g.Status != GenerationStatusRunning {
+		t.Fatalf("expected the generation to still be running, got %+v", g)
+	}
+}
+
+func TestGenerationRepository_UpdateGenerationHeartbeat(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+	genID := uuid.NewString()
+
+	if err := repo.StartGeneration(ctx, genID, chatID, 1); err != nil {
+		t.Fatalf("StartGeneration failed: %v", err)
+	}
+
+	if err := repo.UpdateGenerationHeartbeat(ctx, genID); err != nil {
+		t.Fatalf("UpdateGenerationHeartbeat failed: %v", err)
+	}
+
+	var heartbeat sql.NullTime
+	if err := conn.QueryRowContext(ctx, `SELECT last_heartbeat_at FROM generations WHERE id = ?`, genID).Scan(&heartbeat); err != nil {
+		t.Fatalf("failed to read back last_heartbeat_at: %v", err)
+	}
+	if !heartbeat.Valid {
+		t.Fatalf("expected last_heartbeat_at to be set after UpdateGenerationHeartbeat")
 	}
 }
 

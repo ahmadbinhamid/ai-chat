@@ -47,12 +47,12 @@ func main() {
 		logger.Error("database connection failed", "error", err)
 		os.Exit(1)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	srv, err := server.New(cfg, conn, logger)
 	if err != nil {
 		logger.Error("server initialization failed", "error", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic // process exit reclaims conn's fd either way
 	}
 	defer srv.Close()
 

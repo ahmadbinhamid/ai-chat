@@ -106,8 +106,8 @@ type Service struct {
 	// be a data race: this Service is shared across every concurrent
 	// generation for every chat/tenant, and each one's draft is its own.
 	store      themefs.ThemeStore
-	themeLocks *keyedMutex
-	bus        eventBus // redisEventBus if REDIS_URL was configured, inProcessEventBus otherwise — see eventEmitter
+	themeLocks themeLocker // redisThemeLock if REDIS_URL was configured, keyedMutex otherwise — see themelock.go
+	bus        eventBus    // redisEventBus if REDIS_URL was configured, inProcessEventBus otherwise — see eventEmitter
 	tokens     *pendingTokens
 }
 
@@ -120,17 +120,27 @@ type Service struct {
 // wiring still always passes a real *themefs.Store.
 func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store themefs.ThemeStore, rdb *redis.Client) *Service {
 	var bus eventBus
+	var locks themeLocker
 	if rdb != nil {
 		bus = newRedisEventBus(rdb)
+		locks = newRedisThemeLock(rdb)
 	} else {
 		bus = newInProcessEventBus()
+		// In-process locking only serializes staging/apply/revert within
+		// THIS replica — two replicas can still race the same theme_slug.
+		// Same degradation this service already accepts for the event bus
+		// when REDIS_URL is unset (see the warning above it in server.go):
+		// tolerable for a single-replica deployment, not for more than one.
+		slog.Warn("REDIS_URL is not set — theme write locking falls back to a single-replica, in-process lock, " +
+			"which does not prevent two replicas from staging/applying/reverting the same theme concurrently")
+		locks = newKeyedMutex()
 	}
 	return &Service{
 		repo:       repo,
 		chats:      chats,
 		gen:        gen,
 		store:      store,
-		themeLocks: newKeyedMutex(),
+		themeLocks: locks,
 		bus:        bus,
 		tokens:     newPendingTokens(),
 	}
@@ -597,7 +607,10 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// tightly to just this section per its existing convention (see
 		// themeLocks' own doc comment) — the Claude call above can take
 		// minutes, and a second tab's turn shouldn't queue behind that.
-		unlock := s.themeLocks.Lock(in.ThemeSlug)
+		unlock, err := s.themeLocks.Lock(ctx, in.ThemeSlug)
+		if err != nil {
+			return fmt.Errorf("stage theme changes: %w", err)
+		}
 		defer unlock()
 
 		// Computed entirely in memory first, nothing staged yet: a
@@ -1458,26 +1471,47 @@ func (p writePlan) paths() []string {
 func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, result *ai.Result) (writePlan, error) {
 	var plan writePlan
 
-	for _, f := range result.Files {
-		// store here is the draft overlay (see doGenerate) — "previous"
-		// must be the draft's own prior content (what an earlier turn in
-		// THIS chat already staged), not the last-applied theme, or
-		// revert-within-a-draft (see RevertToMessage's updated doc
-		// comment) would restore the wrong "before" state.
-		previous, err := store.ReadFile(ctx, storeAuth, f.Path)
-		if err != nil {
-			return writePlan{}, fmt.Errorf("read %q: %w", f.Path, err)
+	// Reads run concurrently (errgroup, capped at 8 in flight) rather than
+	// one HTTP round trip at a time — this whole call happens inside
+	// themeLocks (see doGenerate), so a turn proposing a few dozen file
+	// edits was serializing every OTHER chat's staging behind that many
+	// sequential round trips to flowpos-backend. files is pre-sized and
+	// written by index rather than appended, so the plan's file order
+	// stays exactly result.Files' order regardless of which read finishes
+	// first — order matters below (deterministic commitWritePlan writes).
+	if len(result.Files) > 0 {
+		files := make([]planFile, len(result.Files))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(loadThemeFilesConcurrency)
+		for i, f := range result.Files {
+			g.Go(func() error {
+				// store here is the draft overlay (see doGenerate) —
+				// "previous" must be the draft's own prior content (what
+				// an earlier turn in THIS chat already staged), not the
+				// last-applied theme, or revert-within-a-draft (see
+				// RevertToMessage's updated doc comment) would restore
+				// the wrong "before" state.
+				previous, err := store.ReadFile(gctx, storeAuth, f.Path)
+				if err != nil {
+					return fmt.Errorf("read %q: %w", f.Path, err)
+				}
+				var previousPtr *string
+				if previous != "" {
+					previousPtr = &previous
+				}
+				files[i] = planFile{
+					path:     f.Path,
+					action:   FileAction(f.Action),
+					content:  f.Content,
+					previous: previousPtr,
+				}
+				return nil
+			})
 		}
-		var previousPtr *string
-		if previous != "" {
-			previousPtr = &previous
+		if err := g.Wait(); err != nil {
+			return writePlan{}, err
 		}
-		plan.files = append(plan.files, planFile{
-			path:     f.Path,
-			action:   FileAction(f.Action),
-			content:  f.Content,
-			previous: previousPtr,
-		})
+		plan.files = files
 	}
 
 	if result.PageRegistryEntry != nil {
@@ -1652,17 +1686,6 @@ func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID
 	return files, nil
 }
 
-// FilesForChat returns every generated file ever written across a chat's
-// whole history — used to hydrate GET /chat so reopening the page still
-// shows each turn's "Generated files" card, not just the most recent one.
-// Does not check ownership itself; the caller (the chat handler) has
-// already scoped the chat to the requesting tenant.
-// LoadThemeFiles fetches every .liquid template's content in the active
-// theme, keyed by theme-relative path — used by the render preview (phase
-// 5), which needs the whole theme available so {% render %} can resolve
-// any component/partial the previewed page composes, not just the one
-// entry file. CSS/JS/JSON/image paths are skipped: nothing but a template
-// is ever a render target.
 // CreateThemeFromBase creates a brand-new theme for the tenant from
 // flowpos-backend's base-theme catalog entry and returns its slug — the
 // entry point for the "start a theme from scratch" flow, before any chat
@@ -1744,6 +1767,11 @@ func (s *Service) LoadBaseThemeFiles(ctx context.Context, storeAuth themefs.Requ
 	return s.LoadThemeFiles(ctx, s.store, storeAuth, includeAssets)
 }
 
+// FilesForChat returns every generated file ever written across a chat's
+// whole history — used to hydrate GET /chat so reopening the page still
+// shows each turn's "Generated files" card, not just the most recent one.
+// Does not check ownership itself; the caller (the chat handler) has
+// already scoped the chat to the requesting tenant.
 func (s *Service) FilesForChat(ctx context.Context, chatID string) ([]GeneratedFile, error) {
 	return s.repo.ListFilesByChat(ctx, chatID)
 }
@@ -1786,30 +1814,3 @@ func languageFor(path string) string {
 	}
 }
 
-// keyedMutex hands out one mutex per key, created lazily — same shape as
-// ratelimit.PerTenantLimiter, minus the token-bucket part. The map grows by
-// one entry per distinct theme_slug ever seen by this process, not per
-// request — bounded by how many themes actually exist, unlike a per-token
-// cache, so no sweep/eviction is needed here.
-type keyedMutex struct {
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
-}
-
-func newKeyedMutex() *keyedMutex {
-	return &keyedMutex{locks: make(map[string]*sync.Mutex)}
-}
-
-// Lock blocks until key's lock is held, and returns the func to release it.
-func (k *keyedMutex) Lock(key string) func() {
-	k.mu.Lock()
-	lock, ok := k.locks[key]
-	if !ok {
-		lock = &sync.Mutex{}
-		k.locks[key] = lock
-	}
-	k.mu.Unlock()
-
-	lock.Lock()
-	return lock.Unlock
-}

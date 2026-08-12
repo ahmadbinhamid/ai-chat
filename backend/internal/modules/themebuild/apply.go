@@ -116,7 +116,10 @@ func (s *Service) ApplyDraft(ctx context.Context, tenantID uint64, token, chatID
 		return ApplyResult{}, ErrNoPendingChanges
 	}
 
-	unlock := s.themeLocks.Lock(themeSlug)
+	unlock, err := s.themeLocks.Lock(ctx, themeSlug)
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("apply draft: %w", err)
+	}
 	defer unlock()
 
 	plan := pendingFilesToPlan(files)

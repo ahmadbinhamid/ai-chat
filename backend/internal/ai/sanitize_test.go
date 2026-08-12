@@ -2,9 +2,26 @@ package ai
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/anthropics/anthropic-sdk-go"
 )
+
+// typedAPIError builds a minimal *anthropic.Error carrying only a
+// StatusCode — enough to exercise categorizeError's typed-error path
+// without needing a real HTTP round trip or a JSON error body (Type() stays
+// "" unless UnmarshalJSON populated it, which these tests don't need since
+// they're only checking the StatusCode-based branches).
+func typedAPIError(statusCode int) error {
+	return &anthropic.Error{
+		StatusCode: statusCode,
+		Request:    httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil),
+		Response:   &http.Response{StatusCode: statusCode, Status: http.StatusText(statusCode)},
+	}
+}
 
 func TestSanitizeError(t *testing.T) {
 	tests := []struct {
@@ -51,6 +68,31 @@ func TestSanitizeError(t *testing.T) {
 			name:        "unrecognized error falls back to generic",
 			err:         errors.New("some completely novel failure mode nobody anticipated"),
 			wantContain: "something went wrong",
+		},
+		{
+			name:        "typed API error: 429 rate limited",
+			err:         typedAPIError(http.StatusTooManyRequests),
+			wantContain: "too many requests",
+		},
+		{
+			name:        "typed API error: 502 bad gateway",
+			err:         typedAPIError(http.StatusBadGateway),
+			wantContain: "temporarily unavailable",
+		},
+		{
+			// The typed path classifies this correctly from StatusCode
+			// alone, without ever inspecting Error()'s own text — unlike
+			// the string-matching fallback, a "521" appearing incidentally
+			// elsewhere in the request (e.g. a request ID) can't influence
+			// this result, because the fallback is never reached.
+			name: "typed API error: 521 cloudflare origin unreachable, with a request ID that itself contains a misleading status-code-shaped substring",
+			err: &anthropic.Error{
+				StatusCode: 521,
+				Request:    httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages?req=req_429abc", nil),
+				Response:   &http.Response{StatusCode: 521, Status: "521 Web Server Is Down"},
+			},
+			wantContain: "temporarily unavailable",
+			mustNotHave: []string{"too many requests"},
 		},
 	}
 

@@ -12,11 +12,11 @@ import (
 
 // seedQueued inserts a queued row directly for chatID via EnqueueGeneration,
 // returning its ID and the position EnqueueGeneration reported.
-func seedQueued(t *testing.T, repo *Repository, chatID string, tenantID uint64, prompt string) (id string, position int) {
+func seedQueued(t *testing.T, repo *Repository, chatID string, prompt string) (id string, position int) {
 	t.Helper()
 	id = uuid.NewString()
 	position, err := repo.EnqueueGeneration(context.Background(), Generation{
-		ID: id, ChatID: chatID, TenantID: tenantID, Prompt: prompt, ThemeSlug: "test-theme",
+		ID: id, ChatID: chatID, TenantID: 1, Prompt: prompt, ThemeSlug: "test-theme",
 	})
 	if err != nil {
 		t.Fatalf("EnqueueGeneration failed: %v", err)
@@ -30,7 +30,7 @@ func TestRepository_DequeueNext_OrdersByQueuedAt(t *testing.T) {
 	ctx := context.Background()
 	chatID := uuid.NewString()
 
-	first, pos0 := seedQueued(t, repo, chatID, 1, "first")
+	first, pos0 := seedQueued(t, repo, chatID, "first")
 	if pos0 != 0 {
 		t.Fatalf("expected the first enqueue to report position 0, got %d", pos0)
 	}
@@ -40,7 +40,7 @@ func TestRepository_DequeueNext_OrdersByQueuedAt(t *testing.T) {
 	// non-chronological id-ordered outcome instead of the ordering it
 	// actually means to check.
 	time.Sleep(1100 * time.Millisecond)
-	second, pos1 := seedQueued(t, repo, chatID, 1, "second")
+	second, pos1 := seedQueued(t, repo, chatID, "second")
 	if pos1 != 1 {
 		t.Fatalf("expected the second enqueue to report position 1 (one ahead of it), got %d", pos1)
 	}
@@ -93,7 +93,7 @@ func TestRepository_DequeueNext_WhileRunningReturnsErrGenerationInProgress(t *te
 	if err := repo.StartGeneration(ctx, uuid.NewString(), chatID, 1); err != nil {
 		t.Fatalf("StartGeneration failed: %v", err)
 	}
-	seedQueued(t, repo, chatID, 1, "waiting")
+	seedQueued(t, repo, chatID, "waiting")
 
 	if _, err := repo.DequeueNext(ctx, chatID); !errors.Is(err, ErrGenerationInProgress) {
 		t.Fatalf("expected ErrGenerationInProgress while something is running, got %v", err)
@@ -116,8 +116,8 @@ func TestRepository_DequeueNext_ConcurrentRace(t *testing.T) {
 	repo := NewRepository(conn)
 	ctx := context.Background()
 	chatID := uuid.NewString()
-	seedQueued(t, repo, chatID, 1, "one")
-	seedQueued(t, repo, chatID, 1, "two")
+	seedQueued(t, repo, chatID, "one")
+	seedQueued(t, repo, chatID, "two")
 
 	var wg sync.WaitGroup
 	results := make([]error, 2)
@@ -153,7 +153,7 @@ func TestRepository_CancelQueued(t *testing.T) {
 	ctx := context.Background()
 	chatID := uuid.NewString()
 
-	queuedID, _ := seedQueued(t, repo, chatID, 1, "cancel me")
+	queuedID, _ := seedQueued(t, repo, chatID, "cancel me")
 	if err := repo.CancelQueued(ctx, chatID, queuedID); err != nil {
 		t.Fatalf("expected cancelling a queued row to succeed, got %v", err)
 	}
@@ -228,9 +228,9 @@ func TestRepository_ListPending_RunningFirstThenQueuedOldestFirst(t *testing.T) 
 	if err := repo.StartGeneration(ctx, runningID, chatID, 1); err != nil {
 		t.Fatalf("StartGeneration failed: %v", err)
 	}
-	q1, _ := seedQueued(t, repo, chatID, 1, "one")
+	q1, _ := seedQueued(t, repo, chatID, "one")
 	time.Sleep(1100 * time.Millisecond) // queued_at has only second-level precision
-	q2, _ := seedQueued(t, repo, chatID, 1, "two")
+	q2, _ := seedQueued(t, repo, chatID, "two")
 
 	pending, err := repo.ListPending(ctx, chatID)
 	if err != nil {

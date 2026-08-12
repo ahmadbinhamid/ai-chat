@@ -21,16 +21,16 @@ func Fresh(db *sql.DB) error {
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		tables = append(tables, name)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return err
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	if _, err := db.Exec(`SET FOREIGN_KEY_CHECKS = 0`); err != nil {
 		return fmt.Errorf("could not disable foreign key checks: %w", err)

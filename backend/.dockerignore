@@ -1,0 +1,11 @@
+# Keeps the build context small and prevents local/dev-only state (a
+# .env with real secrets, an already-built binary, editor state) from ever
+# being copyable into an image layer, even by accident.
+.git
+.env
+.env.*
+!.env.example
+tmp/
+*.log
+.DS_Store
+.air.toml

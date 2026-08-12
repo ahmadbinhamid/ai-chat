@@ -135,7 +135,10 @@ func (s *Service) revertAppliedHistory(ctx context.Context, tenantID uint64, tok
 	// own staging section is (see themeLocks) — keyed by chatID rather than
 	// themeSlug, since a chat carries no theme_slug of its own to lock on;
 	// this still prevents two reverts of the same chat from racing.
-	unlock := s.themeLocks.Lock(chatID)
+	unlock, err := s.themeLocks.Lock(ctx, chatID)
+	if err != nil {
+		return RevertResult{}, fmt.Errorf("revert applied history: %w", err)
+	}
 	defer unlock()
 
 	storeAuth := themefs.RequestAuth{Token: token, TenantID: tenantID}

@@ -24,7 +24,7 @@ func Run(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("could not read migrations table: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var name string

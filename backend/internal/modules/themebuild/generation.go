@@ -388,18 +388,40 @@ func (r *Repository) GetGeneration(ctx context.Context, chatID string) (Generati
 	return g, err
 }
 
-// ReapStaleGenerations fails every generation still marked "running" that
-// started longer than timeout ago — the process that was running it is
-// presumed dead (crashed, killed, deployed over) rather than genuinely
-// still working, since generateTimeout already bounds a healthy run's own
-// context. Returns how many rows it reaped.
-func (r *Repository) ReapStaleGenerations(ctx context.Context, timeout time.Duration) (int64, error) {
-	cutoff := time.Now().UTC().Add(-timeout)
+// UpdateGenerationHeartbeat stamps id's last_heartbeat_at with now — called
+// from eventEmitter.emit on every durably-persisted progress event a
+// running generation produces (see the 20260813000002 migration's doc
+// comment on why). Best-effort: a failure here must never fail the
+// generation itself, so the caller only logs it (see emit).
+func (r *Repository) UpdateGenerationHeartbeat(ctx context.Context, id string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE generations SET last_heartbeat_at = ? WHERE id = ?
+	`, time.Now().UTC(), id)
+	return err
+}
+
+// ReapStaleGenerations fails every generation still marked "running" whose
+// last_heartbeat_at is older than heartbeatTimeout — see the
+// 20260813000002 migration's doc comment for why this is decoupled from
+// generateTimeout (a healthy run's own per-attempt budget). Rows with no
+// heartbeat yet (last_heartbeat_at IS NULL — never emitted a single
+// progress event, or predate this column existing) fall back to
+// startedFallback measured against started_at instead, the exact behavior
+// this method had before heartbeats existed. Returns how many rows it
+// reaped.
+func (r *Repository) ReapStaleGenerations(ctx context.Context, heartbeatTimeout, startedFallback time.Duration) (int64, error) {
+	now := time.Now().UTC()
+	heartbeatCutoff := now.Add(-heartbeatTimeout)
+	startedCutoff := now.Add(-startedFallback)
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE generations
 		SET status = ?, error = ?, finished_at = ?
-		WHERE status = ? AND started_at < ?
-	`, GenerationStatusFailed, "generation timed out (reaped)", time.Now().UTC(), GenerationStatusRunning, cutoff)
+		WHERE status = ?
+		  AND (
+		    (last_heartbeat_at IS NOT NULL AND last_heartbeat_at < ?)
+		    OR (last_heartbeat_at IS NULL AND started_at < ?)
+		  )
+	`, GenerationStatusFailed, "generation timed out (reaped)", now, GenerationStatusRunning, heartbeatCutoff, startedCutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -431,8 +453,17 @@ func (s *Service) RunReaper(ctx context.Context) {
 	}
 }
 
+// generationHeartbeatTimeout is how long a running generation may go
+// without a heartbeat (see eventEmitter.emit) before the reaper presumes
+// its process died — comfortably longer than reaperInterval (1 minute) so
+// one missed sweep doesn't false-positive a generation that's simply
+// between progress events, short enough that a genuinely stuck generation
+// no longer has to wait out the full generateTimeout budget (up to 65
+// minutes) before ReapStaleGenerations touches it.
+const generationHeartbeatTimeout = 5 * time.Minute
+
 func (s *Service) reapOnce(ctx context.Context) {
-	n, err := s.repo.ReapStaleGenerations(ctx, generateTimeout())
+	n, err := s.repo.ReapStaleGenerations(ctx, generationHeartbeatTimeout, generateTimeout())
 	if err != nil {
 		slog.Error("reap stale generations failed", "error", err)
 	} else if n > 0 {

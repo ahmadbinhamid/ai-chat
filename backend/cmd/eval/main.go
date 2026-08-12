@@ -68,7 +68,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("database connection failed: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	var generator *ai.Generator
 	if cfg.AIProvider == "deepseek" {
@@ -77,7 +77,10 @@ func main() {
 		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
 	}
 	if err != nil {
-		log.Fatalf("ai.New failed: %v", err)
+		// One-shot CLI command exiting the whole process — the OS reclaims
+		// conn's fd regardless of whether this function's own defer got a
+		// chance to run first.
+		log.Fatalf("ai.New failed: %v", err) //nolint:gocritic // process exit reclaims conn's fd either way
 	}
 	store := themefs.NewStore(cfg.FlowposAPIBase)
 

@@ -78,7 +78,7 @@ func create(tableName string) {
 		fmt.Fprintln(os.Stderr, "could not create migration file:", err)
 		os.Exit(1)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	// The init() makes the file register itself with the runner on import.
 	content := fmt.Sprintf(`package migrations
@@ -110,28 +110,28 @@ func Down_%s(db *sql.DB) error {
 
 	if _, err := file.WriteString(content); err != nil {
 		fmt.Fprintln(os.Stderr, "could not write migration file:", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic // process exit reclaims file's fd either way
 	}
 	fmt.Println("created:", filepath.Join(migrationsDir, filename))
 }
 
 func run() {
 	conn := connect()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := migrator.Run(conn); err != nil {
 		fmt.Fprintln(os.Stderr, "migration failed:", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic // process exit reclaims conn's fd either way
 	}
 }
 
 func fresh() {
 	conn := connect()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := migrator.Fresh(conn); err != nil {
 		fmt.Fprintln(os.Stderr, "fresh failed:", err)
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic // process exit reclaims conn's fd either way
 	}
 }
 

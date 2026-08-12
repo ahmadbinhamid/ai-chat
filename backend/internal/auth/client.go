@@ -108,9 +108,9 @@ func (c *Client) Introspect(ctx context.Context, token string) (*IntrospectResul
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrUpstreamUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", ErrUpstreamUnavailable, err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 
 	if res.StatusCode == http.StatusUnauthorized {
 		return nil, ErrUnauthorized
@@ -121,7 +121,7 @@ func (c *Client) Introspect(ctx context.Context, token string) (*IntrospectResul
 
 	var wire wireResponse
 	if err := json.NewDecoder(res.Body).Decode(&wire); err != nil {
-		return nil, fmt.Errorf("%w: malformed response body: %v", ErrUpstreamUnavailable, err)
+		return nil, fmt.Errorf("%w: malformed response body: %w", ErrUpstreamUnavailable, err)
 	}
 
 	result := &IntrospectResult{

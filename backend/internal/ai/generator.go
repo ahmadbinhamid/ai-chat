@@ -141,7 +141,7 @@ func New(apiKey, baseURL, model, effort string, maxTokens int64) (*Generator, er
 	}
 	return &Generator{
 		client:    anthropic.NewClient(opts...),
-		model:     anthropic.Model(model),
+		model:     model,
 		effort:    anthropic.OutputConfigEffort(effort),
 		maxTokens: maxTokens,
 	}, nil
@@ -187,8 +187,8 @@ func (g *Generator) fakeGenerate(ctx context.Context, prompt string) (*Result, e
 // (an httptest.Server standing in for the Anthropic API) — used only by
 // this package's own tests, which need to drive the tool loop against a
 // fake server rather than the real Claude API.
-func newTestGenerator(client anthropic.Client, model string) *Generator {
-	return &Generator{client: client, model: model, effort: anthropic.OutputConfigEffortMedium, maxTokens: defaultMaxTokens}
+func newTestGenerator(client anthropic.Client) *Generator {
+	return &Generator{client: client, model: "claude-test", effort: anthropic.OutputConfigEffortMedium, maxTokens: defaultMaxTokens}
 }
 
 // resultSchema is propose_changes' input_schema (see tools.go) — the same
@@ -267,7 +267,7 @@ var resultSchema = map[string]any{
 // reject both with a 400 ("adaptive thinking is not supported on this
 // model"), unlike every Opus/Sonnet-tier model this service targets.
 func modelSupportsAdaptiveThinking(model anthropic.Model) bool {
-	return !strings.Contains(strings.ToLower(string(model)), "haiku")
+	return !strings.Contains(strings.ToLower(model), "haiku")
 }
 
 // maxToolIterations bounds the read/explore loop before Generate gives up —

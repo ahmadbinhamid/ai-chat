@@ -91,7 +91,7 @@ func (r *Repository) ListFilesByChat(ctx context.Context, chatID string) ([]Gene
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var files []GeneratedFile
 	for rows.Next() {
@@ -133,7 +133,7 @@ func (r *Repository) DraftFiles(ctx context.Context, chatID string) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	draft := make(map[string]string)
 	for rows.Next() {
@@ -161,7 +161,7 @@ func (r *Repository) PendingFiles(ctx context.Context, chatID string) ([]Generat
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var files []GeneratedFile
 	for rows.Next() {
@@ -219,7 +219,7 @@ func (r *Repository) ListAppliedFilesByChat(ctx context.Context, chatID string) 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var files []GeneratedFile
 	for rows.Next() {
