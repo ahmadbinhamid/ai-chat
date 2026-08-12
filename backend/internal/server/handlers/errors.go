@@ -29,8 +29,16 @@ func respondErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, chat.ErrNotFound), errors.Is(err, themebuild.ErrNotFound):
 		httpresponse.Error(c, http.StatusNotFound, err.Error(), "NOT_FOUND")
-	case errors.Is(err, themebuild.ErrGenerationInProgress), errors.Is(err, themebuild.ErrRevertBlockedByRunningGeneration):
+	// themebuild.ErrGenerationInProgress itself is no longer one of the
+	// cases here — Generate never returns it anymore (a prompt that can't
+	// run immediately queues instead of being rejected, see Generate's doc
+	// comment), and nothing else surfaces it to a handler either. The
+	// GENERATION_IN_PROGRESS code lives on purely for revert's still-valid
+	// "can't revert while something is writing to this theme" case.
+	case errors.Is(err, themebuild.ErrRevertBlockedByRunningGeneration):
 		httpresponse.Error(c, http.StatusConflict, err.Error(), "GENERATION_IN_PROGRESS")
+	case errors.Is(err, themebuild.ErrQueueFull):
+		httpresponse.Error(c, http.StatusTooManyRequests, err.Error(), "QUEUE_FULL")
 	default:
 		slog.Default().Error("unhandled request error", "error", err.Error(), "request_id", logging.RequestID(c))
 		httpresponse.Error(c, http.StatusInternalServerError, "an unexpected error occurred", "")

@@ -87,6 +87,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	revertHandler := handlers.NewRevertHandler(buildSvc)
 	previewHandler := handlers.NewPreviewHandler(buildSvc)
 	themeHandler := handlers.NewThemeHandler(buildSvc)
+	queueHandler := handlers.NewQueueHandler(buildSvc)
 
 	r := gin.New()
 	r.Use(gin.Recovery(), logging.Middleware(logger))
@@ -100,6 +101,10 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	if len(cfg.CORSAllowedOrigins) > 0 {
 		r.Use(cors.New(cors.Config{
 			AllowOrigins: cfg.CORSAllowedOrigins,
+			// DELETE is needed for DELETE /chats/:chatId/queue/:generationId
+			// (cancelling a queued prompt) — without it here, the browser's
+			// CORS preflight for that route fails before the request itself
+			// is even sent.
 			AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete},
 			// Authorization carries the FlowPOS bearer token internal/auth
 			// forwards upstream; X-Tenant-Id is the optional tenant-switch
@@ -132,6 +137,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	identified.GET("/chat/status", chatHandler.Status)
 	identified.POST("/chats/messages", messageHandler.Send)
 	identified.POST("/chats/:chatId/messages/:messageId/revert", revertHandler.Revert)
+	identified.DELETE("/chats/:chatId/queue/:generationId", queueHandler.Cancel)
 	identified.POST("/themes/:slug/preview", previewHandler.Preview)
 	identified.POST("/themes", themeHandler.Create)
 

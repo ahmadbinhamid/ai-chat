@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/modules/chat"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -15,40 +16,115 @@ import (
 // Generation is one row of the generations table — a single background
 // Generate call's durable state (phase 3a), replacing the old in-memory
 // generationTracker so it survives a pod restart and works across more
-// than one replica.
+// than one replica. Extended (see the queueing brief) to double as a
+// queued row's own memory of what it was asked to do: a queued generation
+// can sit for a while before DequeueNext promotes it, well after the HTTP
+// request that created it is gone, so Prompt/ThemeSlug/Mode/UserMessageID
+// have to be readable back off the row itself rather than carried in a
+// captured GenerateInput (see Service.Generate/runGeneration).
 type Generation struct {
-	ID         string
-	ChatID     string
-	TenantID   uint64
-	Status     string // "running" | "succeeded" | "failed"
-	Error      *string
-	Attempts   int
-	StartedAt  time.Time
+	ID       string
+	ChatID   string
+	TenantID uint64
+	Status   string // "queued" | "running" | "succeeded" | "failed" | "cancelled"
+	Error    *string
+	Attempts int
+	// Prompt/UserMessageID/ThemeSlug/Mode are set at enqueue time and read
+	// back by runGeneration when this row is dequeued. UserMessageID points
+	// at the chat_messages row RecordUserMessage already wrote when the
+	// prompt was accepted (see Generate) — nil only for rows seeded outside
+	// the normal Generate path (existing tests using StartGeneration
+	// directly). The bearer token needed to actually run this generation is
+	// deliberately NOT one of these fields — see pendingTokens' doc comment
+	// in service.go for why it never touches this table.
+	Prompt        string
+	UserMessageID *string
+	ThemeSlug     string
+	Mode          string
+	// QueuedAt is nil for a row seeded directly as "running" (existing
+	// tests) and set for every row that ever went through EnqueueGeneration.
+	QueuedAt *time.Time
+	// StartedAt is nil until DequeueNext promotes this row to running —
+	// a queued row hasn't started yet, so this can no longer be a plain
+	// time.Time (see the 20260812000001 migration).
+	StartedAt  *time.Time
 	FinishedAt *time.Time
 }
 
 const (
+	GenerationStatusQueued    = "queued"
 	GenerationStatusRunning   = "running"
 	GenerationStatusSucceeded = "succeeded"
 	GenerationStatusFailed    = "failed"
+	GenerationStatusCancelled = "cancelled"
 )
 
 // mysqlDuplicateKeyErrNumber is MySQL's error code for a unique-constraint
 // violation (ER_DUP_ENTRY) — used to tell "a generation is already running
 // for this chat" (the uniq_generations_running_chat index rejecting a
-// second insert) apart from any other insert failure.
+// second insert/update) apart from any other insert/update failure.
 const mysqlDuplicateKeyErrNumber = 1062
 
-// StartGeneration inserts a new running generation row for chatID.
-// ErrGenerationInProgress is returned (not a raw DB error) if one is
-// already running — the uniq_generations_running_chat virtual-column index
-// is what actually enforces this atomically, closing the race an in-memory
-// map + mutex could only close within one process.
+// generationColumns is the column list scanGeneration expects, in order —
+// shared by every SELECT in this file so a column can't be added to one
+// query and silently missed by scanGeneration's positional Scan in another.
+const generationColumns = `
+	id, chat_id, tenant_id, status, error, attempts,
+	prompt, user_message_id, theme_slug, mode, queued_at, started_at, finished_at
+`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanGeneration reads one generationColumns row from either a *sql.Row or
+// mid-iteration *sql.Rows (both satisfy rowScanner) — shared by every
+// method in this file that returns a Generation, so the nullable-column
+// handling (error/user_message_id/queued_at/started_at/finished_at) is
+// written exactly once.
+func scanGeneration(s rowScanner) (Generation, error) {
+	var g Generation
+	var errMsg, userMessageID sql.NullString
+	var queuedAt, startedAt, finishedAt sql.NullTime
+
+	err := s.Scan(&g.ID, &g.ChatID, &g.TenantID, &g.Status, &errMsg, &g.Attempts,
+		&g.Prompt, &userMessageID, &g.ThemeSlug, &g.Mode, &queuedAt, &startedAt, &finishedAt)
+	if err != nil {
+		return Generation{}, err
+	}
+	if errMsg.Valid {
+		g.Error = &errMsg.String
+	}
+	if userMessageID.Valid {
+		g.UserMessageID = &userMessageID.String
+	}
+	if queuedAt.Valid {
+		g.QueuedAt = &queuedAt.Time
+	}
+	if startedAt.Valid {
+		g.StartedAt = &startedAt.Time
+	}
+	if finishedAt.Valid {
+		g.FinishedAt = &finishedAt.Time
+	}
+	return g, nil
+}
+
+// StartGeneration inserts a new running generation row for chatID directly
+// — bypassing the queue entirely. Kept for the tests that seed a "something
+// is already running" state directly (see e.g. generation_test.go) and as
+// the one place a running row can be created with no prior queued row.
+// Everyday traffic no longer calls this (see Service.Generate, which always
+// enqueues first) — ErrGenerationInProgress is returned (not a raw DB
+// error) if one is already running, the same as before this became one of
+// two ways into "running": the uniq_generations_running_chat virtual-column
+// index is what actually enforces this atomically, closing the race an
+// in-memory map + mutex could only close within one process.
 func (r *Repository) StartGeneration(ctx context.Context, id, chatID string, tenantID uint64) error {
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, started_at)
-		VALUES (?, ?, ?, ?, 0, ?)
-	`, id, chatID, tenantID, GenerationStatusRunning, time.Now().UTC())
+		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?)
+	`, id, chatID, tenantID, GenerationStatusRunning, "", time.Now().UTC())
 	if err != nil {
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlDuplicateKeyErrNumber {
@@ -57,6 +133,195 @@ func (r *Repository) StartGeneration(ctx context.Context, id, chatID string, ten
 		return err
 	}
 	return nil
+}
+
+// maxQueueDepth caps how many pending (running + queued) generations one
+// chat may have at once. Independent of internal/ratelimit, which bounds
+// how *fast* new generations can be enqueued — this bounds how many can be
+// waiting at once, so a merchant holding Enter can't queue an unbounded
+// number of Opus calls even while comfortably inside the rate limit.
+const maxQueueDepth = 10
+
+// ErrQueueFull means chatID already has maxQueueDepth pending generations —
+// the caller should reject the new prompt (429) rather than let the queue
+// grow without bound.
+var ErrQueueFull = errors.New("this chat already has the maximum number of pending generations queued")
+
+// EnqueueGeneration inserts a queued row for g.ChatID (g.ID must already be
+// set by the caller — see Service.Generate) and returns how many
+// generations (running + queued) were already ahead of it, so the caller
+// can tell the merchant their position. Runs inside a transaction that
+// locks chatID's existing pending rows for its duration (SELECT ... FOR
+// UPDATE): without that, two enqueues racing right at maxQueueDepth could
+// both read "9 pending" and both insert, blowing past the cap — the same
+// class of race uniq_generations_running_chat exists to close for the
+// running-row case, just enforced here at the application level since
+// "at most 10" isn't expressible as a unique index.
+func (r *Repository) EnqueueGeneration(ctx context.Context, g Generation) (position int, err error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var pending int
+	err = tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM generations
+		WHERE chat_id = ? AND status IN (?, ?)
+		FOR UPDATE
+	`, g.ChatID, GenerationStatusRunning, GenerationStatusQueued).Scan(&pending)
+	if err != nil {
+		return 0, err
+	}
+	if pending >= maxQueueDepth {
+		return 0, ErrQueueFull
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO generations
+			(id, chat_id, tenant_id, status, attempts, prompt, user_message_id, theme_slug, mode, queued_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, g.UserMessageID, g.ThemeSlug, g.Mode, time.Now().UTC())
+	if err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return pending, nil
+}
+
+// DequeueNext atomically promotes chatID's oldest queued row to running and
+// returns it. queued_at is a DATETIME with only second-level precision, so
+// two prompts enqueued in the same second would tie on it alone — id (a
+// UUID, unrelated to arrival order but stable and unique) breaks the tie
+// deterministically instead of leaving it to whatever order MySQL happens
+// to visit matching rows in. revert.go documents this exact class of hazard
+// for chat_generated_files (a wrong answer there is worse than a
+// non-chronological tie-break here); this is the fix for the same hazard
+// in this table, not a reintroduction of it.
+//
+// Returns ErrNotFound when the queue is empty. Returns
+// ErrGenerationInProgress if something is already running — the UPDATE
+// below would itself violate uniq_generations_running_chat in that case,
+// which is a normal race outcome across replicas each racing to drain the
+// same chat's queue, not a failure worth logging loudly.
+func (r *Repository) DequeueNext(ctx context.Context, chatID string) (Generation, error) {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE generations
+		SET status = ?, started_at = ?
+		WHERE chat_id = ? AND status = ?
+		ORDER BY queued_at, id
+		LIMIT 1
+	`, GenerationStatusRunning, time.Now().UTC(), chatID, GenerationStatusQueued)
+	if err != nil {
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlDuplicateKeyErrNumber {
+			return Generation{}, ErrGenerationInProgress
+		}
+		return Generation{}, err
+	}
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return Generation{}, err
+	}
+	if n == 0 {
+		return Generation{}, ErrNotFound
+	}
+
+	// MySQL has no UPDATE ... RETURNING, so the promoted row is fetched by
+	// a follow-up read. Safe to assume there's exactly one running row for
+	// chatID: uniq_generations_running_chat guarantees it, and the UPDATE
+	// above just either created that row or failed outright.
+	row := r.db.QueryRowContext(ctx, `
+		SELECT `+generationColumns+`
+		FROM generations WHERE chat_id = ? AND status = ? LIMIT 1
+	`, chatID, GenerationStatusRunning)
+	return scanGeneration(row)
+}
+
+// CancelQueued cancels one queued row. Never touches a running row —
+// cancelling mid-generation is a different, harder feature and is out of
+// scope (see the queueing brief); a generationID that names a running (or
+// already finished) row simply matches nothing here and comes back as
+// ErrNotFound, same as a generationID that doesn't exist at all.
+func (r *Repository) CancelQueued(ctx context.Context, chatID, generationID string) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE generations SET status = ?, finished_at = ?
+		WHERE id = ? AND chat_id = ? AND status = ?
+	`, GenerationStatusCancelled, time.Now().UTC(), generationID, chatID, GenerationStatusQueued)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ListPending returns the running row (if any) plus every queued row for
+// chatID, oldest first — for GET /chat and the stream's initial state.
+// Ordering by queued_at/id alone (no explicit "running first") is
+// deliberate and correct, not an oversight: DequeueNext always promotes
+// whichever pending row has the smallest queued_at, so the running row (if
+// any) necessarily already has the smallest queued_at among every row this
+// query returns.
+func (r *Repository) ListPending(ctx context.Context, chatID string) ([]Generation, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT `+generationColumns+`
+		FROM generations
+		WHERE chat_id = ? AND status IN (?, ?)
+		ORDER BY queued_at, id
+	`, chatID, GenerationStatusRunning, GenerationStatusQueued)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var gens []Generation
+	for rows.Next() {
+		g, err := scanGeneration(rows)
+		if err != nil {
+			return nil, err
+		}
+		gens = append(gens, g)
+	}
+	return gens, rows.Err()
+}
+
+// ChatsWithOrphanedQueues returns chat IDs that have queued rows but
+// nothing running — used by the reaper to restart a queue stalled by a
+// dead pod (see Service.reapOrphanedQueues): without this, nothing running
+// means no drain loop exists anywhere to ever dequeue them again.
+func (r *Repository) ChatsWithOrphanedQueues(ctx context.Context) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT DISTINCT q.chat_id
+		FROM generations q
+		WHERE q.status = ?
+		AND NOT EXISTS (
+			SELECT 1 FROM generations r WHERE r.chat_id = q.chat_id AND r.status = ?
+		)
+	`, GenerationStatusQueued, GenerationStatusRunning)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var chatIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		chatIDs = append(chatIDs, id)
+	}
+	return chatIDs, rows.Err()
 }
 
 // EndGeneration marks chatID's running generation as finished — succeeded
@@ -71,8 +336,17 @@ func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr er
 		// Never store the raw error — it can contain the backing AI
 		// provider's name/URL/request ID, and this column feeds
 		// GenerationStatus -> chat.go's generation_error, which a merchant
-		// can see. See ai.SanitizeError's doc comment.
+		// can see. See ai.SanitizeError's doc comment. errSessionExpired
+		// (see service.go) is already merchant-safe as-is and passes
+		// through SanitizeError's default branch unchanged in spirit, but
+		// callers that already produced a merchant-safe message (doGenerate,
+		// recordGenerationFailure) pass it through genErr here too — this
+		// column always stores whatever was already shown, never a second,
+		// possibly-differing rendering of it.
 		msg := ai.SanitizeError(genErr)
+		if errors.Is(genErr, errSessionExpired) {
+			msg = errSessionExpired.Error()
+		}
 		errMsg = &msg
 	}
 	_, err := r.db.ExecContext(ctx, `
@@ -95,14 +369,19 @@ func (r *Repository) SetGenerationAttempts(ctx context.Context, chatID string, a
 
 // GetGeneration returns chatID's most recently started generation, or
 // ErrNotFound if the chat has never had one — a normal state for a chat
-// that hasn't sent a first message yet.
+// that hasn't sent a first message yet. started_at DESC still puts the
+// most recently *started* row first now that it's nullable: MySQL sorts
+// NULL as the smallest value, so a never-started (queued-only) row sorts
+// last, never ahead of a row that has actually run. queued_at DESC is a
+// secondary tie-break for the all-queued case (a chat whose only rows are
+// still waiting), so this stays deterministic instead of falling back to
+// unspecified row order.
 func (r *Repository) GetGeneration(ctx context.Context, chatID string) (Generation, error) {
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, chat_id, tenant_id, status, error, attempts, started_at, finished_at
-		FROM generations WHERE chat_id = ? ORDER BY started_at DESC LIMIT 1
+		SELECT `+generationColumns+`
+		FROM generations WHERE chat_id = ? ORDER BY started_at DESC, queued_at DESC LIMIT 1
 	`, chatID)
-	var g Generation
-	err := row.Scan(&g.ID, &g.ChatID, &g.TenantID, &g.Status, &g.Error, &g.Attempts, &g.StartedAt, &g.FinishedAt)
+	g, err := scanGeneration(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Generation{}, ErrNotFound
 	}
@@ -153,12 +432,68 @@ func (s *Service) RunReaper(ctx context.Context) {
 }
 
 func (s *Service) reapOnce(ctx context.Context) {
-	n, err := s.repo.ReapStaleGenerations(ctx, generateTimeout)
+	n, err := s.repo.ReapStaleGenerations(ctx, generateTimeout())
 	if err != nil {
 		slog.Error("reap stale generations failed", "error", err)
+	} else if n > 0 {
+		slog.Warn("reaped stale generations", "count", n)
+	}
+
+	s.reapOrphanedQueues(ctx)
+}
+
+// reapOrphanedQueues restarts any chat whose queue was stranded by a dead
+// pod: nothing running for that chat means no process anywhere has a
+// runGeneration drain loop alive to ever dequeue its queued rows again
+// (see ChatsWithOrphanedQueues). Actually resuming those prompts would need
+// a bearer token, and this reaper — like any process that didn't originally
+// accept the HTTP request — has none (see pendingTokens' doc comment in
+// service.go). Properly resuming them would need a service-account
+// credential distinct from any one merchant's session, which is a larger
+// design decision than this feature makes; until that exists, this fails
+// every orphaned row with the same session-expired message a normal queued
+// row gets when its own token is missing, so the merchant sees a clear
+// "send it again" instead of a prompt that silently never runs.
+func (s *Service) reapOrphanedQueues(ctx context.Context) {
+	chatIDs, err := s.repo.ChatsWithOrphanedQueues(ctx)
+	if err != nil {
+		slog.Error("failed to list chats with orphaned queues", "error", err)
 		return
 	}
-	if n > 0 {
-		slog.Warn("reaped stale generations", "count", n)
+	for _, chatID := range chatIDs {
+		s.failOrphanedQueue(ctx, chatID)
+	}
+}
+
+// failOrphanedQueue drains chatID's entire stranded queue, failing each row
+// in turn — not just the first one — so a chat with several queued prompts
+// doesn't have its later prompts silently left behind once the first is
+// dealt with.
+func (s *Service) failOrphanedQueue(ctx context.Context, chatID string) {
+	for {
+		g, err := s.repo.DequeueNext(ctx, chatID)
+		if errors.Is(err, ErrNotFound) {
+			return
+		}
+		if errors.Is(err, ErrGenerationInProgress) {
+			// A live pod claimed the running slot between
+			// ChatsWithOrphanedQueues' read and now — this chat isn't
+			// actually orphaned anymore, its own drain loop owns the rest.
+			return
+		}
+		if err != nil {
+			slog.Error("failed to dequeue an orphaned generation", "chat_id", chatID, "error", err)
+			return
+		}
+
+		// Built directly from the generation row rather than looked up
+		// through chat.Service: RecordAssistantMessage only ever reads
+		// c.ID/c.TenantID, and a reaper sweep has no tenant-scoped request
+		// to look the chat up through in the first place.
+		c := chat.Chat{ID: chatID, TenantID: g.TenantID}
+		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
+		if endErr := s.repo.EndGeneration(ctx, chatID, errSessionExpired); endErr != nil {
+			slog.Error("failed to record generation end for an orphaned queue", "chat_id", chatID, "error", endErr)
+		}
 	}
 }

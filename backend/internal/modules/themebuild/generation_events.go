@@ -33,7 +33,38 @@ const (
 	EventTypeRepairing   = "repairing"
 	EventTypeDone        = "done"
 	EventTypeFailed      = "failed"
+	// EventTypeQueued is emitted once, from Generate, when a new prompt
+	// loses the race to claim the running slot — payload:
+	// {position, prompt_preview}.
+	EventTypeQueued = "queued"
+	// EventTypeDequeued is emitted at the top of each drain-loop iteration
+	// (see Service.runGeneration) — this generation is now the one running.
+	// No payload: a reconnecting client only needs to know *that* it
+	// started, everything else (prompt, etc.) it already has from the
+	// earlier "queued" event for this same generation_id.
+	EventTypeDequeued = "dequeued"
+	// EventTypeCancelled is emitted from the cancel handler when a merchant
+	// cancels a still-queued prompt. No payload.
+	EventTypeCancelled = "cancelled"
 )
+
+// maxPromptPreviewChars bounds EventTypeQueued's prompt_preview field.
+// AppendGenerationEvent runs a trim DELETE with a correlated subquery after
+// every insert (see its doc comment) — a full prompt in every queued event
+// would make that scan heavier for no benefit, since the full prompt is
+// already durably stored on the generations row itself (see generation.go).
+const maxPromptPreviewChars = 80
+
+// PromptPreview truncates prompt to maxPromptPreviewChars runes (not
+// bytes — a prompt can contain multi-byte characters, and slicing by byte
+// count risks cutting one in half) for EventTypeQueued's payload.
+func PromptPreview(prompt string) string {
+	r := []rune(prompt)
+	if len(r) <= maxPromptPreviewChars {
+		return prompt
+	}
+	return string(r[:maxPromptPreviewChars])
+}
 
 // maxGenerationEventsPerChat is "keep the last 200 per chat" — trimmed
 // after every insert. Generations emit a handful of events each, so this

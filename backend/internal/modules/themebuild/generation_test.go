@@ -129,9 +129,9 @@ func TestGenerationRepository_ReapStaleGenerations(t *testing.T) {
 	genID := uuid.NewString()
 
 	if _, err := conn.ExecContext(ctx, `
-		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, started_at)
-		VALUES (?, ?, 1, ?, 0, ?)
-	`, genID, chatID, GenerationStatusRunning, time.Now().UTC().Add(-10*time.Minute)); err != nil {
+		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at)
+		VALUES (?, ?, 1, ?, 0, ?, ?)
+	`, genID, chatID, GenerationStatusRunning, "", time.Now().UTC().Add(-10*time.Minute)); err != nil {
 		t.Fatalf("failed to seed a stale running generation: %v", err)
 	}
 

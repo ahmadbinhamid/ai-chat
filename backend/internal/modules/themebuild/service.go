@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ai-chat/internal/ai"
@@ -33,15 +34,6 @@ const (
 	// use case sharing the same tenant.
 	ChatType = "builder"
 
-	// generateTimeout bounds runGeneration's background work (see Generate,
-	// which returns to the HTTP caller long before this deadline matters) —
-	// not unbounded, but generous enough for a full-site redesign at high
-	// effort, which can legitimately run close to an hour. Also reused as
-	// the staleness threshold for reaping abandoned "in progress" rows (see
-	// ReapStaleGenerations) — raising this means a truly stuck generation
-	// stays marked in-progress that much longer before being cleaned up.
-	generateTimeout = 65 * time.Minute
-
 	// maxThemeCheckRetries bounds how many times a proposal themecheck
 	// rejects is sent back to the model with its findings before doGenerate
 	// gives up — up to maxThemeCheckRetries+1 total Generate calls (the
@@ -50,6 +42,32 @@ const (
 
 	pathDefaultsJSON = "defaults.json"
 )
+
+// generateTimeoutNanos backs generateTimeout()/setGenerateTimeoutForTest —
+// an atomic.Int64 (nanoseconds), not a plain time.Duration var: production
+// code never writes it, but TestRunGeneration_EachIterationGetsFreshTimeout
+// does, from the test goroutine, concurrently with background drain-loop
+// goroutines reading it (see runOneQueuedGeneration) — a plain var would be
+// a genuine, race-detector-flagged data race between the two, even though
+// in practice the write always happens well outside any window a
+// background goroutine is reading it.
+var generateTimeoutNanos = func() *atomic.Int64 {
+	var v atomic.Int64
+	// 65 minutes: not unbounded, but generous enough for a full-site
+	// redesign at high effort, which can legitimately run close to an hour.
+	// Also reused as the staleness threshold for reaping abandoned
+	// "in progress" rows (see ReapStaleGenerations) — raising this means a
+	// truly stuck generation stays marked in-progress that much longer
+	// before being cleaned up.
+	v.Store(int64(65 * time.Minute))
+	return &v
+}()
+
+// generateTimeout bounds one drain-loop iteration's background work — see
+// runOneQueuedGeneration, which gives every queued generation its own fresh
+// context.WithTimeout(ctx, generateTimeout()) rather than sharing one
+// budget across a whole queue.
+func generateTimeout() time.Duration { return time.Duration(generateTimeoutNanos.Load()) }
 
 // generator is the subset of *ai.Generator's behavior Service depends on —
 // letting tests substitute a fake that never calls the real Claude API,
@@ -77,6 +95,7 @@ type Service struct {
 	store      *themefs.Store
 	themeLocks *keyedMutex
 	bus        eventBus // redisEventBus if REDIS_URL was configured, inProcessEventBus otherwise — see eventEmitter
+	tokens     *pendingTokens
 }
 
 // NewService wires the service's dependencies. rdb may be nil (see
@@ -98,15 +117,77 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		store:      store,
 		themeLocks: newKeyedMutex(),
 		bus:        bus,
+		tokens:     newPendingTokens(),
 	}
+}
+
+// pendingTokens holds each queued generation's bearer token in memory only,
+// keyed by generation ID — never in the generations table (see the
+// 20260812000001 migration's doc comment): a bearer token in a DB column is
+// a credential-at-rest problem, and a prompt queued behind several others
+// may not run for many minutes, by which time flowpos-backend may no longer
+// accept it anyway.
+//
+// Keyed by generation ID rather than owned by whichever goroutine happens
+// to call DequeueNext: two requests racing to claim an empty running slot
+// (see Generate) can result in either one's DequeueNext call promoting
+// *either* request's own enqueued row — the token has to travel with the
+// row that actually gets promoted, not with whichever caller won the race
+// to promote something. store is called once per accepted prompt (Generate);
+// take is called once per drain-loop iteration (runGeneration) and removes
+// the entry — a queued generation only ever runs once, a failure is never
+// retried (see runOneQueuedGeneration), so there is nothing to keep it
+// around for afterward.
+//
+// On a pod restart this map is empty. A queued row that survives in the
+// database (queued rows are just data) has no entry here anymore — take
+// reports that exactly like an expired token, which is the correct
+// treatment: see runOneQueuedGeneration and reapOrphanedQueues, which hits
+// the identical "no token" path for the same reason after a crash.
+type pendingTokens struct {
+	mu     sync.Mutex
+	tokens map[string]string
+}
+
+func newPendingTokens() *pendingTokens {
+	return &pendingTokens{tokens: make(map[string]string)}
+}
+
+func (p *pendingTokens) store(generationID, token string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tokens[generationID] = token
+}
+
+// take returns generationID's token and whether one was found, removing it
+// either way.
+func (p *pendingTokens) take(generationID string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	token, ok := p.tokens[generationID]
+	delete(p.tokens, generationID)
+	return token, ok
+}
+
+// discard drops generationID's token without returning it — used when a
+// queued generation is cancelled (see QueueService.Cancel) before it ever
+// gets a chance to run, so the map doesn't hold a stale entry until process
+// exit.
+func (p *pendingTokens) discard(generationID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.tokens, generationID)
 }
 
 // ErrGenerationInProgress means the tenant's chat already has a background
 // generation running — see the generations table (phase 3a) and
-// Repository.StartGeneration. The caller should reject the new request
-// (409) rather than starting a second concurrent Claude call for the same
-// chat, which would race the first one's disk writes and double-bill the
-// tenant for one prompt.
+// Repository.StartGeneration/DequeueNext. Generate itself never returns
+// this anymore: a prompt that can't run immediately is queued instead of
+// rejected (see Generate's doc comment). It's now purely an internal signal
+// between DequeueNext and its callers (Generate, runGeneration,
+// reapOrphanedQueues) for "something is already running, this dequeue
+// attempt legitimately lost the race" — never surfaced to a caller as an
+// error to react to.
 var ErrGenerationInProgress = errors.New("a generation is already in progress for this chat")
 
 // GenerateInput is one merchant prompt, always against the tenant's one
@@ -138,19 +219,28 @@ type GenerateInput struct {
 }
 
 // GenerateOutcome is the immediate (synchronous) result of accepting a
-// prompt: the chat and the user's own recorded message. AssistantMessage
-// and Files are always nil here — Generate now returns as soon as the
-// prompt is recorded and a background generation has been kicked off (see
-// Generate's doc comment), not once Claude has actually replied. The real
-// outcome (a new assistant message, generated files, or an error) arrives
-// later — the caller polls GET /chat, which reports whether a generation
-// is still running (see GenerationStatus) and surfaces the new history once
-// it's done.
+// prompt: the chat, the user's own recorded message, and where this
+// prompt's generation landed in line. AssistantMessage and Files are always
+// nil here — Generate now returns as soon as the prompt is recorded and
+// either kicked off or queued (see Generate's doc comment), not once Claude
+// has actually replied. The real outcome (a new assistant message,
+// generated files, or an error) arrives later — the caller polls GET
+// /chat, which reports the pending queue (see ListPending) and surfaces the
+// new history once each turn is done.
 type GenerateOutcome struct {
 	Chat             chat.Chat
 	UserMessage      chat.Message
 	AssistantMessage *chat.Message
 	Files            []GeneratedFile
+	// QueuePosition is how many generations (running + queued) were ahead
+	// of this one at the moment it was accepted — 0 means it was dequeued
+	// immediately and is the one running now.
+	QueuePosition int
+	// GenerationID is the row this prompt is tracked under — the caller
+	// needs it to cancel a queued prompt (DELETE /chats/:chatId/queue/
+	// :generationId) or to correlate it with the "queued"/"dequeued"/
+	// "done"/"failed" events it'll see on the stream.
+	GenerationID string
 }
 
 // Generate resolves (or creates) the chat, records the prompt, and returns
@@ -164,8 +254,34 @@ type GenerateOutcome struct {
 // flaky mobile connection, even the browser backgrounding the tab — can be
 // trusted to keep one HTTP request alive that long. Every request this
 // service handles now finishes in milliseconds; the caller learns the
-// actual result by polling GET /chat's `generating`/`generation_error`
-// fields (see GenerationStatus) instead of waiting on this call's response.
+// actual result by polling GET /chat's `queue` field instead of waiting on
+// this call's response.
+//
+// Prompts queue and run one at a time, in order, never in parallel: a
+// second prompt usually depends on the first's result ("now make that
+// header blue"), and themeLocks/uniq_generations_running_chat both exist
+// specifically to prevent two writers touching the same theme at once. So
+// this never returns ErrGenerationInProgress anymore — a prompt that can't
+// run immediately is queued instead of rejected:
+//
+//  1. Record the user's message immediately, unconditionally — the
+//     merchant's prompt appears in the transcript the moment they hit send,
+//     whether or not it runs right now. This is the reverse of the old
+//     ordering (record-then-claim used to be claim-then-record): enqueueing
+//     below can't fail with "already running" the way StartGeneration used
+//     to, so there's no slot to release if RecordUserMessage had come first
+//     and something after it failed.
+//  2. Enqueue a "queued" row carrying everything a later, detached
+//     runGeneration call will need to actually run this turn (see the
+//     Generation struct) — everything except the bearer token, which is
+//     kept in memory only (see pendingTokens).
+//  3. Try to immediately dequeue the oldest pending row for this chat. If
+//     that succeeds, this prompt (or, in a rare race with another request
+//     for the same chat, whichever prompt actually was oldest) starts
+//     running right now. If something is already running, this prompt just
+//     waits — the generation currently running will dequeue it in turn once
+//     it finishes (see runGeneration's drain loop), no extra work needed
+//     here.
 //
 // A model/infra failure, a rejected proposal, or a failure while writing to
 // the theme is never persisted as a chat turn — errors are request-scoped,
@@ -181,42 +297,134 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		return GenerateOutcome{}, err
 	}
 
-	genID := uuid.NewString()
-	if err := s.repo.StartGeneration(ctx, genID, c.ID, in.TenantID); err != nil {
-		if errors.Is(err, ErrGenerationInProgress) {
-			return GenerateOutcome{}, ErrGenerationInProgress
-		}
-		return GenerateOutcome{}, fmt.Errorf("start generation: %w", err)
-	}
-
 	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt)
 	if err != nil {
-		// Release the slot — nothing actually started. Best-effort: if this
-		// itself fails, the reaper cleans it up within a minute rather than
-		// leaving it stuck "running" forever.
-		if endErr := s.repo.EndGeneration(ctx, c.ID, nil); endErr != nil {
-			slog.Error("failed to release generation slot after a failed RecordUserMessage", "chat_id", c.ID, "error", endErr)
-		}
 		return GenerateOutcome{}, fmt.Errorf("record user message: %w", err)
 	}
 
-	// Detached from the caller's own request lifecycle (which is about to
-	// end the moment this function returns) but not unbounded: bounded by
-	// generateTimeout, matching the HTTP server's own writeTimeout.
-	go s.runGeneration(context.WithoutCancel(ctx), in, c, genID)
+	genID := uuid.NewString()
+	position, err := s.repo.EnqueueGeneration(ctx, Generation{
+		ID:            genID,
+		ChatID:        c.ID,
+		TenantID:      in.TenantID,
+		Prompt:        in.Prompt,
+		UserMessageID: &userMsg.ID,
+		ThemeSlug:     in.ThemeSlug,
+		Mode:          in.Mode,
+	})
+	if err != nil {
+		if errors.Is(err, ErrQueueFull) {
+			return GenerateOutcome{}, ErrQueueFull
+		}
+		return GenerateOutcome{}, fmt.Errorf("enqueue generation: %w", err)
+	}
 
-	return GenerateOutcome{Chat: c, UserMessage: userMsg}, nil
+	// Held in memory only — see pendingTokens' doc comment for why this
+	// never becomes a column on the row EnqueueGeneration just inserted.
+	s.tokens.store(genID, in.Token)
+
+	next, err := s.repo.DequeueNext(ctx, c.ID)
+	switch {
+	case err == nil:
+		// Detached from the caller's own request lifecycle (which is about
+		// to end the moment this function returns) but not unbounded: each
+		// drain-loop iteration gets its own generateTimeout budget (see
+		// runGeneration), matching the HTTP server's own writeTimeout.
+		go s.runGeneration(context.WithoutCancel(ctx), c, next)
+	case errors.Is(err, ErrGenerationInProgress):
+		// Something else is already running for this chat — nothing more
+		// to do here. That generation's own drain loop will dequeue this
+		// row once it finishes (see runGeneration).
+		emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
+		emitter.emit(ctx, EventTypeQueued, map[string]any{
+			"position": position, "prompt_preview": PromptPreview(in.Prompt),
+		})
+	default:
+		return GenerateOutcome{}, fmt.Errorf("dequeue next generation: %w", err)
+	}
+
+	return GenerateOutcome{Chat: c, UserMessage: userMsg, QueuePosition: position, GenerationID: genID}, nil
 }
 
-// runGeneration is Generate's actual work, run in the background — see
-// Generate's doc comment. Any error here is only ever recorded in the
-// generations table (see GenerationStatus), never as chat history: errors
-// are transient/request-scoped, same rule as before this became async.
-func (s *Service) runGeneration(ctx context.Context, in GenerateInput, c chat.Chat, genID string) {
-	workCtx, cancel := context.WithTimeout(ctx, generateTimeout)
+// runGeneration drains chatID's queue one generation at a time, starting
+// with g (the row DequeueNext already promoted to running to get here) and
+// continuing until the queue is empty. Without the loop, only g itself
+// would ever run — every prompt queued behind it would sit in the database
+// forever with nothing left to dequeue it, since nothing else calls
+// DequeueNext for a chat that already has something running.
+//
+// If g fails, the loop still continues to whatever's next: a failed
+// generation earlier in the queue is not a reason to auto-cancel later,
+// possibly-unrelated prompts the merchant queued behind it (see
+// runOneQueuedGeneration/doGenerate — a failure is always recorded as a
+// visible chat message, never silently swallowed).
+func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) {
+	for {
+		s.runOneQueuedGeneration(ctx, c, g)
+
+		next, err := s.repo.DequeueNext(ctx, c.ID)
+		if errors.Is(err, ErrNotFound) {
+			return // queue drained
+		}
+		if err != nil {
+			// Not ErrGenerationInProgress (this same loop is the only thing
+			// that can be running for c.ID right now — EndGeneration inside
+			// runOneQueuedGeneration always clears the running slot first)
+			// — a genuine DB error. The reaper's periodic sweep will pick
+			// this chat's queue back up as orphaned (see
+			// ChatsWithOrphanedQueues) rather than retrying it in a tight
+			// loop here.
+			slog.Error("failed to dequeue next generation; the reaper will restart this chat's queue", "chat_id", c.ID, "error", err)
+			return
+		}
+		g = next
+	}
+}
+
+// runOneQueuedGeneration runs a single already-dequeued (status=running)
+// generation to completion and records its outcome — one iteration of
+// runGeneration's drain loop.
+func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Generation) {
+	emitter := newEventEmitter(ctx, s.repo, s.bus, g.ID, c.ID)
+	emitter.emit(ctx, EventTypeDequeued, struct{}{})
+
+	token, ok := s.tokens.take(g.ID)
+	if !ok {
+		// No token in memory for this generation — either this process
+		// never served the request that enqueued it (a pod restart between
+		// enqueue and dequeue) or it's being restarted by the reaper's own
+		// orphaned-queue path (Part 4), which never had one to begin with.
+		// Either way there's no bearer token left to forward to FlowPOS, so
+		// this can't run — fail it with a message the merchant can act on
+		// instead of either silently dropping it or calling FlowPOS
+		// unauthenticated.
+		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
+		endCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.repo.EndGeneration(endCtx, c.ID, errSessionExpired); err != nil {
+			slog.Error("failed to record generation end", "chat_id", c.ID, "error", err)
+		}
+		return
+	}
+
+	in := GenerateInput{
+		TenantID:  g.TenantID,
+		Token:     token,
+		ThemeSlug: g.ThemeSlug,
+		Prompt:    g.Prompt,
+		Mode:      g.Mode,
+	}
+
+	// Each drain-loop iteration gets its own fresh timeout — one shared
+	// deadline across a queue of five prompts would starve the later ones
+	// of their fair share of generateTimeout, or worse, kill them
+	// mid-generation through no fault of their own. ctx itself is already
+	// context.WithoutCancel of the original request (see Generate), so it
+	// outlives any one HTTP call without being unbounded itself.
+	workCtx, cancel := context.WithTimeout(ctx, generateTimeout())
 	defer cancel()
 
-	err := s.doGenerate(workCtx, in, c, genID)
+	err := s.doGenerate(workCtx, in, c, g.ID)
 
 	// A deliberately fresh, short-lived context for this one bookkeeping
 	// write: workCtx may already be expired (a generation that hit
@@ -225,6 +433,30 @@ func (s *Service) runGeneration(ctx context.Context, in GenerateInput, c chat.Ch
 	defer endCancel()
 	if endErr := s.repo.EndGeneration(endCtx, c.ID, err); endErr != nil {
 		slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
+	}
+}
+
+// errSessionExpired is what a queued generation fails with when it has no
+// bearer token left to run with — see pendingTokens' doc comment. Sent to
+// the merchant close to verbatim (never through ai.SanitizeError, which is
+// for AI-provider failures and would mislabel this as one — see
+// doGenerate's use of it and recordGenerationFailure).
+var errSessionExpired = errors.New("your session expired before this prompt ran — send it again")
+
+// recordGenerationFailure appends a merchant-visible failed assistant
+// message and a "failed" event for a generation that never made it into
+// doGenerate — currently only the "no auth token available" case (see
+// runOneQueuedGeneration and reapOrphanedQueues in generation.go). A
+// failure inside doGenerate already gets equivalent treatment from its own
+// defer, which isn't reused here directly since it also closes over
+// doGenerate's own stack (the emitter it already built, the summary
+// variable, etc.) in a way that doesn't factor out cleanly.
+func (s *Service) recordGenerationFailure(ctx context.Context, c chat.Chat, genID string, err error) {
+	slog.Error("generation failed before it could start", "chat_id", c.ID, "tenant_id", c.TenantID, "error", err)
+	emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
+	emitter.emit(ctx, EventTypeFailed, map[string]string{"message": err.Error()})
+	if _, recErr := s.chats.RecordAssistantMessage(ctx, c, err.Error(), chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); recErr != nil {
+		slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", recErr)
 	}
 }
 
@@ -262,6 +494,15 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			// diagnosable server-side.
 			slog.Error("generation failed", "chat_id", c.ID, "tenant_id", in.TenantID, "error", retErr)
 			message := ai.SanitizeError(retErr)
+			if isUnauthorizedErr(retErr) {
+				// A queued generation's token can go stale before its turn
+				// comes up (see "Auth for queued work" / pendingTokens) —
+				// the model was never even called here, so
+				// ai.SanitizeError's generic "AI agent" framing would be
+				// actively misleading. Give the merchant the one thing that
+				// actually explains it and tells them what to do.
+				message = errSessionExpired.Error()
+			}
 			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
 			if _, err := s.chats.RecordAssistantMessage(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
 				slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
@@ -1010,6 +1251,18 @@ func toTurns(messages []chat.Message) []ai.Turn {
 		}
 	}
 	return turns
+}
+
+// isUnauthorizedErr reports whether err looks like a 401 from FlowPOS.
+// themefs.Store doesn't expose a structured status code for this (see
+// statusErr in disk.go) — every read/write error is built as a plain
+// fmt.Errorf wrapping "unexpected status %d: %s" — so this matches on that
+// literal text rather than requiring a themefs API change for a single
+// call site. Used to give a queued generation whose token expired before
+// its turn came up a clear, specific failure message instead of a generic
+// one (see doGenerate's failure defer).
+func isUnauthorizedErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "status 401:")
 }
 
 // validateProposal re-checks every path the model proposed against the same

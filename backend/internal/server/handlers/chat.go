@@ -43,6 +43,11 @@ type chatDetail struct {
 	Messages        []messageWithFiles `json:"messages"`
 	Generating      bool               `json:"generating"`
 	GenerationError string             `json:"generation_error,omitempty"`
+	// Queue is the running generation (if any) plus every generation still
+	// queued behind it, oldest first — see
+	// themebuild.Service.ListPendingGenerations. Always [] rather than null
+	// for a chat with nothing pending, same convention as Messages.
+	Queue []themebuild.PendingGeneration `json:"queue"`
 }
 
 // Get returns the tenant's one chat and its full transcript, with each
@@ -53,7 +58,7 @@ type chatDetail struct {
 func (h *ChatHandler) Get(c *gin.Context) {
 	ch, err := h.chats.GetChatForTenant(c.Request.Context(), auth.TenantID(c), themebuild.ChatType)
 	if errors.Is(err, chat.ErrNotFound) {
-		httpresponse.OK(c, chatDetail{Chat: nil, Messages: []messageWithFiles{}})
+		httpresponse.OK(c, chatDetail{Chat: nil, Messages: []messageWithFiles{}, Queue: []themebuild.PendingGeneration{}})
 		return
 	}
 	if err != nil {
@@ -73,6 +78,11 @@ func (h *ChatHandler) Get(c *gin.Context) {
 		respondErr(c, err)
 		return
 	}
+	queue, err := h.builder.ListPendingGenerations(c.Request.Context(), ch.ID)
+	if err != nil {
+		respondErr(c, err)
+		return
+	}
 
 	filesByMessage := make(map[string][]themebuild.GeneratedFile, len(messages))
 	for _, f := range files {
@@ -85,7 +95,10 @@ func (h *ChatHandler) Get(c *gin.Context) {
 	}
 
 	generating, genErr := h.builder.GenerationStatus(c.Request.Context(), ch.ID)
-	httpresponse.OK(c, chatDetail{Chat: &ch, Messages: withFiles, Generating: generating, GenerationError: genErr})
+	if queue == nil {
+		queue = []themebuild.PendingGeneration{}
+	}
+	httpresponse.OK(c, chatDetail{Chat: &ch, Messages: withFiles, Generating: generating, GenerationError: genErr, Queue: queue})
 }
 
 // chatStatus is just the two fields a caller needs to know whether a

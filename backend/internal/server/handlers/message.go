@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"errors"
 	"net/http"
 
 	"ai-chat/internal/auth"
@@ -46,15 +45,26 @@ type sendMessageResponse struct {
 	// which applies these to the real theme in the same request rather than
 	// waiting for a separate "Apply to theme" call.
 	Files any `json:"generated_files"`
+	// GenerationID/QueuePosition let the caller track this specific prompt
+	// (cancel it while queued, correlate it with stream events) instead of
+	// only the chat as a whole — see themebuild.GenerateOutcome's doc
+	// comment. QueuePosition 0 means it's running now.
+	GenerationID  string `json:"generation_id"`
+	QueuePosition int    `json:"queue_position"`
 }
 
-// Send accepts the merchant's prompt and returns immediately — the actual
-// Claude call and (if the model proposes changes) the write to the real
-// theme happen in the background (see themebuild.Service.Generate); the
-// caller learns the outcome by polling GET /chat's generating/
-// generation_error fields, not from this response. This is still the only
-// route with a per-tenant rate limit (see internal/ratelimit): it's the one
-// place that ever calls Claude, even though the HTTP call itself is now fast.
+// Send accepts the merchant's prompt and always returns 202 immediately —
+// the actual Claude call and (if the model proposes changes) the write to
+// the real theme happen in the background, either right away or once
+// whatever's ahead of it in the queue finishes (see
+// themebuild.Service.Generate). There is no "already busy" rejection
+// anymore: prompts queue instead (see the queueing brief) — the caller
+// learns the outcome by polling GET /chat's `queue` field or the WebSocket
+// stream, not from this response. This is still the only route with a
+// per-tenant rate limit (see internal/ratelimit): it bounds how fast new
+// generations can be *enqueued*, independent of themebuild.ErrQueueFull
+// (how many can be *waiting* at once) — the one place that ever calls
+// Claude, even though the HTTP call itself is now fast either way.
 func (h *MessageHandler) Send(c *gin.Context) {
 	// Bind first: a malformed, oversized, or empty body is the caller's
 	// mistake and was never going to reach Claude — it shouldn't also cost
@@ -82,10 +92,6 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		Mode:      in.Mode,
 	})
 	if err != nil {
-		if errors.Is(err, themebuild.ErrGenerationInProgress) {
-			httpresponse.Error(c, http.StatusConflict, "a generation is already in progress for this chat", "GENERATION_IN_PROGRESS")
-			return
-		}
 		respondErr(c, err)
 		return
 	}
@@ -99,5 +105,7 @@ func toResponse(o themebuild.GenerateOutcome) sendMessageResponse {
 		UserMessage:      o.UserMessage,
 		AssistantMessage: o.AssistantMessage,
 		Files:            o.Files,
+		GenerationID:     o.GenerationID,
+		QueuePosition:    o.QueuePosition,
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Store reads and writes the tenant's active theme's files through
@@ -97,7 +98,7 @@ func (s *Store) ReadFile(ctx context.Context, auth RequestAuth, relPath string) 
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := s.client.Do(req)
+	resp, err := s.doReadWithRetry(req)
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", relPath, err)
 	}
@@ -309,6 +310,51 @@ func encodePathSegments(relPath string) string {
 		segments[i] = url.PathEscape(seg)
 	}
 	return strings.Join(segments, "/")
+}
+
+// readRetryBackoff is how long doReadWithRetry waits between attempts — the
+// two delays used across readRetryAttempts-1 retries.
+var readRetryBackoff = []time.Duration{300 * time.Millisecond, 900 * time.Millisecond}
+
+// readRetryAttempts bounds ReadFile's retries against a transient upstream
+// failure (a brief Cloudflare 5xx — 521/522/523/524 are "origin
+// unreachable/timeout", not a real error in the theme file itself — or a
+// dropped connection) so one momentary blip mid-generation doesn't fail an
+// otherwise-successful, possibly 30+ minute generation at its very last
+// step (buildSnapshot reads files to validate what the model already
+// proposed). Not applied to WriteFile: retrying a write that may have
+// already landed risks a duplicate/partial write, a different risk profile
+// than a read. Must stay one more than len(readRetryBackoff) — one initial
+// attempt plus one retry per backoff delay.
+var readRetryAttempts = len(readRetryBackoff) + 1
+
+// doReadWithRetry runs req (a GET with no body, safe to resend as-is) and
+// retries on a network error or 5xx response — anything else (2xx, 404,
+// 401, etc.) returns immediately on the first attempt.
+func (s *Store) doReadWithRetry(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < readRetryAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(readRetryBackoff[attempt-1]):
+			}
+		}
+
+		resp, err := s.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s", statusErr(resp))
+			resp.Body.Close()
+			continue
+		}
+		return resp, nil
+	}
+	return nil, lastErr
 }
 
 func statusErr(resp *http.Response) string {
