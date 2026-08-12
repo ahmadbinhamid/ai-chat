@@ -310,8 +310,11 @@ var errMaxTokensTruncated = errors.New("model response was truncated at the max_
 // the model calls propose_changes, whose input becomes Result. onDelta, if
 // non-nil, is called with each new chunk of raw text the model streams
 // (thinking-style narration, not the proposal itself) across every
-// iteration — mainly useful for a live "..." progress indicator.
-func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string), toolExec ToolExecutor) (*Result, error) {
+// iteration — mainly useful for a live "..." progress indicator. progress,
+// if non-nil, is notified around every toolExec call — see ToolProgress's
+// doc comment for why the caller (not this method) decides what to do with
+// that.
+func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string), progress ToolProgress, toolExec ToolExecutor) (*Result, error) {
 	if g.fake {
 		return g.fakeGenerate(ctx, prompt)
 	}
@@ -425,17 +428,26 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		message := anthropic.Message{}
 		emitted := 0
+		// Fresh per iteration, same as message/emitted above: each
+		// iteration is its own streaming API call with its own text run,
+		// and coalescer.flush() below already empties it before the next
+		// iteration could otherwise reuse a stale buffer.
+		coalescer := newDeltaCoalescer(onDelta)
 		for stream.Next() {
 			if err := message.Accumulate(stream.Current()); err != nil {
 				return nil, fmt.Errorf("accumulate stream: %w", err)
 			}
-			if onDelta != nil {
-				if full := currentText(message); len(full) > emitted {
-					onDelta(full[emitted:])
-					emitted = len(full)
-				}
+			if full := currentText(message); len(full) > emitted {
+				coalescer.add(full[emitted:])
+				emitted = len(full)
 			}
 		}
+		// Whatever's still buffered when this iteration's stream ends must
+		// go out now — otherwise the last <80-char, <200ms fragment of a
+		// turn's narration (very often the tail end, since a stream just
+		// ending is exactly when there's no more input to trigger the next
+		// add() call that would have flushed it) is silently lost.
+		coalescer.flush()
 		if err := stream.Err(); err != nil {
 			return nil, fmt.Errorf("claude stream: %w", err)
 		}
@@ -497,8 +509,18 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		resultBlocks := make([]anthropic.ContentBlockParamUnion, 0, len(toolUses))
 		for _, tu := range toolUses {
+			if progress != nil {
+				progress.ToolStarted(tu.Name, tu.Input)
+			}
 			output, err := toolExec(ctx, tu.Name, tu.Input)
 			isError := err != nil
+			if progress != nil {
+				// Summarized from output/err before output is overwritten
+				// below with err.Error() — summarizeToolResult wants the
+				// real error, not the string it gets turned into for the
+				// model's own tool_result block.
+				progress.ToolFinished(tu.Name, summarizeToolResult(tu.Name, output, err), err)
+			}
 			if err != nil {
 				output = err.Error()
 			}
@@ -683,15 +705,156 @@ func writeFileTree(b *strings.Builder, entries []themefs.FileTreeEntry, depth in
 	}
 }
 
-// currentText concatenates the accumulated text blocks of a (possibly
-// partial) message — the model's narration, not the proposal itself, which
-// arrives as a tool call's input rather than text (see Generate).
+// coalesceInterval/coalesceMaxChars bound how often onDelta actually fires
+// — Anthropic streams text token-by-token (often single words or even
+// sub-word pieces per SSE frame), and a caller wired to publish each delta
+// live (see themebuild's EventTypeThinking) would otherwise put one Redis
+// publish and one WebSocket write per token. Flushing on whichever limit
+// is hit first keeps narration feeling live (never more than ~200ms stale)
+// without the per-token volume.
+const (
+	coalesceInterval = 200 * time.Millisecond
+	coalesceMaxChars = 80
+)
+
+// deltaCoalescer batches onDelta's raw per-token chunks into fewer, larger
+// calls — see coalesceInterval/coalesceMaxChars. Not safe for concurrent
+// use; Generate only ever calls add/flush from its own single goroutine's
+// streaming loop, so it doesn't need to be.
+type deltaCoalescer struct {
+	onDelta   func(string)
+	buf       strings.Builder
+	lastFlush time.Time
+}
+
+func newDeltaCoalescer(onDelta func(string)) *deltaCoalescer {
+	return &deltaCoalescer{onDelta: onDelta, lastFlush: time.Now()}
+}
+
+// add appends chunk to the buffer and flushes immediately if either limit
+// is already hit — a no-op entirely if onDelta is nil (the common case:
+// most callers, e.g. Summarize's plain completion, never stream progress
+// at all), so add's caller doesn't need its own nil check before calling it.
+func (c *deltaCoalescer) add(chunk string) {
+	if c.onDelta == nil {
+		return
+	}
+	c.buf.WriteString(chunk)
+	if c.buf.Len() >= coalesceMaxChars || time.Since(c.lastFlush) >= coalesceInterval {
+		c.flush()
+	}
+}
+
+// flush sends whatever's buffered (a no-op if nothing is) — called both
+// from add(), on either limit, and once more by Generate right after each
+// streaming call ends, so a short final fragment that never hit either
+// limit on its own still goes out instead of being silently dropped.
+func (c *deltaCoalescer) flush() {
+	if c.buf.Len() == 0 {
+		return
+	}
+	text := c.buf.String()
+	c.buf.Reset()
+	c.lastFlush = time.Now()
+	c.onDelta(text)
+}
+
+// currentText concatenates the accumulated text and thinking blocks of a
+// (possibly partial) message — the model's narration, not the proposal
+// itself, which arrives as a tool call's input rather than text (see
+// Generate). Thinking blocks matter here specifically because adaptive
+// thinking is enabled (modelSupportsAdaptiveThinking) and ToolChoiceAny
+// forces a tool call on every single iteration (see Generate's own doc
+// comment) — a model given no free choice of "just reply with text" often
+// emits little or no plain TextBlock content, so most of a turn's actual
+// narration lives in ThinkingBlock instead. Without reading it too,
+// onDelta's caller (see themebuild's EventTypeThinking wiring) would see
+// almost nothing on most turns.
+//
+// block.AsAny() returns `any` — an unrecognized block shape (a future SDK
+// addition, or a provider-specific variant via DeepSeek's Anthropic-compat
+// endpoint, see New's doc comment) simply matches neither switch case below
+// and is skipped, never a panic. This path is provider-sensitive: DeepSeek
+// may serialize thinking differently than Anthropic's own API, and
+// skip-not-crash is the deliberate, defensive choice for that uncertainty
+// rather than assuming every provider's blocks look identical.
 func currentText(message anthropic.Message) string {
 	var text strings.Builder
 	for _, block := range message.Content {
-		if b, ok := block.AsAny().(anthropic.TextBlock); ok {
+		switch b := block.AsAny().(type) {
+		case anthropic.TextBlock:
 			text.WriteString(b.Text)
+		case anthropic.ThinkingBlock:
+			text.WriteString(b.Thinking)
 		}
 	}
 	return text.String()
+}
+
+// maxToolResultSummaryChars bounds ToolProgress.ToolFinished's summary — it
+// lands in a persisted event payload downstream (see themebuild's
+// AppendGenerationEvent), which is why this stays well under the ~40
+// character budget the caller asked for even once a short prefix like
+// "failed: " is added.
+const maxToolResultSummaryChars = 40
+
+// summarizeToolResult turns one tool call's raw output into the short,
+// human-readable result ToolFinished reports — a line count for a read, a
+// match count for a grep, an entry count for a list. Computed here (not by
+// ToolProgress's implementation) because this package already owns each
+// toolName*'s shape via its own tool definitions (tools.go) and has the raw
+// output/error in hand right where the call happens; every ToolProgress
+// implementation re-deriving "3 matches" from a raw grep_theme string would
+// just be this same logic duplicated at each call site. These are
+// approximations read off the tool's own output text, not a fresh
+// recomputation against the real theme (Generate never touches themefs
+// directly — see ToolExecutor's doc comment) — good enough for "what just
+// happened" narration, not meant to be authoritative.
+func summarizeToolResult(name, output string, toolErr error) string {
+	if toolErr != nil {
+		return truncateSummary("failed: "+toolErr.Error(), maxToolResultSummaryChars)
+	}
+	switch name {
+	case toolNameListThemeFiles:
+		// output is the JSON-encoded file tree (see themebuild's
+		// execListThemeFiles) — counting `"path":` occurrences approximates
+		// the file+directory count without this package decoding the tree
+		// itself, which would mean depending on themefs.FileTreeEntry's
+		// exact shape for a display nicety alone.
+		return fmt.Sprintf("%d entries", strings.Count(output, `"path":`))
+	case toolNameReadThemeFile:
+		return fmt.Sprintf("%d lines", strings.Count(output, "\n"))
+	case toolNameGrepTheme:
+		return summarizeGrepResult(output)
+	default:
+		return truncateSummary(output, maxToolResultSummaryChars)
+	}
+}
+
+// summarizeGrepResult counts execGrepTheme's own match lines ("path:line:
+// text", one per match) in its raw output — everything except the special
+// "(no matches)" result and an optional trailing "(stopped at N matches…)"
+// note, both of which start with "(" and aren't matches themselves.
+func summarizeGrepResult(output string) string {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "(no matches)" {
+		return "no matches"
+	}
+	matches := 0
+	for _, line := range strings.Split(trimmed, "\n") {
+		if line != "" && !strings.HasPrefix(line, "(") {
+			matches++
+		}
+	}
+	return fmt.Sprintf("%d match(es)", matches)
+}
+
+// truncateSummary bounds s to max runes, collapsing newlines to spaces
+// first — a summary is meant to be a single display line.
+func truncateSummary(s string, max int) string {
+	r := []rune(strings.ReplaceAll(s, "\n", " "))
+	if len(r) <= max {
+		return string(r)
+	}
+	return string(r[:max])
 }

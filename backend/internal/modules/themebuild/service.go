@@ -75,7 +75,7 @@ func generateTimeout() time.Duration { return time.Duration(generateTimeoutNanos
 // calls per turn). *ai.Generator satisfies this today with no changes on
 // its side; callers passing one continue to work unchanged.
 type generator interface {
-	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string), toolExec ai.ToolExecutor) (*ai.Result, error)
+	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor) (*ai.Result, error)
 	// Summarize is used by summarizeOldTurns to collapse old chat history
 	// into one synthetic turn instead of resending it verbatim on every
 	// call — see summarizeOldTurns's doc comment. *ai.Generator's fake mode
@@ -535,6 +535,15 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	var warnings []themecheck.Finding
 	if proposalHasChanges(result) {
+		// Emitted for the model's first accepted propose_changes call, not
+		// whatever checkAndRepair's retries eventually settle on below — by
+		// the time a repair retry replaces result, the merchant watching
+		// the step list has already seen "Writing N files…" once for this
+		// turn, which is the narration point that matters (a repair retry
+		// changing the exact count isn't worth a second, confusing
+		// "Writing M files…" for the same turn).
+		emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(result.Files)})
+
 		snap, err := s.buildSnapshot(ctx, storeAuth, result)
 		if err != nil {
 			return fmt.Errorf("build theme snapshot: %w", err)
@@ -569,6 +578,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		if err != nil {
 			return fmt.Errorf("apply to theme: %w", err)
 		}
+		emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": plan.paths()})
+
 		written, err = s.commitWritePlan(ctx, storeAuth, plan)
 		if err != nil {
 			return fmt.Errorf("apply to theme: %w", err)
@@ -952,7 +963,7 @@ func (s *Service) generateValidProposal(
 	// checkAndRepair's own separate retry budget for themecheck rejections
 	// (see doGenerate's structure: these are two distinct stages).
 	for attempt := 1; ; attempt++ {
-		result, genErr := s.gen.Generate(ctx, tc, turns, nextPrompt, nil, toolExec)
+		result, genErr := s.gen.Generate(ctx, tc, turns, nextPrompt, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec)
 		if genErr != nil {
 			// A hard API/transport error is a different failure mode from an
 			// invalid proposal — already handled by the caller/reaper, not
@@ -1079,7 +1090,7 @@ func (s *Service) checkAndRepair(
 		repair := repairPrompt(errorFindings)
 
 		repairStart := time.Now()
-		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, nil, toolExec)
+		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec)
 		repairElapsed := time.Since(repairStart)
 		if genErr != nil {
 			// Surfaced distinctly from the generic reaper cleanup: without
@@ -1355,6 +1366,22 @@ type writePlan struct {
 	files       []planFile
 	layoutStart *planFile
 	layoutEnd   *planFile
+}
+
+// paths lists every path this plan will write, in the same order it's
+// computed — used only for EventTypeStaged's narration payload; the write
+// itself (commitWritePlan) doesn't need this, it walks the struct directly.
+func (p writePlan) paths() []string {
+	paths := make([]string, 0, len(p.files)+2)
+	for _, f := range p.files {
+		paths = append(paths, f.path)
+	}
+	for _, f := range []*planFile{p.layoutStart, p.layoutEnd} {
+		if f != nil {
+			paths = append(paths, f.path)
+		}
+	}
+	return paths
 }
 
 // buildWritePlan computes every file this turn would write — proposed

@@ -17,7 +17,7 @@ type fakeGeneratorErr struct {
 	err       error
 }
 
-func (f *fakeGeneratorErr) Generate(ctx context.Context, tc ai.ThemeContext, turns []ai.Turn, prompt string, onDelta func(string), toolExec ai.ToolExecutor) (*ai.Result, error) {
+func (f *fakeGeneratorErr) Generate(ctx context.Context, tc ai.ThemeContext, turns []ai.Turn, prompt string, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor) (*ai.Result, error) {
 	f.calls++
 	if f.calls == f.errOnCall {
 		return nil, f.err

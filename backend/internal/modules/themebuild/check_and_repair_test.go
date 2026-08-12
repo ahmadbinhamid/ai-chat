@@ -18,7 +18,7 @@ type fakeGenerator struct {
 	results []*ai.Result // returned in order; the last one repeats once exhausted
 }
 
-func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ func(string), _ ai.ToolExecutor) (*ai.Result, error) {
+func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor) (*ai.Result, error) {
 	f.calls++
 	idx := f.calls - 1
 	if idx >= len(f.results) {

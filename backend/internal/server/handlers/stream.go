@@ -238,6 +238,14 @@ func (h *StreamHandler) Stream(c *gin.Context) {
 // comment), and return only on client disconnect (ctx.Done) or a
 // write/ping failure. It deliberately never returns on
 // EventTypeDone/EventTypeFailed — see Stream's doc comment.
+//
+// Seq == 0 is the ephemeral-event marker (see eventEmitter.emitLive) —
+// those are never compared against *watermark and never advance it. They
+// aren't replay-able (never durably stored), so "already delivered during
+// replay" can never apply to one, and if compared against a real watermark
+// (which starts at 0 and only grows) every single Seq: 0 event would
+// wrongly look "already delivered" and never reach the client at all — the
+// exact bug this carve-out exists to avoid.
 func (h *StreamHandler) waitForLiveEvents(ctx context.Context, conn *websocket.Conn, live <-chan themebuild.GenerationEvent, watermark *int64) {
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
@@ -268,13 +276,17 @@ func (h *StreamHandler) waitForLiveEvents(ctx context.Context, conn *websocket.C
 				// this channel, so there's nothing left to wait on.
 				return
 			}
-			if ev.Seq <= *watermark {
-				continue // already delivered during replay — see Stream's doc comment
+			if ev.Seq != 0 {
+				if ev.Seq <= *watermark {
+					continue // already delivered during replay — see Stream's doc comment
+				}
 			}
 			if !writeStreamEvent(ctx, conn, ev) {
 				return
 			}
-			*watermark = ev.Seq
+			if ev.Seq != 0 {
+				*watermark = ev.Seq
+			}
 		}
 	}
 }

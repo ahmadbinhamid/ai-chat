@@ -46,6 +46,31 @@ const (
 	// EventTypeCancelled is emitted from the cancel handler when a merchant
 	// cancels a still-queued prompt. No payload.
 	EventTypeCancelled = "cancelled"
+	// EventTypeToolCall is emitted just before a read-only theme tool runs —
+	// payload: {"tool": "read_theme_file", "path": "pages/home.liquid"} (or
+	// "pattern" for grep_theme; list_theme_files carries just {"tool": ...}).
+	EventTypeToolCall = "tool_call"
+	// EventTypeToolResult is emitted just after — payload: {"summary": "..."},
+	// a short (<~40 char) human-readable outcome (line count, match count,
+	// file count). Emitted even when the tool errors, so the step list never
+	// gets stuck showing a call with no result.
+	EventTypeToolResult = "tool_result"
+	// EventTypeProposing is emitted from doGenerate the moment the model's
+	// propose_changes call comes back with a non-empty proposal — payload:
+	// {"file_count": N}.
+	EventTypeProposing = "proposing"
+	// EventTypeStaged is emitted once the write plan for an accepted
+	// proposal is built (before it's committed to the real theme) — payload:
+	// {"paths": [...]}.
+	EventTypeStaged = "staged"
+	// EventTypeThinking is EPHEMERAL — see emitLive. Never pass this to
+	// emit(): it would durably persist every streamed text chunk of every
+	// generation, and worse, burn a seq number per chunk, breaking
+	// GetEventsSince's replay window for every other event type sharing
+	// this chat's seq counter (see eventEmitter's doc comment). Payload:
+	// {"text": "..."}, one coalesced chunk at a time — see
+	// internal/ai.Generate's onDelta coalescing.
+	EventTypeThinking = "thinking"
 )
 
 // maxPromptPreviewChars bounds EventTypeQueued's prompt_preview field.
@@ -220,6 +245,37 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 	if e.bus != nil {
 		e.bus.Publish(ctx, e.chatID, ev)
 	}
+}
+
+// emitLive publishes an event to the live bus only — never to
+// generation_events, and never consuming a seq number (always published
+// with Seq: 0). For high-frequency, disposable progress (streamed model
+// text): a client that reconnects mid-generation simply doesn't see what it
+// missed, which is correct for narration but would be wrong for anything
+// structural. See emit for the durable path, and AppendGenerationEvent's
+// doc comment for why volume matters here (an insert plus a trim DELETE per
+// call, unaffordable at one call per token).
+//
+// A no-op if bus is nil (no REDIS_URL and no in-process subscriber — see
+// NewService) or if this generation has no live subscriber at all: unlike
+// emit, there's no durable fallback to fall back to, so the ephemeral text
+// is simply never seen. That's fine — a merchant not actively watching the
+// stream never sees "thinking" narration either way.
+func (e *eventEmitter) emitLive(ctx context.Context, eventType string, payload any) {
+	if e == nil || e.bus == nil {
+		return
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		slog.Error("failed to marshal live generation event payload", "type", eventType, "error", err)
+		return
+	}
+
+	ev := GenerationEvent{
+		ID: uuid.NewString(), GenerationID: e.generationID, ChatID: e.chatID,
+		Seq: 0, Type: eventType, Payload: payloadJSON, CreatedAt: time.Now().UTC(),
+	}
+	e.bus.Publish(ctx, e.chatID, ev)
 }
 
 // NewRedisClient parses redisURL (e.g. "redis://127.0.0.1:6379") into a

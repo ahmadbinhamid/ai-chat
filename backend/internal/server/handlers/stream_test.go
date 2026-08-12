@@ -272,6 +272,97 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	readEvent(t, wsConn, themebuild.EventTypeStarted, 5)
 }
 
+// TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark is
+// item 5: a client that's already replayed the durable history (watermark
+// at seq 2) must still receive a live ephemeral (seq: 0) event — the whole
+// reason for waitForLiveEvents' seq==0 carve-out is that Seq: 0 <=
+// watermark is otherwise ALWAYS true once watermark has advanced past 0,
+// which would make every ephemeral event look like an "already delivered
+// during replay" duplicate and get silently dropped forever. It then also
+// confirms the ephemeral event didn't corrupt the watermark itself: a
+// genuine overlap-window duplicate of seq 2 published afterward must still
+// be correctly skipped, and a real seq 3 event must still arrive next, not
+// the stale duplicate.
+func TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark(t *testing.T) {
+	conn := openStreamTestDB(t)
+	rdb, err := themebuild.NewRedisClient(getenvOr("REDIS_URL", "redis://127.0.0.1:6379"))
+	if err != nil {
+		t.Fatalf("invalid test REDIS_URL: %v", err)
+	}
+	if pingErr := rdb.Ping(context.Background()).Err(); pingErr != nil {
+		t.Skipf("skipping: test redis not reachable: %v", pingErr)
+	}
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	chatRepo := chat.NewRepository(conn)
+	chatSvc := chat.NewService(chatRepo)
+	buildRepo := themebuild.NewRepository(conn)
+	buildSvc := themebuild.NewService(buildRepo, chatSvc, nil, nil, rdb)
+
+	tenantID := uint64(time.Now().UnixNano())
+	ctx := context.Background()
+	ch, err := chatSvc.GetOrCreateChat(ctx, tenantID, themebuild.ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	genID := uuid.NewString()
+	if err := buildRepo.StartGeneration(ctx, genID, ch.ID, tenantID); err != nil {
+		t.Fatalf("StartGeneration failed: %v", err)
+	}
+	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 1, themebuild.EventTypeStarted, struct{}{})
+	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 2, themebuild.EventTypeChecking, map[string]int{"attempt": 1})
+
+	flowpos := fakeFlowposServer(t, tenantID)
+	authClient := auth.NewClient(flowpos.URL, 5*time.Second)
+	authCache := auth.NewMemoryCache()
+	t.Cleanup(authCache.Close)
+
+	router := gin.New()
+	router.GET("/chats/:chatId/stream", NewStreamHandler(chatSvc, buildSvc, authClient, authCache, time.Minute, time.Minute, nil).Stream)
+	ts := httptest.NewServer(router)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/chats/" + ch.ID + "/stream"
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	wsConn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{ //nolint:bodyclose
+		Subprotocols: authSubprotocols("test-token", tenantID),
+	})
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v", err)
+	}
+	defer func() { _ = wsConn.CloseNow() }()
+
+	// Replay ends with watermark at 2 — the exact state under which the
+	// Seq:0<=watermark bug would always trigger.
+	readEvent(t, wsConn, themebuild.EventTypeStarted, 1)
+	readEvent(t, wsConn, themebuild.EventTypeChecking, 2)
+	readReady(t, wsConn, 2)
+
+	// Live ephemeral event — must arrive despite Seq: 0.
+	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
+		GenerationID: genID, ChatID: ch.ID, Seq: 0, Type: themebuild.EventTypeThinking,
+		Payload: json.RawMessage(`{"text":"hmm, let's see"}`), CreatedAt: time.Now().UTC(),
+	})
+	readEvent(t, wsConn, themebuild.EventTypeThinking, 0)
+
+	// An overlap-window duplicate of seq 2 (see Stream's own doc comment on
+	// why this can legitimately happen) — must be silently skipped, which
+	// only holds if the ephemeral event above didn't reset the watermark.
+	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
+		GenerationID: genID, ChatID: ch.ID, Seq: 2, Type: themebuild.EventTypeChecking,
+		Payload: json.RawMessage(`{"attempt":1}`), CreatedAt: time.Now().UTC(),
+	})
+	// A real seq 3 event published right after — if the duplicate above had
+	// wrongly gotten through, it (not this one) would be what arrives next.
+	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
+		GenerationID: genID, ChatID: ch.ID, Seq: 3, Type: themebuild.EventTypeRepairing,
+		Payload: json.RawMessage(`{"attempt":1}`), CreatedAt: time.Now().UTC(),
+	})
+	readEvent(t, wsConn, themebuild.EventTypeRepairing, 3)
+}
+
 // TestStreamHandler_UnresponsivePeerIsClosedWithinIOTimeout guards against a
 // peer that's alive at the TCP level (no FIN/RST — a sleeping laptop, a
 // dropped WiFi association, a NAT that silently stopped forwarding) but

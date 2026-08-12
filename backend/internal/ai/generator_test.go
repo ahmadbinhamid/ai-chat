@@ -105,7 +105,7 @@ func TestGenerate_ToolLoopReadsThenProposes(t *testing.T) {
 	}
 
 	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil,
-		"make testimonials light with a cream background on the about page", nil, toolExec)
+		"make testimonials light with a cream background on the about page", nil, nil, toolExec)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestNew_BaseURLReachesFakeServer(t *testing.T) {
 		t.Fatal("no tool call expected")
 		return "", nil
 	}
-	if _, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "noop", nil, toolExec); err != nil {
+	if _, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "noop", nil, nil, toolExec); err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}
 	if calls != 1 {
@@ -183,7 +183,7 @@ func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {
 		return "[]", nil
 	}
 
-	_, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, toolExec)
+	_, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, nil, toolExec)
 	if err == nil {
 		t.Fatal("expected an error once the iteration cap is hit")
 	}
@@ -238,7 +238,7 @@ func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 		return "[]", nil
 	}
 
-	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, toolExec)
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, nil, toolExec)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestGenerate_BrandModeOnlyOffersProposeChanges(t *testing.T) {
 	g := newTestGenerator(client, "claude-test")
 
 	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo", GenerationMode: GenerationModeBrand}, nil,
-		"make the primary color blue", nil, nil)
+		"make the primary color blue", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}

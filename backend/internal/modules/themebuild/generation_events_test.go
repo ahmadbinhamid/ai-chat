@@ -205,3 +205,87 @@ func TestEventEmitter_NilRepoIsANoOp(t *testing.T) {
 	emitter2 := newEventEmitter(context.Background(), nil, nil, "gen", "chat")
 	emitter2.emit(context.Background(), EventTypeStarted, struct{}{})
 }
+
+// TestEmitLive_PublishesButNeverPersistsOrAdvancesSeq is the regression
+// test for emitLive's whole reason to exist (see its doc comment): a
+// high-frequency ephemeral event (streamed model text) must reach a live
+// subscriber over the bus, but must never hit generation_events (an insert
+// plus a trim DELETE per call — see AppendGenerationEvent) and must never
+// consume a seq number, since seq is the replay watermark every durable
+// event on this chat shares (see eventEmitter's doc comment) — a "thinking"
+// event stealing one would desync GetEventsSince's replay window for
+// everything else.
+func TestEmitLive_PublishesButNeverPersistsOrAdvancesSeq(t *testing.T) {
+	conn := openTestDB(t)
+	rdb := openTestRedis(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+	genID := seedGeneration(t, repo, chatID)
+
+	sub := rdb.Subscribe(ctx, redisChannelForChat(chatID))
+	defer func() { _ = sub.Close() }()
+	if _, err := sub.Receive(ctx); err != nil {
+		t.Fatalf("subscribe failed: %v", err)
+	}
+
+	emitter := newEventEmitter(ctx, repo, newRedisEventBus(rdb), genID, chatID)
+	seqBefore := emitter.nextSeq
+
+	emitter.emitLive(ctx, EventTypeThinking, map[string]string{"text": "hello"})
+
+	select {
+	case msg := <-sub.Channel():
+		var got GenerationEvent
+		if err := json.Unmarshal([]byte(msg.Payload), &got); err != nil {
+			t.Fatalf("failed to decode published event: %v", err)
+		}
+		if got.Type != EventTypeThinking || got.Seq != 0 {
+			t.Errorf("expected a live Seq:0 thinking event, got %+v", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the live-published event")
+	}
+
+	if emitter.nextSeq != seqBefore {
+		t.Errorf("expected emitLive to leave nextSeq unchanged, was %d now %d", seqBefore, emitter.nextSeq)
+	}
+
+	events, err := repo.GetEventsSince(ctx, chatID, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince failed: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Type == EventTypeThinking {
+			t.Errorf("expected emitLive to never persist to generation_events, found %+v", ev)
+		}
+	}
+}
+
+// TestEmit_StillPersistsAndAdvancesSeq is emitLive's test's counterpart —
+// the durable path (emit) must still do both of the things emitLive
+// deliberately skips.
+func TestEmit_StillPersistsAndAdvancesSeq(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+	genID := seedGeneration(t, repo, chatID)
+
+	emitter := newEventEmitter(ctx, repo, nil, genID, chatID)
+	seqBefore := emitter.nextSeq
+
+	emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": 1})
+
+	if emitter.nextSeq != seqBefore+1 {
+		t.Errorf("expected nextSeq to advance by exactly 1, was %d now %d", seqBefore, emitter.nextSeq)
+	}
+
+	events, err := repo.GetEventsSince(ctx, chatID, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince failed: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != EventTypeChecking || events[0].Seq != seqBefore {
+		t.Fatalf("expected the checking event durably persisted at seq %d, got %+v", seqBefore, events)
+	}
+}

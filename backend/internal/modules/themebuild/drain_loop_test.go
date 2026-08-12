@@ -31,7 +31,7 @@ type scriptedResult struct {
 	err   error
 }
 
-func (g *scriptedGenerator) Generate(ctx context.Context, _ ai.ThemeContext, _ []ai.Turn, prompt string, _ func(string), _ ai.ToolExecutor) (*ai.Result, error) {
+func (g *scriptedGenerator) Generate(ctx context.Context, _ ai.ThemeContext, _ []ai.Turn, prompt string, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor) (*ai.Result, error) {
 	g.mu.Lock()
 	i := g.calls
 	g.calls++
