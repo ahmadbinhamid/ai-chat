@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/themefs"
 )
 
@@ -24,9 +25,23 @@ type RevertResult struct {
 	DeletedFiles []string `json:"deleted_files"`
 }
 
-// RevertToMessage restores every theme file this chat has ever generated
-// back to the state it was in immediately after messageID's turn, undoing
-// every later turn's file changes.
+// RevertToMessage undoes every turn after messageID's — the exact meaning
+// of "undo" now depends on whether messageID falls inside the chat's
+// current, still-unapplied draft or before it, since generation no longer
+// writes to FlowPOS immediately (see themebuild's package doc comment):
+//
+//   - messageID.ApplyStatus == pending: the target turn is itself part of
+//     the current draft, nothing about it has ever reached FlowPOS. Revert
+//     is a pure draft operation (revertWithinDraft) — discard every
+//     'pending' message after it so the draft overlay (Repository.DraftFiles)
+//     stops seeing their rows and falls back to whatever was there before
+//     them. Zero FlowPOS calls: there is nothing on FlowPOS to undo yet.
+//   - otherwise (applied / not_applicable): messageID is from before the
+//     current draft — anything the draft itself has staged is irrelevant to
+//     what's actually live on FlowPOS right now, so this still needs to
+//     write (revertAppliedHistory), but computed ONLY from 'applied' rows,
+//     never 'pending'/'discarded' ones, which were never written and would
+//     otherwise pollute "what does the live theme currently look like".
 //
 // This is ai-chat's answer to "git-backed drafts and revert": themefs.Store
 // is an HTTP client to flowpos-backend's theme-file API (see its own doc
@@ -34,10 +49,7 @@ type RevertResult struct {
 // there is no working directory here to run `git init`/`git commit`
 // against. The chat_generated_files audit trail this service already
 // writes on every turn (content + previous_content, per file, per turn) is
-// the equivalent history that actually exists in ai-chat's own boundary,
-// so revert is built on that instead: for every file touched after the
-// target turn, restore its last known content at-or-before that turn, or
-// delete it if it didn't exist yet then.
+// the equivalent history that actually exists in ai-chat's own boundary.
 //
 // Content-only: a page's pages.json fields (title, SEO metadata, status)
 // aren't tracked per-turn independently of file content, so those reflect
@@ -59,15 +71,48 @@ func (s *Service) RevertToMessage(ctx context.Context, tenantID uint64, token, c
 		return RevertResult{}, ErrRevertBlockedByRunningGeneration
 	}
 
-	files, err := s.repo.ListFilesByChat(ctx, chatID)
+	if target.ApplyStatus == chat.ApplyStatusPending {
+		return s.revertWithinDraft(ctx, chatID, target)
+	}
+	return s.revertAppliedHistory(ctx, tenantID, token, chatID, target)
+}
+
+// revertWithinDraft discards every still-pending message created after
+// target — see RevertToMessage's doc comment. No themeLocks use here
+// either: nothing is read-modify-written against the real theme, only a
+// chat_messages UPDATE, which needs no more coordination than any other
+// single-statement write already gets from the database itself.
+func (s *Service) revertWithinDraft(ctx context.Context, chatID string, target chat.Message) (RevertResult, error) {
+	discardedPaths, err := s.repo.DiscardMessagesAfter(ctx, chatID, target.CreatedAt)
+	if err != nil {
+		return RevertResult{}, fmt.Errorf("revert within draft: %w", err)
+	}
+	sort.Strings(discardedPaths)
+	// Framed as "restored" even though nothing was written anywhere: from
+	// the merchant's perspective, the draft preview will now render as it
+	// did right after the target turn (whatever an earlier draft row, or
+	// the last-applied theme, has for these paths) — RevertResult has no
+	// separate "nothing to do here" shape, and DeletedFiles specifically
+	// means "didn't exist as of the target turn," which discarding a later
+	// pending row doesn't establish either way without checking prior
+	// draft state, so RestoredFiles is the closer fit of the two.
+	return RevertResult{RestoredFiles: discardedPaths}, nil
+}
+
+// revertAppliedHistory is RevertToMessage's original logic, scoped to only
+// 'applied' rows (see RevertToMessage's doc comment on why 'pending'/
+// 'discarded' rows must never enter this computation): restore every path
+// APPLIED after target back to its last-applied-at-or-before-target state,
+// or delete it if it didn't exist applied yet then.
+func (s *Service) revertAppliedHistory(ctx context.Context, tenantID uint64, token, chatID string, target chat.Message) (RevertResult, error) {
+	files, err := s.repo.ListAppliedFilesByChat(ctx, chatID)
 	if err != nil {
 		return RevertResult{}, err
 	}
 
-	// latestAtOrBefore holds, per path, the last audit row at or before the
-	// target turn — nil (absent) means the path didn't exist yet then.
-	// touchedAfter holds every path any LATER turn touched, since only
-	// those can possibly differ from the target turn's state.
+	// latestAtOrBefore holds, per path, the last APPLIED audit row at or
+	// before the target turn — absent means the path wasn't applied yet
+	// then. touchedAfter holds every path any LATER applied turn touched.
 	//
 	// Ordering is by created_at, a DATETIME column with only second-level
 	// precision (matching chat_messages/chat_generated_files as they exist
@@ -87,7 +132,7 @@ func (s *Service) RevertToMessage(ctx context.Context, tenantID uint64, token, c
 	}
 
 	// Serialized against a concurrent generation the same way doGenerate's
-	// own write section is (see themeLocks) — keyed by chatID rather than
+	// own staging section is (see themeLocks) — keyed by chatID rather than
 	// themeSlug, since a chat carries no theme_slug of its own to lock on;
 	// this still prevents two reverts of the same chat from racing.
 	unlock := s.themeLocks.Lock(chatID)

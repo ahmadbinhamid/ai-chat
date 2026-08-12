@@ -21,7 +21,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/errgroup"
 )
+
+// loadThemeFilesConcurrency bounds how many concurrent ReadFile calls
+// LoadThemeFiles makes — generous enough to turn a few dozen sequential
+// ~50ms reads into a fraction of a second, not so high it looks like a
+// burst to flowpos-backend or exhausts this process's own outbound
+// connection pool.
+const loadThemeFilesConcurrency = 8
 
 const (
 	pathPagesJSON   = "pages.json"
@@ -89,10 +97,15 @@ type generator interface {
 // proposed changes and write them straight to the real theme filesystem
 // (see Generate) — there is no separate review/apply step.
 type Service struct {
-	repo       *Repository
-	chats      *chat.Service
-	gen        generator
-	store      *themefs.Store
+	repo  *Repository
+	chats *chat.Service
+	gen   generator
+	// store is always the REAL (non-overlay) store — see doGenerate, which
+	// wraps it in a fresh themefs.OverlayStore per generation call rather
+	// than mutating this field. A mutable "current store" field here would
+	// be a data race: this Service is shared across every concurrent
+	// generation for every chat/tenant, and each one's draft is its own.
+	store      themefs.ThemeStore
 	themeLocks *keyedMutex
 	bus        eventBus // redisEventBus if REDIS_URL was configured, inProcessEventBus otherwise — see eventEmitter
 	tokens     *pendingTokens
@@ -102,8 +115,10 @@ type Service struct {
 // NewRedisClient) — generation events are then still durably written to
 // generation_events, and live delivery falls back to an in-process fan-out
 // (see eventbus.go) that only reaches a WebSocket connected to this same
-// replica.
-func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store *themefs.Store, rdb *redis.Client) *Service {
+// replica. store takes the themefs.ThemeStore interface, not the concrete
+// *themefs.Store, purely so tests can substitute a fake — server.go's own
+// wiring still always passes a real *themefs.Store.
+func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store themefs.ThemeStore, rdb *redis.Client) *Service {
 	var bus eventBus
 	if rdb != nil {
 		bus = newRedisEventBus(rdb)
@@ -514,18 +529,33 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
 
+	// The draft overlay this whole feature exists for: every prior turn's
+	// still-'pending' file content, read first before falling through to
+	// the real (last-applied) theme — see themefs.OverlayStore. Built once
+	// per generation call and threaded through every read the rest of this
+	// function does; store (not s.store) is what buildThemeContext,
+	// buildToolExecutor's three tools, buildSnapshot, and buildWritePlan
+	// all read from, so a second/third prompt in this chat always sees
+	// what earlier turns in the SAME draft already changed, never the
+	// stale saved theme. See doGenerate's package-level doc comment.
+	draft, err := s.repo.DraftFiles(ctx, c.ID)
+	if err != nil {
+		return fmt.Errorf("load draft overlay: %w", err)
+	}
+	store := themefs.NewOverlayStore(s.store, draft)
+
 	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
 		return fmt.Errorf("load chat history: %w", err)
 	}
 
-	tc, err := s.buildThemeContext(ctx, storeAuth, in.ThemeSlug)
+	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)
 	if err != nil {
 		return fmt.Errorf("load theme context: %w", err)
 	}
 	tc.GenerationMode = in.Mode
 
-	toolExec := s.buildToolExecutor(storeAuth)
+	toolExec := s.buildToolExecutor(store, storeAuth)
 
 	turns := summarizeOldTurns(ctx, s.gen, toTurns(priorMessages))
 	result, turns, err := s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, emitter, in)
@@ -544,7 +574,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// "Writing M files…" for the same turn).
 		emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(result.Files)})
 
-		snap, err := s.buildSnapshot(ctx, storeAuth, result)
+		snap, err := s.buildSnapshot(ctx, store, storeAuth, result)
 		if err != nil {
 			return fmt.Errorf("build theme snapshot: %w", err)
 		}
@@ -556,39 +586,43 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	hasChanges := proposalHasChanges(result)
 
-	var written []writtenFile
+	var staged []writtenFile
 	if hasChanges {
-		// Serializes the read-modify-write critical section below per
-		// theme: two concurrent requests for the same theme (two tabs, a
-		// client retry racing the original) must not interleave reads and
-		// writes of pages.json/the layout files, or one's registration can
-		// silently clobber the other's (a lost update). Scoped tightly to
-		// just this section, not the whole call — the Claude call above
-		// can take minutes, and a second tab's edit shouldn't queue behind
-		// that, only behind the fast disk work.
+		// Still locked, even though nothing is written to FlowPOS here
+		// anymore — buildWritePlan still READS the layout files and the
+		// theme's current file list, and two concurrent generations for
+		// the same theme staging at once could otherwise compute their
+		// layout splices against an inconsistent view of each other's
+		// in-flight (but not yet persisted-as-pending) draft. Scoped
+		// tightly to just this section per its existing convention (see
+		// themeLocks' own doc comment) — the Claude call above can take
+		// minutes, and a second tab's turn shouldn't queue behind that.
 		unlock := s.themeLocks.Lock(in.ThemeSlug)
 		defer unlock()
 
-		// Computed entirely in memory first, nothing written yet: a
-		// failure here (e.g. a duplicate page slug) leaves the real theme
+		// Computed entirely in memory first, nothing staged yet: a
+		// failure here (e.g. a duplicate page slug) leaves the draft
 		// completely untouched, rather than a validation error arriving
-		// after some files already landed on disk with nothing recording
-		// that they did.
-		plan, err := s.buildWritePlan(ctx, storeAuth, result)
+		// after some files already landed in chat_generated_files with
+		// nothing recording that they did.
+		plan, err := s.buildWritePlan(ctx, store, storeAuth, result)
 		if err != nil {
-			return fmt.Errorf("apply to theme: %w", err)
+			return fmt.Errorf("stage theme changes: %w", err)
 		}
 		emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": plan.paths()})
 
-		written, err = s.commitWritePlan(ctx, storeAuth, plan)
-		if err != nil {
-			return fmt.Errorf("apply to theme: %w", err)
-		}
+		// No commitWritePlan call — this is the entire point of the
+		// draft/apply split (see themebuild's package doc comment):
+		// nothing reaches FlowPOS here. planToStaged turns the plan into
+		// the same writtenFile shape persistFileRecords already knows how
+		// to audit, including the layout splices (see GeneratedFileKind)
+		// that used to be silently un-audited when writes were immediate.
+		staged = planToStaged(plan)
 	}
 
 	applyStatus := chat.ApplyStatusNotApplicable
 	if hasChanges {
-		applyStatus = chat.ApplyStatusApplied
+		applyStatus = chat.ApplyStatusPending
 	}
 
 	// The schema requires "summary" as a key but not a non-empty one, so an
@@ -610,7 +644,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return fmt.Errorf("record assistant message: %w", err)
 	}
 
-	if _, err := s.persistFileRecords(ctx, c, assistantMsg.ID, written); err != nil {
+	if _, err := s.persistFileRecords(ctx, c, assistantMsg.ID, staged); err != nil {
 		return fmt.Errorf("persist generated-file audit rows: %w", err)
 	}
 
@@ -639,22 +673,38 @@ func (s *Service) GenerationStatus(ctx context.Context, chatID string) (generati
 	return g.Status == GenerationStatusRunning, ""
 }
 
-func (s *Service) buildThemeContext(ctx context.Context, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
-	pagesJSON, err := s.store.ReadFile(ctx, storeAuth, pathPagesJSON)
+// manifestGenerator is the *themefs.Store-only capability buildThemeContext
+// needs beyond themefs.ThemeStore (see ThemeStore's own doc comment on why
+// GetOrGenerateManifest isn't part of it). store here is whatever this
+// generation call is actually reading from (the draft overlay, mid-
+// generation) — its manifest is always generated from s.store (the real,
+// non-overlay store, see Service.store's doc comment), never the draft:
+// making the component-signature manifest draft-aware isn't required by
+// this feature and manifest caching is keyed to the real theme's own
+// fingerprint (see manifest.go), which a draft has no independent notion of.
+type manifestGenerator interface {
+	GetOrGenerateManifest(ctx context.Context, auth themefs.RequestAuth) (themefs.Manifest, error)
+}
+
+func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
+	pagesJSON, err := store.ReadFile(ctx, storeAuth, pathPagesJSON)
 	if err != nil {
 		return ai.ThemeContext{}, err
 	}
-	defaultsJSON, err := s.store.ReadFile(ctx, storeAuth, pathDefaultsJSON)
+	defaultsJSON, err := store.ReadFile(ctx, storeAuth, pathDefaultsJSON)
 	if err != nil {
 		return ai.ThemeContext{}, err
 	}
-	tree, err := s.store.ListFiles(ctx, storeAuth)
+	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
 		return ai.ThemeContext{}, err
 	}
-	manifest, err := s.store.GetOrGenerateManifest(ctx, storeAuth)
-	if err != nil {
-		return ai.ThemeContext{}, fmt.Errorf("build manifest: %w", err)
+	var manifest themefs.Manifest
+	if mg, ok := s.store.(manifestGenerator); ok {
+		manifest, err = mg.GetOrGenerateManifest(ctx, storeAuth)
+		if err != nil {
+			return ai.ThemeContext{}, fmt.Errorf("build manifest: %w", err)
+		}
 	}
 	return ai.ThemeContext{
 		ThemeSlug:    themeSlug,
@@ -685,23 +735,23 @@ var grepThemeSearchableExt = map[string]bool{".liquid": true, ".css": true, ".js
 // to read the real theme — the only place ai.Generate ever reaches
 // themefs, and only through this closure (see ai.ToolExecutor's doc
 // comment): package ai never imports themefs's Store directly.
-func (s *Service) buildToolExecutor(storeAuth themefs.RequestAuth) ai.ToolExecutor {
+func (s *Service) buildToolExecutor(store themefs.ThemeStore, storeAuth themefs.RequestAuth) ai.ToolExecutor {
 	return func(ctx context.Context, name string, input json.RawMessage) (string, error) {
 		switch name {
 		case "list_theme_files":
-			return s.execListThemeFiles(ctx, storeAuth)
+			return s.execListThemeFiles(ctx, store, storeAuth)
 		case "read_theme_file":
-			return s.execReadThemeFile(ctx, storeAuth, input)
+			return s.execReadThemeFile(ctx, store, storeAuth, input)
 		case "grep_theme":
-			return s.execGrepTheme(ctx, storeAuth, input)
+			return s.execGrepTheme(ctx, store, storeAuth, input)
 		default:
 			return "", fmt.Errorf("unknown tool %q", name)
 		}
 	}
 }
 
-func (s *Service) execListThemeFiles(ctx context.Context, storeAuth themefs.RequestAuth) (string, error) {
-	tree, err := s.store.ListFiles(ctx, storeAuth)
+func (s *Service) execListThemeFiles(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth) (string, error) {
+	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
 		return "", err
 	}
@@ -720,7 +770,7 @@ type readThemeFileInput struct {
 // content returned at maxToolReadBytes — a model asking for several large
 // files in one call gets a clear truncation marker rather than a silently
 // cut-off response it might mistake for the whole file.
-func (s *Service) execReadThemeFile(ctx context.Context, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
+func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
 	var args readThemeFileInput
 	if err := json.Unmarshal(input, &args); err != nil {
 		return "", fmt.Errorf("invalid read_theme_file input: %w", err)
@@ -739,7 +789,13 @@ func (s *Service) execReadThemeFile(ctx context.Context, storeAuth themefs.Reque
 			fmt.Fprintf(&b, "### %s\nERROR: %s\n\n", p, err.Error())
 			continue
 		}
-		content, err := s.store.ReadFile(ctx, storeAuth, p)
+		// store here is the draft overlay (see doGenerate) — reading
+		// through it, not s.store directly, is THE fix this whole feature
+		// hinges on: without it, a model that just edited pages/home.liquid
+		// and then re-reads it (e.g. before a second, related edit) would
+		// see the stale pre-edit content and could silently undo its own
+		// prior work.
+		content, err := store.ReadFile(ctx, storeAuth, p)
 		if err != nil {
 			fmt.Fprintf(&b, "### %s\nERROR: %s\n\n", p, err.Error())
 			continue
@@ -767,7 +823,7 @@ type grepThemeInput struct {
 // expression (RE2 — Go's regexp package, not a plain substring; see
 // grepThemeTool's description) matched line-by-line, optionally restricted
 // to paths matching path_glob (path.Match — one wildcard segment, no "**").
-func (s *Service) execGrepTheme(ctx context.Context, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
+func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
 	var args grepThemeInput
 	if err := json.Unmarshal(input, &args); err != nil {
 		return "", fmt.Errorf("invalid grep_theme input: %w", err)
@@ -780,7 +836,7 @@ func (s *Service) execGrepTheme(ctx context.Context, storeAuth themefs.RequestAu
 		return "", fmt.Errorf("invalid pattern: %w", err)
 	}
 
-	tree, err := s.store.ListFiles(ctx, storeAuth)
+	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
 		return "", err
 	}
@@ -814,7 +870,7 @@ func (s *Service) execGrepTheme(ctx context.Context, storeAuth themefs.RequestAu
 		if matches >= maxGrepMatches {
 			break
 		}
-		content, err := s.store.ReadFile(ctx, storeAuth, p)
+		content, err := store.ReadFile(ctx, storeAuth, p)
 		if err != nil || content == "" {
 			continue
 		}
@@ -853,8 +909,8 @@ func (s *Service) execGrepTheme(ctx context.Context, storeAuth themefs.RequestAu
 // be replaced by a retried proposal (checkAndRepair keeps re-using this
 // same snapshot; only fresh update paths that first appear on a retry
 // would miss a "before" here, same as before this change for any path).
-func (s *Service) buildSnapshot(ctx context.Context, storeAuth themefs.RequestAuth, result *ai.Result) (themecheck.Snapshot, error) {
-	tree, err := s.store.ListFiles(ctx, storeAuth)
+func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, result *ai.Result) (themecheck.Snapshot, error) {
+	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
 		return themecheck.Snapshot{}, fmt.Errorf("list theme files: %w", err)
 	}
@@ -863,7 +919,7 @@ func (s *Service) buildSnapshot(ctx context.Context, storeAuth themefs.RequestAu
 
 	files := make(map[string]string, 4)
 	for _, path := range []string{pathPagesJSON, pathDefaultsJSON, pathLayoutStart, pathLayoutEnd} {
-		content, err := s.store.ReadFile(ctx, storeAuth, path)
+		content, err := store.ReadFile(ctx, storeAuth, path)
 		if err != nil {
 			return themecheck.Snapshot{}, fmt.Errorf("read %s: %w", path, err)
 		}
@@ -876,7 +932,7 @@ func (s *Service) buildSnapshot(ctx context.Context, storeAuth themefs.RequestAu
 		if _, ok := files[f.Path]; ok {
 			continue
 		}
-		content, err := s.store.ReadFile(ctx, storeAuth, f.Path)
+		content, err := store.ReadFile(ctx, storeAuth, f.Path)
 		if err != nil {
 			return themecheck.Snapshot{}, fmt.Errorf("read %s: %w", f.Path, err)
 		}
@@ -1334,13 +1390,21 @@ func validateBrandModeProposal(r *ai.Result) error {
 	return nil
 }
 
-// writtenFile is one proposed file after it's been written to disk, paired
-// with whatever content it replaced — captured before the write so the
+// writtenFile is one proposed or layout file staged into the draft (see
+// planToStaged) or, for Service.ApplyDraft, actually written to FlowPOS
+// (see commitWritePlan) — paired with whatever content it replaced so the
 // audit row persisted afterward (see persistFileRecords) can still record
-// what changed, even though the real "before" state is gone from disk by then.
+// what changed, even after the real "before" state is gone. Despite the
+// name (kept from when this only ever meant "already committed to disk" —
+// see doGenerate's staging path, which never calls commitWritePlan at all
+// now), the struct itself is just "here's what to audit," write or no write.
 type writtenFile struct {
 	generated ai.GeneratedFile
 	previous  *string
+	// kind/pageMeta are what the 20260813000001 migration's two new
+	// columns exist for — see GeneratedFileKind and persistFileRecords.
+	kind     GeneratedFileKind
+	pageMeta *themefs.PageMeta
 }
 
 // planFile is one file a writePlan will commit — either a proposed file
@@ -1391,11 +1455,16 @@ func (p writePlan) paths() []string {
 // a failure here (a layout file missing its insertion marker, a page
 // registry entry with no matching file) leaves the real theme completely
 // untouched instead of partially, silently modified.
-func (s *Service) buildWritePlan(ctx context.Context, storeAuth themefs.RequestAuth, result *ai.Result) (writePlan, error) {
+func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, result *ai.Result) (writePlan, error) {
 	var plan writePlan
 
 	for _, f := range result.Files {
-		previous, err := s.store.ReadFile(ctx, storeAuth, f.Path)
+		// store here is the draft overlay (see doGenerate) — "previous"
+		// must be the draft's own prior content (what an earlier turn in
+		// THIS chat already staged), not the last-applied theme, or
+		// revert-within-a-draft (see RevertToMessage's updated doc
+		// comment) would restore the wrong "before" state.
+		previous, err := store.ReadFile(ctx, storeAuth, f.Path)
 		if err != nil {
 			return writePlan{}, fmt.Errorf("read %q: %w", f.Path, err)
 		}
@@ -1447,7 +1516,7 @@ func (s *Service) buildWritePlan(ctx context.Context, storeAuth themefs.RequestA
 	}
 
 	if len(result.LayoutLinksToAdd) > 0 {
-		current, err := s.store.ReadFile(ctx, storeAuth, pathLayoutStart)
+		current, err := store.ReadFile(ctx, storeAuth, pathLayoutStart)
 		if err != nil {
 			return writePlan{}, fmt.Errorf("add layout css links: %w", err)
 		}
@@ -1468,7 +1537,7 @@ func (s *Service) buildWritePlan(ctx context.Context, storeAuth themefs.RequestA
 	}
 
 	if len(result.LayoutScriptsToAdd) > 0 {
-		current, err := s.store.ReadFile(ctx, storeAuth, pathLayoutEnd)
+		current, err := store.ReadFile(ctx, storeAuth, pathLayoutEnd)
 		if err != nil {
 			return writePlan{}, fmt.Errorf("add layout js links: %w", err)
 		}
@@ -1518,19 +1587,57 @@ func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.Request
 	return written, nil
 }
 
-// persistFileRecords writes the audit row for each file already written to
-// disk (see commitWritePlan) — done after the assistant message exists
-// since chat_generated_files.message_id is a foreign key into it.
+// planToStaged converts a writePlan into the same writtenFile shape
+// commitWritePlan's callers already know how to audit — used by
+// doGenerate's staging path (no write, see its own comment) instead of
+// commitWritePlan, which actually writes and is now only ever called by
+// Service.ApplyDraft. Unlike commitWritePlan, this DOES include
+// plan.layoutStart/layoutEnd (tagged GeneratedFileKindLayout) — see the
+// 20260813000001 migration's doc comment for why an unaudited layout
+// splice, harmless when writes were immediate, is a silent data-loss bug
+// the moment the write is deferred: nothing else remembers the splice
+// happened until Apply runs.
+func planToStaged(plan writePlan) []writtenFile {
+	staged := make([]writtenFile, 0, len(plan.files)+2)
+	for _, f := range plan.files {
+		staged = append(staged, writtenFile{
+			generated: ai.GeneratedFile{Path: f.path, Action: string(f.action), Content: f.content},
+			previous:  f.previous,
+			kind:      GeneratedFileKindProposed,
+			pageMeta:  f.pageMeta,
+		})
+	}
+	for _, f := range []*planFile{plan.layoutStart, plan.layoutEnd} {
+		if f == nil {
+			continue
+		}
+		staged = append(staged, writtenFile{
+			generated: ai.GeneratedFile{Path: f.path, Action: string(FileActionUpdate), Content: f.content},
+			kind:      GeneratedFileKindLayout,
+		})
+	}
+	return staged
+}
+
+// persistFileRecords writes the audit row for each staged/written file
+// (see planToStaged/commitWritePlan) — done after the assistant message
+// exists since chat_generated_files.message_id is a foreign key into it.
 func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID string, written []writtenFile) ([]GeneratedFile, error) {
 	files := make([]GeneratedFile, 0, len(written))
 	now := time.Now().UTC()
 	for _, w := range written {
+		kind := w.kind
+		if kind == "" {
+			kind = GeneratedFileKindProposed
+		}
 		f := GeneratedFile{
 			ID:              uuid.NewString(),
 			MessageID:       messageID,
 			ChatID:          c.ID,
 			FilePath:        w.generated.Path,
 			Action:          FileAction(w.generated.Action),
+			Kind:            kind,
+			PageMeta:        w.pageMeta,
 			Language:        languageFor(w.generated.Path),
 			Content:         w.generated.Content,
 			PreviousContent: w.previous,
@@ -1568,26 +1675,73 @@ func (s *Service) CreateThemeFromBase(ctx context.Context, tenantID uint64, toke
 	return slug, nil
 }
 
-func (s *Service) LoadThemeFiles(ctx context.Context, storeAuth themefs.RequestAuth) (map[string]string, error) {
-	tree, err := s.store.ListFiles(ctx, storeAuth)
+// LoadThemeFiles fetches every render-relevant theme file's content, keyed
+// by theme-relative path. store lets a caller pass a draft overlay (see
+// themefs.OverlayStore) so a preview reflects unsaved changes instead of
+// only the last-applied theme — the AI chat page's draft preview always
+// does; Preview (the Go-renderer fidelity check) still passes s.store
+// directly, unchanged, since it works from its own explicit overlay map
+// instead (see handlers/preview.go).
+//
+// includeAssets adds .css/.js alongside .liquid — the original .liquid-only
+// behavior stays available (includeAssets: false) for callers that only
+// ever needed templates (nothing but a template is a render target for the
+// Go engine — see liquidrender). LiquidJS's frontend preview needs CSS/JS
+// too, to inline draft stylesheets/scripts (see asset_url's doc comment in
+// liquid-engine.ts).
+//
+// Reads run concurrently (errgroup, capped at 8 in flight) rather than one
+// HTTP round trip at a time — sequential reads of a real theme's full file
+// set (a few dozen files at flowpos-backend's typical latency) added up to
+// multiple seconds of pure network wait, and this is now called on every
+// turn (draft preview), not just once per Editor page load.
+func (s *Service) LoadThemeFiles(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, includeAssets bool) (map[string]string, error) {
+	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
 		return nil, fmt.Errorf("list theme files: %w", err)
 	}
 	paths := make(map[string]bool)
 	flattenFileTree(tree, paths)
 
-	files := make(map[string]string, len(paths))
+	var wanted []string
 	for path := range paths {
-		if !strings.HasSuffix(path, ".liquid") {
+		if strings.HasSuffix(path, ".liquid") {
+			wanted = append(wanted, path)
 			continue
 		}
-		content, err := s.store.ReadFile(ctx, storeAuth, path)
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", path, err)
+		if includeAssets && (strings.HasSuffix(path, ".css") || strings.HasSuffix(path, ".js")) {
+			wanted = append(wanted, path)
 		}
-		files[path] = content
+	}
+
+	files := make(map[string]string, len(wanted))
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(loadThemeFilesConcurrency)
+	for _, path := range wanted {
+		g.Go(func() error {
+			content, err := store.ReadFile(gctx, storeAuth, path)
+			if err != nil {
+				return fmt.Errorf("read %s: %w", path, err)
+			}
+			mu.Lock()
+			files[path] = content
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
 	}
 	return files, nil
+}
+
+// LoadBaseThemeFiles is LoadThemeFiles against the real (non-overlay)
+// store — a convenience for callers (handlers/preview.go) that have no
+// draft-overlay reason to build one themselves and shouldn't need to know
+// s.store is even a field they could reach for.
+func (s *Service) LoadBaseThemeFiles(ctx context.Context, storeAuth themefs.RequestAuth, includeAssets bool) (map[string]string, error) {
+	return s.LoadThemeFiles(ctx, s.store, storeAuth, includeAssets)
 }
 
 func (s *Service) FilesForChat(ctx context.Context, chatID string) ([]GeneratedFile, error) {

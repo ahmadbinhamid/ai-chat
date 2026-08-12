@@ -50,7 +50,7 @@ func TestExecListThemeFiles(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	out, err := svc.execListThemeFiles(context.Background(), testStoreAuth())
+	out, err := svc.execListThemeFiles(context.Background(), svc.store, testStoreAuth())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestExecReadThemeFile_Basic(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"components/testimonials.liquid", "pages/offers.liquid"}})
-	out, err := svc.execReadThemeFile(context.Background(), testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestExecReadThemeFile_MissingFile(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"pages/nope.liquid"}})
-	out, err := svc.execReadThemeFile(context.Background(), testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestExecReadThemeFile_RejectsDisallowedExtension(t *testing.T) {
 	// accepts the extensions ValidateGeneratedFilePath allows (.liquid/.css/
 	// .js) — pages.json/defaults.json go through buildThemeContext instead.
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"pages.json"}})
-	out, err := svc.execReadThemeFile(context.Background(), testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -127,7 +127,7 @@ func TestExecReadThemeFile_CapsPathCount(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(readThemeFileInput{Paths: paths})
-	out, err := svc.execReadThemeFile(context.Background(), testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestExecGrepTheme_FindsMatchesWithLineNumbers(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(grepThemeInput{Pattern: `render 'components/testimonials'`})
-	out, err := svc.execGrepTheme(context.Background(), testStoreAuth(), input)
+	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestExecGrepTheme_PathGlobRestriction(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(grepThemeInput{Pattern: "TODO", PathGlob: "pages/*.liquid"})
-	out, err := svc.execGrepTheme(context.Background(), testStoreAuth(), input)
+	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestExecGrepTheme_NoMatches(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(grepThemeInput{Pattern: "will-not-match-anything"})
-	out, err := svc.execGrepTheme(context.Background(), testStoreAuth(), input)
+	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestExecGrepTheme_InvalidPattern(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(grepThemeInput{Pattern: "(unclosed"})
-	if _, err := svc.execGrepTheme(context.Background(), testStoreAuth(), input); err == nil {
+	if _, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input); err == nil {
 		t.Error("expected an error for an invalid regex pattern")
 	}
 }
@@ -213,7 +213,7 @@ func TestBuildToolExecutor_UnknownTool(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	toolExec := svc.buildToolExecutor(testStoreAuth())
+	toolExec := svc.buildToolExecutor(svc.store, testStoreAuth())
 	if _, err := toolExec(context.Background(), "not_a_real_tool", nil); err == nil {
 		t.Error("expected an error for an unknown tool name")
 	}

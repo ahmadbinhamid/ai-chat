@@ -31,16 +31,29 @@ const (
 	MessageStatusFailed    MessageStatus = "failed"
 )
 
-// ApplyStatus records whether an assistant turn's proposed changes were
-// written to the real theme. There is no "pending" state to wait on —
-// generation applies its changes immediately (see
-// themebuild.Service.Generate) — so this is only ever set once, at the same
-// time as everything else on the message.
+// ApplyStatus records whether an assistant turn's proposed changes have
+// been written to the real theme. Generation no longer writes immediately
+// (see themebuild/model.go's own package doc comment on the draft/apply
+// split) — a turn with changes starts "pending" (generated, previewable via
+// the draft overlay, not yet on FlowPOS) and is later resolved to either
+// "applied" (themebuild.Service.ApplyDraft) or "discarded"
+// (Service.DiscardDraft), both of which stamp every "pending" message in
+// the chat at once — a draft is applied/discarded as a whole, there is no
+// per-turn apply.
 type ApplyStatus string
 
 const (
 	ApplyStatusNotApplicable ApplyStatus = "not_applicable"
 	ApplyStatusApplied       ApplyStatus = "applied"
+	// ApplyStatusPending means this turn proposed changes that exist only
+	// in the draft overlay (chat_generated_files rows for this message) —
+	// not yet written to FlowPOS.
+	ApplyStatusPending ApplyStatus = "pending"
+	// ApplyStatusDiscarded means a pending turn's changes were thrown away
+	// (Service.DiscardDraft) rather than applied — kept, not deleted, so
+	// the transcript still shows the turn happened; see the discarded turn
+	// message. AppliedAt is never set for this status.
+	ApplyStatusDiscarded ApplyStatus = "discarded"
 )
 
 // Chat is the one, ongoing conversation thread for a (tenant_id, type) pair

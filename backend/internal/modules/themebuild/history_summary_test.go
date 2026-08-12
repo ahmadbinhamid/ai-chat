@@ -141,4 +141,3 @@ func TestSummarizeOldTurns_FailsOpenOnSummarizeError(t *testing.T) {
 		}
 	}
 }
-

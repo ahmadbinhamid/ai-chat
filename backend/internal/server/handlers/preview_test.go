@@ -98,7 +98,7 @@ func TestPreviewHandler_RendersUnsavedDraftContent(t *testing.T) {
 	draft := `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
 <p>Draft: {{ store.name }}</p>
 {% render 'liquid/layout-end', theme: theme, store: store %}`
-	body, _ := json.Marshal(previewRequest{Path: "pages/draft.liquid", Content: draft})
+	body, _ := json.Marshal(previewRequest{Path: "pages/draft.liquid", Files: map[string]string{"pages/draft.liquid": draft}})
 	req := httptest.NewRequest(http.MethodPost, "/themes/demo/preview", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

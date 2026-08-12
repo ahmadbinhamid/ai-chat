@@ -39,6 +39,10 @@ func respondErr(c *gin.Context, err error) {
 		httpresponse.Error(c, http.StatusConflict, err.Error(), "GENERATION_IN_PROGRESS")
 	case errors.Is(err, themebuild.ErrQueueFull):
 		httpresponse.Error(c, http.StatusTooManyRequests, err.Error(), "QUEUE_FULL")
+	case errors.Is(err, themebuild.ErrApplyBlockedByRunningGeneration):
+		httpresponse.Error(c, http.StatusConflict, err.Error(), "APPLY_IN_PROGRESS")
+	case errors.Is(err, themebuild.ErrNoPendingChanges):
+		httpresponse.Error(c, http.StatusConflict, err.Error(), "NO_PENDING_CHANGES")
 	default:
 		slog.Default().Error("unhandled request error", "error", err.Error(), "request_id", logging.RequestID(c))
 		httpresponse.Error(c, http.StatusInternalServerError, "an unexpected error occurred", "")

@@ -14,6 +14,22 @@ import (
 	"time"
 )
 
+// ThemeStore is the subset of *Store's behavior themebuild depends on —
+// exists so OverlayStore (see overlay.go) can wrap either a real *Store or,
+// in tests, a fake, and so themebuild.Service can hold one without caring
+// which. *Store satisfies this with no changes on its side. Deliberately
+// doesn't include GetOrGenerateManifest: manifest generation isn't made
+// draft-aware by this interface (see themebuild.Service's own doc comment
+// on why) and stays a *Store-only capability, reached via a type assertion
+// where it's still needed.
+type ThemeStore interface {
+	ReadFile(ctx context.Context, auth RequestAuth, relPath string) (string, error)
+	WriteFile(ctx context.Context, auth RequestAuth, relPath, content string, meta *PageMeta) error
+	DeleteFile(ctx context.Context, auth RequestAuth, relPath string) error
+	ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntry, error)
+	CreateThemeFromBase(ctx context.Context, auth RequestAuth) (string, error)
+}
+
 // Store reads and writes the tenant's active theme's files through
 // flowpos-backend's own theme-file API (store/themes/active/files/...) —
 // see ThemeFileController/ThemeFileService in flowpos-backend. This service

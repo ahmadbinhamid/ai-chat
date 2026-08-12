@@ -34,7 +34,7 @@ func TestBuildWritePlan_PageRegistryEntryMatchesFile_TopLevelPages(t *testing.T)
 		},
 	}
 
-	plan, err := svc.buildWritePlan(context.Background(), auth, result)
+	plan, err := svc.buildWritePlan(context.Background(), svc.store, auth, result)
 	if err != nil {
 		t.Fatalf("buildWritePlan returned an error: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestBuildWritePlan_PageRegistryEntryMatchesFile_AuthSubdir(t *testing.T) {
 		},
 	}
 
-	plan, err := svc.buildWritePlan(context.Background(), auth, result)
+	plan, err := svc.buildWritePlan(context.Background(), svc.store, auth, result)
 	if err != nil {
 		t.Fatalf("buildWritePlan returned an error: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestBuildWritePlan_PageRegistryEntryWithNoMatchingFileErrors(t *testing.T) 
 		},
 	}
 
-	if _, err := svc.buildWritePlan(context.Background(), auth, result); err == nil {
+	if _, err := svc.buildWritePlan(context.Background(), svc.store, auth, result); err == nil {
 		t.Fatal("expected an error when the registry entry doesn't match any proposed file")
 	}
 }

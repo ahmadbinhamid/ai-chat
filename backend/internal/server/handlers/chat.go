@@ -48,6 +48,11 @@ type chatDetail struct {
 	// themebuild.Service.ListPendingGenerations. Always [] rather than null
 	// for a chat with nothing pending, same convention as Messages.
 	Queue []themebuild.PendingGeneration `json:"queue"`
+	// PendingChanges reports the chat's unapplied draft, if any — see
+	// themebuild.Service.DraftSummary. Never includes file CONTENT (that's
+	// GET /chats/:chatId/draft, its own route — see DraftHandler's doc
+	// comment on why this payload shouldn't grow by dozens of whole files).
+	PendingChanges themebuild.DraftSummaryResult `json:"pending_changes"`
 }
 
 // Get returns the tenant's one chat and its full transcript, with each
@@ -58,7 +63,10 @@ type chatDetail struct {
 func (h *ChatHandler) Get(c *gin.Context) {
 	ch, err := h.chats.GetChatForTenant(c.Request.Context(), auth.TenantID(c), themebuild.ChatType)
 	if errors.Is(err, chat.ErrNotFound) {
-		httpresponse.OK(c, chatDetail{Chat: nil, Messages: []messageWithFiles{}, Queue: []themebuild.PendingGeneration{}})
+		httpresponse.OK(c, chatDetail{
+			Chat: nil, Messages: []messageWithFiles{}, Queue: []themebuild.PendingGeneration{},
+			PendingChanges: themebuild.DraftSummaryResult{FilePaths: []string{}},
+		})
 		return
 	}
 	if err != nil {
@@ -83,6 +91,11 @@ func (h *ChatHandler) Get(c *gin.Context) {
 		respondErr(c, err)
 		return
 	}
+	pendingChanges, err := h.builder.DraftSummary(c.Request.Context(), ch.ID)
+	if err != nil {
+		respondErr(c, err)
+		return
+	}
 
 	filesByMessage := make(map[string][]themebuild.GeneratedFile, len(messages))
 	for _, f := range files {
@@ -98,7 +111,10 @@ func (h *ChatHandler) Get(c *gin.Context) {
 	if queue == nil {
 		queue = []themebuild.PendingGeneration{}
 	}
-	httpresponse.OK(c, chatDetail{Chat: &ch, Messages: withFiles, Generating: generating, GenerationError: genErr, Queue: queue})
+	httpresponse.OK(c, chatDetail{
+		Chat: &ch, Messages: withFiles, Generating: generating, GenerationError: genErr,
+		Queue: queue, PendingChanges: pendingChanges,
+	})
 }
 
 // chatStatus is just the two fields a caller needs to know whether a

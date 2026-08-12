@@ -14,7 +14,13 @@ import (
 
 // PreviewHandler renders a theme page against fixture data (see
 // themefs.FixtureContext) — a merchant can see what a page looks like
-// without it ever being saved to the real theme.
+// without it ever being saved to the real theme. The frontend's own
+// LiquidJS engine (see tenant-dashboard's liquid-engine.ts) now does this
+// same rendering client-side, instantly, for the AI chat page's draft
+// preview — this endpoint stays as the fidelity reference it renders
+// against ("Check accuracy" in PreviewPane.tsx posts the draft here and
+// diffs the two HTML outputs), not something replaced by the client-side
+// engine. Do not delete this or internal/liquidrender.
 type PreviewHandler struct {
 	builder *themebuild.Service
 }
@@ -25,16 +31,18 @@ func NewPreviewHandler(builder *themebuild.Service) *PreviewHandler {
 
 type previewRequest struct {
 	// Page is a pages.json basename (e.g. "home") — resolves to
-	// pages/home.liquid. Ignored if Path or Content is set.
+	// pages/home.liquid. Ignored if Path is set.
 	Page string `json:"page"`
 	// Path is an explicit theme-relative path override, e.g.
 	// "pages/auth/login.liquid" (for a page under pages/auth/).
 	Path string `json:"path"`
-	// Content, if set, is rendered as the entry page's literal source
-	// instead of whatever currently exists at Path/Page — an unsaved
-	// draft, exactly the case a preview exists for. The rest of the
-	// theme's real files are still available to it via {% render %}.
-	Content string `json:"content"`
+	// Files, if set, overlays these theme-relative paths -> content on top
+	// of the real theme's own files before rendering — an unsaved draft
+	// (potentially many files: pages, components, layout splices), exactly
+	// the case a preview/accuracy-check exists for. Superset of the old
+	// single-file Content field: a draft is never just one file once a
+	// chat's turn touches a component another page also renders.
+	Files map[string]string `json:"files"`
 }
 
 type previewResponse struct {
@@ -60,18 +68,18 @@ func (h *PreviewHandler) Preview(c *gin.Context) {
 		entryPath = "pages/" + in.Page + ".liquid"
 	}
 	if entryPath == "" {
-		respondBindErr(c, errors.New("one of page, path, or content is required"))
+		respondBindErr(c, errors.New("one of page or path is required"))
 		return
 	}
 
 	storeAuth := themefs.RequestAuth{Token: auth.Token(c), TenantID: auth.TenantID(c)}
-	files, err := h.builder.LoadThemeFiles(c.Request.Context(), storeAuth)
+	files, err := h.builder.LoadBaseThemeFiles(c.Request.Context(), storeAuth, false)
 	if err != nil {
 		respondErr(c, err)
 		return
 	}
-	if in.Content != "" {
-		files[entryPath] = in.Content
+	for path, content := range in.Files {
+		files[path] = content
 	}
 
 	renderer := liquidrender.Renderer{Files: files}
@@ -81,4 +89,13 @@ func (h *PreviewHandler) Preview(c *gin.Context) {
 	}
 
 	httpresponse.OK(c, previewResponse{HTML: html, Errors: errs})
+}
+
+// Context handles GET /api/v1/preview/context — themefs.FixtureContext()
+// as JSON, so the frontend's LiquidJS preview never hand-copies the
+// fixture data into TypeScript (a second, driftable copy of the same
+// sample product/category/etc. shape this Go endpoint already owns) and
+// instead fetches the one source of truth.
+func (h *PreviewHandler) Context(c *gin.Context) {
+	httpresponse.OK(c, themefs.FixtureContext())
 }
