@@ -1436,6 +1436,24 @@ func validateProposal(r *ai.Result, mode string) error {
 		if f.Action != "create" && f.Action != "update" {
 			return fmt.Errorf("file %q: invalid action %q", f.Path, f.Action)
 		}
+		// layout-start.liquid/layout-end.liquid may only ever be touched via
+		// layout_links_to_add/layout_scripts_to_add (see buildWritePlan) —
+		// never as a regular files[] entry. Nothing stopped the model from
+		// doing both to the same file in one turn (observed in production:
+		// a files[] edit to layout-start.liquid alongside a layout_links_to_add
+		// entry), and buildWritePlan doesn't dedupe between the two paths —
+		// planToStaged then produces two audit rows for the identical
+		// (message_id, file_path) pair, and the second INSERT dies on
+		// chat_generated_files' own uniqueness constraint. That failure
+		// happens well after this point (post-themecheck, post-repair),
+		// aborts persistFileRecords' whole batch, and surfaces to the
+		// merchant as an opaque "something went wrong" with no indication
+		// anything was even wrong with the proposal itself. Rejecting here
+		// instead — before a single themecheck/repair round-trip is spent —
+		// is cheap and gives the model something concrete to correct.
+		if f.Path == pathLayoutStart || f.Path == pathLayoutEnd {
+			return fmt.Errorf("proposed file rejected: %q may only be edited via layout_links_to_add/layout_scripts_to_add, not files[]", f.Path)
+		}
 	}
 	for _, p := range r.LayoutLinksToAdd {
 		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
