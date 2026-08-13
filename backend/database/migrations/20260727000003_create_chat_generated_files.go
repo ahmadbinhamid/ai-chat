@@ -14,15 +14,15 @@ func init() {
 	})
 }
 
-// chat_generated_files is an audit log of one file an assistant message
-// wrote ("Generated 2 files" in the UI) — generation writes straight to the
-// real theme filesystem now (see themebuild.Service.Generate), so there is
-// no pending/applied/reverted lifecycle to track here anymore, just a record
-// of what was written and what it replaced. file_path is required, not
-// optional metadata: it's the only record of *where* content was written —
-// without it this table couldn't answer "what did this message change".
-// chat_id is denormalized from message_id so "every file ever touched in
-// this chat" doesn't need a join through chat_messages.
+// chat_generated_files is a record of every file an assistant message
+// changed ("Generated 2 files" in the UI). A new file starts out "pending"
+// (staged as a draft, not yet on the real theme) and later becomes
+// "applied" or "discarded" — see the 20260813000001 migration, which adds
+// the columns that track this. file_path is required, not optional
+// metadata: it's the only record of *where* content was written — without
+// it this table couldn't answer "what did this message change". chat_id is
+// denormalized from message_id so "every file ever touched in this chat"
+// doesn't need a join through chat_messages.
 func Up_20260727000003(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chat_generated_files (
