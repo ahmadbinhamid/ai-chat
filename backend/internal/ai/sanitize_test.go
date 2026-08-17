@@ -39,6 +39,18 @@ func TestSanitizeError(t *testing.T) {
 			mustNotHave: []string{"Anthropic", "anthropic", "claude", "api.anthropic.com"},
 		},
 		{
+			// Regression test: observed in production. DeepSeek's compat
+			// endpoint's own wording for "out of money" has no "credit" in
+			// it at all, unlike Anthropic's — the original check (looking
+			// for "credit balance" or "insufficient"+"credit" together)
+			// silently missed this and fell through to the generic message.
+			name: "deepseek insufficient balance",
+			err: errors.New(`claude stream: POST "https://api.deepseek.com/anthropic/v1/messages": 402 Payment Required ` +
+				`{"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}`),
+			wantContain: "out of credits",
+			mustNotHave: []string{"DeepSeek", "deepseek", "api.deepseek.com"},
+		},
+		{
 			name:        "deepseek rate limited",
 			err:         errors.New(`deepseek stream: POST "https://api.deepseek.com/anthropic/v1/messages": 429 Too Many Requests`),
 			wantContain: "too many requests",

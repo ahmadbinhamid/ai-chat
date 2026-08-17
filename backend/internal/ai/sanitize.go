@@ -77,7 +77,13 @@ func categorizeError(err error) string {
 
 	lower := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(lower, "credit balance") || (strings.Contains(lower, "insufficient") && strings.Contains(lower, "credit")):
+	case strings.Contains(lower, "credit balance") || strings.Contains(lower, "insufficient balance") ||
+		strings.Contains(lower, "payment required") || (strings.Contains(lower, "insufficient") && strings.Contains(lower, "credit")):
+		// "insufficient balance"/"payment required" cover DeepSeek's own
+		// wording for the same condition (its compat endpoint's 402 body is
+		// {"error":{"message":"Insufficient Balance",...}} — no "credit" in
+		// it at all, so the original credit-only check silently missed it
+		// and fell through to the generic message). Observed in production.
 		return "the account is out of credits — please contact support"
 	case strings.Contains(lower, "did not call propose_changes within"):
 		return "the task was too complex to finish in one attempt — please try breaking it into smaller requests"
