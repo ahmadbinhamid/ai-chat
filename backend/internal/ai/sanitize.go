@@ -77,6 +77,15 @@ func categorizeError(err error) string {
 
 	lower := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(lower, "accumulate stream") || strings.Contains(lower, "error converting content block to json"):
+		// The provider's streamed response was cut off or garbled mid-chunk
+		// before the SDK could reassemble it into valid JSON (seen in
+		// production as both "unexpected end of JSON input" and "invalid
+		// character '}' after top-level value" — a dropped connection or
+		// truncated response, not anything about the request itself).
+		// Checked before the generic "timeout"/"unavailable" matches below
+		// since those substrings don't otherwise appear here.
+		return "the connection to the AI provider was interrupted mid-response — please try again"
 	case strings.Contains(lower, "credit balance") || strings.Contains(lower, "insufficient balance") ||
 		strings.Contains(lower, "payment required") || (strings.Contains(lower, "insufficient") && strings.Contains(lower, "credit")):
 		// "insufficient balance"/"payment required" cover DeepSeek's own

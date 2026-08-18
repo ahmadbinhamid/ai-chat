@@ -51,6 +51,21 @@ func TestSanitizeError(t *testing.T) {
 			mustNotHave: []string{"DeepSeek", "deepseek", "api.deepseek.com"},
 		},
 		{
+			// Regression test: observed in production twice, with two
+			// different underlying json.Unmarshal failures — the provider's
+			// stream got cut off/garbled mid-chunk before the SDK could
+			// reassemble a content block's JSON. Neither message matched any
+			// existing case, so both fell through to the generic message.
+			name:        "provider stream truncated mid-response",
+			err:         errors.New("accumulate stream: error converting content block to JSON: json: error calling MarshalJSON for type json.RawMessage: unexpected end of JSON input"),
+			wantContain: "interrupted",
+		},
+		{
+			name:        "provider stream garbled mid-response",
+			err:         errors.New("accumulate stream: error converting content block to JSON: json: error calling MarshalJSON for type json.RawMessage: invalid character '}' after top-level value"),
+			wantContain: "interrupted",
+		},
+		{
 			name:        "deepseek rate limited",
 			err:         errors.New(`deepseek stream: POST "https://api.deepseek.com/anthropic/v1/messages": 429 Too Many Requests`),
 			wantContain: "too many requests",

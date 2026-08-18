@@ -288,6 +288,25 @@ const maxToolIterations = 28
 // the budget with nothing to show for it.
 const forceProposeWithinLastN = 3
 
+// streamAccumulateMaxAttempts is how many times a single tool-loop
+// iteration's streaming call is attempted when the provider's stream itself
+// arrives truncated/garbled mid-chunk (see isRetryableAccumulateErr) —
+// observed in production as a transport-level hiccup unrelated to the
+// request, so a short retry resolves it in practice rather than failing the
+// whole generation. streamAccumulateRetryDelay between attempts gives the
+// provider a moment to recover; 3 attempts * 5s = up to 10s of retrying
+// before giving up.
+const streamAccumulateMaxAttempts = 3
+const streamAccumulateRetryDelay = 5 * time.Second
+
+// isRetryableAccumulateErr reports whether err is message.Accumulate failing
+// to parse a truncated/garbled streamed chunk — see sanitize.go's matching
+// categorization of the same error text for what the merchant sees if every
+// retry still fails.
+func isRetryableAccumulateErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "accumulate stream")
+}
+
 // defaultMaxTokens is used when ANTHROPIC_MAX_TOKENS is unset — comfortably
 // below Opus-tier's real ceiling (per Anthropic's docs, 64000 is nowhere
 // near the effective context/output limit for claude-opus-* models) while
@@ -424,32 +443,57 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}}
 			params.OutputConfig = anthropic.OutputConfigParam{Effort: g.effort}
 		}
-		stream := g.client.Messages.NewStreaming(ctx, params)
-
-		message := anthropic.Message{}
-		emitted := 0
-		// Fresh per iteration, same as message/emitted above: each
-		// iteration is its own streaming API call with its own text run,
-		// and coalescer.flush() below already empties it before the next
-		// iteration could otherwise reuse a stale buffer.
-		coalescer := newDeltaCoalescer(onDelta)
-		for stream.Next() {
-			if err := message.Accumulate(stream.Current()); err != nil {
-				return nil, fmt.Errorf("accumulate stream: %w", err)
+		var message anthropic.Message
+		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
+			stream := g.client.Messages.NewStreaming(ctx, params)
+			message = anthropic.Message{}
+			emitted := 0
+			var accumulateErr error
+			// Fresh per attempt, same as message/emitted above: a retried
+			// attempt is its own streaming API call with its own text run,
+			// and coalescer.flush() below already empties it before the next
+			// attempt/iteration could otherwise reuse a stale buffer. Note
+			// this does mean a retry re-emits onDelta from the start of this
+			// iteration's text — acceptable since the failure this retries
+			// (see isRetryableAccumulateErr) happens while parsing a
+			// tool_use block's arguments, which iterations that narrate
+			// meaningful text rarely reach before it would have failed.
+			coalescer := newDeltaCoalescer(onDelta)
+			for stream.Next() {
+				if err := message.Accumulate(stream.Current()); err != nil {
+					accumulateErr = fmt.Errorf("accumulate stream: %w", err)
+					break
+				}
+				if full := currentText(message); len(full) > emitted {
+					coalescer.add(full[emitted:])
+					emitted = len(full)
+				}
 			}
-			if full := currentText(message); len(full) > emitted {
-				coalescer.add(full[emitted:])
-				emitted = len(full)
+			// Whatever's still buffered when this attempt ends must go out
+			// now — otherwise the last <80-char, <200ms fragment of a turn's
+			// narration (very often the tail end, since a stream just ending
+			// is exactly when there's no more input to trigger the next
+			// add() call that would have flushed it) is silently lost.
+			coalescer.flush()
+			if accumulateErr == nil {
+				if err := stream.Err(); err != nil {
+					return nil, fmt.Errorf("claude stream: %w", err)
+				}
+				break
 			}
-		}
-		// Whatever's still buffered when this iteration's stream ends must
-		// go out now — otherwise the last <80-char, <200ms fragment of a
-		// turn's narration (very often the tail end, since a stream just
-		// ending is exactly when there's no more input to trigger the next
-		// add() call that would have flushed it) is silently lost.
-		coalescer.flush()
-		if err := stream.Err(); err != nil {
-			return nil, fmt.Errorf("claude stream: %w", err)
+			if !isRetryableAccumulateErr(accumulateErr) || attempt == streamAccumulateMaxAttempts {
+				return nil, accumulateErr
+			}
+			// The provider's stream arrived truncated/garbled mid-chunk — a
+			// transport-level hiccup, not anything about this request — so a
+			// short pause and a fresh attempt resolves it in practice.
+			slog.Warn("ai: provider stream truncated/garbled, retrying", "attempt", attempt,
+				"max_attempts", streamAccumulateMaxAttempts, "error", accumulateErr.Error())
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(streamAccumulateRetryDelay):
+			}
 		}
 		totalInputTokens += message.Usage.InputTokens
 		totalOutputTokens += message.Usage.OutputTokens
