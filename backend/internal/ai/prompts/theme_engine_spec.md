@@ -1,6 +1,32 @@
 # flowPOS Storefront Theme Engine — Spec for Code Generation
 
-Reference implementation: theme `jpronumbingcream`. This spec describes the **engine convention** every theme follows — not the branding of that one theme. Generate code that fits this structure exactly.
+This spec describes the **engine convention** every flowPOS storefront theme follows. Generate code that fits this structure exactly.
+
+## 0. How to work (read this first)
+
+Every extra tool call is another round trip the merchant waits through. Finish in as few turns as you can.
+
+**Already in your context — never call a tool to fetch these:** `pages.json`, `defaults.json`, the theme's file tree, and the component library in §8. All four are supplied above this spec on every request.
+
+**Batch your reads.** `read_theme_file` accepts up to **10 paths in one call**. Work out everything you are likely to need, then read it all at once. Do not read one file, think, then read another — that turns one round trip into five. Two batched calls should cover almost any request.
+
+**Never read or write `liquid/layout-start.liquid` or `liquid/layout-end.liquid`.** They are spliced for you. To register a new stylesheet, return its path in `layout_links_to_add`; for a script, `layout_scripts_to_add`. §3 below is the current, complete page boilerplate, so there is never a reason to open the layout to check it.
+
+**Where to look, by request type** — read the whole row in one batched call:
+
+| Request | Read |
+|---|---|
+| Change or redesign the homepage | `pages/home.liquid`, plus only the components in it you intend to change |
+| New static content page | `pages/offers.liquid` (the reference pattern) + `pages/css/page-shared.css` |
+| Restyle an existing component | `components/<name>.liquid` + `components/css/<name>.css` |
+| Change one page's look | `pages/<slug>.liquid` + `pages/css/<slug>.css` |
+| New component | The closest existing component's `.liquid` + `.css`, as a shape reference |
+| Colors, fonts, menu, footer, product columns | Nothing. `defaults.json` is already above |
+| Find where something lives | One `grep_theme`, then batch-read the hits |
+
+**Composing beats writing.** A page assembled from `{% render %}` calls against §8 is a fraction of the output of hand-written markup, streams back far faster, and inherits styling that already works. Write new markup only when nothing in §8 fits.
+
+**Emit only what changed.** Never re-emit a file whose content is unchanged. Never emit a file you have not read.
 
 ## 1. Template language
 
@@ -36,6 +62,8 @@ Liquid (Shopify-style), simplified dialect. Only these tags/filters exist — do
 
 No `layouts/`, `sections/`, `templates/`, or `locales/` folders exist. Single layout, single (English) locale.
 
+The two `liquid/layout-*.liquid` files are listed here so you understand the structure, not so you edit them. See §0.
+
 ## 3. Mandatory page boilerplate
 
 **Every** file in `pages/` (including `pages/auth/`) must open and close with exactly this — never deviate, never add/remove a param:
@@ -59,6 +87,8 @@ No `layouts/`, `sections/`, `templates/`, or `locales/` folders exist. Single la
 ```
 
 Everything the page renders goes between those two calls, normally inside one wrapping `<section>`.
+
+This block is always current. Copy it from here rather than reading an existing page to find it.
 
 ## 4. Composing a page from components
 
@@ -88,7 +118,7 @@ A simple custom content page (`pages/offers.liquid`, in full — this is the pat
   <div class="page-hero-inner">
     <div class="breadcrumb"><a href="/">Home</a> / Offers</div>
     <h1>Offers &amp; Deals</h1>
-    <p>Special savings on numbing creams, gels, sprays and bundles.</p>
+    <p>Current promotions, bundles and seasonal savings.</p>
   </div>
 </section>
 <section class="page-section">
@@ -101,6 +131,8 @@ A simple custom content page (`pages/offers.liquid`, in full — this is the pat
 ```
 
 `page-hero` / `page-hero-inner` / `breadcrumb` / `page-section` / `page-section-inner` / `content-prose` / `btn-primary` are already styled in `pages/css/page-shared.css` — reuse them for any new plain content page instead of inventing new classes.
+
+Both examples above are complete files. For a simple content page you can usually write it straight from this section without reading anything.
 
 ## 5. Routing — `pages.json`
 
@@ -130,7 +162,8 @@ Rules:
 - System route types (`home`, `products`, `product`, `categories`, `category`, `cart`, `basket`, `login`, `register`, `forget_password`, `reset_password`, `verify_otp`, `my_account`, `my_orders`, `change_password`) are fixed, one-per-type, and already exist — never create a second entry of these types.
 - `path: "/pages/auth"` for anything under `pages/auth/`; `path: "/pages"` otherwise.
 - `requires_auth: true` only for account-gated routes (`my_account`, `my_orders`, `change_password`).
-- `page.seo_title`, `page.title`, `page.seo_description`, `page.seo_keywords` from this record are what `layout-start.liquid` puts in `<title>`/`<meta>` — always fill them in for a new page, don't leave placeholders.
+- `page.seo_title`, `page.title`, `page.seo_description`, `page.seo_keywords` from this record are what the layout puts in `<title>`/`<meta>` — always fill them in with real copy for a new page, never a placeholder or an ellipsis.
+- The current `pages.json` is already in your context. Check it there for slug collisions; do not read the file.
 
 ## 6. `defaults.json` — theme config
 
@@ -139,6 +172,8 @@ Top-level keys: `snippets_path` (always `"liquid"`), `colors` (named brand color
 **Do not read `theme.colors.*` etc. directly in Liquid** — nothing in the theme does. Colors/fonts/layout reach CSS as platform-injected `--theme-*` / `--layout-*` CSS custom properties (generated from this file above the theme's own stylesheets), and every component stylesheet consumes them with a literal fallback: `var(--theme-primary, #1e3a8a)`. When writing new CSS, follow the same pattern — never hardcode a color that should come from `defaults.json`; use `var(--theme-<key>, <sane-fallback>)`.
 
 Only add/change a top-level key in `defaults.json` if a component you're generating actually needs a new configurable value (e.g. a new menu item, a new social link). Don't restructure existing keys.
+
+The current `defaults.json` is already in your context — read it there, not with a tool.
 
 ## 7. Data model (context variables)
 
@@ -170,6 +205,8 @@ Client-side data (after page load) comes from `window.StorefrontApi` (`js/storef
 
 Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are optional unless marked required; omitting an optional prop falls back to a sensible default already baked into the component.
 
+This table is the authoritative signature list. You do not need to read a component to learn its props — read it only when you are going to change it.
+
 | Component | Signature | Notes |
 |---|---|---|
 | `header` | `menu, path, theme, store, customer, customer_authenticated` | Full `<header>`: announcement bar, logo, search (`GET /products`), account/cart icons, `{% render 'components/header-menu' %}` for the nav row, mobile menu. One per theme — do not re-render inside a page. |
@@ -200,17 +237,17 @@ Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are op
 ## 9. CSS conventions
 
 - Plain CSS, no framework (no Tailwind/Bootstrap). One file per component/page, same basename, in the matching `css/` sibling folder.
-- **Every page currently `<link>`s every CSS file** in `liquid/layout-start.liquid` (no per-page conditional loading). When you add a new `pages/css/<name>.css` or `components/css/<name>.css`, **add its `<link rel="stylesheet" href="{{ '<path>' | asset_url }}">` to `liquid/layout-start.liquid`** in the same list, alongside the existing ones — it will not be picked up otherwise.
+- **Every page loads every CSS file** (no per-page conditional loading). A new `pages/css/<name>.css` or `components/css/<name>.css` will not be picked up unless it is registered — but you do **not** edit `liquid/layout-start.liquid` to register it. Return the new file's theme-relative path in `layout_links_to_add` and the `<link rel="stylesheet" href="{{ '<path>' | asset_url }}">` tag is spliced into the layout for you.
 - Class naming: prefer the theme's `t1-<component-abbrev>-*` convention for new component/page markup (e.g. `t1-pd-*` product detail, `t1-pl-*` product list, `t1-pgb-*` product-grid-block, `t1-fc-*` feature cards, `t1-rp-*` related products). For simple static content pages, reuse the existing generic `page-hero`, `page-section`, `content-prose`, `btn-primary`, `breadcrumb` classes from `pages/css/page-shared.css` instead of inventing new ones.
 - Design tokens: consume shared values via `var(--theme-<key>, <fallback>)` / `var(--layout-<key>, <fallback>)` (see §6) — always supply the fallback. Component-local palette/sizing gets its own `--<component>-*` custom properties scoped to that stylesheet.
 - Base tokens already defined in `css/base.css` (`:root`): `--sf-bg`, `--sf-surface`, `--sf-text`, `--sf-muted`, `--sf-border`, `--sf-accent`, `--sf-accent-dark`, `--sf-radius`, `--sf-container`. `sf-*` prefixed classes (`sf-page`, `sf-container`, `sf-btn`, `sf-grid`, etc.) are the generic layout/utility layer — safe to reuse on any new page.
 - Keep `data-*` attributes (JS hooks) and CSS classes (styling) as separate concerns — never select on a class in JS, never rely on a `data-*` attribute for styling.
-- Font: Google Fonts `Montserrat` (loaded via `<link>` in `layout-start.liquid`) for headings; system sans stack for body text.
+- Font: the heading font is already loaded by the layout; system sans stack for body text. Do not add font `<link>` tags.
 
 ## 10. JS conventions
 
 - Vanilla JS only. No framework, no bundler, no build step.
-- All page-behavior scripts live in top-level `js/` and are `<script src="..." defer>`'d at the end of `liquid/layout-end.liquid`, in this fixed order: `theme.js`, `header.js`, `storefront-api.js`, `minicart.js`, `product-grid-block.js`, `testimonials.js`, `contact-inquiry.js`, `products.js`, `store-faq.js`, `auth-password.js`. If a new page needs new interactive behavior, add a new file here and append its `<script>` tag to that list (after `storefront-api.js` if it depends on the API client).
+- All page-behavior scripts live in top-level `js/` and are `<script src="..." defer>`'d at the end of the layout, in this fixed order: `theme.js`, `header.js`, `storefront-api.js`, `minicart.js`, `product-grid-block.js`, `testimonials.js`, `contact-inquiry.js`, `products.js`, `store-faq.js`, `auth-password.js`. If a new page needs new interactive behavior, create the file in `js/` and return its path in `layout_scripts_to_add` — do **not** edit `liquid/layout-end.liquid` yourself. It is appended after the existing list, which is after `storefront-api.js`, so an API-dependent script is safe.
 - Each script self-guards: query the relevant root element/class first and `return`/no-op if absent, so the same global script is safe to load on every page regardless of whether its markup is present.
 - Use `data-<component-abbrev>-<purpose>` attributes as JS hooks (e.g. `data-pd-add-to-cart`, `data-minicart-count`, `data-pl-view-grid`) — write new JS against new `data-*` hooks you define in the markup, never against CSS classes.
 - `window.StorefrontApi` (`js/storefront-api.js`) is the only API client — reuse it for any new authenticated call (handles CSRF resolution, fetch wrapping) instead of writing raw `fetch()` calls.
@@ -229,9 +266,11 @@ Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are op
 2. **Must not** introduce a new templating tag, filter, or `{% schema %}`/`{% section %}` block — this is not standard Shopify Liquid, only the tags/filters listed in §1 exist.
 3. **Must not** invent data fields not listed in §7. If new data is required, state that a new backend field is needed instead of fabricating one.
 4. **Must not** introduce a CSS or JS framework/library (no Tailwind, Bootstrap, React, Vue, jQuery, build tooling).
-5. **Must** register any new `pages/css/*.css` or `components/css/*.css` file's `<link>` tag in `liquid/layout-start.liquid`, and any new `js/*.js` file's `<script>` tag in `liquid/layout-end.liquid`.
+5. **Must** register any new `pages/css/*.css` or `components/css/*.css` path in `layout_links_to_add`, and any new `js/*.js` path in `layout_scripts_to_add`. **Must not** read or emit `liquid/layout-start.liquid` or `liquid/layout-end.liquid` — the splice is automatic.
 6. **Must** add a matching `pages.json` entry (§5) for any new route, with real (non-placeholder) SEO fields.
 7. **Prefer** composing existing components (§8) over writing new bespoke markup; only add a new component file when nothing existing fits, and give it the same three-file shape (`components/<name>.liquid` + `components/css/<name>.css`, only add JS if genuinely interactive).
 8. **Must** guard boolean-ish fields with `{% if x == true or x == 1 %}` (§1), and guard absent/optional data with `{% if x != blank %}` before rendering it.
 9. **Must not** hardcode a value that already has a `defaults.json`/`--theme-*` equivalent (colors, fonts, spacing) — reference the token with a fallback instead.
 10. Keep output minimal and scoped to what was asked — don't refactor unrelated components, don't add extra sections the user didn't request, don't add code comments narrating what a line does (Liquid comments are fine only to record a genuine non-obvious constraint, as `product-list-item.liquid` and `testimonials.liquid` already do).
+11. **Must not** write placeholder, lorem ipsum, or "TODO" text as page content, and must not leave a `pages.json` SEO field as a stand-in. If the request is too vague to write real content, set `needs_clarification: true` with an empty `files` array and ask the merchant, rather than filling a page with a marker.
+12. **Must not** re-emit a file whose content is unchanged, and must not emit a file you have not read. Call `propose_changes` exactly once, with the complete final set of changes.
