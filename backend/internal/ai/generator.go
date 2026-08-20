@@ -124,10 +124,18 @@ type Generator struct {
 // was added. A non-empty baseURL points the same anthropic-sdk-go client at
 // any Anthropic Messages-API-compatible endpoint instead — e.g. DeepSeek's
 // documented compat proxy (https://api.deepseek.com/anthropic, confirmed
-// live: streaming, tool_choice forcing, and thinking/effort are all
-// supported there; cache_control is silently ignored, not an error). This
-// is why Generate/tools.go/resultSchema need zero provider-specific code:
-// the wire protocol is the same, only the endpoint and model string differ.
+// live: streaming and thinking/effort are supported there; cache_control is
+// silently ignored, not an error). This is why Generate/tools.go/
+// resultSchema need zero provider-specific code: the wire protocol is the
+// same, only the endpoint and model string differ.
+//
+// tool_choice forcing is NOT reliably honored by DeepSeek's compat endpoint,
+// despite being accepted without error — confirmed empirically: a plain
+// "hello" with tool_choice: any still gets a toolless conversational
+// end_turn reply. Real Anthropic guarantees at least one tool call under
+// OfAny; DeepSeek's model will still reason its way to skipping one anyway.
+// See Generate's "len(toolUses) == 0" handling, which nudges rather than
+// fails outright specifically to route around this.
 func New(apiKey, baseURL, model, effort string, maxTokens int64) (*Generator, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("API key is not set")
@@ -537,11 +545,27 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		}
 
 		if len(toolUses) == 0 {
-			// ToolChoice: OfAny forces at least one tool call, so this is
-			// defensive against an API/behavior change rather than an
-			// expected path — no read tool to execute and nothing proposed
-			// means the loop genuinely has nothing to do next.
-			return nil, fmt.Errorf("model turn produced no tool call and no proposal")
+			// Real Anthropic's ToolChoice: OfAny guarantees at least one tool
+			// call. DeepSeek's Anthropic-compat endpoint does NOT honor that
+			// guarantee — confirmed empirically: a plain "hello"/"hi" gets a
+			// conversational end_turn reply with zero tool calls despite
+			// tool_choice being forced, because the model reasons (visibly,
+			// in its own thinking block) that no tool is needed. Failing the
+			// whole generation over that would turn every greeting into an
+			// error. Nudge instead: replay the model's own toolless turn,
+			// tell it a tool call is required, and let the loop's own
+			// budget (maxToolIterations, forcingPropose near the ceiling)
+			// bound how long this can go on — same safety net as the normal
+			// tool-call path below, just without a real tool_result to reply
+			// with.
+			messages = append(messages, message.ToParam())
+			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(
+				"You must call one of the available tools on every turn — propose_changes if you already have enough "+
+					"to finish (even for a simple greeting or question, propose_changes with no file changes and a "+
+					"reply in `summary` is correct), or a read/explore tool otherwise. A plain text reply with no tool "+
+					"call is not valid here.",
+			)))
+			continue
 		}
 
 		// Replay the model's own turn (its narration text plus every

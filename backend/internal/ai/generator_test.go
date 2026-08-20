@@ -128,6 +128,93 @@ func TestGenerate_ToolLoopReadsThenProposes(t *testing.T) {
 	}
 }
 
+// textOnlySSEResponse renders a complete one-turn SSE stream where the model
+// replies with plain text and stop_reason "end_turn" — no tool_use block at
+// all, despite tool_choice being forced. This is DeepSeek's actual observed
+// behavior for a prompt it judges doesn't need a tool (confirmed live
+// against DeepSeek's compat endpoint for a bare "hello"), which real
+// Anthropic's ToolChoice: OfAny is supposed to make impossible.
+func textOnlySSEResponse(msgID, text string, inputTokens, outputTokens int64) string {
+	var b strings.Builder
+	sseEvent(&b, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": msgID, "type": "message", "role": "assistant", "model": "claude-test",
+			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0},
+		},
+	})
+	sseEvent(&b, "content_block_start", map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	})
+	sseEvent(&b, "content_block_delta", map[string]any{
+		"type": "content_block_delta", "index": 0,
+		"delta": map[string]any{"type": "text_delta", "text": text},
+	})
+	sseEvent(&b, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	sseEvent(&b, "message_delta", map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+		"usage": map[string]any{"output_tokens": outputTokens},
+	})
+	sseEvent(&b, "message_stop", map[string]any{"type": "message_stop"})
+	return b.String()
+}
+
+// TestGenerate_NudgesRatherThanFailsOnToollessTurn is the regression test
+// for the DeepSeek "hello" bug: a turn that comes back with no tool call at
+// all (see textOnlySSEResponse) must not fail the whole generation — it
+// must be nudged (its own toolless turn replayed, plus a user message
+// insisting on a tool call) and given another iteration, exactly like a
+// real tool_use turn would get its result replayed. Two toolless turns in a
+// row before propose_changes proves this isn't a one-shot special case.
+func TestGenerate_NudgesRatherThanFailsOnToollessTurn(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch calls {
+		case 1, 2:
+			fmt.Fprint(w, textOnlySSEResponse(fmt.Sprintf("msg_%d", calls), "Hello! How can I help?", 50, 10))
+		case 3:
+			fmt.Fprint(w, toolUseSSEResponse("msg_3", "toolu_3", "propose_changes", map[string]any{
+				"summary":               "Hi there! Nothing to change yet — let me know what you'd like.",
+				"needs_clarification":   false,
+				"files":                 []map[string]any{},
+				"page_registry_entry":   nil,
+				"layout_links_to_add":   []string{},
+				"layout_scripts_to_add": []string{},
+			}, 60, 15))
+		default:
+			t.Errorf("unexpected 4th call to the fake Anthropic server")
+		}
+	}))
+	defer ts.Close()
+
+	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
+	g := newTestGenerator(client)
+
+	toolExec := func(_ context.Context, name string, input json.RawMessage) (string, error) {
+		t.Errorf("no tool should have been executed, got %q", name)
+		return "", fmt.Errorf("unexpected tool %q", name)
+	}
+
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, toolExec)
+	if err != nil {
+		t.Fatalf("Generate returned an error: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected exactly 3 calls (2 nudges + the eventual proposal), got %d", calls)
+	}
+	if len(result.Files) != 0 {
+		t.Errorf("expected zero files for a greeting, got %+v", result.Files)
+	}
+	if result.Summary == "" {
+		t.Error("expected a non-empty summary")
+	}
+}
+
 // TestNew_BaseURLReachesFakeServer confirms New's baseURL param actually
 // wires the SDK client at the target endpoint — this is the whole
 // DeepSeek-compatibility story (New(apiKey, baseURL, ...) pointed at
