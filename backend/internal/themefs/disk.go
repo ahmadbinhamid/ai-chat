@@ -104,41 +104,62 @@ type themeFileEnvelope struct {
 // doesn't exist yet (e.g. reading pages.json for a theme with no custom
 // pages registered yet is a normal, empty case, not an error).
 func (s *Store) ReadFile(ctx context.Context, auth RequestAuth, relPath string) (string, error) {
-	if err := ValidatePathSafety(relPath); err != nil {
+	b, err := s.readFileRaw(ctx, auth, relPath)
+	if err != nil {
 		return "", err
+	}
+	return string(b), nil
+}
+
+// ReadFileBytes is ReadFile's binary-safe counterpart — for anything that
+// isn't UTF-8 text (theme images/fonts, fetched via AssetHandler for the
+// LiquidJS preview, see server.go's route comment), converting through a Go
+// string the way ReadFile does silently corrupts the content. Not part of
+// the ThemeStore interface (see its own doc comment on the same pattern for
+// GetOrGenerateManifest) — reached via a type assertion where needed.
+func (s *Store) ReadFileBytes(ctx context.Context, auth RequestAuth, relPath string) ([]byte, error) {
+	return s.readFileRaw(ctx, auth, relPath)
+}
+
+// readFileRaw is the shared HTTP round trip + base64 decoding behind
+// ReadFile and ReadFileBytes — the only difference between the two is
+// whether the caller wants the result as text or as binary-safe bytes.
+func (s *Store) readFileRaw(ctx context.Context, auth RequestAuth, relPath string) ([]byte, error) {
+	if err := ValidatePathSafety(relPath); err != nil {
+		return nil, err
 	}
 
 	req, err := s.newRequest(ctx, auth, http.MethodGet, relPath, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := s.doReadWithRetry(req)
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", relPath, err)
+		return nil, fmt.Errorf("read %s: %w", relPath, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return "", nil
+		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("read %s: %s", relPath, statusErr(resp))
+		return nil, fmt.Errorf("read %s: %s", relPath, statusErr(resp))
 	}
 
 	var out themeFileEnvelope
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("read %s: decode response: %w", relPath, err)
+		return nil, fmt.Errorf("read %s: decode response: %w", relPath, err)
 	}
 	if out.Data.Encoding == "base64" {
 		decoded, err := base64.StdEncoding.DecodeString(out.Data.Content)
 		if err != nil {
-			return "", fmt.Errorf("read %s: decode base64 content: %w", relPath, err)
+			return nil, fmt.Errorf("read %s: decode base64 content: %w", relPath, err)
 		}
-		return string(decoded), nil
+		return decoded, nil
 	}
-	return out.Data.Content, nil
+	return []byte(out.Data.Content), nil
 }
 
 // WriteFile upserts a theme file's content. meta is only meaningful for a

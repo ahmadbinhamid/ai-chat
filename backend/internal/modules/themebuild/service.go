@@ -768,6 +768,30 @@ type manifestGenerator interface {
 	GetOrGenerateManifest(ctx context.Context, auth themefs.RequestAuth) (themefs.Manifest, error)
 }
 
+// rawAssetReader is the *themefs.Store-only capability ReadThemeAssetBytes
+// needs, same reasoning as manifestGenerator above: ThemeStore's ReadFile
+// returns a string, which silently corrupts binary content (theme images/
+// fonts) — see themefs.Store.ReadFileBytes's own doc comment.
+type rawAssetReader interface {
+	ReadFileBytes(ctx context.Context, auth themefs.RequestAuth, relPath string) ([]byte, error)
+}
+
+// ReadThemeAssetBytes fetches one theme file's raw bytes, authenticated as
+// storeAuth — backs AssetHandler, which lets the frontend's client-side
+// LiquidJS preview (a sandboxed iframe with no real origin — see
+// tenant-dashboard's usePreviewDoc.ts) resolve an <img src="/theme-assets/
+// ...restrictive-path"> reference into actual image bytes instead of a
+// broken relative path. Always reads the real theme (s.store, not a draft
+// overlay): images aren't something a generation turn's proposal ever
+// writes, so there's no draft-vs-real distinction to make here.
+func (s *Service) ReadThemeAssetBytes(ctx context.Context, storeAuth themefs.RequestAuth, relPath string) ([]byte, error) {
+	reader, ok := s.store.(rawAssetReader)
+	if !ok {
+		return nil, fmt.Errorf("theme store does not support raw asset reads")
+	}
+	return reader.ReadFileBytes(ctx, storeAuth, relPath)
+}
+
 func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
 	pagesJSON, err := store.ReadFile(ctx, storeAuth, pathPagesJSON)
 	if err != nil {
@@ -1900,4 +1924,3 @@ func languageFor(path string) string {
 		return ""
 	}
 }
-
