@@ -1,18 +1,27 @@
 # Go
 backend/tmp/
 backend/build-errors.log
+backend/bin/
 *.exe
+*.test
+*.out
 
 # Env
 .env
+.env.*
+!.env.example
 backend/.env
+backend/.env.*
+!backend/.env.example
 
-# Node (root package.json has no real deps today, but keep this ready)
+# Node
 node_modules/
+
+# Editor and agent config (executable surface)
+.vscode/
+.idea/
+.claude/settings.json
+.claude/settings.local.json
 
 # OS
 .DS_Store
-branch_structure.json
-temp_auto_push.bat
-temp_interactive_push.bat
-.gitignore
