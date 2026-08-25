@@ -9,6 +9,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/safego"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -439,7 +440,18 @@ const reaperInterval = 1 * time.Minute
 // startup in addition to the ticker so a generation orphaned by a crash
 // right before this process restarted doesn't wait a full interval.
 func (s *Service) RunReaper(ctx context.Context) {
-	s.reapOnce(ctx)
+	// Each call wrapped individually (not once for RunReaper as a whole):
+	// this is launched via a bare `go` in server.go and runs for the
+	// process's entire lifetime — a panic in one sweep recovering shouldn't
+	// end reaping for good afterward, since that's the exact mechanism
+	// every other orphan-recovery path in this package (a crashed pod, a
+	// lost bearer token) depends on staying alive.
+	safeReapOnce := func() {
+		defer safego.Recover("themebuild.reapOnce")
+		s.reapOnce(ctx)
+	}
+
+	safeReapOnce()
 
 	ticker := time.NewTicker(reaperInterval)
 	defer ticker.Stop()
@@ -448,7 +460,7 @@ func (s *Service) RunReaper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.reapOnce(ctx)
+			safeReapOnce()
 		}
 	}
 }

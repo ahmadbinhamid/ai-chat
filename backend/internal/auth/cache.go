@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"ai-chat/internal/safego"
 )
 
 // CacheEntry is a cached FlowPOS introspection result, keyed by hashed
@@ -72,7 +74,15 @@ func (c *MemoryCache) sweepLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			c.sweep()
+			// Wrapped per-tick (not once for the whole loop): this runs
+			// for the process's entire lifetime, so one bad sweep
+			// recovering shouldn't stop reclaiming memory for good
+			// afterward — see MemoryCache's own doc comment on why an
+			// unbounded, unswept cache is the failure mode this guards.
+			func() {
+				defer safego.Recover("auth.MemoryCache.sweep")
+				c.sweep()
+			}()
 		case <-c.stop:
 			return
 		}

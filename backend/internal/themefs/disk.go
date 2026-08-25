@@ -46,12 +46,22 @@ type Store struct {
 	manifests manifestCache
 }
 
+// storeHTTPTimeout bounds every flowpos-backend file-API call Store makes —
+// without it, a single hung connection occupies the calling goroutine
+// indefinitely, relying entirely on the caller's own context for a deadline
+// (which is either generateTimeout, up to 65 minutes, or nothing at all for
+// a request-scoped call). Generous rather than tight: this same client
+// fetches theme-asset bytes up to a few MB (video, see AssetHandler), not
+// just small JSON payloads, and a real but slow transfer shouldn't be cut
+// off at the same threshold that catches a genuinely dead connection.
+const storeHTTPTimeout = 60 * time.Second
+
 // NewStore builds a Store calling baseURL (config.FlowposAPIBase) — the same
 // root internal/auth.Client calls /user against.
 func NewStore(baseURL string) *Store {
 	return &Store{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		client:  &http.Client{},
+		client:  &http.Client{Timeout: storeHTTPTimeout},
 	}
 }
 

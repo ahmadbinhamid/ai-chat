@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync"
 
+	"ai-chat/internal/safego"
+
 	"github.com/redis/go-redis/v9"
 )
 
@@ -126,16 +128,23 @@ func (b *redisEventBus) Subscribe(ctx context.Context, chatID string) (<-chan Ge
 	go func() {
 		defer close(ch)
 		for msg := range sub.Channel() {
-			var ev GenerationEvent
-			if err := json.Unmarshal([]byte(msg.Payload), &ev); err != nil {
-				slog.Error("redis event bus: failed to decode published event", "chat_id", chatID, "error", err)
-				continue
-			}
-			select {
-			case ch <- ev:
-			default:
-				slog.Warn("redis event bus: dropped event, subscriber buffer full", "chat_id", chatID, "type", ev.Type)
-			}
+			// Wrapped per-message (not once for the whole relay): this
+			// goroutine is meant to keep running for the subscription's
+			// entire lifetime, so one bad message recovering shouldn't end
+			// delivery for every message after it too.
+			func() {
+				defer safego.Recover("themebuild.eventBusSubscribe")
+				var ev GenerationEvent
+				if err := json.Unmarshal([]byte(msg.Payload), &ev); err != nil {
+					slog.Error("redis event bus: failed to decode published event", "chat_id", chatID, "error", err)
+					return
+				}
+				select {
+				case ch <- ev:
+				default:
+					slog.Warn("redis event bus: dropped event, subscriber buffer full", "chat_id", chatID, "type", ev.Type)
+				}
+			}()
 		}
 	}()
 

@@ -4,6 +4,7 @@ import (
 	"ai-chat/internal/auth"
 	"ai-chat/internal/httpresponse"
 	"ai-chat/internal/modules/themebuild"
+	"ai-chat/internal/themefs"
 
 	"github.com/gin-gonic/gin"
 )
@@ -28,6 +29,12 @@ type applyRequest struct {
 func (h *ApplyHandler) Apply(c *gin.Context) {
 	var in applyRequest
 	if err := c.ShouldBindJSON(&in); err != nil {
+		respondBindErr(c, err)
+		return
+	}
+	// See message.go's Send for why this can't be skipped: binding:"required"
+	// alone doesn't reject a slug containing a path separator or "..".
+	if err := themefs.ValidateThemeSlug(in.ThemeSlug); err != nil {
 		respondBindErr(c, err)
 		return
 	}

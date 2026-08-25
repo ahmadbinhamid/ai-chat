@@ -7,6 +7,7 @@ import (
 	"ai-chat/internal/httpresponse"
 	"ai-chat/internal/modules/themebuild"
 	"ai-chat/internal/ratelimit"
+	"ai-chat/internal/themefs"
 
 	"github.com/gin-gonic/gin"
 )
@@ -71,6 +72,16 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	// the tenant a slot from their per-minute generation budget.
 	var in sendMessageRequest
 	if err := c.ShouldBindJSON(&in); err != nil {
+		respondBindErr(c, err)
+		return
+	}
+	// binding:"required" above only rejects an empty ThemeSlug — it doesn't
+	// stop one containing a path separator or ".." from reaching
+	// ai.ThemeContext.ThemeSlug (interpolated straight into the model's own
+	// system prompt — a prompt-injection surface) and the theme-lock Redis
+	// key. ValidateThemeSlug is themefs' own guard for exactly this shape
+	// of input (see pathsafety.go) — it just wasn't being called here.
+	if err := themefs.ValidateThemeSlug(in.ThemeSlug); err != nil {
 		respondBindErr(c, err)
 		return
 	}

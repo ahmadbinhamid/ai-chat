@@ -167,6 +167,15 @@ func sliceOf(v any, args []any) any {
 		return ""
 	}
 	end := start + length
+	// A negative length (or one that overflows) must not push end below
+	// start — s[start:end] panics ("slice bounds out of range") the moment
+	// end < start, and length is arbitrary caller/model-supplied input (see
+	// this filter's callers: AI-proposed page content rendered straight
+	// through POST /themes/:slug/preview) rather than something this engine
+	// controls the shape of.
+	if end < start {
+		end = start
+	}
 	if end > len(s) {
 		end = len(s)
 	}

@@ -239,12 +239,26 @@ func (r *Repository) ListAppliedFilesByChat(ctx context.Context, chatID string) 
 // UPDATE deliberately: once a message is marked 'discarded' its rows drop
 // out of anything scoped to apply_status = 'pending', including a query
 // trying to report what just got discarded.
+//
+// Both statements run inside one transaction, the SELECT with FOR UPDATE:
+// without that, a concurrent write landing between the two (e.g. another
+// request enqueuing a new message for this chat right as this call runs)
+// could make the returned paths not exactly match what the UPDATE actually
+// marked discarded — the FOR UPDATE lock on the matched chat_messages rows
+// closes that gap by holding them until this transaction commits.
 func (r *Repository) DiscardMessagesAfter(ctx context.Context, chatID string, after time.Time) ([]string, error) {
-	rows, err := r.db.QueryContext(ctx, `
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
 		SELECT DISTINCT f.file_path
 		FROM chat_generated_files f
 		JOIN chat_messages m ON m.id = f.message_id
 		WHERE f.chat_id = ? AND m.apply_status = ? AND m.created_at > ? AND f.kind != ?
+		FOR UPDATE
 	`, chatID, string(chat.ApplyStatusPending), after, string(GeneratedFileKindLayout))
 	if err != nil {
 		return nil, err
@@ -264,10 +278,14 @@ func (r *Repository) DiscardMessagesAfter(ctx context.Context, chatID string, af
 	}
 	_ = rows.Close()
 
-	if _, err := r.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE chat_messages SET apply_status = ?
 		WHERE chat_id = ? AND apply_status = ? AND created_at > ?
 	`, string(chat.ApplyStatusDiscarded), chatID, string(chat.ApplyStatusPending), after); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return paths, nil

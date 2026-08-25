@@ -1,11 +1,11 @@
 package handlers
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"bytes"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"ai-chat/internal/auth"
 	"ai-chat/internal/modules/themebuild"
@@ -79,40 +79,58 @@ func (h *AssetHandler) Get(c *gin.Context) {
 
 	// This route has no cheap upstream cache validator to forward — the
 	// flowpos-backend file API this proxies (themefs.Store.ReadFileBytes)
-	// returns raw content with no hash/ETag/Last-Modified of its own — and a
-	// path here is a mutable slot, not content-addressed (a merchant can
-	// re-upload the same path with different bytes), so a bare long-lived
-	// Cache-Control would risk serving stale content indefinitely. Hashing
-	// the bytes ourselves gives a correct strong ETag at near-zero cost next
-	// to the network round trip that already happened to fetch them, and
-	// turns every repeat request (a dashboard preview reload, a browser
-	// refresh) into a 304 instead of re-transferring the full asset —
-	// tenant-dashboard's usePreviewDoc.ts fetches every referenced image on
-	// every render with no caching of its own before this.
-	sum := sha256.Sum256(data)
-	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	// returns raw content with no hash/ETag/Last-Modified of its own, so the
+	// full fetch above always happens; caching here only removes the
+	// ai-chat<->browser leg's cost (the repeated re-transfer + re-decode
+	// tenant-dashboard's usePreviewDoc.ts otherwise paid on every render),
+	// not the ai-chat<->flowpos-backend one.
+	//
+	// no-cache (not max-age): a path here is a mutable slot, not
+	// content-addressed — a merchant can replace an asset at the same path
+	// through a completely different flow (the Editor page, straight to
+	// flowpos-backend) that this route has no way to invalidate against.
+	// max-age would let a browser serve stale bytes for its whole window
+	// with zero contact with this server at all; no-cache instead forces a
+	// conditional GET on every use, so a change is always picked up on the
+	// very next request — the ETag below is what keeps that revalidation
+	// cheap (a small 304, not a full re-transfer) rather than costly.
 	// private: scoped to the caller's own bearer token/tenant (storeAuth
 	// above), not something a shared/intermediate cache should store.
-	// must-revalidate: once max-age lapses, force a conditional GET rather
-	// than silently serving something possibly stale — the ETag above is
-	// what makes that revalidation a cheap 304 instead of a full re-fetch.
 	// Vary on the request headers that actually change what this returns —
 	// without it, a browser's cache is keyed on URL alone, and a second
 	// tenant/user sharing the same browser profile could otherwise be served
-	// the first one's cached bytes for the same path.
-	c.Header("Cache-Control", "private, max-age=3600, must-revalidate")
-	c.Header("ETag", etag)
-	c.Header("Vary", "Authorization, X-Tenant-Id")
-	if c.GetHeader("If-None-Match") == etag {
-		c.Status(http.StatusNotModified)
-		return
-	}
+	// the first one's cached bytes for the same path. Note this can't catch
+	// every case: if a caller ever omits X-Tenant-Id, auth.Middleware falls
+	// back to resolving the tenant server-side (see resolveTenantID), a
+	// dimension Vary can't express since the client never sent it — today's
+	// only real caller (tenant-dashboard's ai-chat-client.ts) always sends
+	// it explicitly, so this is a latent gap, not a live one.
+	//
+	// Add, not Set/c.Header: this route sits behind CORS middleware
+	// (server.go) that already sets its own Vary: Origin on every
+	// cross-origin response — which every real call here is, since the
+	// dashboard calls this API straight from the browser. c.Header uses Set
+	// semantics and would silently clobber that, breaking CORS caching
+	// correctness for a completely unrelated reason.
+	c.Header("Cache-Control", "private, no-cache")
+	c.Header("ETag", themefs.AssetETag(data))
+	c.Writer.Header().Add("Vary", "Authorization, X-Tenant-Id")
 
 	contentType, ok := assetContentTypes[extLower(relPath)]
 	if !ok {
 		contentType = "application/octet-stream"
 	}
-	c.Data(http.StatusOK, contentType, data)
+	c.Header("Content-Type", contentType)
+
+	// http.ServeContent (not c.Data) for RFC 7232-correct conditional-GET:
+	// it checks If-None-Match against the ETag header set above itself,
+	// handling the comma-separated-list and "*" forms a hand-rolled `==`
+	// comparison against a single value silently gets wrong (falling
+	// through to a full 200 instead of the spec-correct 304). modtime is
+	// the zero value — this route has no Last-Modified from upstream, so
+	// only the ETag check applies; ServeContent skips modtime-based
+	// validation entirely for a zero time.Time.
+	http.ServeContent(c.Writer, c.Request, relPath, time.Time{}, bytes.NewReader(data))
 }
 
 func extLower(path string) string {

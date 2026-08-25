@@ -93,7 +93,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	assetHandler := handlers.NewAssetHandler(buildSvc)
 
 	r := gin.New()
-	r.Use(gin.Recovery(), logging.Middleware(logger))
+	r.Use(gin.Recovery(), logging.Middleware(logger), maxBodySize(cfg.MaxRequestBodyBytes))
 
 	// The tenant dashboard calls this API directly from the browser (it is
 	// a native React page, not an iframed mini-app), so it needs real CORS
@@ -184,6 +184,22 @@ func (s *Server) Handler() http.Handler {
 // Addr is the configured listen address.
 func (s *Server) Addr() string {
 	return ":" + s.cfg.Port
+}
+
+// maxBodySize caps every request body this API accepts at limit bytes — see
+// config.Config.MaxRequestBodyBytes's doc comment for why. http.MaxBytesReader
+// makes any read past limit fail with a *http.MaxBytesError instead of
+// silently allowing unbounded in-memory allocation; every handler already
+// surfaces a body-read/decode failure as a normal 400 through its existing
+// c.ShouldBindJSON + respondBindErr path (see handlers/errors.go), so a
+// request that hits this limit gets a clear error, not a crash or a hang.
+func maxBodySize(limit int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+		}
+		c.Next()
+	}
 }
 
 // useJSONFieldNames makes the binding validator report a field's JSON name

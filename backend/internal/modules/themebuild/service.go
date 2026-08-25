@@ -16,6 +16,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/safego"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
 
@@ -370,7 +371,15 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		// to end the moment this function returns) but not unbounded: each
 		// drain-loop iteration gets its own generateTimeout budget (see
 		// runGeneration), matching the HTTP server's own writeTimeout.
-		go s.runGeneration(context.WithoutCancel(ctx), c, next)
+		go func() {
+			// One-shot: a panic here ends just this generation's run — the
+			// reaper's own orphaned-queue sweep independently recovers a
+			// generation that never finished, so this doesn't need to keep
+			// retrying itself. See safego's package doc comment on why this
+			// is needed at all: gin.Recovery() doesn't reach a bare `go`.
+			defer safego.Recover("themebuild.runGeneration")
+			s.runGeneration(context.WithoutCancel(ctx), c, next)
+		}()
 	case errors.Is(err, ErrGenerationInProgress):
 		// Something else is already running for this chat — nothing more
 		// to do here. That generation's own drain loop will dequeue this
@@ -502,18 +511,25 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 			case <-workCtx.Done():
 				return
 			case <-heartbeatTicker.C:
-				// Best-effort, matching UpdateGenerationHeartbeat's own
-				// convention (see eventEmitter.emit): a fresh, short-lived
-				// context rather than workCtx, since workCtx can already be
-				// canceled by the time a tick lands right as the
-				// generation finishes — a heartbeat write for a generation
-				// about to be marked done/failed anyway is harmless to
-				// lose, not worth erroring over.
-				hbCtx, hbCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				if err := s.repo.UpdateGenerationHeartbeat(hbCtx, g.ID); err != nil {
-					slog.Error("failed to update generation heartbeat (ticker)", "generation_id", g.ID, "error", err)
-				}
-				hbCancel()
+				// Wrapped per-tick (not once for the whole goroutine): this
+				// loop is meant to keep running for the generation's entire
+				// duration, so one bad tick recovering shouldn't end
+				// heartbeats for everything after it too.
+				func() {
+					defer safego.Recover("themebuild.heartbeatTicker")
+					// Best-effort, matching UpdateGenerationHeartbeat's own
+					// convention (see eventEmitter.emit): a fresh, short-lived
+					// context rather than workCtx, since workCtx can already be
+					// canceled by the time a tick lands right as the
+					// generation finishes — a heartbeat write for a generation
+					// about to be marked done/failed anyway is harmless to
+					// lose, not worth erroring over.
+					hbCtx, hbCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer hbCancel()
+					if err := s.repo.UpdateGenerationHeartbeat(hbCtx, g.ID); err != nil {
+						slog.Error("failed to update generation heartbeat (ticker)", "generation_id", g.ID, "error", err)
+					}
+				}()
 			}
 		}
 	}()

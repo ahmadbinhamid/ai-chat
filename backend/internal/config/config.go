@@ -99,6 +99,18 @@ type Config struct {
 	// instance, but not a reason to fail startup on a single-instance
 	// deployment that doesn't have Redis yet.
 	RedisURL string
+
+	// MaxRequestBodyBytes caps every JSON request body this API accepts
+	// (see server.go's maxBodySize middleware) — without it, any
+	// authenticated caller can send an arbitrarily large body (bounded only
+	// by the HTTP server's own read timeout) and force a large in-memory
+	// allocation before struct-tag validation (e.g. sendMessageRequest's
+	// Prompt max=6000) ever runs, since c.ShouldBindJSON fully unmarshals
+	// first. 10MB comfortably covers the largest legitimate payload today
+	// (POST /themes/:slug/preview's Files map — a full draft theme's
+	// Liquid/CSS/JS text content) with headroom, while still being far
+	// short of "an attacker can meaningfully exhaust memory with one call."
+	MaxRequestBodyBytes int64
 }
 
 // Load reads configuration from the process environment. Callers are
@@ -148,6 +160,8 @@ func Load() Config {
 		CORSAllowedOrigins: getenvList("CORS_ALLOWED_ORIGINS"),
 
 		RedisURL: os.Getenv("REDIS_URL"),
+
+		MaxRequestBodyBytes: int64(getenvInt("MAX_REQUEST_BODY_BYTES", 10*1024*1024)),
 	}
 }
 

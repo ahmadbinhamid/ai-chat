@@ -1,15 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"database/sql"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"ai-chat/internal/config"
 
+	"github.com/gin-gonic/gin"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -30,6 +34,7 @@ func testConfig() config.Config {
 		FakeAIMode:                   true,
 		FakeAIDelay:                  time.Millisecond,
 		GenerationRateLimitPerMinute: 10,
+		MaxRequestBodyBytes:          10 * 1024 * 1024,
 	}
 }
 
@@ -129,5 +134,49 @@ func TestNew_CORSAllowsConfiguredOrigin(t *testing.T) {
 
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://dashboard.example.test" {
 		t.Fatalf("expected Access-Control-Allow-Origin to echo the allow-listed origin, got %q", got)
+	}
+}
+
+// echoBodyLen is a minimal handler for testing maxBodySize in isolation —
+// deliberately not routed through auth.Middleware (which would reject an
+// unauthenticated test request before the body is ever read, making it
+// impossible to tell "rejected for being too large" apart from "rejected
+// for having no token").
+func echoBodyLen(c *gin.Context) {
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, c.Request.Body); err != nil {
+		c.String(http.StatusBadRequest, "%v", err)
+		return
+	}
+	c.String(http.StatusOK, "%d bytes", buf.Len())
+}
+
+func TestMaxBodySize_RejectsBodyOverLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(maxBodySize(10))
+	r.POST("/echo", echoBodyLen)
+
+	req := httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader(strings.Repeat("a", 1000)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected reading a body past the limit to fail with 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMaxBodySize_AllowsBodyUnderLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(maxBodySize(1000))
+	r.POST("/echo", echoBodyLen)
+
+	req := httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader("small body"))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected a body under the limit to be read fine, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

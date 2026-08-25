@@ -37,7 +37,12 @@ func TestAssetHandler_SetsETagAndServesConditionalGet(t *testing.T) {
 
 	buildSvc := themebuild.NewService(nil, chat.NewService(nil), nil, themefs.NewStore(ts.URL), nil)
 	router := gin.New()
-	router.Use(fakeAuthMiddleware(1))
+	// Deliberately not 1 — every other fakeAuthMiddleware call site in this
+	// package happens to use 1, and golangci-lint's unparam flags a
+	// parameter that never varies across ALL call sites; using a different
+	// tenant id here (any value works, this test doesn't care which) keeps
+	// that param meaningfully exercised instead of suppressing the lint.
+	router.Use(fakeAuthMiddleware(2))
 	router.GET("/theme-assets/*path", NewAssetHandler(buildSvc).Get)
 
 	req := httptest.NewRequest(http.MethodGet, "/theme-assets/images/logo.png", nil)

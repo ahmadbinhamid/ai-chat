@@ -33,6 +33,28 @@ func TestRender_Filters(t *testing.T) {
 	}
 }
 
+func TestRender_SliceFilterNegativeLengthDoesNotPanic(t *testing.T) {
+	files := map[string]string{"pages/home.liquid": "[{{ 'hello' | slice: 1, -5 }}]"}
+	html, errs := render(t, files, "pages/home.liquid", nil)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if html != "[]" {
+		t.Errorf("expected a negative length to clamp to an empty slice, got %q", html)
+	}
+}
+
+func TestRender_SliceFilterPositiveLength(t *testing.T) {
+	files := map[string]string{"pages/home.liquid": "{{ 'hello world' | slice: 6, 5 }}"}
+	html, errs := render(t, files, "pages/home.liquid", nil)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if html != "world" {
+		t.Errorf("got %q", html)
+	}
+}
+
 func TestRender_IfElsifElse(t *testing.T) {
 	tpl := "{% if a == true or a == 1 %}A{% elsif b %}B{% else %}C{% endif %}"
 	files := map[string]string{"pages/home.liquid": tpl}
