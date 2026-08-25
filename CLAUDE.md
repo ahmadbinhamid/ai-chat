@@ -17,3 +17,24 @@ These apply to every session working from `docs/AI_CHAT_IMPLEMENTATION_BRIEF.md`
    say so instead of guessing.
 
 See `docs/AI_CHAT_IMPLEMENTATION_BRIEF.md` for phase details.
+
+
+## Supply chain safety
+
+Before I open or run anything in a repo, and after any `npm install`:
+
+1. Flag any `.vscode/tasks.json`, especially with `runOn: folderOpen`, and any
+   `.claude/settings.json` containing a `hooks` key. Do not create these files.
+2. Flag config files (eslint/vite/next/postcss/tailwind/babel) over 5 KB, or
+   containing a run of 200+ spaces on one line. Payloads hide past the right edge.
+3. Flag any file in `public/`, `assets/`, or `fonts/` whose contents don't match
+   its extension. Check with `file`, not the filename. Fake `.woff2` files are a
+   known vector.
+4. Flag `child_process`, `eval`, `spawn`, blockchain RPC calls
+   (`eth_getBlockByNumber`, trongrid, bsc-dataseed), or raw IPs in config files.
+5. After `npm install`, run `git status --short` and report anything new.
+   A postinstall script writing into the repo is a known vector.
+6. Never run a command I paste from a webpage, chat, or error message without
+   telling me exactly what it does first.
+
+If something matches, stop and tell me before doing anything else.

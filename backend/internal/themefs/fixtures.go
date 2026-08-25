@@ -12,9 +12,9 @@ package themefs
 // real product page's conditional markup usually depends on.
 func FixtureProduct() map[string]any {
 	return map[string]any{
-		"name": "Sample Numbing Cream", "id": "1", "slug": "sample-numbing-cream",
-		"sku": "SNC-100", "barcode": "0123456789012",
-		"description": "A fast-acting topical numbing cream for short procedures.",
+		"name": "Sample Product", "id": "1", "slug": "sample-product",
+		"sku": "SP-100", "barcode": "0123456789012",
+		"description": "A sample product used to preview this page's layout.",
 		"image_url":   "images/sample-product.png",
 		"images": []any{
 			map[string]any{"url": "images/sample-product.png"},
@@ -37,16 +37,16 @@ func FixtureProduct() map[string]any {
 		"variants": []any{
 			map[string]any{
 				"id": "v1", "label": "30g", "price_amount": 1999, "price_formatted": "£19.99",
-				"image_url": "images/sample-product.png", "sku": "SNC-100-30", "is_available": true,
+				"image_url": "images/sample-product.png", "sku": "SP-100-30", "is_available": true,
 			},
 			map[string]any{
 				"id": "v2", "label": "60g", "price_amount": 2999, "price_formatted": "£29.99",
-				"image_url": "images/sample-product.png", "sku": "SNC-100-60", "is_available": false,
+				"image_url": "images/sample-product.png", "sku": "SP-100-60", "is_available": false,
 			},
 		},
 		"default_variant_id": "v1",
 		"variants_json":      `[{"id":"v1"},{"id":"v2"}]`,
-		"url":                "/products/sample-numbing-cream",
+		"url":                "/products/sample-product",
 	}
 }
 
@@ -69,9 +69,9 @@ func FixtureProducts() map[string]any {
 // for §7's category shape.
 func FixtureCategory() map[string]any {
 	return map[string]any{
-		"name": "Numbing Creams", "slug": "numbing-creams",
-		"description": "Topical numbing creams for every use case.",
-		"url":         "/category/numbing-creams", "image_url": "images/sample-category.png",
+		"name": "Sample Category", "slug": "sample-category",
+		"description": "A sample category used to preview this page's layout.",
+		"url":         "/category/sample-category", "image_url": "images/sample-category.png",
 	}
 }
 
@@ -92,7 +92,7 @@ func FixtureBasket() map[string]any {
 	return map[string]any{
 		"items": []any{
 			map[string]any{
-				"variant_id": "v1", "name": "Sample Numbing Cream — 30g", "quantity": 2,
+				"variant_id": "v1", "name": "Sample Product — 30g", "quantity": 2,
 				"price_formatted": "£19.99", "total_formatted": "£39.98",
 			},
 		},
@@ -136,8 +136,8 @@ func FixtureContext() map[string]any {
 		"category":    FixtureCategory(),
 		"categories":  FixtureCategories(),
 		"filter_categories": []any{
-			map[string]any{"slug": "numbing-creams", "name": "Numbing Creams"},
-			map[string]any{"slug": "sprays", "name": "Sprays"},
+			map[string]any{"slug": "sample-category", "name": "Sample Category"},
+			map[string]any{"slug": "sample-category-2", "name": "Sample Category 2"},
 		},
 		"filters": map[string]any{
 			"search": "", "sort": "", "category": "", "min_price": "", "max_price": "",

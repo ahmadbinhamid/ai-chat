@@ -8,7 +8,7 @@ import (
 
 func TestCheckSEOFilled_AllFilled(t *testing.T) {
 	p := Proposal{PageRegistryEntry: &themefs.PageEntry{
-		SEOTitle: "Offers & Deals | Numbing Cream Co", SEODescription: "Save on numbing creams and gels.", SEOKeywords: "numbing cream, offers",
+		SEOTitle: "Offers & Deals | Sample Store", SEODescription: "Save on our sample products.", SEOKeywords: "sample product, offers",
 	}}
 	if got := checkSEOFilled(p, Snapshot{}); len(got) != 0 {
 		t.Errorf("expected no findings, got %+v", got)

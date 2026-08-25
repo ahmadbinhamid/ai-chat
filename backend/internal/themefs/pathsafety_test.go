@@ -75,7 +75,7 @@ func TestValidateGeneratedFilePath_Rejected(t *testing.T) {
 }
 
 func TestValidateThemeSlug(t *testing.T) {
-	if err := ValidateThemeSlug("jpronumbingcream"); err != nil {
+	if err := ValidateThemeSlug("acmestore"); err != nil {
 		t.Errorf("expected a plain slug to be valid, got: %v", err)
 	}
 	for _, slug := range []string{"", "../escape", "a/b", "a\\b"} {

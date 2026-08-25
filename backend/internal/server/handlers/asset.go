@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strings"
@@ -72,6 +74,37 @@ func (h *AssetHandler) Get(c *gin.Context) {
 	}
 	if data == nil {
 		c.Status(http.StatusNotFound)
+		return
+	}
+
+	// This route has no cheap upstream cache validator to forward — the
+	// flowpos-backend file API this proxies (themefs.Store.ReadFileBytes)
+	// returns raw content with no hash/ETag/Last-Modified of its own — and a
+	// path here is a mutable slot, not content-addressed (a merchant can
+	// re-upload the same path with different bytes), so a bare long-lived
+	// Cache-Control would risk serving stale content indefinitely. Hashing
+	// the bytes ourselves gives a correct strong ETag at near-zero cost next
+	// to the network round trip that already happened to fetch them, and
+	// turns every repeat request (a dashboard preview reload, a browser
+	// refresh) into a 304 instead of re-transferring the full asset —
+	// tenant-dashboard's usePreviewDoc.ts fetches every referenced image on
+	// every render with no caching of its own before this.
+	sum := sha256.Sum256(data)
+	etag := `"` + hex.EncodeToString(sum[:]) + `"`
+	// private: scoped to the caller's own bearer token/tenant (storeAuth
+	// above), not something a shared/intermediate cache should store.
+	// must-revalidate: once max-age lapses, force a conditional GET rather
+	// than silently serving something possibly stale — the ETag above is
+	// what makes that revalidation a cheap 304 instead of a full re-fetch.
+	// Vary on the request headers that actually change what this returns —
+	// without it, a browser's cache is keyed on URL alone, and a second
+	// tenant/user sharing the same browser profile could otherwise be served
+	// the first one's cached bytes for the same path.
+	c.Header("Cache-Control", "private, max-age=3600, must-revalidate")
+	c.Header("ETag", etag)
+	c.Header("Vary", "Authorization, X-Tenant-Id")
+	if c.GetHeader("If-None-Match") == etag {
+		c.Status(http.StatusNotModified)
 		return
 	}
 
