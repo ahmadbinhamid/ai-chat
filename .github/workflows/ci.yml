@@ -1,19 +1,9 @@
 name: CI
 
-# Runs on every push and PR — see backend/CLAUDE.md rule 6 ("every phase ends
-# with make test and make lint passing"): this is that rule enforced outside
-# a human remembering to run it locally. golangci-lint's config
-# (backend/.golangci.yml) already enables unconvert/unparam/gocritic/
-# errorlint/bodyclose; this workflow is what actually invokes it.
 on:
   push:
   pull_request:
 
-# ai-chat (this repo) and tenant-dashboard are separate repositories — this
-# workflow only covers the Go service. tenant-dashboard carries its own
-# ci.yml (typecheck/lint/build) since a single workflow file can't span two
-# repos without a cross-repo checkout token, which is more machinery than a
-# CI-parity fix like this one should introduce.
 jobs:
   go:
     name: Go build, vet, test, lint
@@ -24,23 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to go.mod's own `go` directive, not a floating tag — a CI
-      # toolchain older than what go.mod declares would fail to build for a
-      # reason that has nothing to do with the code under test.
       - name: Read Go version from go.mod
         id: go-version
         run: echo "version=$(go mod edit -json | jq -r .Go)" >> "$GITHUB_OUTPUT"
-        # go.mod isn't parseable with a plain grep one-liner once it has a
-        # toolchain directive too — `go mod edit -json` is the same parser
-        # the toolchain itself uses, so this can't drift from what `go
-        # build` actually requires. Needs a `go` on PATH just to run this
-        # one command; setup-go below installs the pinned version for
-        # every step after it.
+
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ steps.go-version.outputs.version }}
-          # actions/setup-go's own module-cache, keyed on go.sum — separate
-          # from tenant-dashboard's npm cache in the other job below.
           cache-dependency-path: backend/go.sum
 
       - name: go build
@@ -49,15 +29,6 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      # -race: this service runs concurrent generation goroutines, a shared
-      # in-process/Redis event bus, and lazily-created per-key mutexes (see
-      # themebuild's keyedMutex/theme lock) — exactly the class of bug the
-      # race detector exists to catch before it reaches production as a
-      # once-a-week flaky lost update. Every test in this suite is already
-      # written to tolerate -race (DB/Redis-backed tests skip cleanly when
-      # neither is reachable — see openTestDB/openTestRedis), so this
-      # doesn't need service containers to produce a meaningful signal, just
-      # a more thorough one where they're configured (see below).
       - name: go test -race
         run: go test -race ./...
 
@@ -68,12 +39,6 @@ jobs:
           working-directory: backend
           args: --timeout=5m
 
-  # Optional, best-effort extra coverage: the same test run again with real
-  # MySQL/Redis reachable, so the DB/Redis-backed integration tests
-  # (openTestDB/openTestRedis-gated) actually execute instead of skipping.
-  # Kept as a separate job (not folded into `go` above) so a real
-  # infrastructure hiccup here never blocks the fast, always-meaningful
-  # build/vet/test/lint signal the `go` job already gives on every push.
   go-integration:
     name: Go test -race (with MySQL + Redis)
     runs-on: ubuntu-latest
