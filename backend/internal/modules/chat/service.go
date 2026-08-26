@@ -162,11 +162,14 @@ func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64,
 }
 
 // RecordAssistantMessage appends the model's reply, rolling its token usage
-// into the chat's running totals. applyStatus should be ApplyStatusApplied
-// when the turn's proposed changes were already written to the real theme,
-// ApplyStatusNotApplicable otherwise. Only ever called for a turn that
-// actually completed — a failed generation is never persisted (see
-// themebuild.Service.Generate), so there is no "failed" status to pass here.
+// into the chat's running totals. applyStatus should be ApplyStatusPending
+// when the turn's proposed changes were staged into the draft overlay (the
+// normal case now that generation defers writing to the real theme — see
+// themebuild's package doc comment), ApplyStatusNotApplicable when it
+// proposed none; ApplyStatusApplied is stamped later, in bulk, by
+// Service.ApplyDraft's own UPDATE, not through this function. Also called
+// for a failed generation (status MessageStatusFailed) — see
+// chat.MessageStatusFailed's doc comment — not just a turn that completed.
 func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus) (Message, error) {
 	now := time.Now().UTC()
 	m := Message{

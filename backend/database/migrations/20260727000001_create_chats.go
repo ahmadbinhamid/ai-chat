@@ -20,8 +20,10 @@ func init() {
 // theme-builder use case. type is "builder" today; a future chat use case
 // on the same tenant gets its own row via a new type value, not a schema
 // change. There's no local FK to tenant/user: identity lives in the calling
-// system, not duplicated here (see internal/server/handlers/identity.go —
-// this service trusts the identity headers a trusted caller sets).
+// system, not duplicated here (see internal/auth — every request is
+// authenticated by delegating the bearer token to FlowPOS's own /user
+// endpoint, and tenant_id comes from the resolved identity, not a
+// blindly-trusted header).
 func Up_20260727000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (

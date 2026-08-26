@@ -14,7 +14,9 @@ import (
 
 // MessageHandler is the one endpoint that actually calls Claude — sending a
 // prompt resolves (or creates) the tenant's one builder chat and, if the
-// model proposes any changes, writes them to the real theme immediately.
+// model proposes any changes, stages them into the chat's draft overlay —
+// writing to the real theme is a separate, explicit apply/discard step the
+// merchant triggers later (see themebuild's package doc comment).
 type MessageHandler struct {
 	builder *themebuild.Service
 	limiter *ratelimit.PerTenantLimiter
@@ -39,12 +41,20 @@ type sendMessageRequest struct {
 }
 
 type sendMessageResponse struct {
-	Chat             any `json:"chat"`
-	UserMessage      any `json:"user_message"`
+	Chat        any `json:"chat"`
+	UserMessage any `json:"user_message"`
+	// AssistantMessage is always nil on this response — Generate returns as
+	// soon as the prompt is recorded and either kicked off or queued, before
+	// Claude has actually replied (see themebuild.GenerateOutcome's doc
+	// comment). Still populated in the struct/JSON shape the frontend
+	// already expects from GET /chat's history, just never set here; kept on
+	// the wire rather than removed so this response shape doesn't change
+	// depending on the code path.
 	AssistantMessage any `json:"assistant_message"`
-	// Files is a record of what was written — see themebuild.Service.Generate,
-	// which applies these to the real theme in the same request rather than
-	// waiting for a separate "Apply to theme" call.
+	// Files is always nil/empty on this response for the same reason as
+	// AssistantMessage above — see themebuild.GenerateOutcome's doc comment.
+	// The real files a turn staged arrive later, via GET /chat once the
+	// background generation finishes.
 	Files any `json:"generated_files"`
 	// GenerationID/QueuePosition let the caller track this specific prompt
 	// (cancel it while queued, correlate it with stream events) instead of
@@ -55,9 +65,9 @@ type sendMessageResponse struct {
 }
 
 // Send accepts the merchant's prompt and always returns 202 immediately —
-// the actual Claude call and (if the model proposes changes) the write to
-// the real theme happen in the background, either right away or once
-// whatever's ahead of it in the queue finishes (see
+// the actual Claude call and (if the model proposes changes) staging them
+// into the chat's draft overlay happen in the background, either right away
+// or once whatever's ahead of it in the queue finishes (see
 // themebuild.Service.Generate). There is no "already busy" rejection
 // anymore: prompts queue instead (see the queueing brief) — the caller
 // learns the outcome by polling GET /chat's `queue` field or the WebSocket

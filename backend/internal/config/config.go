@@ -87,8 +87,8 @@ type Config struct {
 	// directly (the tenant dashboard's own origin(s) — dev and prod). Empty
 	// by default, which safely blocks all cross-origin browser requests
 	// rather than falling back to a permissive "*" — misconfiguring this
-	// breaks the feature, it doesn't open a hole, so unlike JWT_SECRET this
-	// one degrades instead of failing the process at startup.
+	// breaks the feature, it doesn't open a hole, so unlike FLOWPOS_API_BASE
+	// this one degrades instead of failing the process at startup.
 	CORSAllowedOrigins []string
 
 	// RedisURL backs cross-replica generation-event pub/sub (phase 3b/3c —

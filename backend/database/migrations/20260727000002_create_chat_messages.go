@@ -20,14 +20,20 @@ func init() {
 // for tenant-scoped checks without a join. role/status/apply_status are
 // plain VARCHAR rather than ENUM so a new value never needs a schema
 // migration — Go's chat.Role/MessageStatus/ApplyStatus types are the actual
-// constraint. apply_status is set directly to applied/not_applicable at
-// generation time now (see themebuild.Service.Generate) — there is no
-// pending state to wait on, generation writes to the real theme immediately.
+// constraint. apply_status was set directly to applied/not_applicable at
+// generation time when this migration was written — there was no pending
+// state to wait on, generation wrote to the real theme immediately. Since
+// then generation started deferring the write to a per-chat draft instead
+// (see themebuild's package doc comment); apply_status now also takes
+// "pending" and "discarded" — see the 20260813000001 migration's doc
+// comment for why that needed no schema change here.
 //
-// There is deliberately no error_message column: a failed generation is
-// never persisted as a turn at all (see Service.Generate) — errors are
-// request-scoped and returned directly in the HTTP response, not stored as
-// chat history. A row existing here at all means it completed.
+// There is deliberately no error_message column: the error text for a
+// failed generation is stored in the ordinary content column, on a row with
+// status = 'failed' (see chat.MessageStatusFailed's doc comment and
+// themebuild.Service.doGenerate) — not a separate column, and not only
+// returned in the HTTP response the way it was before generation became
+// async and queued.
 func Up_20260727000002(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chat_messages (
