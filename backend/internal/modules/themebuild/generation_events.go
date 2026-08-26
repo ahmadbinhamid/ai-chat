@@ -25,7 +25,6 @@ type GenerationEvent struct {
 	CreatedAt    time.Time
 }
 
-// Event type constants — see docs/AI_CHAT_IMPLEMENTATION_BRIEF.md phase 3b.
 const (
 	EventTypeStarted     = "started"
 	EventTypeChecking    = "checking"
@@ -171,7 +170,6 @@ func (r *Repository) GetMaxSeqForChat(ctx context.Context, chatID string) (int64
 }
 
 // redisChannelForChat is the Redis pub/sub channel a generation's events
-// are published to — see docs/AI_CHAT_IMPLEMENTATION_BRIEF.md phase 3b:
 // "gen:{chat_id}".
 func redisChannelForChat(chatID string) string { return "gen:" + chatID }
 

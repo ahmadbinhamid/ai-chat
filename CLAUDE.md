@@ -1,7 +1,5 @@
 # Standing rules
 
-These apply to every session working from `docs/AI_CHAT_IMPLEMENTATION_BRIEF.md`.
-
 1. Follow the existing architecture: `handlers` → `service` → `repository` →
    `model`. Handlers never touch SQL.
 2. New pure logic goes in its own `internal/` package with table-driven tests,
@@ -15,9 +13,6 @@ These apply to every session working from `docs/AI_CHAT_IMPLEMENTATION_BRIEF.md`
 6. Every phase ends with `make test` and `make lint` passing.
 7. If a requirement here conflicts with the spec or the existing code, stop and
    say so instead of guessing.
-
-See `docs/AI_CHAT_IMPLEMENTATION_BRIEF.md` for phase details.
-
 
 ## Supply chain safety
 

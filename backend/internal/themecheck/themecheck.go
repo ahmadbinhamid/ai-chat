@@ -1,6 +1,5 @@
 // Package themecheck enforces theme_engine_spec.md's hard rules against a
 // model's proposed file changes before they're allowed to reach disk (see
-// docs/AI_CHAT_IMPLEMENTATION_BRIEF.md phase 1). Pure functions only — no DB,
 // no network, no disk — same discipline as themefs's own pure-function files
 // (pathsafety.go, layout.go, pages.go).
 package themecheck
