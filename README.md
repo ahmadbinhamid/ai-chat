@@ -43,32 +43,31 @@ delivery and isn't needed for a single instance.
 **4. Install dependencies and migrate**
 
 ```bash
-cd backend && go mod tidy && cd ..
-npm run migrate
+cd backend
+go mod tidy
+make migrate
 ```
 
 **5. Run it**
 
 ```bash
-npm install   # no real JS dependencies, just makes `npm run dev` consistent
-npm run dev
+make run
 ```
 
 Check it's up: `curl localhost:8080/health`
 
 ## Commands
 
-Run from `backend/` (or via the `npm run <script>` equivalents shown for the
-common ones):
+Run from `backend/`:
 
-| Command | npm equivalent | Purpose |
-|---|---|---|
-| `make run` | `npm run dev` | Start the server — uses `air` for live-reload if installed, else plain `go run`. |
-| `make build` | `npm run build` | Compile to `./tmp/main`. |
-| `make migrate` | `npm run migrate` | Apply any pending migrations. |
-| `make fresh` | `npm run migrate:fresh` | Drop every table and re-run all migrations from scratch. |
-| `make create name=x` | — | Scaffold a new migration file (`database/migrations/<timestamp>_x.go`). |
-| `make tidy` | — | Sync `go.mod`/`go.sum` with actual imports. |
-| `make test` | `npm test` | `go test ./...` |
-| `make lint` | `npm run lint` | `golangci-lint run ./...` (requires `golangci-lint` installed). |
-| `make eval` | — | Run the fixed task list in `internal/evals` against the real Claude + FlowPOS pipeline. Needs `EVAL_BEARER_TOKEN` and `EVAL_TENANT_ID` from a real logged-in tenant user — see `cmd/eval/main.go`'s doc comment. |
+| Command | Purpose |
+|---|---|
+| `make run` | Start the server — uses `air` for live-reload if installed, else plain `go run`. |
+| `make build` | Compile to `./tmp/main`. |
+| `make migrate` | Apply any pending migrations. |
+| `make fresh` | Drop every table and re-run all migrations from scratch. |
+| `make create name=x` | Scaffold a new migration file (`database/migrations/<timestamp>_x.go`). |
+| `make tidy` | Sync `go.mod`/`go.sum` with actual imports. |
+| `make test` | `go test ./...` |
+| `make lint` | `golangci-lint run ./...` (requires `golangci-lint` installed). |
+| `make eval` | Run the fixed task list in `internal/evals` against the real Claude + FlowPOS pipeline. Needs `EVAL_BEARER_TOKEN` and `EVAL_TENANT_ID` from a real logged-in tenant user — see `cmd/eval/main.go`'s doc comment. |
