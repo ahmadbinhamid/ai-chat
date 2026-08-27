@@ -476,6 +476,91 @@ func TestDiscardDraft_MakesZeroFlowposCalls(t *testing.T) {
 	}
 }
 
+// TestSaveManualEdit_StagesAsPendingAndFoldsIntoDraft covers a preview edit
+// end to end: it must land as a new pending chat_generated_files row that
+// DraftFiles (the same read the LiquidJS preview and Apply both use) folds
+// in ahead of the base theme's own content, tagged with a bookkeeping
+// message the merchant — not the model — authored.
+func TestSaveManualEdit_StagesAsPendingAndFoldsIntoDraft(t *testing.T) {
+	ts := newFakeThemeServer(t, map[string]string{"pages/home.liquid": "<h1>Original</h1>"})
+	defer ts.Close()
+
+	conn := openTestDB(t)
+	chatSvc := chat.NewService(chat.NewRepository(conn))
+	buildRepo := NewRepository(conn)
+	svc := NewService(buildRepo, chatSvc, nil, themefs.NewStore(ts.URL), nil)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	file, err := svc.SaveManualEdit(ctx, tenantID, "tok", c.ID, "pages/home.liquid", "<h1>Edited by merchant</h1>")
+	if err != nil {
+		t.Fatalf("SaveManualEdit failed: %v", err)
+	}
+	if file.Kind != GeneratedFileKindProposed || file.Action != FileActionUpdate {
+		t.Errorf("expected a proposed/update row, got kind=%q action=%q", file.Kind, file.Action)
+	}
+	if file.PreviousContent == nil || *file.PreviousContent != "<h1>Original</h1>" {
+		t.Errorf("expected previous_content to capture the pre-edit content, got %+v", file.PreviousContent)
+	}
+
+	draft, err := svc.DraftFiles(ctx, tenantID, "tok", c.ID)
+	if err != nil {
+		t.Fatalf("DraftFiles failed: %v", err)
+	}
+	if draft["pages/home.liquid"] != "<h1>Edited by merchant</h1>" {
+		t.Fatalf("expected the manual edit to win in the effective draft, got %q", draft["pages/home.liquid"])
+	}
+
+	msg, err := chatSvc.GetMessage(ctx, c.ID, file.MessageID)
+	if err != nil {
+		t.Fatalf("GetMessage failed: %v", err)
+	}
+	if msg.Role != chat.RoleSystem {
+		t.Errorf("expected the bookkeeping message to use RoleSystem, got %q", msg.Role)
+	}
+	if msg.ApplyStatus != chat.ApplyStatusPending {
+		t.Errorf("expected the bookkeeping message to be pending (not yet applied), got %q", msg.ApplyStatus)
+	}
+
+	summary, err := svc.DraftSummary(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("DraftSummary failed: %v", err)
+	}
+	if !summary.HasChanges {
+		t.Error("expected DraftSummary.HasChanges to flip true — this is what shows the Apply/Discard bar")
+	}
+}
+
+// TestSaveManualEdit_RejectsPathNotInDraft — an edit posted against a path
+// that isn't actually part of the theme (a stale preview, or a client bug)
+// must be rejected, not silently create a new file.
+func TestSaveManualEdit_RejectsPathNotInDraft(t *testing.T) {
+	ts := newFakeThemeServer(t, map[string]string{"pages/home.liquid": "<h1>Original</h1>"})
+	defer ts.Close()
+
+	conn := openTestDB(t)
+	chatSvc := chat.NewService(chat.NewRepository(conn))
+	buildRepo := NewRepository(conn)
+	svc := NewService(buildRepo, chatSvc, nil, themefs.NewStore(ts.URL), nil)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	_, err = svc.SaveManualEdit(ctx, tenantID, "tok", c.ID, "pages/does-not-exist.liquid", "content")
+	if !errors.Is(err, ErrManualEditFileNotFound) {
+		t.Fatalf("expected ErrManualEditFileNotFound, got %v", err)
+	}
+}
+
 // Item 12: revert to a turn inside the current draft makes no FlowPOS
 // calls (see revertWithinDraft).
 func TestRevertToMessage_WithinDraftMakesZeroFlowposCalls(t *testing.T) {

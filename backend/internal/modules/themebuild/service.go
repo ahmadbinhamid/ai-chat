@@ -794,6 +794,25 @@ type rawAssetReader interface {
 	ReadFileBytes(ctx context.Context, auth themefs.RequestAuth, relPath string) ([]byte, error)
 }
 
+// storeSettingsFetcher is the *themefs.Store-only capability
+// FetchStoreSettings needs, same reasoning as rawAssetReader above: store
+// settings aren't a theme file, so they're not part of ThemeStore.
+type storeSettingsFetcher interface {
+	FetchStoreSettings(ctx context.Context, auth themefs.RequestAuth) (themefs.StoreSettings, error)
+}
+
+// FetchStoreSettings fetches the tenant's real store settings (currently
+// just its name) for PreviewHandler's buildPreviewContext, so the AI-chat
+// preview's header shows the merchant's actual store name instead of
+// FixtureContext's canned "Sample Store".
+func (s *Service) FetchStoreSettings(ctx context.Context, storeAuth themefs.RequestAuth) (themefs.StoreSettings, error) {
+	fetcher, ok := s.store.(storeSettingsFetcher)
+	if !ok {
+		return themefs.StoreSettings{}, fmt.Errorf("theme store does not support store settings fetch")
+	}
+	return fetcher.FetchStoreSettings(ctx, storeAuth)
+}
+
 // ReadThemeAssetBytes fetches one theme file's raw bytes, authenticated as
 // storeAuth — backs AssetHandler, which lets the frontend's client-side
 // LiquidJS preview (a sandboxed iframe with no real origin — see

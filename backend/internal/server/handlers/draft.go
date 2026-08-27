@@ -32,3 +32,30 @@ func (h *DraftHandler) Files(c *gin.Context) {
 	}
 	httpresponse.OK(c, files)
 }
+
+type saveManualEditRequest struct {
+	FilePath string `json:"file_path" binding:"required"`
+	Content  string `json:"content"`
+}
+
+// SaveManualEdit handles POST /chats/:chatId/draft/edit — a merchant editing
+// static template text directly in the preview (see
+// themebuild.Service.SaveManualEdit), not a generation turn. Text only for
+// now — see SaveManualEdit's own doc comment on why an image edit can't go
+// through this same path yet.
+func (h *DraftHandler) SaveManualEdit(c *gin.Context) {
+	var in saveManualEditRequest
+	if err := c.ShouldBindJSON(&in); err != nil {
+		respondBindErr(c, err)
+		return
+	}
+
+	file, err := h.builder.SaveManualEdit(
+		c.Request.Context(), auth.TenantID(c), auth.Token(c), c.Param("chatId"), in.FilePath, in.Content,
+	)
+	if err != nil {
+		respondErr(c, err)
+		return
+	}
+	httpresponse.OK(c, file)
+}

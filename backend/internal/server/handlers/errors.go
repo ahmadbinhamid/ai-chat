@@ -44,6 +44,8 @@ func respondErr(c *gin.Context, err error) {
 		httpresponse.Error(c, http.StatusConflict, err.Error(), "APPLY_IN_PROGRESS")
 	case errors.Is(err, themebuild.ErrNoPendingChanges):
 		httpresponse.Error(c, http.StatusConflict, err.Error(), "NO_PENDING_CHANGES")
+	case errors.Is(err, themebuild.ErrManualEditFileNotFound):
+		httpresponse.Error(c, http.StatusNotFound, err.Error(), "FILE_NOT_FOUND")
 	// isUpstreamUnavailable is checked before the generic default branch —
 	// a merchant seeing "the theme service is temporarily unavailable,
 	// please try again" (a real, actionable, non-scary explanation) instead

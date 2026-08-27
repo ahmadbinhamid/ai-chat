@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"ai-chat/internal/themefs"
+
+	"github.com/google/uuid"
 )
 
 // ErrApplyBlockedByRunningGeneration mirrors
@@ -282,4 +284,73 @@ func (s *Service) DiscardDraft(ctx context.Context, tenantID uint64, chatID stri
 		}
 	}
 	return DiscardResult{DiscardedPaths: paths, DiscardedTurns: len(seenMessages)}, nil
+}
+
+// ErrManualEditFileNotFound means SaveManualEdit's path isn't a file that
+// exists in this chat's current effective draft. Rejected rather than
+// silently created: an edit made by clicking something in the rendered
+// preview should only ever touch a file that's actually rendering right
+// now, never introduce a new one — a mismatch here means the client's
+// preview is stale (rendered against an older draft) or sent a bad path.
+var ErrManualEditFileNotFound = errors.New("this file does not exist in the current draft")
+
+// SaveManualEdit persists one file's content as a new pending draft change,
+// authored directly in the preview (a merchant editing static template
+// text by hand) rather than by a generation turn. Written as an ordinary
+// chat_generated_files row under a new bookkeeping message (see
+// chat.Service.RecordManualEditMessage) — the same table ApplyDraft,
+// DiscardDraft, and DraftSummary already read (see pendingFilesToPlan's own
+// comment on last-write-wins-per-path folding), so a manual edit rides that
+// existing machinery — the Apply/Discard bar, revert, draft folding across
+// however many edits/turns — unchanged, rather than needing a parallel path.
+//
+// Text only: content is written to chat_generated_files.content as-is,
+// which flows straight into themefs.Store.WriteFile's plain-string request
+// body on Apply. That's fine for the .liquid/.css/.js files this feature
+// targets, but NOT binary-safe — a caller must not use this for an image
+// edit until WriteFile itself supports binary content (see its own doc
+// comment); doing so today would write the corrupted bytes straight into
+// the tenant's live theme the moment Apply runs.
+func (s *Service) SaveManualEdit(ctx context.Context, tenantID uint64, token, chatID, filePath, content string) (GeneratedFile, error) {
+	if err := themefs.ValidatePathSafety(filePath); err != nil {
+		return GeneratedFile{}, err
+	}
+
+	c, err := s.chats.GetChat(ctx, tenantID, chatID)
+	if err != nil {
+		return GeneratedFile{}, err
+	}
+
+	current, err := s.DraftFiles(ctx, tenantID, token, chatID)
+	if err != nil {
+		return GeneratedFile{}, err
+	}
+	previous, existed := current[filePath]
+	if !existed {
+		return GeneratedFile{}, ErrManualEditFileNotFound
+	}
+
+	msg, err := s.chats.RecordManualEditMessage(ctx, c, filePath)
+	if err != nil {
+		return GeneratedFile{}, err
+	}
+
+	now := time.Now().UTC()
+	f := GeneratedFile{
+		ID:              uuid.NewString(),
+		MessageID:       msg.ID,
+		ChatID:          c.ID,
+		FilePath:        filePath,
+		Action:          FileActionUpdate,
+		Kind:            GeneratedFileKindProposed,
+		Language:        languageFor(filePath),
+		Content:         content,
+		PreviousContent: &previous,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if err := s.repo.CreateFile(ctx, f); err != nil {
+		return GeneratedFile{}, err
+	}
+	return f, nil
 }
