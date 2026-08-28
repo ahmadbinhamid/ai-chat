@@ -1115,7 +1115,14 @@ func languageFor(path string) string {
 		return "JS"
 	case strings.HasSuffix(path, ".json"):
 		return "JSON"
+	case isEditableImagePath(path):
+		return "IMAGE"
 	default:
 		return ""
 	}
+}
+
+func isEditableImagePath(path string) bool {
+	lower := strings.ToLower(path)
+	return strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".jpg") || strings.HasSuffix(lower, ".webp")
 }
