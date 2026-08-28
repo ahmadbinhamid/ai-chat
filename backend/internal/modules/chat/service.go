@@ -161,6 +161,33 @@ func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64,
 	return m, nil
 }
 
+// RecordManualEditMessage appends a bookkeeping turn for a file the merchant
+// edited directly in the preview (see themebuild.Service.SaveManualEdit) —
+// every chat_generated_files row needs a message_id to hang off (foreign
+// key), and this didn't come from the model, so RoleAssistant would
+// misattribute it as something Claude said. Uses RoleSystem (defined
+// alongside RoleUser/RoleAssistant, previously unused) rather than adding a
+// new role — this is exactly the "not a conversation turn" case it exists
+// for. ApplyStatusPending because, like a generation turn, its file exists
+// only in the draft overlay until Apply.
+func (s *Service) RecordManualEditMessage(ctx context.Context, c Chat, filePath string) (Message, error) {
+	now := time.Now().UTC()
+	m := Message{
+		ID:          uuid.NewString(),
+		ChatID:      c.ID,
+		TenantID:    c.TenantID,
+		Role:        RoleSystem,
+		Content:     "Edited " + filePath + " directly in the preview",
+		Status:      MessageStatusCompleted,
+		ApplyStatus: ApplyStatusPending,
+		CreatedAt:   now,
+	}
+	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, 0, 0, now); err != nil {
+		return Message{}, err
+	}
+	return m, nil
+}
+
 // RecordAssistantMessage appends the model's reply, rolling its token usage
 // into the chat's running totals. applyStatus should be ApplyStatusPending
 // when the turn's proposed changes were staged into the draft overlay (the

@@ -2,6 +2,7 @@ package themebuild
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,11 +18,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// fakeApplyServer stands in for flowpos-backend's theme-file API for
-// ApplyDraft/DiscardDraft/RevertToMessage tests — every GET 404s (nothing
-// pre-exists), every POST (write) is recorded, and calls is a running
-// count of every request this server ever received, useful for "zero
-// FlowPOS calls" assertions (items 10, 12).
 type fakeApplyServer struct {
 	mu       sync.Mutex
 	calls    int
@@ -186,15 +182,6 @@ func TestApplyDraft_RestoresPageMetaForPagesFile(t *testing.T) {
 	}
 }
 
-// Bug: pendingFilesToPlan's last-write-wins collapse used to replace a
-// path's whole planFile wholesale. buildWritePlan only ever sets pageMeta
-// on the turn carrying the model's PageRegistryEntry — a follow-up turn
-// editing the same page has none (the page already exists as far as the
-// model is concerned), so the older row's pageMeta was silently discarded.
-// ApplyDraft would then WriteFile the page's content with a nil pageMeta,
-// landing the .liquid file without ever registering it in pages.json — no
-// error anywhere, just a 404 the merchant discovers later. This is the
-// regression test: it must fail against the pre-fix collapse.
 func TestApplyDraft_CarriesForwardPageMetaAcrossTurns(t *testing.T) {
 	fake := newFakeApplyServer()
 	svc, chatSvc, buildRepo := newApplyTestService(t, fake)
@@ -221,9 +208,6 @@ func TestApplyDraft_CarriesForwardPageMetaAcrossTurns(t *testing.T) {
 		t.Fatalf("CreateFile (turn 1) failed: %v", err)
 	}
 
-	// created_at has only second-level precision (see revert.go's own doc
-	// comment on the same hazard) — sleep past a second boundary so turn 2
-	// deterministically orders after turn 1.
 	time.Sleep(1100 * time.Millisecond)
 
 	// Turn 2: "make the heading bigger" — the page already exists, so the
@@ -258,11 +242,6 @@ func TestApplyDraft_CarriesForwardPageMetaAcrossTurns(t *testing.T) {
 	}
 }
 
-// TestPendingFilesToPlan_CollapseAcrossTurns is the table-driven unit test
-// for pendingFilesToPlan's last-write-wins collapse — pure function, no DB
-// needed. Covers the three cases the ApplyDraft-level regression test above
-// doesn't: a newer turn's own PageMeta winning over an older one's, the
-// create/update action collapse, and an update-only path staying update.
 func TestPendingFilesToPlan_CollapseAcrossTurns(t *testing.T) {
 	older := time.Now().UTC().Add(-time.Minute)
 	newer := time.Now().UTC()
@@ -276,9 +255,6 @@ func TestPendingFilesToPlan_CollapseAcrossTurns(t *testing.T) {
 		wantAction   FileAction
 	}{
 		{
-			// A newer turn's own registration data (e.g. the merchant asked
-			// to change the slug) must not be overwritten by the older
-			// turn's now-stale PageMeta.
 			name: "newer turn's own PageMeta wins over older turn's",
 			files: []GeneratedFile{
 				{FilePath: "pages/about.liquid", Action: FileActionCreate, PageMeta: metaV1, CreatedAt: older},
@@ -327,10 +303,6 @@ func TestPendingFilesToPlan_CollapseAcrossTurns(t *testing.T) {
 	}
 }
 
-// Item 8: ApplyDraft applies a kind='layout' row so the <link> tag
-// survives — a layout splice staged during generation but never separately
-// audited before this feature would otherwise be lost between staging and
-// apply.
 func TestApplyDraft_AppliesLayoutRow(t *testing.T) {
 	fake := newFakeApplyServer()
 	svc, chatSvc, buildRepo := newApplyTestService(t, fake)
@@ -357,12 +329,6 @@ func TestApplyDraft_AppliesLayoutRow(t *testing.T) {
 	}
 }
 
-// Bug: AppliedPaths used to include layout splice paths (layout-start.liquid/
-// layout-end.liquid) even though DraftSummary.FilePaths excludes them (see
-// GeneratedFileKindLayout) — a merchant would see "1 unsaved change" before
-// applying and "applied 2 files" after, for the exact same draft. The
-// layout row must still be WRITTEN (a splice is real, applied work), just
-// not counted in AppliedPaths, matching DraftSummary's own exclusion.
 func TestApplyDraft_AppliedPathsExcludesLayoutRows(t *testing.T) {
 	fake := newFakeApplyServer()
 	svc, chatSvc, buildRepo := newApplyTestService(t, fake)
@@ -473,6 +439,157 @@ func TestDiscardDraft_MakesZeroFlowposCalls(t *testing.T) {
 		if m.Role == chat.RoleAssistant && m.ApplyStatus != chat.ApplyStatusDiscarded {
 			t.Errorf("expected message %s discarded, got %q", m.ID, m.ApplyStatus)
 		}
+	}
+}
+
+func TestSaveManualEdit_StagesAsPendingAndFoldsIntoDraft(t *testing.T) {
+	ts := newFakeThemeServer(t, map[string]string{"pages/home.liquid": "<h1>Original</h1>"})
+	defer ts.Close()
+
+	conn := openTestDB(t)
+	chatSvc := chat.NewService(chat.NewRepository(conn))
+	buildRepo := NewRepository(conn)
+	svc := NewService(buildRepo, chatSvc, nil, themefs.NewStore(ts.URL), nil)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	file, err := svc.SaveManualEdit(ctx, tenantID, "tok", c.ID, "pages/home.liquid", "<h1>Edited by merchant</h1>")
+	if err != nil {
+		t.Fatalf("SaveManualEdit failed: %v", err)
+	}
+	if file.Kind != GeneratedFileKindProposed || file.Action != FileActionUpdate {
+		t.Errorf("expected a proposed/update row, got kind=%q action=%q", file.Kind, file.Action)
+	}
+	if file.PreviousContent == nil || *file.PreviousContent != "<h1>Original</h1>" {
+		t.Errorf("expected previous_content to capture the pre-edit content, got %+v", file.PreviousContent)
+	}
+
+	draft, err := svc.DraftFiles(ctx, tenantID, "tok", c.ID)
+	if err != nil {
+		t.Fatalf("DraftFiles failed: %v", err)
+	}
+	if draft["pages/home.liquid"] != "<h1>Edited by merchant</h1>" {
+		t.Fatalf("expected the manual edit to win in the effective draft, got %q", draft["pages/home.liquid"])
+	}
+
+	msg, err := chatSvc.GetMessage(ctx, c.ID, file.MessageID)
+	if err != nil {
+		t.Fatalf("GetMessage failed: %v", err)
+	}
+	if msg.Role != chat.RoleSystem {
+		t.Errorf("expected the bookkeeping message to use RoleSystem, got %q", msg.Role)
+	}
+	if msg.ApplyStatus != chat.ApplyStatusPending {
+		t.Errorf("expected the bookkeeping message to be pending (not yet applied), got %q", msg.ApplyStatus)
+	}
+
+	summary, err := svc.DraftSummary(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("DraftSummary failed: %v", err)
+	}
+	if !summary.HasChanges {
+		t.Error("expected DraftSummary.HasChanges to flip true — this is what shows the Apply/Discard bar")
+	}
+}
+
+func TestSaveManualEdit_ImagePath_UsesAssetReadNotDraftFiles(t *testing.T) {
+	originalBytes := []byte("fake-png-bytes")
+	originalB64 := base64.StdEncoding.EncodeToString(originalBytes)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/store/themes/active/files" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"files": []themefs.FileTreeEntry{}}})
+			return
+		}
+		if r.URL.Path == "/store/themes/active/files/images/hero.png" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"path": "images/hero.png", "content": originalB64, "encoding": "base64"},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	conn := openTestDB(t)
+	chatSvc := chat.NewService(chat.NewRepository(conn))
+	buildRepo := NewRepository(conn)
+	svc := NewService(buildRepo, chatSvc, nil, themefs.NewStore(ts.URL), nil)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	newB64 := base64.StdEncoding.EncodeToString([]byte("new-png-bytes"))
+	file, err := svc.SaveManualEdit(ctx, tenantID, "tok", c.ID, "images/hero.png", newB64)
+	if err != nil {
+		t.Fatalf("SaveManualEdit failed: %v", err)
+	}
+	if file.Language != "IMAGE" {
+		t.Errorf("expected Language IMAGE, got %q", file.Language)
+	}
+	if file.PreviousContent == nil || *file.PreviousContent != originalB64 {
+		t.Errorf("expected previous_content to be the original base64, got %+v", file.PreviousContent)
+	}
+	if file.Content != newB64 {
+		t.Errorf("expected content to be the new base64, got %q", file.Content)
+	}
+}
+
+// TestSaveManualEdit_ImagePath_NotFound — an image path that doesn't exist
+// as a real theme asset must be rejected the same way a missing text file is.
+func TestSaveManualEdit_ImagePath_NotFound(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	conn := openTestDB(t)
+	chatSvc := chat.NewService(chat.NewRepository(conn))
+	buildRepo := NewRepository(conn)
+	svc := NewService(buildRepo, chatSvc, nil, themefs.NewStore(ts.URL), nil)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	_, err = svc.SaveManualEdit(ctx, tenantID, "tok", c.ID, "images/does-not-exist.png", "Zm9v")
+	if !errors.Is(err, ErrManualEditFileNotFound) {
+		t.Fatalf("expected ErrManualEditFileNotFound, got %v", err)
+	}
+}
+
+func TestSaveManualEdit_RejectsPathNotInDraft(t *testing.T) {
+	ts := newFakeThemeServer(t, map[string]string{"pages/home.liquid": "<h1>Original</h1>"})
+	defer ts.Close()
+
+	conn := openTestDB(t)
+	chatSvc := chat.NewService(chat.NewRepository(conn))
+	buildRepo := NewRepository(conn)
+	svc := NewService(buildRepo, chatSvc, nil, themefs.NewStore(ts.URL), nil)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	_, err = svc.SaveManualEdit(ctx, tenantID, "tok", c.ID, "pages/does-not-exist.liquid", "content")
+	if !errors.Is(err, ErrManualEditFileNotFound) {
+		t.Fatalf("expected ErrManualEditFileNotFound, got %v", err)
 	}
 }
 
