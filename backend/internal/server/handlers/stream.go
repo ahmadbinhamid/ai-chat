@@ -276,6 +276,15 @@ func (h *StreamHandler) waitForLiveEvents(ctx context.Context, conn *websocket.C
 				// this channel, so there's nothing left to wait on.
 				return
 			}
+			if ev.Type == themebuild.EventTypeCancelRequested {
+				// Internal-only signal asking whichever replica actually
+				// owns this generation to stop it (see
+				// Service.CancelQueuedGeneration's running branch) — not
+				// something a merchant's client has any use for. It never
+				// gets a durable seq either, so there's nothing to skip
+				// past on reconnect by not forwarding it here.
+				continue
+			}
 			if ev.Seq != 0 {
 				if ev.Seq <= *watermark {
 					continue // already delivered during replay — see Stream's doc comment

@@ -197,6 +197,57 @@ func TestRepository_CancelQueued_RunningRowIsRejected(t *testing.T) {
 	}
 }
 
+func TestRepository_GetGenerationByID(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+
+	queuedID, _ := seedQueued(t, repo, chatID, "find me")
+
+	g, err := repo.GetGenerationByID(ctx, chatID, queuedID)
+	if err != nil {
+		t.Fatalf("GetGenerationByID failed: %v", err)
+	}
+	if g.ID != queuedID || g.Status != GenerationStatusQueued {
+		t.Fatalf("expected the queued row back, got %+v", g)
+	}
+
+	if _, err := repo.GetGenerationByID(ctx, chatID, uuid.NewString()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for an unknown id, got %v", err)
+	}
+	if _, err := repo.GetGenerationByID(ctx, uuid.NewString(), queuedID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for the right id under the wrong chat, got %v", err)
+	}
+}
+
+func TestRepository_EndGenerationCancelled(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+
+	runningID := uuid.NewString()
+	if err := repo.StartGeneration(ctx, runningID, chatID, 1); err != nil {
+		t.Fatalf("StartGeneration failed: %v", err)
+	}
+
+	if err := repo.EndGenerationCancelled(ctx, chatID); err != nil {
+		t.Fatalf("EndGenerationCancelled failed: %v", err)
+	}
+
+	g, err := repo.GetGeneration(ctx, chatID)
+	if err != nil {
+		t.Fatalf("GetGeneration failed: %v", err)
+	}
+	if g.Status != GenerationStatusCancelled {
+		t.Fatalf("expected status %q, got %q", GenerationStatusCancelled, g.Status)
+	}
+	if g.Error != nil {
+		t.Fatalf("expected no error recorded for a cancelled generation, got %q", *g.Error)
+	}
+}
+
 func TestRepository_EnqueueGeneration_RejectsPastQueueCap(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)

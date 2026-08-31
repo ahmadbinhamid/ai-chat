@@ -2,6 +2,7 @@ package themebuild
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -485,6 +486,91 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	workCtx, cancel := context.WithTimeout(ctx, generateTimeout())
 	defer cancel()
 
+	// A second, inner cancel layer over the timeout above, purely to
+	// interrupt doGenerate promptly — NOT what tells its defer "the
+	// merchant stopped this" (see cancelledByUser below for that): ctx can
+	// arrive here already-canceled for entirely unrelated reasons (a
+	// caller whose own request context died — see
+	// TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext),
+	// which is indistinguishable from userCancel() below by error type
+	// alone (both are plain context.Canceled). cancelledByUser is the
+	// explicit, unambiguous signal instead.
+	workCtx, userCancel := context.WithCancel(workCtx)
+	defer userCancel()
+
+	// Set (before userCancel() is called, never after) by the listener
+	// goroutine below the moment it recognizes a genuine cancel request
+	// for THIS generation — read back both by doGenerate's own defer (to
+	// decide whether to emit EventTypeCancelled instead of
+	// EventTypeFailed) and by this function's own tail (to decide between
+	// EndGenerationCancelled and EndGeneration). atomic because it's
+	// written from the listener goroutine and read from this one.
+	var cancelledByUser atomic.Bool
+
+	// Listens for this specific generation's EventTypeCancelRequested (see
+	// Service.CancelQueuedGeneration's running branch) and, on receipt,
+	// cancels workCtx so doGenerate unwinds — same subscribe-by-chat-id
+	// bus every connected client's stream uses, since a cancel request can
+	// land on any replica, not necessarily the one actually running this
+	// generation. Torn down via userCancelDone the moment this generation
+	// ends for any other reason, so it never outlives the goroutine below.
+	userCancelDone := make(chan struct{})
+	defer close(userCancelDone)
+	cancelEvents, cancelSub := s.bus.Subscribe(context.Background(), c.ID)
+	defer cancelSub()
+
+	// Closes the subscribe-after-cancel race: a cancel request can be
+	// published (see CancelQueuedGeneration's running branch) in the gap
+	// between DequeueNext marking this row running and the Subscribe call
+	// just above — Publish only reaches subscribers already registered at
+	// the moment it's sent, so that request would otherwise be silently
+	// missed. RequestGenerationCancellation's durable write is what this
+	// checks back; see its doc comment. The heartbeat ticker below
+	// re-checks the same flag on every tick as a backstop for a dropped
+	// live event too, so this one check only needs to close the narrow
+	// startup race, not stand in for the live path generally.
+	//
+	// Bounded the same as every other ad hoc call in this function
+	// (endCtx/hbCtx/emitCtx/commitCtx) — this one runs synchronously,
+	// before the listener goroutine, heartbeat ticker, or doGenerate even
+	// start, so an unbounded call here would stall this generation's
+	// entire start on a slow/locked database instead of just this one
+	// check.
+	precheckCtx, precheckCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if requested, err := s.repo.IsCancellationRequested(precheckCtx, c.ID, g.ID); err == nil && requested {
+		cancelledByUser.Store(true)
+		userCancel()
+	}
+	precheckCancel()
+
+	go func() {
+		defer safego.Recover("themebuild.cancelListener")
+		for {
+			select {
+			case <-userCancelDone:
+				return
+			case ev, ok := <-cancelEvents:
+				if !ok {
+					return
+				}
+				if ev.Type != EventTypeCancelRequested {
+					continue
+				}
+				var payload struct {
+					GenerationID string `json:"generation_id"`
+				}
+				if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+					continue
+				}
+				if payload.GenerationID == g.ID {
+					cancelledByUser.Store(true)
+					userCancel()
+					return
+				}
+			}
+		}
+	}()
+
 	// Heartbeat ticker — the second of two layers keeping generations
 	// with a healthy but slow model call from being reaped mid-flight
 	// (see the 20260813000002 migration and generationHeartbeatTimeout).
@@ -530,19 +616,42 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 					if err := s.repo.UpdateGenerationHeartbeat(hbCtx, g.ID); err != nil {
 						slog.Error("failed to update generation heartbeat (ticker)", "generation_id", g.ID, "error", err)
 					}
+					// Backstop for a cancel request whose live event was
+					// dropped — EventTypeCancelRequested shares a bounded,
+					// best-effort channel with high-frequency "thinking"
+					// deltas (see eventBus's subscriberBufferSize) and can
+					// be silently lost under load. Piggybacked on this
+					// same tick rather than a second ticker: same cadence,
+					// same already-open DB round trip's neighborhood, one
+					// fewer goroutine.
+					if requested, err := s.repo.IsCancellationRequested(hbCtx, c.ID, g.ID); err == nil && requested {
+						cancelledByUser.Store(true)
+						userCancel()
+					}
 				}()
 			}
 		}
 	}()
 
-	err := s.doGenerate(workCtx, in, c, g.ID)
+	err := s.doGenerate(workCtx, in, c, g.ID, &cancelledByUser)
 
 	// A deliberately fresh, short-lived context for this one bookkeeping
 	// write: workCtx may already be expired (a generation that hit
-	// generateTimeout), and the outcome still needs recording either way.
+	// generateTimeout, or that userCancel above ended early), and the
+	// outcome still needs recording either way.
 	endCtx, endCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer endCancel()
-	if endErr := s.repo.EndGeneration(endCtx, c.ID, err); endErr != nil {
+	// err != nil is required here, not cancelledByUser.Load() alone: the
+	// flag can still flip true after doGenerate has already committed a
+	// real, successful result (see doGenerate's own defer, which applies
+	// the identical guard for the same reason) — a nil err unambiguously
+	// means the turn completed, and must never be relabeled "cancelled"
+	// just because a cancel request happened to race its very end.
+	if err != nil && cancelledByUser.Load() {
+		if endErr := s.repo.EndGenerationCancelled(endCtx, c.ID); endErr != nil {
+			slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
+		}
+	} else if endErr := s.repo.EndGeneration(endCtx, c.ID, err); endErr != nil {
 		slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
 	}
 }
@@ -576,7 +685,11 @@ func (s *Service) recordGenerationFailure(ctx context.Context, c chat.Chat, genI
 // and stage them into the chat's draft overlay — see this package's own
 // doc comment for the draft/apply split; writing to the real theme is a
 // separate, explicit Service.ApplyDraft step, not something this does.
-func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat, genID string) (retErr error) {
+// cancelledByUser is nil from tests that drive doGenerate directly with no
+// cancel machinery of their own (see
+// TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext) — only
+// runOneQueuedGeneration ever passes a real one.
+func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat, genID string, cancelledByUser *atomic.Bool) (retErr error) {
 	emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
 	emitter.emit(ctx, EventTypeStarted, struct{}{})
 
@@ -596,6 +709,47 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// WebSocket (and the chat) with no record of why it failed.
 		emitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+
+		// retErr != nil is required alongside cancelledByUser, not
+		// cancelledByUser alone: the listener/backstop can flip it true at
+		// any point relative to this function's own progress, including
+		// after RecordAssistantMessage + persistFileRecords below have
+		// already committed a real, successful result — commitCtx (see
+		// below) makes that commit itself immune to cancellation once
+		// reached, so retErr == nil there unambiguously means the turn
+		// really did complete and must never be relabeled "cancelled"
+		// just because a request happened to race its very end.
+		//
+		// Deliberately NOT ctx.Err()-based either: ctx can arrive here
+		// already canceled for reasons that have nothing to do with a
+		// merchant cancel request (a caller whose own request context died
+		// — see TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext),
+		// which is indistinguishable from a real cancel by error type
+		// alone. cancelledByUser is the explicit, unambiguous signal.
+		if retErr != nil && cancelledByUser != nil && cancelledByUser.Load() {
+			// A merchant-requested stop (see
+			// Service.CancelQueuedGeneration's running branch and
+			// runOneQueuedGeneration's cancelledByUser), not a failure — no
+			// failed message gets recorded, mirroring how cancelling a
+			// still-queued prompt already leaves no chat message behind
+			// either.
+			//
+			// retErr is still logged if it ISN'T the expected
+			// context.Canceled this cancellation itself produces:
+			// cancelledByUser being true only means a cancel request was
+			// observed at some point, not that it's what caused retErr —
+			// a genuinely unrelated failure (a DB error, an AI-provider
+			// error) can coincidentally race a cancel request landing at
+			// the same moment. Silently treating every such coincidence as
+			// "just a cancellation" would erase the one place doGenerate's
+			// real failures are diagnosable server-side (see the retErr !=
+			// nil branch below, which logs unconditionally).
+			if !errors.Is(retErr, context.Canceled) {
+				slog.Error("generation failed (raced a concurrent cancel request)", "chat_id", c.ID, "tenant_id", in.TenantID, "error", retErr)
+			}
+			emitter.emit(emitCtx, EventTypeCancelled, map[string]string{"generation_id": genID})
+			return
+		}
 
 		if retErr != nil {
 			// Never surface retErr.Error() directly — it can contain the
@@ -739,12 +893,24 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	}
 	summary = appendWarningsNote(summary, warnings)
 
-	assistantMsg, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
+	// A cancel request landing in this exact window — after the model's
+	// output has already been decided and is only being committed — must
+	// never be allowed to leave a "completed" assistant message
+	// referencing files that were only partially written, or vice versa.
+	// commitCtx is deliberately detached from ctx (rooted at
+	// context.Background(), not derived from it, with its own bounded
+	// timeout — the same pattern as endCtx/emitCtx elsewhere in this
+	// file) so a cancellation can only ever stop this turn BEFORE this
+	// point, never in the middle of recording its result.
+	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer commitCancel()
+
+	assistantMsg, err := s.chats.RecordAssistantMessage(commitCtx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
 	if err != nil {
 		return fmt.Errorf("record assistant message: %w", err)
 	}
 
-	if _, err := s.persistFileRecords(ctx, c, assistantMsg.ID, staged); err != nil {
+	if _, err := s.persistFileRecords(commitCtx, c, assistantMsg.ID, staged); err != nil {
 		return fmt.Errorf("persist generated-file audit rows: %w", err)
 	}
 

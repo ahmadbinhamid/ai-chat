@@ -2,6 +2,7 @@ package themebuild
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -282,6 +283,319 @@ func TestRunGeneration_EachIterationGetsFreshTimeout(t *testing.T) {
 	if completed != 3 {
 		t.Fatalf("expected all 3 generations to complete under their own fresh timeouts, got %d completed out of 3", completed)
 	}
+}
+
+// Cancelling a RUNNING generation (not just a queued one — see
+// TestRepository_CancelQueued for that path) must actually interrupt it,
+// not just eventually let it run to completion: the scripted generator's
+// delay (2s) comfortably outlasts how long this test is willing to poll
+// for the cancelled outcome (well under 2s), so the test only passes if
+// CancelQueuedGeneration's running branch actually woke doGenerate's ctx
+// early via EventTypeCancelRequested, rather than the row merely timing
+// out or finishing on its own.
+func TestGenerate_CancelWhileRunning_StopsGenerationWithNoAssistantMessage(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &scriptedGenerator{results: []scriptedResult{{delay: 2 * time.Second}}}
+	svc.gen = gen
+
+	tenantID := uint64(time.Now().UnixNano())
+	ctx := context.Background()
+
+	out, err := svc.Generate(ctx, GenerateInput{TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme", Prompt: "cancel me"})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	waitForCalls(t, gen, 1, 5*time.Second) // generator actually invoked, so the row is genuinely "running"
+
+	if err := svc.CancelQueuedGeneration(ctx, tenantID, out.Chat.ID, out.GenerationID); err != nil {
+		t.Fatalf("CancelQueuedGeneration on a running row failed: %v", err)
+	}
+
+	deadline := time.Now().Add(1500 * time.Millisecond) // well short of the 2s scripted delay
+	var g Generation
+	for time.Now().Before(deadline) {
+		g, err = svc.repo.GetGeneration(ctx, out.Chat.ID)
+		if err != nil {
+			t.Fatalf("GetGeneration failed: %v", err)
+		}
+		if g.Status == GenerationStatusCancelled {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if g.Status != GenerationStatusCancelled {
+		t.Fatalf("expected the running generation to be cancelled well before its 2s scripted delay elapsed, last observed status %q", g.Status)
+	}
+	if g.Error != nil {
+		t.Fatalf("expected no error recorded for a cancelled generation, got %q", *g.Error)
+	}
+
+	messages, err := chatSvc.ListMessagesForVerifiedChat(ctx, out.Chat.ID)
+	if err != nil {
+		t.Fatalf("ListMessagesForVerifiedChat failed: %v", err)
+	}
+	for _, m := range messages {
+		if m.Role == chat.RoleAssistant {
+			t.Fatalf("expected no assistant message for a cancelled turn, got one: %+v", m)
+		}
+	}
+}
+
+// A cancel request can be durably recorded (RequestGenerationCancellation)
+// before runOneQueuedGeneration's own goroutine ever calls Subscribe — the
+// gap between DequeueNext marking a row running and that Subscribe call
+// (see CancelQueuedGeneration's running branch doc comment). This seeds
+// exactly that: the row is marked cancel-requested via the repository
+// directly, standing in for a request that landed in the gap, *before*
+// runOneQueuedGeneration is ever called — proving the immediate
+// post-subscribe check catches it rather than relying solely on the live
+// event, which in this scenario was never published at all.
+func TestRunOneQueuedGeneration_HonorsCancelRequestedBeforeSubscribing(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &scriptedGenerator{results: []scriptedResult{{delay: 2 * time.Second}}}
+	svc.gen = gen
+
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+
+	genID := uuid.NewString()
+	if err := svc.repo.StartGeneration(ctx, genID, c.ID, tenantID); err != nil {
+		t.Fatalf("StartGeneration failed: %v", err)
+	}
+	svc.tokens.store(genID, "tok")
+	if err := svc.repo.RequestGenerationCancellation(ctx, c.ID, genID); err != nil {
+		t.Fatalf("RequestGenerationCancellation failed: %v", err)
+	}
+
+	g := Generation{ID: genID, ChatID: c.ID, TenantID: tenantID, ThemeSlug: "test-theme", Prompt: "do something"}
+
+	start := time.Now()
+	svc.runOneQueuedGeneration(ctx, c, g)
+	elapsed := time.Since(start)
+
+	if elapsed > 1*time.Second {
+		t.Fatalf("expected the pre-existing cancel request to be caught immediately after subscribing, took %v (scripted delay was 2s)", elapsed)
+	}
+
+	got, err := svc.repo.GetGeneration(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("GetGeneration failed: %v", err)
+	}
+	if got.Status != GenerationStatusCancelled {
+		t.Fatalf("expected status %q, got %q", GenerationStatusCancelled, got.Status)
+	}
+}
+
+// A cancel request that loses the race against an already-finishing (or
+// already-finished) generation must never corrupt or relabel its real
+// outcome — see doGenerate's commitCtx and its defer's retErr != nil
+// guard, and runOneQueuedGeneration's matching err != nil guard. The
+// scripted generator here returns instantly, so by the time
+// CancelQueuedGeneration is called the turn has very likely already
+// committed (possibly even already recorded as "succeeded") — exactly the
+// case those guards exist for.
+func TestRunOneQueuedGeneration_CancelAfterSuccessDoesNotRelabelOutcome(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &scriptedGenerator{results: []scriptedResult{{}}} // completes immediately, no delay
+	svc.gen = gen
+
+	tenantID := uint64(time.Now().UnixNano())
+	ctx := context.Background()
+
+	out, err := svc.Generate(ctx, GenerateInput{TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme", Prompt: "finish fast"})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+
+	waitForCalls(t, gen, 1, 5*time.Second)
+	// Racing a cancel request against an already-finishing generation on
+	// purpose: by the time this lands, doGenerate has very likely already
+	// committed. Either way the assertions below hold — the point is that
+	// a request landing this late must never turn a real success into a
+	// reported cancellation.
+	_ = svc.CancelQueuedGeneration(ctx, tenantID, out.Chat.ID, out.GenerationID)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var g Generation
+	for time.Now().Before(deadline) {
+		g, err = svc.repo.GetGeneration(ctx, out.Chat.ID)
+		if err != nil {
+			t.Fatalf("GetGeneration failed: %v", err)
+		}
+		if g.Status != GenerationStatusRunning {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if g.Status != GenerationStatusSucceeded {
+		t.Fatalf("expected a late cancel request to leave a genuinely successful generation as %q, got %q", GenerationStatusSucceeded, g.Status)
+	}
+
+	messages, err := chatSvc.ListMessagesForVerifiedChat(ctx, out.Chat.ID)
+	if err != nil {
+		t.Fatalf("ListMessagesForVerifiedChat failed: %v", err)
+	}
+	var completed int
+	for _, m := range messages {
+		if m.Role == chat.RoleAssistant && m.Status == chat.MessageStatusCompleted {
+			completed++
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("expected the completed assistant message to still be recorded despite the late cancel request, got %d completed messages", completed)
+	}
+}
+
+// CancelAllPending must stop the running generation AND every prompt still
+// queued behind it, not just the running one — otherwise the very next
+// queued prompt would immediately take its place, which is exactly what a
+// merchant hitting "stop" on the whole thing does not expect.
+func TestCancelAllPending_StopsRunningAndEveryQueuedPrompt(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &scriptedGenerator{results: []scriptedResult{{delay: 2 * time.Second}}}
+	svc.gen = gen
+
+	tenantID := uint64(time.Now().UnixNano())
+	ctx := context.Background()
+
+	out, err := svc.Generate(ctx, GenerateInput{TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme", Prompt: "running"})
+	if err != nil {
+		t.Fatalf("Generate(running) failed: %v", err)
+	}
+	chatID := out.Chat.ID
+
+	var queuedIDs []string
+	for _, p := range []string{"queued one", "queued two"} {
+		qOut, err := svc.Generate(ctx, GenerateInput{TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme", Prompt: p})
+		if err != nil {
+			t.Fatalf("Generate(%q) failed: %v", p, err)
+		}
+		queuedIDs = append(queuedIDs, qOut.GenerationID)
+	}
+
+	waitForCalls(t, gen, 1, 5*time.Second) // the running one is genuinely running before we cancel it
+
+	if err := svc.CancelAllPending(ctx, tenantID, chatID); err != nil {
+		t.Fatalf("CancelAllPending failed: %v", err)
+	}
+
+	// The two queued rows are cancelled synchronously — no need to poll.
+	for _, id := range queuedIDs {
+		g, err := svc.repo.GetGenerationByID(ctx, chatID, id)
+		if err != nil {
+			t.Fatalf("GetGenerationByID(%s) failed: %v", id, err)
+		}
+		if g.Status != GenerationStatusCancelled {
+			t.Fatalf("expected queued generation %s to be cancelled, got %q", id, g.Status)
+		}
+	}
+
+	// The running row stops asynchronously — poll for it, well short of
+	// its 2s scripted delay, proving it was actually interrupted rather
+	// than left to finish (or worse, immediately replaced by one of the
+	// queued prompts, which is exactly the bug this feature fixes).
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	var running Generation
+	for time.Now().Before(deadline) {
+		running, err = svc.repo.GetGenerationByID(ctx, chatID, out.GenerationID)
+		if err != nil {
+			t.Fatalf("GetGenerationByID(running) failed: %v", err)
+		}
+		if running.Status == GenerationStatusCancelled {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if running.Status != GenerationStatusCancelled {
+		t.Fatalf("expected the running generation to be cancelled well before its 2s scripted delay, last observed status %q", running.Status)
+	}
+
+	// Nothing left dequeueable — a queued row surviving cancel-all (or the
+	// drain loop somehow still advancing to it) would let it start
+	// running right after, which is the whole scenario this guards
+	// against.
+	if _, err := svc.repo.DequeueNext(ctx, chatID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected the queue to be fully drained after cancel-all, got %v", err)
+	}
+
+	messages, err := chatSvc.ListMessagesForVerifiedChat(ctx, chatID)
+	if err != nil {
+		t.Fatalf("ListMessagesForVerifiedChat failed: %v", err)
+	}
+	for _, m := range messages {
+		if m.Role == chat.RoleAssistant {
+			t.Fatalf("expected no assistant message from any cancelled turn, got one: %+v", m)
+		}
+	}
+}
+
+// CancelAllPending must still fully cancel the queue even when the
+// originally-running generation finishes on its own (success, in this
+// case) WHILE the cancel is still being processed — not just when it's
+// genuinely interrupted. This is what the multi-pass retry exists for
+// (see CancelAllPending's own doc comment): a single pass can miss a row
+// the drain loop promotes to running mid-loop, since that row was
+// snapshotted as "queued" before the promotion. Forcing the first
+// generation to complete near-instantly (no scripted delay) creates real
+// timing pressure for exactly that race — the assertion is on the
+// guarantee a merchant actually cares about (nothing is left running or
+// queued afterward), not on hitting one specific interleaving.
+func TestCancelAllPending_StillFullyCancelsWhenRunningOneFinishesNaturallyMidCancel(t *testing.T) {
+	svc, _ := newQueueTestService(t)
+	// A short but non-zero delay on the running one: long enough that
+	// it's still genuinely "running" when CancelAllPending starts (the
+	// three synchronous Generate() calls below return well under this),
+	// short enough that it has a real chance of finishing naturally while
+	// CancelAllPending's own loop is still working through the two queued
+	// rows behind it — the actual window this test exists to pressure.
+	gen := &scriptedGenerator{results: []scriptedResult{{delay: 30 * time.Millisecond}, {}, {}}}
+	svc.gen = gen
+
+	tenantID := uint64(time.Now().UnixNano())
+	ctx := context.Background()
+
+	out, err := svc.Generate(ctx, GenerateInput{TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme", Prompt: "running"})
+	if err != nil {
+		t.Fatalf("Generate(running) failed: %v", err)
+	}
+	chatID := out.Chat.ID
+
+	for _, p := range []string{"queued one", "queued two"} {
+		if _, err := svc.Generate(ctx, GenerateInput{TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme", Prompt: p}); err != nil {
+			t.Fatalf("Generate(%q) failed: %v", p, err)
+		}
+	}
+
+	// No wait for the running one to actually start (unlike the sibling
+	// test above) — deliberately racing CancelAllPending against
+	// everything still settling, since that's exactly the window the
+	// multi-pass retry has to cover.
+	if err := svc.CancelAllPending(ctx, tenantID, chatID); err != nil {
+		t.Fatalf("CancelAllPending failed: %v", err)
+	}
+
+	// Whatever the exact interleaving was, nothing should still be
+	// running or queued shortly after — poll briefly since the drain
+	// loop's own completion bookkeeping (EndGeneration, DequeueNext) is
+	// itself async relative to this goroutine.
+	deadline := time.Now().Add(2 * time.Second)
+	var pending []Generation
+	for time.Now().Before(deadline) {
+		pending, err = svc.repo.ListPending(ctx, chatID)
+		if err != nil {
+			t.Fatalf("ListPending failed: %v", err)
+		}
+		if len(pending) == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected the whole queue to end up fully cancelled/finished, but %d row(s) are still pending: %+v", len(pending), pending)
 }
 
 // Item 10: a chat with queued rows and nothing running gets those rows

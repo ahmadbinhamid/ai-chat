@@ -303,6 +303,85 @@ func (r *Repository) GetGeneration(ctx context.Context, chatID string) (Generati
 	return g, err
 }
 
+// GetGenerationByID returns one specific generation row by id, scoped to
+// chatID — ErrNotFound if it doesn't exist (or belongs to a different
+// chat). Used by Service.CancelQueuedGeneration to decide whether
+// generationID is still queued, already running, or neither, before
+// deciding how (or whether) to cancel it.
+func (r *Repository) GetGenerationByID(ctx context.Context, chatID, generationID string) (Generation, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT `+generationColumns+`
+		FROM generations WHERE id = ? AND chat_id = ?
+	`, generationID, chatID)
+	g, err := scanGeneration(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Generation{}, ErrNotFound
+	}
+	return g, err
+}
+
+// EndGenerationCancelled marks chatID's running generation as cancelled —
+// the running-generation counterpart to CancelQueued above, used once a
+// generation's own goroutine notices EventTypeCancelRequested and unwinds
+// (see runOneQueuedGeneration). No error to record here, unlike
+// EndGeneration's failed case: cancelling mid-flight is a deliberate
+// merchant action, not a failure.
+func (r *Repository) EndGenerationCancelled(ctx context.Context, chatID string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE generations SET status = ?, finished_at = ?
+		WHERE chat_id = ? AND status = ?
+	`, GenerationStatusCancelled, time.Now().UTC(), chatID, GenerationStatusRunning)
+	return err
+}
+
+// RequestGenerationCancellation durably marks chatID's running generation
+// generationID as having a cancel request pending — the counterpart to the
+// live EventTypeCancelRequested signal (see
+// Service.CancelQueuedGeneration's running branch and the
+// 20260831000001 migration's doc comment on why the live signal alone
+// isn't enough). Always (re-)stamps the current time rather than only the
+// first call, so a repeated cancel request — a double-click, or a retry
+// after a dropped response — is a harmless success rather than a spurious
+// not-found on the second attempt. A no-op (ErrNotFound) if the row isn't
+// running anymore — nothing left to request against.
+func (r *Repository) RequestGenerationCancellation(ctx context.Context, chatID, generationID string) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE generations SET cancel_requested_at = ?
+		WHERE id = ? AND chat_id = ? AND status = ?
+	`, time.Now().UTC(), generationID, chatID, GenerationStatusRunning)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// IsCancellationRequested reports whether generationID has a pending cancel
+// request — see RequestGenerationCancellation's doc comment. false (not an
+// error) if the row doesn't exist at all: a generation that's already gone
+// (reaped, or this process's own EndGeneration racing this exact check) has
+// nothing left to report, and the caller (runOneQueuedGeneration) is about
+// to record its own outcome anyway.
+func (r *Repository) IsCancellationRequested(ctx context.Context, chatID, generationID string) (bool, error) {
+	var requested sql.NullTime
+	err := r.db.QueryRowContext(ctx, `
+		SELECT cancel_requested_at FROM generations WHERE id = ? AND chat_id = ?
+	`, generationID, chatID).Scan(&requested)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return requested.Valid, nil
+}
+
 // UpdateGenerationHeartbeat stamps id's last_heartbeat_at with now — called
 // from eventEmitter.emit on every durably-persisted progress event a
 // running generation produces (see the 20260813000002 migration's doc
