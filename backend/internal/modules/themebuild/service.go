@@ -979,6 +979,31 @@ func (s *Service) FetchStoreSettings(ctx context.Context, storeAuth themefs.Requ
 	return fetcher.FetchStoreSettings(ctx, storeAuth)
 }
 
+// FetchThemeMenu reads the tenant's real defaults.json and returns its
+// menu object (`items[]` — see theme_engine_spec.md §6) for
+// PreviewHandler's buildPreviewContext, so the AI-chat preview's nav shows
+// every link the merchant has actually configured instead of
+// FixtureContext's static 3-link fallback. Unlike FetchStoreSettings, menu
+// data lives in a theme file, so it's read straight off ThemeStore —
+// no *themefs.Store-only capability interface needed.
+func (s *Service) FetchThemeMenu(ctx context.Context, storeAuth themefs.RequestAuth) (map[string]any, error) {
+	raw, err := s.store.ReadFile(ctx, storeAuth, pathDefaultsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("read defaults.json: %w", err)
+	}
+	var parsed struct {
+		Menu map[string]any `json:"menu"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, fmt.Errorf("parse defaults.json: %w", err)
+	}
+	items, _ := parsed.Menu["items"].([]any)
+	if len(items) == 0 {
+		return nil, fmt.Errorf("defaults.json has no menu items")
+	}
+	return parsed.Menu, nil
+}
+
 // ReadThemeAssetBytes fetches one theme file's raw bytes, authenticated as
 // storeAuth — backs AssetHandler, which lets the frontend's client-side
 // LiquidJS preview (a sandboxed iframe with no real origin — see

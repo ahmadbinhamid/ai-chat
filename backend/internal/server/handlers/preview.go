@@ -14,29 +14,34 @@ import (
 )
 
 // buildPreviewContext is themefs.FixtureContext() with the tenant's real
-// store identity overlaid on top (see themebuild.Service.FetchStoreSettings)
-// — everything else (products, categories, basket) stays fixture data,
-// since those have no single real value the way a store's name does and a
-// brand-new tenant may have none yet.
+// store identity and real nav menu overlaid on top (see
+// themebuild.Service.FetchStoreSettings / FetchThemeMenu) — everything else
+// (products, categories, basket) stays fixture data, since those have no
+// single real value the way a store's name/menu does and a brand-new
+// tenant may have none yet.
 //
 // Shared by Preview and Context rather than each calling FixtureContext()
 // independently: the frontend's LiquidJS engine (tenant-dashboard's
 // liquid-engine.ts) renders against Context's output, and PreviewPane's
 // "Check accuracy" button diffs that against Preview's own render — if only
-// one of the two carried the real store name, accuracy-check would report a
-// false "these differ" on every single page, which is exactly the noise it
-// exists to avoid (see liquid-engine.ts's own comment on what it's actually
-// meant to catch).
+// one of the two carried the real store name/menu, accuracy-check would
+// report a false "these differ" on every single page, which is exactly the
+// noise it exists to avoid (see liquid-engine.ts's own comment on what it's
+// actually meant to catch).
 //
-// Falls back to the fixture value on fetch failure — a store-settings
-// lookup hiccup shouldn't break the whole preview render.
+// Each overlay falls back to the fixture value on its own fetch failure —
+// one lookup hiccup (e.g. a brand-new theme with no defaults.json yet)
+// shouldn't block the other overlay or break the whole preview render.
 func buildPreviewContext(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth) map[string]any {
 	fixture := themefs.FixtureContext()
-	settings, err := builder.FetchStoreSettings(ctx, storeAuth)
-	if err != nil || settings.Name == "" {
-		return fixture
+
+	if settings, err := builder.FetchStoreSettings(ctx, storeAuth); err == nil && settings.Name != "" {
+		fixture["store"] = map[string]any{"name": settings.Name}
 	}
-	fixture["store"] = map[string]any{"name": settings.Name}
+	if menu, err := builder.FetchThemeMenu(ctx, storeAuth); err == nil {
+		fixture["menu"] = menu
+	}
+
 	return fixture
 }
 
