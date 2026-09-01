@@ -86,6 +86,10 @@ func (s *Service) generateValidProposal(
 
 		clearIfNeedsClarification(result)
 		if err := validateProposal(result, tc.GenerationMode); err == nil {
+			// Distinguishes a first-try success from one that only passed
+			// after retrying an invalid proposal — see theory 4 (retries) in
+			// the diagnostics task this instruments.
+			slog.Info("generateValidProposal succeeded", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempts_used", attempt)
 			return result, turns, nil
 		} else if attempt >= maxThemeCheckRetries+1 {
 			return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
@@ -184,6 +188,11 @@ func (s *Service) checkAndRepair(
 				slog.Info("themecheck accepted proposal after retry",
 					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "warning_count", len(warningFindings))
 			}
+			// Unconditional (unlike the log above, which only fires on
+			// attempt > 1) so a first-try success is distinguishable from a
+			// retried one in the logs — see theory 4 in the diagnostics task
+			// this instruments.
+			slog.Info("checkAndRepair succeeded", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempts_used", attempt)
 			result.InputTokens, result.OutputTokens = totalInput, totalOutput
 			return result, warningFindings, nil
 		}

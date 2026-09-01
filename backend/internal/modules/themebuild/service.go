@@ -697,6 +697,18 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// this defer's closure captures the same variable and sees its final
 	// value — a "done" event needs the actual summary, not a placeholder.
 	var summary string
+	// doGenerateStart/hasChanges back the end-to-end wall-clock log below —
+	// this is the number the merchant actually experiences; everything
+	// internal/ai logs explains it. hasChanges is declared here (rather
+	// than with := at its normal point of use further down) purely so this
+	// defer's closure can see its final value the same way summary above
+	// does; it's assigned, never redeclared, below.
+	doGenerateStart := time.Now()
+	var hasChanges bool
+	defer func() {
+		slog.Info("ai: generation wall-clock", "chat_id", c.ID, "mode", in.Mode,
+			"elapsed_ms", time.Since(doGenerateStart).Milliseconds(), "has_changes", hasChanges)
+	}()
 	defer func() {
 		// A deliberately fresh, short-lived context for this defer's own
 		// writes — mirrors runGeneration's endCtx pattern. ctx itself may
@@ -835,7 +847,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
-	hasChanges := proposalHasChanges(result)
+	hasChanges = proposalHasChanges(result)
 
 	var staged []writtenFile
 	if hasChanges {

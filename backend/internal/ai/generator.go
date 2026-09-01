@@ -147,6 +147,16 @@ func New(apiKey, baseURL, model, effort string, maxTokens int64) (*Generator, er
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}
+	// One-time record of which configuration this process's Generate calls
+	// will use — see theory 1 (reasoning tax) in the diagnostics task this
+	// instruments. base_url_set only (not the URL itself) since it's not
+	// sensitive but also not needed to answer the question.
+	slog.Info("ai: generator configured",
+		"model", model,
+		"effort", effort,
+		"max_tokens", maxTokens,
+		"base_url_set", baseURL != "",
+		"adaptive_thinking_supported", modelSupportsAdaptiveThinking(model))
 	return &Generator{
 		client:    anthropic.NewClient(opts...),
 		model:     model,
@@ -398,7 +408,32 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	system := []anthropic.TextBlockParam{staticSystemPromptBlock(), dynamicBlock}
 
 	var totalInputTokens, totalOutputTokens int64
+	// generateStart/totalModelElapsed/totalToolElapsed/iterationsUsed back
+	// the single summary line the deferred log below emits on every return
+	// path (success or error) — see theories 1-4 in the diagnostics task
+	// this instruments; none of these affect control flow.
+	generateStart := time.Now()
+	var totalModelElapsed, totalToolElapsed time.Duration
+	iterationsUsed := 0
+	// totalReasoningTokens/reasoningTokensReported back theory 1 (reasoning
+	// tax) directly — see the per-iteration "ai: model call timing" log
+	// below for what sets reasoningTokensReported and why a false there
+	// means "not reported by this provider," not "confirmed zero."
+	var totalReasoningTokens int64
+	reasoningTokensReported := false
+	defer func() {
+		slog.Info("ai: generate call finished",
+			"iterations_used", iterationsUsed,
+			"elapsed_ms", time.Since(generateStart).Milliseconds(),
+			"model_elapsed_ms", totalModelElapsed.Milliseconds(),
+			"tool_elapsed_ms", totalToolElapsed.Milliseconds(),
+			"total_input_tokens", totalInputTokens,
+			"total_output_tokens", totalOutputTokens,
+			"total_reasoning_tokens", totalReasoningTokens,
+			"reasoning_tokens_reported", reasoningTokensReported)
+	}()
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
+		iterationsUsed = iteration + 1
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
 		forcingPropose := iteration >= maxToolIterations-forceProposeWithinLastN
 		if forcingPropose {
@@ -452,7 +487,14 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			params.OutputConfig = anthropic.OutputConfigParam{Effort: g.effort}
 		}
 		var message anthropic.Message
+		// modelCallStart/attemptsUsed cover every streamAccumulateMaxAttempts
+		// retry within this one iteration — a slow iteration due to a
+		// retried stream isn't misread as slow inference, since
+		// attempts_used is logged alongside elapsed_ms below.
+		modelCallStart := time.Now()
+		attemptsUsed := 0
 		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
+			attemptsUsed = attempt
 			stream := g.client.Messages.NewStreaming(ctx, params)
 			message = anthropic.Message{}
 			emitted := 0
@@ -503,8 +545,24 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			case <-time.After(streamAccumulateRetryDelay):
 			}
 		}
+		modelElapsed := time.Since(modelCallStart)
+		totalModelElapsed += modelElapsed
 		totalInputTokens += message.Usage.InputTokens
 		totalOutputTokens += message.Usage.OutputTokens
+		// OutputTokensDetails is a plain value struct (never nil), and
+		// ThinkingTokens a plain int64 — no pointer to guard. Whether the
+		// provider actually populated it is instead tracked by the SDK's own
+		// presence marker (respjson.Field.Valid, same mechanism used for
+		// every other optional field on Usage): reasoningTokensValid is
+		// false when DeepSeek's response omitted output_tokens_details (or
+		// its thinking_tokens) entirely, distinguishing that from a
+		// genuinely-reported 0.
+		reasoningTokens := message.Usage.OutputTokensDetails.ThinkingTokens
+		reasoningTokensValid := message.Usage.OutputTokensDetails.JSON.ThinkingTokens.Valid()
+		totalReasoningTokens += reasoningTokens
+		if reasoningTokensValid {
+			reasoningTokensReported = true
+		}
 
 		var toolUses []anthropic.ContentBlockUnion
 		var proposeInput json.RawMessage
@@ -523,6 +581,22 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			toolNames[i] = tu.Name
 		}
 		slog.Info("ai: tool-loop iteration", "iteration", iteration, "tools_called", toolNames, "stop_reason", message.StopReason)
+		// Model-call latency/token breakdown for this iteration only — see
+		// theories 1 (reasoning tax) and 2 (prompt caching) in the
+		// diagnostics task this instruments. cache_read_input_tokens > 0 on
+		// iteration 2+ means caching is actually working (whether or not
+		// Anthropic's cache_control is what triggered it).
+		slog.Info("ai: model call timing",
+			"iteration", iteration,
+			"elapsed_ms", modelElapsed.Milliseconds(),
+			"attempts_used", attemptsUsed,
+			"forcing_propose", forcingPropose,
+			"input_tokens", message.Usage.InputTokens,
+			"output_tokens", message.Usage.OutputTokens,
+			"cache_read_input_tokens", message.Usage.CacheReadInputTokens,
+			"cache_creation_input_tokens", message.Usage.CacheCreationInputTokens,
+			"reasoning_tokens", reasoningTokens,
+			"reasoning_tokens_reported", reasoningTokensValid)
 
 		// StopReason == "max_tokens" means Claude was cut off mid-stream —
 		// propose_changes' input (if any tool_use block even parsed as valid
@@ -545,6 +619,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		}
 
 		if len(toolUses) == 0 {
+			// Counts how often this nudge fires — see theory 3 (wasted
+			// round-trips) in the diagnostics task this instruments.
+			slog.Warn("ai: tool-loop nudge fired (zero tool calls despite forced tool_choice)", "iteration", iteration)
 			// Real Anthropic's ToolChoice: OfAny guarantees at least one tool
 			// call. DeepSeek's Anthropic-compat endpoint does NOT honor that
 			// guarantee — confirmed empirically: a plain "hello"/"hi" gets a
@@ -580,7 +657,14 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			if progress != nil {
 				progress.ToolStarted(tu.Name, tu.Input)
 			}
+			toolCallStart := time.Now()
 			output, err := toolExec(ctx, tu.Name, tu.Input)
+			toolElapsed := time.Since(toolCallStart)
+			totalToolElapsed += toolElapsed
+			// Distinguishes tool-execution latency (an HTTP round trip to
+			// FlowPOS) from model latency logged above — see "ai: model call
+			// timing".
+			slog.Info("ai: tool exec timing", "iteration", iteration, "tool", tu.Name, "elapsed_ms", toolElapsed.Milliseconds(), "error", err != nil)
 			isError := err != nil
 			if progress != nil {
 				// Summarized from output/err before output is overwritten
