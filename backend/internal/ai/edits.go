@@ -363,22 +363,24 @@ const reindentTabWidth = 4
 // discarding its indentation entirely). A genuinely blank line is left
 // blank, never given trailing whitespace it didn't have.
 //
-// Mixed tabs/spaces: every output line's new indentation is rebuilt from
-// the TARGET's own leading-whitespace character (its first character, or a
-// space if the target has none) repeated to the computed width — never a
-// mix of a line's original character and the target's. Re-indenting is
-// already recomputing a width from scratch, not shifting existing
-// characters in place, so there's no natural "original character" to
-// preserve; using the target's keeps the re-indented block visually
-// consistent with what actually surrounds it in the file.
+// Mixed tabs/spaces: every output line's new indentation is always plain
+// spaces, one per column of the computed width — never the target's or the
+// line's own original whitespace character. Re-indenting already rebuilds
+// the indent from scratch rather than shifting existing characters in
+// place, so there is no original character being preserved either way;
+// the choice is purely between "always spaces" and "whatever the target
+// happened to use". A tab counts as reindentTabWidth columns (see
+// indentWidth) for the delta ARITHMETIC, but emitting that many literal
+// tab characters back out — the bug this comment used to describe — turns
+// one tab of indentation into reindentTabWidth tabs, a 4x blowup at zero
+// delta whenever the target is tab-indented. Spaces have no such
+// character-vs-column ambiguity: a computed width of N always means
+// exactly N space characters. A few space-indented lines inside an
+// otherwise tab-indented file are cosmetically inconsistent but render
+// identically; that's a strictly smaller problem than visibly mangled
+// indentation.
 func reindentToMatch(matched, inserted string) string {
-	targetIndent := leadingWhitespace(firstLine(matched))
-	targetWidth := indentWidth(targetIndent)
-	targetChar := byte(' ')
-	if targetIndent != "" {
-		targetChar = targetIndent[0]
-	}
-
+	targetWidth := indentWidth(leadingWhitespace(firstLine(matched)))
 	insertedLines := strings.Split(inserted, "\n")
 	delta := targetWidth - indentWidth(leadingWhitespace(insertedLines[0]))
 
@@ -392,7 +394,7 @@ func reindentToMatch(matched, inserted string) string {
 		if newWidth < 0 {
 			newWidth = 0
 		}
-		insertedLines[i] = strings.Repeat(string(targetChar), newWidth) + line[len(lineIndent):]
+		insertedLines[i] = strings.Repeat(" ", newWidth) + line[len(lineIndent):]
 	}
 	return strings.Join(insertedLines, "\n")
 }

@@ -317,6 +317,52 @@ func TestReindentToMatch_BlankLinesStayBlank(t *testing.T) {
 	}
 }
 
+// TestReindentToMatch_TabTargetZeroDeltaEmitsSpacesNotFourTabs is the
+// regression this task exists for: indentWidth measures a tab as
+// reindentTabWidth (4) columns for the delta ARITHMETIC, but the old
+// implementation then emitted that many literal TAB characters back out —
+// one tab of real indentation becoming four tabs at zero delta. Output
+// must be four columns of plain spaces, never repeated tab characters.
+func TestReindentToMatch_TabTargetZeroDeltaEmitsSpacesNotFourTabs(t *testing.T) {
+	matched := "\t<div>old</div>" // target: 1 tab = width 4
+	inserted := "\t<p>new</p>"    // source: 1 tab = width 4, so delta = 0
+	got := reindentToMatch(matched, inserted)
+	want := "    <p>new</p>" // 4 spaces — NOT "\t\t\t\t"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestReindentToMatch_TabTargetClosingCascade is the tab-indented
+// equivalent of the space-indented closing-cascade test: widths still
+// shift by the same signed delta and relative structure is still
+// preserved, just expressed in spaces on the way out.
+func TestReindentToMatch_TabTargetClosingCascade(t *testing.T) {
+	matched := "\t<div>old</div>" // target: 1 tab = width 4
+	// source (new_string's first line): 2 tabs = width 8; delta = 4-8 = -4
+	inserted := "\t\t<p>Powered By FlowPOS</p>\n\t</div>\n</div>"
+	got := reindentToMatch(matched, inserted)
+	want := "    <p>Powered By FlowPOS</p>\n</div>\n</div>" // widths 4, 0, 0 (clamped)
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestReindentToMatch_MixedTabAndSpaceInsertedNormalizesToSpaces confirms
+// a new_string that itself mixes tabs and spaces re-indents to plain
+// spaces at the correct computed widths against a space-indented target.
+func TestReindentToMatch_MixedTabAndSpaceInsertedNormalizesToSpaces(t *testing.T) {
+	matched := "    <div>old</div>" // target: 4 spaces = width 4
+	// line0 "\t  " = 1 tab (4) + 2 spaces = width 6; delta = 4-6 = -2
+	// line1 "\t\t" = 2 tabs = width 8; 8-2 = 6
+	inserted := "\t  <p>a</p>\n\t\t<p>b</p>"
+	got := reindentToMatch(matched, inserted)
+	want := "    <p>a</p>\n      <p>b</p>" // 4 spaces, then 6 spaces
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 // TestApplyEdits_ExactTierNeverReindents confirms tier 1 splices new_string
 // byte-for-byte with no re-indentation at all — new_string's deliberately
 // "wrong" 2-space indent (the file elsewhere uses 4) must survive

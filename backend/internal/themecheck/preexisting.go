@@ -1,6 +1,9 @@
 package themecheck
 
-import "strings"
+import (
+	"log/slog"
+	"strings"
+)
 
 // DowngradePreExistingFindings downgrades an error-severity Finding to
 // SeverityWarning when the violating line was already present in the file
@@ -74,6 +77,7 @@ func DowngradePreExistingFindings(findings []Finding, proposal Proposal, baselin
 		}
 		if lines[violatingLine] {
 			out[i].Severity = SeverityWarning
+			slog.Info("themecheck: downgraded pre-existing violation", "path", f.Path, "rule", f.Rule)
 		}
 	}
 

@@ -290,3 +290,54 @@ func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
 		t.Fatalf("expected the repaired result to be returned, got %+v", got)
 	}
 }
+
+// TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip is the case
+// that motivates AutoFixThemeTokens: six hardcoded colors the model could
+// have reached for real defaults.json tokens for, all mechanically
+// resolvable — the repair round-trip (a real Generate call, minutes of
+// wall-clock in production) must never happen at all.
+func TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip(t *testing.T) {
+	defaultsJSON := `{"colors": {
+		"primary": "#1e3a8a", "secondary": "#111111", "accent": "#3d5bbf",
+		"background": "#ffffff", "border": "#e8e8e8", "danger": "#dc2626"
+	}}`
+	content := `.a { color: #1e3a8a; }
+.b { color: #111111; }
+.c { color: #3d5bbf; }
+.d { background-color: #ffffff; }
+.e { border-color: #e8e8e8; }
+.f { color: #dc2626; }
+`
+	result := &ai.Result{
+		Summary: "redesigned contact us page",
+		Files:   []ai.GeneratedFile{{Path: "components/css/contact.css", Action: "create", Content: content}},
+	}
+	snap := themecheck.Snapshot{
+		Paths: map[string]bool{"liquid/layout-start.liquid": true, "liquid/layout-end.liquid": true},
+		Files: map[string]string{"defaults.json": defaultsJSON},
+	}
+	fg := &fakeGenerator{}
+	svc := &Service{gen: fg}
+	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
+
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, result, snap, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fg.calls != 0 {
+		t.Fatalf("expected all six hardcoded colors to auto-fix without any repair round-trip, got %d Generate calls", fg.calls)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("expected no warnings, got %+v", warnings)
+	}
+	want := `.a { color: var(--theme-primary, #1e3a8a); }
+.b { color: var(--theme-secondary, #111111); }
+.c { color: var(--theme-accent, #3d5bbf); }
+.d { background-color: var(--theme-background, #ffffff); }
+.e { border-color: var(--theme-border, #e8e8e8); }
+.f { color: var(--theme-danger, #dc2626); }
+`
+	if got.Files[0].Content != want {
+		t.Errorf("got %q, want %q", got.Files[0].Content, want)
+	}
+}

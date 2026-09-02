@@ -362,6 +362,42 @@ const maxToolIterations = 28
 // the budget with nothing to show for it.
 const forceProposeWithinLastN = 3
 
+// thrashOutputTokenThreshold flags a tool-loop iteration that called only
+// read-only exploration tools (list_theme_files/read_theme_file/grep_theme
+// — see allExplorationTools) with no propose_changes, yet still burned a
+// large amount of output — narration/reasoning the model produced
+// alongside tool calls whose own arguments carry almost none of it.
+// Observed in production: one iteration of 6 grep_theme calls (whose
+// arguments are maybe 200 tokens combined) cost 24,315 output tokens and
+// 285 of a 477-second generation's total wall clock — 60% of the run, with
+// no file changed. This constant only backs a diagnostic slog.Warn
+// (see Generate) so the pattern's real-world frequency can be measured; it
+// does not abort, truncate, or otherwise change the loop's behavior.
+const thrashOutputTokenThreshold = 5000
+
+// explorationToolNames are the read-only tools a tool-loop iteration can
+// call besides propose_changes — see tools.go's toolName* constants.
+var explorationToolNames = map[string]bool{
+	toolNameListThemeFiles: true,
+	toolNameReadThemeFile:  true,
+	toolNameGrepTheme:      true,
+}
+
+// allExplorationTools reports whether names is non-empty and every entry is
+// a read-only exploration tool — i.e. this iteration explored but never
+// called propose_changes.
+func allExplorationTools(names []string) bool {
+	if len(names) == 0 {
+		return false
+	}
+	for _, n := range names {
+		if !explorationToolNames[n] {
+			return false
+		}
+	}
+	return true
+}
+
 // streamAccumulateMaxAttempts is how many times a single tool-loop
 // iteration's streaming call is attempted when the provider's stream itself
 // arrives truncated/garbled mid-chunk (see isRetryableAccumulateErr) —
@@ -633,7 +669,20 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		var toolUses []anthropic.ContentBlockUnion
 		var proposeInput json.RawMessage
+		// textBlockCount/textChars are counted here, off the fully
+		// accumulated message.Content for this iteration (after the
+		// attempt loop above has already finished reassembling the whole
+		// streamed response) — the same source toolUses/toolNames below
+		// already reads, not raw incremental SSE deltas, so a still-in-
+		// progress or retried attempt is never double-counted.
+		textBlockCount := 0
+		textChars := 0
 		for _, block := range message.Content {
+			if block.Type == "text" {
+				textBlockCount++
+				textChars += len(block.Text)
+				continue
+			}
 			if block.Type != "tool_use" {
 				continue
 			}
@@ -663,7 +712,21 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			"cache_read_input_tokens", message.Usage.CacheReadInputTokens,
 			"cache_creation_input_tokens", message.Usage.CacheCreationInputTokens,
 			"reasoning_tokens", reasoningTokens,
-			"reasoning_tokens_reported", reasoningTokensValid)
+			"reasoning_tokens_reported", reasoningTokensValid,
+			"text_block_count", textBlockCount,
+			"text_chars", textChars,
+			"tool_use_count", len(toolUses))
+
+		// Flags, never controls: an iteration that called only read-only
+		// exploration tools (no propose_changes) yet still burned a large
+		// amount of output is the "thrash" pattern observed in production
+		// — see thrashOutputTokenThreshold's own doc comment for the
+		// 24,315-token/6-grep-call case that motivated this. Purely
+		// diagnostic — nothing about the loop's own behavior changes here.
+		if allExplorationTools(toolNames) && message.Usage.OutputTokens > thrashOutputTokenThreshold {
+			slog.Warn("ai: tool-loop iteration spent unusually many output tokens on exploration only",
+				"iteration", iteration, "output_tokens", message.Usage.OutputTokens, "tools_called", toolNames)
+		}
 
 		// StopReason == "max_tokens" means Claude was cut off mid-stream —
 		// propose_changes' input (if any tool_use block even parsed as valid

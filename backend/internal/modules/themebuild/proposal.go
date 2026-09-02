@@ -183,6 +183,27 @@ func (s *Service) checkAndRepair(
 				result.LayoutScriptsToAdd = append(result.LayoutScriptsToAdd, scripts...)
 				fixedAny = true
 			}
+			// A hardcoded color the model could have reached for a real
+			// token instead is the most common single repair trigger in
+			// production, and the most expensive one to send back to the
+			// model — fixing six colors means re-emitting every touched
+			// file in full. See themecheck.AutoFixThemeTokens' own doc
+			// comment. Runs against `findings`, the SAME pre-auto-fixer
+			// Check() result rawErrorFindings above was split from —
+			// deliberately not re-Check()'d against the two fixers above
+			// first, because neither touches a .css file's Content
+			// (boilerplate only rewrites pages/*.liquid; asset
+			// registration only appends to LayoutLinksToAdd/
+			// LayoutScriptsToAdd), so the theme-token findings already
+			// computed above are still exactly accurate either way.
+			if fixedContent, any := themecheck.AutoFixThemeTokens(toProposal(result), snap, findings); any {
+				for i, f := range result.Files {
+					if patched, ok := fixedContent[f.Path]; ok {
+						result.Files[i].Content = patched
+					}
+				}
+				fixedAny = true
+			}
 			if fixedAny {
 				findings = themecheck.Check(toProposal(result), snap)
 			}
