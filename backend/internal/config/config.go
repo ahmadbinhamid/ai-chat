@@ -65,6 +65,19 @@ type Config struct {
 	DeepSeekAPIKey  string
 	DeepSeekModel   string
 	DeepSeekBaseURL string
+	// HistorySummarizationEnabled gates themebuild's collapsed-history-turn
+	// summarization (see themebuild.Service.summarizeOldTurnsCached).
+	// Defaults to enabled for both providers, not just Anthropic — the
+	// summary is now cached per chat (keyed by how many older turns it
+	// covers), so the same synthetic turn is resent on every call instead
+	// of a freshly-generated one each time. That matters specifically for
+	// DeepSeek: its compat endpoint caches on request-prefix match rather
+	// than honoring cache_control, so a summary that changed text on every
+	// call used to invalidate that prefix cache for the whole conversation
+	// — see .env.example's own note on this var. Set to false to disable
+	// summarization outright (full history is always resent verbatim) if a
+	// deployment still finds it not worth the tradeoff.
+	HistorySummarizationEnabled bool
 	// FakeAIMode, when true, skips the real Claude API entirely — see
 	// ai.NewFake. For debugging the surrounding plumbing (the async
 	// generation lifecycle, the stream WebSocket, the dashboard) without
@@ -154,6 +167,8 @@ func Load() Config {
 		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
 		DeepSeekModel:   getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
 		DeepSeekBaseURL: getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
+
+		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 

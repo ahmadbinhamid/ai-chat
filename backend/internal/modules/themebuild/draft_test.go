@@ -3,6 +3,8 @@ package themebuild
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -107,6 +109,47 @@ func TestBuildSnapshot_SeesDraftCreatedFileInMergedTree(t *testing.T) {
 	}
 	if !snap.Paths["pages/new.liquid"] {
 		t.Fatalf("expected the draft-created file to appear in the snapshot's Paths, got %+v", snap.Paths)
+	}
+}
+
+// TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration covers the
+// pre-existing-violation-filtering edge case: a store error (network hiccup
+// to FlowPOS) fetching one proposed "update" file's baseline content must
+// not fail the whole generation — it degrades to that one file having no
+// baseline (today's stricter, no-grandfathering behavior), never an error
+// returned from buildSnapshot itself. The four required files (pages.json,
+// defaults.json, the two layout files) are unaffected — this fake server
+// serves them normally, a 500 only for the one proposed update file.
+func TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/store/themes/active/files" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"files": []themefs.FileTreeEntry{}}, "status": true})
+			return
+		}
+		reqPath := strings.TrimPrefix(r.URL.Path, "/store/themes/active/files/")
+		if reqPath == "components/footer.liquid" {
+			w.WriteHeader(http.StatusInternalServerError) // simulates a real store error, not a 404
+			return
+		}
+		// Every other path (the four required files) — empty content, same
+		// as a brand-new theme, matching newFakeThemeServer's own behavior
+		// for a path outside its files map.
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	svc := &Service{store: themefs.NewStore(ts.URL)}
+	result := &ai.Result{Files: []ai.GeneratedFile{
+		{Path: "components/footer.liquid", Action: "update", Content: "new content"},
+	}}
+
+	snap, err := svc.buildSnapshot(context.Background(), svc.store, testStoreAuth(), result)
+	if err != nil {
+		t.Fatalf("expected buildSnapshot to fail open on a baseline fetch error, got: %v", err)
+	}
+	if _, ok := snap.Files["components/footer.liquid"]; ok {
+		t.Errorf("expected no baseline entry for the file whose fetch failed, got %+v", snap.Files)
 	}
 }
 

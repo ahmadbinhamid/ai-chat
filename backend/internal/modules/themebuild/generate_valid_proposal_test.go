@@ -17,7 +17,7 @@ type fakeGeneratorErr struct {
 	err       error
 }
 
-func (f *fakeGeneratorErr) Generate(ctx context.Context, tc ai.ThemeContext, turns []ai.Turn, prompt string, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor) (*ai.Result, error) {
+func (f *fakeGeneratorErr) Generate(ctx context.Context, tc ai.ThemeContext, turns []ai.Turn, prompt string, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor, readFile ai.FileReader) (*ai.Result, error) {
 	f.calls++
 	if f.calls == f.errOnCall {
 		return nil, f.err
@@ -34,7 +34,7 @@ func TestGenerateValidProposal_SucceedsImmediately(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, turns, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, in)
+	got, turns, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, nil, in)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestGenerateValidProposal_RetriesPastAnInvalidFirstReply(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, turns, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, in)
+	got, turns, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, nil, in)
 	if err != nil {
 		t.Fatalf("expected the generation to recover after the invalid reply, got error: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestGenerateValidProposal_FailsCleanlyWhenBudgetExhausted(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	_, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, in)
+	_, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, nil, in)
 	if err == nil {
 		t.Fatal("expected an error once the retry budget is exhausted")
 	}
@@ -93,7 +93,7 @@ func TestGenerateValidProposal_HardGenerateErrorIsNotRetried(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	_, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, in)
+	_, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, nil, in)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected the hard error to propagate unwrapped-ish immediately, got %v", err)
 	}

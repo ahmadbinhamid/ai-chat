@@ -38,11 +38,28 @@ type Turn struct {
 	Content string
 }
 
-// GeneratedFile is one file the model proposes creating or updating.
+// GeneratedFile is one file the model proposes creating, updating, or
+// editing. Action "edit" is a wire-format optimization only — see
+// materializeEdits, which Generate calls immediately after parsing
+// propose_changes' input: by the time a *Result leaves Generate, every file
+// is "create" or "update" with real Content, and Edits is always empty.
+// Nothing downstream of Generate (themebuild, themecheck, the write plan)
+// ever sees "edit" — this field's zero value (nil) already behaves as "no
+// edits", so a fake generator or eval fixture built directly in Go, never
+// through JSON, needs no special-casing.
 type GeneratedFile struct {
 	Path    string `json:"path"`
-	Action  string `json:"action"` // "create" | "update"
+	Action  string `json:"action"` // "create" | "update" | "edit"
 	Content string `json:"content"`
+	Edits   []Edit `json:"edits"`
+}
+
+// Edit is one find/replace pair for GeneratedFile's "edit" action —
+// old_string must match the file's current content exactly once (see
+// applyEdits); new_string may be empty (a deletion).
+type Edit struct {
+	OldString string `json:"old_string"`
+	NewString string `json:"new_string"`
 }
 
 // Result is the model's final answer for a turn, delivered as the input of
@@ -226,16 +243,55 @@ var resultSchema = map[string]any{
 			"type":        "boolean",
 			"description": "true if the request conflicts with a hard rule in the spec or is too ambiguous to safely generate. When true, files must be empty.",
 		},
+		// Strict: true + additionalProperties: false (see proposeChangesTool)
+		// means every property here must be present on every files[] item —
+		// content and edits are both always required, their meaning set by
+		// action rather than by which one is present. Deliberately not an
+		// anyOf/oneOf split keyed on action: DeepSeek's Anthropic-compat
+		// endpoint (the actual target for this schema) has unverified
+		// support for conditional subschemas, so the contract is documented
+		// in each field's description instead and enforced server-side by
+		// materializeEdits, not by the schema itself.
 		"files": map[string]any{
 			"type": "array",
 			"items": map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
-				"required":             []string{"path", "action", "content"},
+				"required":             []string{"path", "action", "content", "edits"},
 				"properties": map[string]any{
-					"path":    map[string]any{"type": "string", "description": "Theme-root-relative path, e.g. 'pages/offers.liquid'."},
-					"action":  map[string]any{"type": "string", "enum": []string{"create", "update"}},
-					"content": map[string]any{"type": "string", "description": "Full file content — never a diff or partial snippet."},
+					"path": map[string]any{"type": "string", "description": "Theme-root-relative path, e.g. 'pages/offers.liquid'."},
+					"action": map[string]any{
+						"type": "string", "enum": []string{"create", "update", "edit"},
+						"description": "'create'/'update': content is the full file, edits is []. 'edit': content is \"\", " +
+							"edits is a non-empty list of find/replace pairs applied to the file's current content.",
+					},
+					"content": map[string]any{
+						"type": "string",
+						"description": "Full file content for 'create'/'update' — never a diff or partial snippet. " +
+							"\"\" for 'edit', where edits carries the change instead.",
+					},
+					"edits": map[string]any{
+						"type":        "array",
+						"description": "Find/replace pairs for action 'edit' — [] for 'create'/'update'. Applied in order.",
+						"items": map[string]any{
+							"type":                 "object",
+							"additionalProperties": false,
+							"required":             []string{"old_string", "new_string"},
+							"properties": map[string]any{
+								"old_string": map[string]any{
+									"type": "string",
+									"description": "Exact text to find. Must match the file's real current content " +
+										"exactly once — whitespace and indentation included. Include enough surrounding " +
+										"context to make it unique; a single line that repeats elsewhere in the file will " +
+										"be rejected.",
+								},
+								"new_string": map[string]any{
+									"type":        "string",
+									"description": "Replacement text. Empty string deletes old_string.",
+								},
+							},
+						},
+					},
 				},
 			},
 		},
@@ -344,17 +400,28 @@ var errMaxTokensTruncated = errors.New("model response was truncated at the max_
 // each call may return one or more tool_use blocks, which toolExec executes
 // (list_theme_files/read_theme_file/grep_theme — ai never touches themefs
 // itself, see ToolExecutor), with the results fed back as a new turn, until
-// the model calls propose_changes, whose input becomes Result. onDelta, if
-// non-nil, is called with each new chunk of raw text the model streams
-// (thinking-style narration, not the proposal itself) across every
-// iteration — mainly useful for a live "..." progress indicator. progress,
-// if non-nil, is notified around every toolExec call — see ToolProgress's
-// doc comment for why the caller (not this method) decides what to do with
-// that.
-func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string), progress ToolProgress, toolExec ToolExecutor) (*Result, error) {
+// the model calls propose_changes, whose input becomes Result — with one
+// extra step first: any "edit"-action file is materialized into "update"
+// via materializeEdits(readFile) before the result is returned, so callers
+// never see "edit" (see GeneratedFile's doc comment). A materialization
+// failure does NOT return an error or end the turn: it's fed back as this
+// propose_changes call's own tool_result, and the loop continues exactly
+// like an ordinary tool call would, giving the model a chance to correct
+// itself — see the propose_changes handling below. onDelta, if non-nil, is
+// called with each new chunk of raw text the model streams (thinking-style
+// narration, not the proposal itself) across every iteration — mainly
+// useful for a live "..." progress indicator. progress, if non-nil, is
+// notified around every toolExec call — see ToolProgress's doc comment for
+// why the caller (not this method) decides what to do with that.
+func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string), progress ToolProgress, toolExec ToolExecutor, readFile FileReader) (*Result, error) {
 	if g.fake {
 		return g.fakeGenerate(ctx, prompt)
 	}
+	// Keyed by path, persists across every iteration of this one Generate
+	// call — see materializeEdits' own doc comment on why a path that keeps
+	// failing needs to fall back to requesting full content rather than
+	// retrying forever.
+	editFailureCounts := make(map[string]int)
 	// Anthropic rejects any empty text content block outright ("text content
 	// blocks must be non-empty") — not just for the cache_control
 	// breakpoint below, for any message anywhere in the request — so an
@@ -608,14 +675,25 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			return nil, errMaxTokensTruncated
 		}
 
+		// materializeFailureMsg, when non-empty, is fed back below as the
+		// propose_changes tool_use's own tool_result (isError: true) instead
+		// of returning — see materializeEdits' doc comment. Declared here
+		// (not inside the if) so the general toolUses loop further down can
+		// see it regardless of which branch set it.
+		var materializeFailureMsg string
 		if proposeInput != nil {
 			var result Result
 			if err := json.Unmarshal(proposeInput, &result); err != nil {
 				return nil, fmt.Errorf("could not parse propose_changes input: %w", err)
 			}
-			result.InputTokens = totalInputTokens
-			result.OutputTokens = totalOutputTokens
-			return &result, nil
+			ok, retryMsg := materializeEdits(ctx, &result, readFile, editFailureCounts)
+			if ok {
+				result.InputTokens = totalInputTokens
+				result.OutputTokens = totalOutputTokens
+				return &result, nil
+			}
+			slog.Warn("ai: propose_changes edit materialization failed, retrying", "iteration", iteration)
+			materializeFailureMsg = retryMsg
 		}
 
 		if len(toolUses) == 0 {
@@ -654,6 +732,16 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		resultBlocks := make([]anthropic.ContentBlockParamUnion, 0, len(toolUses))
 		for _, tu := range toolUses {
+			// propose_changes was already "executed" above (parsed, edits
+			// materialized) — reaching this loop for it at all means that
+			// failed, so its tool_result is the failure description rather
+			// than a real toolExec call (propose_changes isn't one of
+			// ToolExecutor's tools; calling toolExec with it would just
+			// error "unknown tool").
+			if tu.Name == toolNameProposeChanges {
+				resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, materializeFailureMsg, true))
+				continue
+			}
 			if progress != nil {
 				progress.ToolStarted(tu.Name, tu.Input)
 			}

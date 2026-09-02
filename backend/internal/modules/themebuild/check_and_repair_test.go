@@ -18,7 +18,7 @@ type fakeGenerator struct {
 	results []*ai.Result // returned in order; the last one repeats once exhausted
 }
 
-func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor) (*ai.Result, error) {
+func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
 	f.calls++
 	idx := f.calls - 1
 	if idx >= len(f.results) {
@@ -72,7 +72,7 @@ func TestCheckAndRepair_AcceptsCleanProposalWithoutRetrying(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, goodResult(), testSnapshot(), nil, nil)
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, goodResult(), testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestCheckAndRepair_RetriesOnceThenSucceeds(t *testing.T) {
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
 	bad := badResult()
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, bad, testSnapshot(), nil, nil)
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, bad, testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestCheckAndRepair_ExhaustsRetriesAndFails(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil)
+	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected an error once retries are exhausted")
 	}
@@ -152,7 +152,7 @@ func TestCheckAndRepair_RetriesPastAnInvalidRepairReply(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("expected the generation to recover after the invalid reply, got error: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestCheckAndRepair_FailsWhenInvalidReplyExhaustsRetries(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil)
+	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected an error once retries are exhausted on repeated invalid replies")
 	}
@@ -197,7 +197,7 @@ func TestCheckAndRepair_WarningsPassThroughOnAccept(t *testing.T) {
 	})
 	result.LayoutLinksToAdd = []string{"components/css/testimonials.css"}
 
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, result, testSnapshot(), nil, nil)
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, result, testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -209,5 +209,84 @@ func TestCheckAndRepair_WarningsPassThroughOnAccept(t *testing.T) {
 	}
 	if got != result {
 		t.Errorf("expected the same result object back when accepted on the first try")
+	}
+}
+
+// footerTrustpilotScript mirrors the incident this feature exists to
+// prevent: a merchant's theme already carries a third-party <script src>
+// (Trustpilot, Meta pixel, GA, Intercom, ...) before the model ever touches
+// the file.
+const footerTrustpilotScript = `  <script src="https://widget.trustpilot.com/tp-widget.min.js"></script>`
+
+// TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair is the
+// footer/"Powered By FlowPOS" incident end to end: the model's proposal
+// re-emits the whole file (proposals are always complete files, never
+// diffs) with the merchant's pre-existing script intact plus its own new
+// line. Without pre-existing-violation filtering this used to cost a full
+// repair round-trip whose only way to "fix" an error it didn't cause was to
+// delete the merchant's script.
+func TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair(t *testing.T) {
+	baselineFooter := "<footer>\n" + footerTrustpilotScript + "\n</footer>"
+	proposedFooter := "<footer>\n  <p>Powered by FlowPOS</p>\n" + footerTrustpilotScript + "\n</footer>"
+
+	result := &ai.Result{
+		Summary: "added Powered by FlowPOS",
+		Files:   []ai.GeneratedFile{{Path: "components/footer.liquid", Action: "update", Content: proposedFooter}},
+	}
+	snap := themecheck.Snapshot{
+		Paths: map[string]bool{"liquid/layout-start.liquid": true, "liquid/layout-end.liquid": true},
+		Files: map[string]string{"components/footer.liquid": baselineFooter}, // the pre-change baseline buildSnapshot fetches
+	}
+	fg := &fakeGenerator{}
+	svc := &Service{gen: fg}
+	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
+
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, result, snap, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fg.calls != 0 {
+		t.Fatalf("expected the pre-existing script to NOT trigger a repair round-trip, got %d Generate calls", fg.calls)
+	}
+	if len(warnings) != 1 || warnings[0].Rule != "no-framework" {
+		t.Fatalf("expected the pre-existing violation to surface as exactly 1 no-framework warning, got %+v", warnings)
+	}
+	if got.Files[0].Content != proposedFooter {
+		t.Errorf("expected the merchant's script to survive untouched in the accepted result, got %q", got.Files[0].Content)
+	}
+}
+
+// TestCheckAndRepair_SameViolationInNewFileStillRepairs confirms the same
+// off-theme script, when it's the model's OWN new file rather than an edit
+// to an existing one, still triggers a real repair — a brand-new file has
+// no baseline, so the model owns every line of it.
+func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
+	badNewFooter := "<footer>\n" + footerTrustpilotScript + "\n</footer>"
+	fixedNewFooter := "<footer></footer>"
+
+	first := &ai.Result{
+		Summary: "new footer component",
+		Files:   []ai.GeneratedFile{{Path: "components/new-footer.liquid", Action: "create", Content: badNewFooter}},
+	}
+	fixed := &ai.Result{
+		Summary: "fixed",
+		Files:   []ai.GeneratedFile{{Path: "components/new-footer.liquid", Action: "create", Content: fixedNewFooter}},
+	}
+	snap := themecheck.Snapshot{Paths: map[string]bool{"liquid/layout-start.liquid": true, "liquid/layout-end.liquid": true}}
+	// No snap.Files entry for components/new-footer.liquid — it's brand new.
+
+	fg := &fakeGenerator{results: []*ai.Result{fixed}}
+	svc := &Service{gen: fg}
+	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
+
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, first, snap, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fg.calls != 1 {
+		t.Fatalf("expected a violation in a brand-new file to trigger exactly 1 repair round-trip, got %d", fg.calls)
+	}
+	if got.Summary != "fixed" {
+		t.Fatalf("expected the repaired result to be returned, got %+v", got)
 	}
 }

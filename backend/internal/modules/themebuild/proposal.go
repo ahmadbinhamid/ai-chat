@@ -65,6 +65,7 @@ func (s *Service) generateValidProposal(
 	turns []ai.Turn,
 	prompt string,
 	toolExec ai.ToolExecutor,
+	readFile ai.FileReader,
 	emitter *eventEmitter,
 	in GenerateInput,
 ) (*ai.Result, []ai.Turn, error) {
@@ -76,7 +77,7 @@ func (s *Service) generateValidProposal(
 	// checkAndRepair's own separate retry budget for themecheck rejections
 	// (see doGenerate's structure: these are two distinct stages).
 	for attempt := 1; ; attempt++ {
-		result, genErr := s.gen.Generate(ctx, tc, turns, nextPrompt, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec)
+		result, genErr := s.gen.Generate(ctx, tc, turns, nextPrompt, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
 		if genErr != nil {
 			// A hard API/transport error is a different failure mode from an
 			// invalid proposal — already handled by the caller/reaper, not
@@ -131,6 +132,7 @@ func (s *Service) checkAndRepair(
 	result *ai.Result,
 	snap themecheck.Snapshot,
 	toolExec ai.ToolExecutor,
+	readFile ai.FileReader,
 	emitter *eventEmitter,
 ) (*ai.Result, []themecheck.Finding, error) {
 	turns := append([]ai.Turn(nil), history...)
@@ -149,7 +151,11 @@ func (s *Service) checkAndRepair(
 
 		emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": attempt})
 		findings := themecheck.Check(toProposal(result), snap)
-		errorFindings, warningFindings := splitFindings(findings)
+		// Only the raw error COUNT is needed here, to gate the auto-fixer
+		// block below — the real errorFindings/warningFindings that drive
+		// this attempt's repair decision are computed once, after
+		// filtering, further down.
+		rawErrorFindings, _ := splitFindings(findings)
 
 		// A missing layout-start/layout-end render is mechanical, not a
 		// judgment call — the required text is fixed and known, so patch it
@@ -159,7 +165,7 @@ func (s *Service) checkAndRepair(
 		// Free (no extra Generate call): just re-run Check on the patched
 		// content before deciding whether a real repair round-trip is
 		// needed at all.
-		if len(errorFindings) > 0 {
+		if len(rawErrorFindings) > 0 {
 			fixedAny := false
 			if fixedContent, any := themecheck.AutoFixMissingBoilerplate(toProposal(result)); any {
 				for i, f := range result.Files {
@@ -179,9 +185,28 @@ func (s *Service) checkAndRepair(
 			}
 			if fixedAny {
 				findings = themecheck.Check(toProposal(result), snap)
-				errorFindings, warningFindings = splitFindings(findings)
 			}
 		}
+
+		// Downgrade findings the merchant's own theme already had before
+		// this proposal touched the file — see
+		// themecheck.DowngradePreExistingFindings's own doc comment for the
+		// matching rule and why it's deliberately biased toward
+		// "pre-existing" (the Trustpilot-widget incident this exists to
+		// prevent). Deliberately AFTER the auto-fixer block above (which
+		// gates on rawErrorFindings, not this), not before: both auto-fixers
+		// decide whether to run off the RAW error count, independent of
+		// which specific findings caused it — filtering first would risk
+		// zeroing that count down to 0 on a proposal that still has a
+		// genuine missing-boilerplate/asset-registration problem, skipping a
+		// free fix it would otherwise have gotten. snap.Files is the
+		// baseline source (see buildSnapshot, which fetches each "update"
+		// file's pre-change content into it) — snap itself is computed once
+		// before this whole retry loop starts, so every attempt here checks
+		// against the ORIGINAL pre-generation content, never a prior failed
+		// attempt's own output.
+		findings = themecheck.DowngradePreExistingFindings(findings, toProposal(result), snap.Files)
+		errorFindings, warningFindings := splitFindings(findings)
 
 		if len(errorFindings) == 0 {
 			if attempt > 1 {
@@ -212,7 +237,7 @@ func (s *Service) checkAndRepair(
 		repair := repairPrompt(errorFindings)
 
 		repairStart := time.Now()
-		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec)
+		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
 		repairElapsed := time.Since(repairStart)
 		if genErr != nil {
 			// Surfaced distinctly from the generic reaper cleanup: without
@@ -335,6 +360,16 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 	b.WriteString("\nIf you're unsure of a file's exact current content, call read_theme_file on it again " +
 		"before resubmitting — don't reconstruct it from memory, that's how boilerplate like the layout " +
 		"renders above gets silently dropped.")
+	// A themecheck rejection is exactly the case action "edit" is for: the
+	// findings above already say precisely which line(s) are wrong, so a
+	// targeted old_string/new_string fix is normally both correct and far
+	// smaller than resubmitting the whole file — see the intro sentence
+	// above, which still applies (edit's server-side materialization always
+	// produces that same complete, corrected file; it's just a cheaper way
+	// to submit it, not a partial one).
+	b.WriteString("\n\nFor most of these, action \"edit\" on the file you already have (a precise old_string/" +
+		"new_string pair per finding) is the right fix — resubmit the whole file as action \"update\" only if the " +
+		"correction is broad enough that a full rewrite is genuinely simpler.")
 	return b.String()
 }
 

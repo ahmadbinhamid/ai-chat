@@ -135,5 +135,5 @@ func checkKnownFieldsInFile(path, content string) []Finding {
 }
 
 func knownFieldsFinding(path string, line int, message string) Finding {
-	return Finding{Path: path, Rule: ruleIDKnownFields, Severity: SeverityError, Message: fmt.Sprintf("line %d: %s", line, message)}
+	return Finding{Path: path, Rule: ruleIDKnownFields, Severity: SeverityError, Message: fmt.Sprintf("line %d: %s", line, message), Line: line}
 }

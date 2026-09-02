@@ -24,6 +24,14 @@ type Finding struct {
 	Rule     string // stable id, e.g. "page-boilerplate"
 	Severity Severity
 	Message  string
+	// Line is the 1-based line in the proposed file's content the violation
+	// is anchored to, or 0 when a rule has no single meaningful line for it
+	// (a theme-wide finding, an existence check, etc.). Populated only where
+	// a rule already computes one for its Message (see lineAt and the Tag/
+	// Expression.Line fields it backs) — never parsed back out of Message,
+	// which stays free to reword. See DowngradePreExistingFindings, the one
+	// consumer that needs this as data rather than prose.
+	Line int
 }
 
 // Snapshot is the current theme state a Proposal is checked against.

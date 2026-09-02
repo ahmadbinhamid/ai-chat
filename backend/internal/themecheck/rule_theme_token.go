@@ -57,9 +57,10 @@ func checkThemeToken(p Proposal, snap Snapshot) []Finding {
 			if prevVarRefs[strings.TrimSpace(f.Content[m[0]:m[1]])] {
 				continue
 			}
-			findings = append(findings, themeTokenFinding(f.Path, SeverityError, fmt.Sprintf(
+			line := lineAt(f.Content, m[0])
+			findings = append(findings, themeTokenFinding(f.Path, SeverityError, line, fmt.Sprintf(
 				"line %d: var(%s) has no fallback — every var(--theme-*)/var(--layout-*) reference needs one, "+
-					"e.g. var(%s, #1e3a8a).", lineAt(f.Content, m[0]), token, token)))
+					"e.g. var(%s, #1e3a8a).", line, token, token)))
 		}
 
 		for _, m := range declRe.FindAllStringSubmatchIndex(f.Content, -1) {
@@ -74,13 +75,13 @@ func checkThemeToken(p Proposal, snap Snapshot) []Finding {
 			case colorProperties[prop]:
 				withoutVarCalls := varCallRe.ReplaceAllString(value, "")
 				if hexOrRGBRe.MatchString(withoutVarCalls) {
-					findings = append(findings, themeTokenFinding(f.Path, SeverityError, fmt.Sprintf(
+					findings = append(findings, themeTokenFinding(f.Path, SeverityError, line, fmt.Sprintf(
 						"line %d: '%s' has a raw color value (%s) — use var(--theme-<key>, <fallback>) instead of "+
 							"hardcoding it (§6/§9).", line, prop, strings.TrimSpace(value))))
 				}
 			case strings.HasPrefix(prop, "--"):
 				if hexOrRGBRe.MatchString(value) {
-					findings = append(findings, themeTokenFinding(f.Path, SeverityWarning, fmt.Sprintf(
+					findings = append(findings, themeTokenFinding(f.Path, SeverityWarning, line, fmt.Sprintf(
 						"line %d: custom property '%s' bakes in a raw color value (%s) — fine for a component-local "+
 							"token (§9), but prefer sourcing it from a --theme-*/--layout-* value if one already exists.",
 						line, prop, strings.TrimSpace(value))))
@@ -106,6 +107,6 @@ func normalizedMatches(content string, re *regexp.Regexp) map[string]bool {
 	return set
 }
 
-func themeTokenFinding(path string, severity Severity, message string) Finding {
-	return Finding{Path: path, Rule: ruleIDThemeToken, Severity: severity, Message: message}
+func themeTokenFinding(path string, severity Severity, line int, message string) Finding {
+	return Finding{Path: path, Rule: ruleIDThemeToken, Severity: severity, Message: message, Line: line}
 }

@@ -48,6 +48,20 @@ func (s *Service) buildToolExecutor(store themefs.ThemeStore, storeAuth themefs.
 	}
 }
 
+// buildFileReader returns the ai.FileReader a generation call uses to
+// materialize an "edit" action's find/replace pairs into full content (see
+// ai.Generate's propose_changes handling) — store here is the same overlay
+// store buildToolExecutor above reads through, so a materialized edit sees
+// earlier turns' staged draft changes too, never stale saved-theme content.
+// Deliberately not routed through ToolExecutor: that returns a
+// model-facing formatted string (see execReadThemeFile), not the clean raw
+// content materializeEdits needs to apply a find/replace against.
+func (s *Service) buildFileReader(store themefs.ThemeStore, storeAuth themefs.RequestAuth) ai.FileReader {
+	return func(ctx context.Context, path string) (string, error) {
+		return store.ReadFile(ctx, storeAuth, path)
+	}
+}
+
 func (s *Service) execListThemeFiles(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth) (string, error) {
 	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {

@@ -27,7 +27,7 @@ func checkRenderTargetExists(p Proposal, snap Snapshot) []Finding {
 			}
 
 			if !strings.HasPrefix(target, "liquid/") && !strings.HasPrefix(target, "components/") {
-				findings = append(findings, renderTargetFinding(f.Path, fmt.Sprintf(
+				findings = append(findings, renderTargetFinding(f.Path, t.Line, fmt.Sprintf(
 					"{%% render '%s' %%} on line %d: render path must start with 'liquid/' or 'components/', never a bare name.",
 					target, t.Line)))
 				continue
@@ -43,7 +43,7 @@ func checkRenderTargetExists(p Proposal, snap Snapshot) []Finding {
 			if _, inProposal := p.fileByPath(resolved); inProposal {
 				continue
 			}
-			findings = append(findings, renderTargetFinding(f.Path, fmt.Sprintf(
+			findings = append(findings, renderTargetFinding(f.Path, t.Line, fmt.Sprintf(
 				"{%% render '%s' %%} on line %d: '%s' does not exist in the theme and isn't one of the files this "+
 					"proposal creates.", target, t.Line, resolved)))
 		}
@@ -51,6 +51,6 @@ func checkRenderTargetExists(p Proposal, snap Snapshot) []Finding {
 	return findings
 }
 
-func renderTargetFinding(path, message string) Finding {
-	return Finding{Path: path, Rule: ruleIDRenderTargetExists, Severity: SeverityError, Message: message}
+func renderTargetFinding(path string, line int, message string) Finding {
+	return Finding{Path: path, Rule: ruleIDRenderTargetExists, Severity: SeverityError, Message: message, Line: line}
 }

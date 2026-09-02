@@ -96,7 +96,7 @@ func heartbeatTickerInterval() time.Duration { return time.Duration(heartbeatTic
 // calls per turn). *ai.Generator satisfies this today with no changes on
 // its side; callers passing one continue to work unchanged.
 type generator interface {
-	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor) (*ai.Result, error)
+	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor, readFile ai.FileReader) (*ai.Result, error)
 	// Summarize is used by summarizeOldTurns to collapse old chat history
 	// into one synthetic turn instead of resending it verbatim on every
 	// call — see summarizeOldTurns's doc comment. *ai.Generator's fake mode
@@ -123,6 +123,25 @@ type Service struct {
 	themeLocks themeLocker // redisThemeLock if REDIS_URL was configured, keyedMutex otherwise — see themelock.go
 	bus        eventBus    // redisEventBus if REDIS_URL was configured, inProcessEventBus otherwise — see eventEmitter
 	tokens     *pendingTokens
+	// historySummarizationEnabled/historySummaries/historySummaryLocks back
+	// summarizeOldTurnsCached (see history_summary.go for the full
+	// rationale) — always non-nil/true after NewService; not a constructor
+	// parameter because NewService's 5-arg shape is depended on by every
+	// test in this package and several in internal/server/handlers, for a
+	// value that in practice never varies across the single Service
+	// instance this process ever builds. Overridden via
+	// SetHistorySummarizationEnabled, called once by server.go's wiring.
+	historySummarizationEnabled bool
+	historySummaries            *historySummaryCache
+	historySummaryLocks         *keyedMutex
+}
+
+// SetHistorySummarizationEnabled overrides the default (enabled) — see the
+// Service struct's own doc comment on why this isn't a NewService
+// parameter. Call once, before serving traffic; not safe to call
+// concurrently with a generation already reading the field.
+func (s *Service) SetHistorySummarizationEnabled(enabled bool) {
+	s.historySummarizationEnabled = enabled
 }
 
 // NewService wires the service's dependencies. rdb may be nil (see
@@ -150,13 +169,16 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		locks = newKeyedMutex()
 	}
 	return &Service{
-		repo:       repo,
-		chats:      chats,
-		gen:        gen,
-		store:      store,
-		themeLocks: locks,
-		bus:        bus,
-		tokens:     newPendingTokens(),
+		repo:                        repo,
+		chats:                       chats,
+		gen:                         gen,
+		store:                       store,
+		themeLocks:                  locks,
+		bus:                         bus,
+		tokens:                      newPendingTokens(),
+		historySummarizationEnabled: true,
+		historySummaries:            newHistorySummaryCache(),
+		historySummaryLocks:         newKeyedMutex(),
 	}
 }
 
@@ -819,9 +841,10 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	tc.GenerationMode = in.Mode
 
 	toolExec := s.buildToolExecutor(store, storeAuth)
+	readFile := s.buildFileReader(store, storeAuth)
 
-	turns := summarizeOldTurns(ctx, s.gen, toTurns(priorMessages))
-	result, turns, err := s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, emitter, in)
+	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
+	result, turns, err := s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
 	if err != nil {
 		return err
 	}
@@ -841,7 +864,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		if err != nil {
 			return fmt.Errorf("build theme snapshot: %w", err)
 		}
-		result, warnings, err = s.checkAndRepair(ctx, in, c.ID, tc, turns, result, snap, toolExec, emitter)
+		result, warnings, err = s.checkAndRepair(ctx, in, c.ID, tc, turns, result, snap, toolExec, readFile, emitter)
 		if err != nil {
 			return err
 		}
@@ -1070,13 +1093,19 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 // content-shrink check, which needs a real "before" to compare the
 // proposal's "after" against — a page's prior content was never loaded
 // into the snapshot before this, so that check had nothing to compare
-// with). Called once per doGenerate call, before the check-and-repair
+// with). That same per-file "before" content is also what
+// themecheck.DowngradePreExistingFindings uses as its baseline (see
+// checkAndRepair) to tell a violation the merchant's theme already had from
+// one this proposal just introduced — sourced from store, the same overlay
+// store the model's own read_theme_file tool reads through, so it reflects
+// what the model actually saw, staged draft changes from earlier turns
+// included. Called once per doGenerate call, before the check-and-repair
 // loop: nothing is written to the theme until after that loop accepts a
-// proposal, so the same snapshot is valid across every retry within one
-// call — no need to refetch it per attempt, even though result itself may
-// be replaced by a retried proposal (checkAndRepair keeps re-using this
-// same snapshot; only fresh update paths that first appear on a retry
-// would miss a "before" here, same as before this change for any path).
+// proposal, so the same snapshot — and the same pre-generation baseline —
+// is valid across every retry within one call, never a prior failed
+// attempt's own output (checkAndRepair keeps re-using this same snapshot;
+// only fresh update paths that first appear on a retry would miss a
+// "before" here, same as before this change for any path).
 func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, result *ai.Result) (themecheck.Snapshot, error) {
 	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
@@ -1102,7 +1131,16 @@ func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, s
 		}
 		content, err := store.ReadFile(ctx, storeAuth, f.Path)
 		if err != nil {
-			return themecheck.Snapshot{}, fmt.Errorf("read %s: %w", f.Path, err)
+			// Fails open, unlike the four required files above: this fetch
+			// only backs the placeholder-body "before" compare and the
+			// pre-existing-violation baseline, both optional refinements —
+			// missing it just means that one file falls back to today's
+			// stricter behavior (no grandfathering, no shrink check) rather
+			// than failing the whole generation over a network hiccup to
+			// FlowPOS.
+			slog.Warn("failed to fetch baseline content for proposed file; treating it as having no baseline",
+				"path", f.Path, "error", err)
+			continue
 		}
 		files[f.Path] = content
 	}

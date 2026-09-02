@@ -32,7 +32,7 @@ func checkBoolGuard(p Proposal, _ Snapshot) []Finding {
 				if !isBoolIshRef(ref) {
 					continue
 				}
-				findings = append(findings, boolGuardFinding(f.Path, fmt.Sprintf(
+				findings = append(findings, boolGuardFinding(f.Path, cond.Line, fmt.Sprintf(
 					"line %d: '{%% if %s %%}' is a bare truthy check on a bool-ish field — booleans from the backend "+
 						"are inconsistent (true/false/1/0/\"1\"/\"0\"), so guard it as '{%% if %s == true or %s == 1 %%}'.",
 					cond.Line, ref, ref, ref)))
@@ -53,6 +53,6 @@ func isBoolIshRef(ref string) bool {
 	return boolIshLastSegments[last]
 }
 
-func boolGuardFinding(path, message string) Finding {
-	return Finding{Path: path, Rule: ruleIDBoolGuard, Severity: SeverityError, Message: message}
+func boolGuardFinding(path string, line int, message string) Finding {
+	return Finding{Path: path, Rule: ruleIDBoolGuard, Severity: SeverityError, Message: message, Line: line}
 }

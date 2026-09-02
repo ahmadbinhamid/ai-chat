@@ -63,6 +63,30 @@ func TestExecListThemeFiles(t *testing.T) {
 	}
 }
 
+// TestBuildFileReader_ReadsThroughDraftOverlay confirms the ai.FileReader
+// backing edit materialization (see materializeEdits in package ai) reads
+// through the SAME draft overlay the model's own read_theme_file tool
+// reads through — an edit targeting a file an earlier turn already staged
+// must see that staged content, never the stale saved-theme version
+// underneath it (same property execReadThemeFile's own test/doc comment
+// already establishes for the model-facing read tool).
+func TestBuildFileReader_ReadsThroughDraftOverlay(t *testing.T) {
+	ts := newFakeThemeServer(t, map[string]string{"components/footer.liquid": "saved theme content"})
+	defer ts.Close()
+
+	svc := &Service{store: themefs.NewStore(ts.URL)}
+	overlay := themefs.NewOverlayStore(svc.store, map[string]string{"components/footer.liquid": "staged draft content"})
+	readFile := svc.buildFileReader(overlay, testStoreAuth())
+
+	got, err := readFile(context.Background(), "components/footer.liquid")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "staged draft content" {
+		t.Errorf("expected the draft-staged content, got %q", got)
+	}
+}
+
 func TestExecReadThemeFile_Basic(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{
 		"components/testimonials.liquid": "<div>hi</div>",
