@@ -200,6 +200,73 @@ func TestPreviewHandler_UsesRealStoreName(t *testing.T) {
 	}
 }
 
+// TestPreviewHandler_UsesRealMenuItems covers buildPreviewContext's menu
+// overlay: a theme with more (or fewer) than FixtureContext's 3 canned
+// links must render all of its real defaults.json links, from both Preview
+// and Context (see TestPreviewHandler_UsesRealStoreName on why the two
+// must agree).
+func TestPreviewHandler_UsesRealMenuItems(t *testing.T) {
+	files := map[string]string{
+		"liquid/layout-start.liquid": `<body>`,
+		"liquid/layout-end.liquid":   `</body>`,
+		"defaults.json": `{"menu": {"items": [
+			{"id": "home", "label": "Home", "url": "/", "children": []},
+			{"id": "shop", "label": "Shop", "url": "/shop", "children": []},
+			{"id": "contact", "label": "Contact Us", "url": "/contact-us", "children": []},
+			{"id": "loyalty", "label": "Loyalty", "url": "/loyalty", "children": []},
+			{"id": "blog", "label": "Blog", "url": "/blog", "children": []}
+		]}}`,
+		"pages/home.liquid": `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
+<ul>{% for item in menu.items %}<li>{{ item.label }}</li>{% endfor %}</ul>
+{% render 'liquid/layout-end', theme: theme, store: store %}`,
+	}
+	ts := fakePreviewThemeServer(files)
+	defer ts.Close()
+
+	buildSvc := themebuild.NewService(nil, chat.NewService(nil), nil, themefs.NewStore(ts.URL), nil)
+	router := gin.New()
+	router.Use(fakeAuthMiddleware(1))
+	previewHandler := NewPreviewHandler(buildSvc)
+	router.POST("/themes/:slug/preview", previewHandler.Preview)
+	router.GET("/preview/context", previewHandler.Context)
+
+	body, _ := json.Marshal(previewRequest{Page: "home"})
+	req := httptest.NewRequest(http.MethodPost, "/themes/demo/preview", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Data previewResponse `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	for _, label := range []string{"Home", "Shop", "Contact Us", "Loyalty", "Blog"} {
+		if !strings.Contains(resp.Data.HTML, "<li>"+label+"</li>") {
+			t.Errorf("expected menu item %q to render, got %q", label, resp.Data.HTML)
+		}
+	}
+
+	ctxReq := httptest.NewRequest(http.MethodGet, "/preview/context", nil)
+	ctxRec := httptest.NewRecorder()
+	router.ServeHTTP(ctxRec, ctxReq)
+	var ctxResp struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(ctxRec.Body.Bytes(), &ctxResp); err != nil {
+		t.Fatalf("failed to decode context response: %v", err)
+	}
+	menu, _ := ctxResp.Data["menu"].(map[string]any)
+	items, _ := menu["items"].([]any)
+	if len(items) != 5 {
+		t.Errorf("expected GET /preview/context to also report all 5 real menu items, got %d: %+v", len(items), ctxResp.Data["menu"])
+	}
+}
+
 func TestPreviewHandler_MissingTargetIsBadRequest(t *testing.T) {
 	router := gin.New()
 	router.Use(fakeAuthMiddleware(1))

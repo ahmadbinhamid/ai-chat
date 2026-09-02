@@ -75,7 +75,7 @@ func TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext(t *testing.
 	cancel() // already dead before doGenerate even starts
 
 	in := GenerateInput{TenantID: tenantID, Token: "t", ThemeSlug: "test-theme", Prompt: "do something"}
-	retErr := svc.doGenerate(canceledCtx, in, c, genID)
+	retErr := svc.doGenerate(canceledCtx, in, c, genID, nil)
 	if retErr == nil {
 		t.Fatal("expected doGenerate to return an error")
 	}

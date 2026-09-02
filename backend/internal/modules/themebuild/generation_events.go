@@ -42,9 +42,23 @@ const (
 	// started, everything else (prompt, etc.) it already has from the
 	// earlier "queued" event for this same generation_id.
 	EventTypeDequeued = "dequeued"
-	// EventTypeCancelled is emitted from the cancel handler when a merchant
-	// cancels a still-queued prompt. No payload.
+	// EventTypeCancelled is emitted once a generation has actually stopped
+	// as the result of a merchant's cancel request — whether it was still
+	// queued (stopped immediately, see Service.CancelQueuedGeneration's
+	// queued branch) or was already running (stopped once its own
+	// goroutine noticed EventTypeCancelRequested — see
+	// runOneQueuedGeneration). Payload: {"generation_id": "..."}.
 	EventTypeCancelled = "cancelled"
+	// EventTypeCancelRequested is a live-only signal (published straight
+	// to eventBus, never through emit/emitLive — see
+	// Service.CancelQueuedGeneration's running branch) asking whichever
+	// replica's goroutine actually owns generationID to stop. Purely
+	// internal plumbing between backend processes: stream.go filters it
+	// out of what gets relayed to a connected client, since a merchant's
+	// client only ever needs to see the terminal EventTypeCancelled once
+	// the generation has actually stopped, not the request to stop it.
+	// Payload: {"generation_id": "..."}.
+	EventTypeCancelRequested = "cancel_requested"
 	// EventTypeToolCall is emitted just before a read-only theme tool runs —
 	// payload: {"tool": "read_theme_file", "path": "pages/home.liquid"} (or
 	// "pattern" for grep_theme; list_theme_files carries just {"tool": ...}).
