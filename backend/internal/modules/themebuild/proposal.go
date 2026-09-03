@@ -50,6 +50,35 @@ func clearIfNeedsClarification(result *ai.Result) {
 	result.LayoutScriptsToAdd = nil
 }
 
+// emptyProposalFallbackSummary replaces the model's own summary when an
+// unexplored, empty proposal (see isUnexploredEmptyProposal) survives every
+// retry — the merchant-facing admission that nothing happened, instead of
+// the model's own fabricated description of work it never did.
+const emptyProposalFallbackSummary = "I wasn't able to make that change — try rephrasing, or be more specific about which page or section you mean."
+
+// isUnexploredEmptyProposal reports whether result is the hallucinated-
+// success shape this whole mechanism exists to catch: needs_clarification
+// is false (the model isn't correctly signaling "nothing to change" the
+// documented way), proposalHasChanges is false (no files, no page
+// registration, no layout links — genuinely nothing proposed), AND the
+// model made zero exploration tool calls (list_theme_files/read_theme_file/
+// grep_theme — see ai.Result.ExplorationToolCalls) before proposing.
+//
+// That last condition is the actual distinguishing rule, and it's the part
+// that matters: reading nothing isn't proof of a hallucination by itself —
+// a trivial request could legitimately need no exploration — but a model
+// that explored NOTHING and still describes specific work ("added an
+// animated hero, a sticky sidebar...") is fabricating, while a model that
+// read the relevant files and THEN concluded there's nothing to change (a
+// real "that's already true" or "that's out of scope" answer — see the
+// out_of_scope/unrelated_technical_question eval tasks) is behaving
+// reasonably and its own summary is trustworthy. Zero exploration is the
+// one signal available in an ai.Result that separates the two without
+// flagging every legitimate empty answer along with the real hallucination.
+func isUnexploredEmptyProposal(result *ai.Result) bool {
+	return !result.NeedsClarification && !proposalHasChanges(result) && result.ExplorationToolCalls == 0
+}
+
 // generateValidProposal makes doGenerate's very first Generate call and
 // retries it, up to maxThemeCheckRetries times, if the reply fails
 // validateProposal — the same bounded treatment checkAndRepair's own retry
@@ -70,12 +99,24 @@ func (s *Service) generateValidProposal(
 	in GenerateInput,
 ) (*ai.Result, []ai.Turn, error) {
 	nextPrompt := prompt
+	// Only for the two Warn lines below — emitter's own emit is already
+	// nil-safe, but a direct field read on a nil *eventEmitter (tests pass
+	// nil — see generate_valid_proposal_test.go) is not.
+	chatID := ""
+	if emitter != nil {
+		chatID = emitter.chatID
+	}
 
 	// attempt counts total Generate calls made here, including the first —
 	// mirrors checkAndRepair's own budget: maxThemeCheckRetries+1 total
 	// calls (the original attempt plus this many retries), independent of
 	// checkAndRepair's own separate retry budget for themecheck rejections
-	// (see doGenerate's structure: these are two distinct stages).
+	// (see doGenerate's structure: these are two distinct stages). Shared,
+	// not duplicated, by the invalid-proposal retry below AND the
+	// unexplored-empty-proposal retry further down — see
+	// isUnexploredEmptyProposal's own doc comment for why an otherwise-valid
+	// but suspiciously empty proposal needs its own check here rather than
+	// being accepted as a real answer.
 	for attempt := 1; ; attempt++ {
 		result, genErr := s.gen.Generate(ctx, tc, turns, nextPrompt, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
 		if genErr != nil {
@@ -86,15 +127,11 @@ func (s *Service) generateValidProposal(
 		}
 
 		clearIfNeedsClarification(result)
-		if err := validateProposal(result, tc.GenerationMode); err == nil {
-			// Distinguishes a first-try success from one that only passed
-			// after retrying an invalid proposal — see theory 4 (retries) in
-			// the diagnostics task this instruments.
-			slog.Info("generateValidProposal succeeded", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempts_used", attempt)
-			return result, turns, nil
-		} else if attempt >= maxThemeCheckRetries+1 {
-			return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
-		} else {
+
+		if err := validateProposal(result, tc.GenerationMode); err != nil {
+			if attempt >= maxThemeCheckRetries+1 {
+				return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
+			}
 			slog.Warn("initial generation produced an invalid proposal, retrying if budget remains",
 				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
 			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
@@ -110,7 +147,48 @@ func (s *Service) generateValidProposal(
 						"of guessing.", err)},
 			)
 			nextPrompt = "Please resubmit a corrected, complete proposal as instructed above."
+			continue
 		}
+
+		if isUnexploredEmptyProposal(result) {
+			if attempt >= maxThemeCheckRetries+1 {
+				// Fail open, per this whole mechanism's own rule: never turn
+				// a working generation into a failed one. The merchant sees
+				// an honest "nothing happened" instead of the model's own
+				// fabricated summary — see emptyProposalFallbackSummary.
+				// Replacing it HERE (not further down doGenerate) is what
+				// keeps the chat transcript consistent: whatever gets
+				// recorded as the assistant message is exactly result.Summary
+				// from this point on, nothing downstream ever sees the
+				// original fabricated text.
+				slog.Warn("generateValidProposal: empty proposal with no exploration survived every retry, replacing summary with an honest fallback",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "chat_id", chatID, "attempts_used", attempt)
+				result.Summary = emptyProposalFallbackSummary
+				return result, turns, nil
+			}
+			slog.Warn("generateValidProposal: empty proposal with no exploration, retrying if budget remains",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "chat_id", chatID, "attempt", attempt)
+			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+				"attempt": attempt, "message": "proposal described changes but made no changes and explored no files",
+			})
+			turns = append(turns,
+				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
+				ai.Turn{Role: "user", Content: "Your last reply described a change but proposed an empty files array " +
+					"without reading or exploring any theme files first. If you have a real change to make, read the " +
+					"relevant files (or use grep_theme/list_theme_files to find them) and propose it fully. If there " +
+					"is genuinely nothing to change for this request, call propose_changes again with " +
+					"needs_clarification: true, files: [], and a summary explaining why — never describe changes " +
+					"that were not made."},
+			)
+			nextPrompt = "Please try again as instructed above."
+			continue
+		}
+
+		// Distinguishes a first-try success from one that only passed after
+		// retrying an invalid proposal — see theory 4 (retries) in the
+		// diagnostics task this instruments.
+		slog.Info("generateValidProposal succeeded", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempts_used", attempt)
+		return result, turns, nil
 	}
 }
 

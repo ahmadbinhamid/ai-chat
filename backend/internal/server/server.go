@@ -48,13 +48,13 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 		generator = ai.NewFake(cfg.FakeAIDelay)
 	case cfg.AIProvider == "deepseek":
 		var err error
-		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
+		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.MaxTokens)
 		if err != nil {
 			return nil, err
 		}
 	default:
 		var err error
-		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.AnthropicEffort, cfg.AnthropicMaxTokens)
+		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.MaxTokens)
 		if err != nil {
 			return nil, err
 		}

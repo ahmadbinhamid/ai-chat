@@ -75,6 +75,14 @@ type Result struct {
 	LayoutScriptsToAdd []string           `json:"layout_scripts_to_add"`
 	InputTokens        int64              `json:"-"`
 	OutputTokens       int64              `json:"-"`
+	// ExplorationToolCalls is how many list_theme_files/read_theme_file/
+	// grep_theme calls this whole Generate call made before propose_changes
+	// — never part of the model's own JSON, set here from the tool loop's
+	// own count. Callers use it to tell a model that explored nothing before
+	// proposing (a real hallucination risk) from one that read files and
+	// reasonably concluded there was nothing to change — see themebuild's
+	// isUnexploredEmptyProposal.
+	ExplorationToolCalls int `json:"-"`
 }
 
 // GenerationMode restricts what a turn is allowed to touch — see
@@ -128,7 +136,8 @@ type Generator struct {
 	fake      bool
 	fakeDelay time.Duration
 	// maxTokens is the Claude call's max_tokens — see defaultMaxTokens and
-	// config.Config.AnthropicMaxTokens (ANTHROPIC_MAX_TOKENS env var).
+	// config.Config.MaxTokens (AI_MAX_TOKENS env var, falling back to the
+	// deprecated ANTHROPIC_MAX_TOKENS).
 	maxTokens int64
 }
 
@@ -417,7 +426,8 @@ func isRetryableAccumulateErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "accumulate stream")
 }
 
-// defaultMaxTokens is used when ANTHROPIC_MAX_TOKENS is unset — comfortably
+// defaultMaxTokens is used when AI_MAX_TOKENS (or the deprecated
+// ANTHROPIC_MAX_TOKENS) is unset — comfortably
 // below Opus-tier's real ceiling (per Anthropic's docs, 64000 is nowhere
 // near the effective context/output limit for claude-opus-* models) while
 // still well above the prior fixed 32000, which was observed truncating
@@ -511,6 +521,13 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	system := []anthropic.TextBlockParam{staticSystemPromptBlock(), dynamicBlock}
 
 	var totalInputTokens, totalOutputTokens int64
+	// explorationToolCalls counts every list_theme_files/read_theme_file/
+	// grep_theme call across the whole Generate call (never propose_changes
+	// itself) — see Result.ExplorationToolCalls' own doc comment for what
+	// this backs. Incremented once per call regardless of whether that call
+	// errored: an attempted read that failed is still evidence the model
+	// tried to look before proposing.
+	explorationToolCalls := 0
 	// generateStart/totalModelElapsed/totalToolElapsed/iterationsUsed back
 	// the single summary line the deferred log below emits on every return
 	// path (success or error) — see theories 1-4 in the diagnostics task
@@ -753,6 +770,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			if ok {
 				result.InputTokens = totalInputTokens
 				result.OutputTokens = totalOutputTokens
+				result.ExplorationToolCalls = explorationToolCalls
 				return &result, nil
 			}
 			slog.Warn("ai: propose_changes edit materialization failed, retrying", "iteration", iteration)
@@ -805,6 +823,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, materializeFailureMsg, true))
 				continue
 			}
+			explorationToolCalls++
 			if progress != nil {
 				progress.ToolStarted(tu.Name, tu.Input)
 			}
