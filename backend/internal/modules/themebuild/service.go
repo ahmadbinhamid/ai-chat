@@ -1258,7 +1258,10 @@ func (s *Service) CreateThemeFromBase(ctx context.Context, tenantID uint64, toke
 // ever needed templates (nothing but a template is a render target for the
 // Go engine — see liquidrender). LiquidJS's frontend preview needs CSS/JS
 // too, to inline draft stylesheets/scripts (see asset_url's doc comment in
-// liquid-engine.ts).
+// liquid-engine.ts). pages.json is always included, regardless of
+// includeAssets — a route's slug can differ from its liquid file's name
+// (PageEntry.Slug vs .Page), so any caller resolving a URL to an entry file
+// needs it to do that correctly.
 //
 // Reads run concurrently (errgroup, capped at 8 in flight) rather than one
 // HTTP round trip at a time — sequential reads of a real theme's full file
@@ -1282,6 +1285,17 @@ func (s *Service) LoadThemeFiles(ctx context.Context, store themefs.ThemeStore, 
 		if includeAssets && (strings.HasSuffix(path, ".css") || strings.HasSuffix(path, ".js")) {
 			wanted = append(wanted, path)
 		}
+	}
+	// pages.json unconditionally, not gated behind includeAssets: a route's
+	// slug and its actual liquid file name can differ (e.g. slug "shop" ->
+	// page "products" — see PageEntry.Slug vs .Page), and any caller that
+	// resolves a URL path to an entry file needs this to do it correctly
+	// instead of guessing pages/<slug>.liquid, which breaks for exactly that
+	// case. Harmless for callers that don't: the Go liquidrender.Renderer
+	// this also feeds (handlers/preview.go) never references a "pages.json"
+	// key from a {% render %}/{% include %} tag.
+	if paths[pathPagesJSON] {
+		wanted = append(wanted, pathPagesJSON)
 	}
 
 	files := make(map[string]string, len(wanted))

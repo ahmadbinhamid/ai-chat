@@ -208,6 +208,7 @@ func (s *Service) summarizeOldTurnsCached(ctx context.Context, chatID string, tu
 	// duplicate Summarize call, never a crash or a race on the cache itself
 	// (historySummaryCache is safe for concurrent use on its own).
 	if s.historySummaryLocks != nil {
+		// Error discarded safely: historySummaryLocks is the concrete *keyedMutex (always returns nil error), not the themeLocker interface, whose Redis implementation does return errors.
 		unlock, _ := s.historySummaryLocks.Lock(ctx, chatID)
 		defer unlock()
 

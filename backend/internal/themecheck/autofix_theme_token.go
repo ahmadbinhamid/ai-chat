@@ -24,11 +24,15 @@ import (
 // grandfathering logic here would risk silently diverging from it and
 // rewriting a declaration the rule never actually flagged — the same class
 // of bug DowngradePreExistingFindings exists to prevent elsewhere in this
-// package. Instead, findings' Path+Line say precisely which lines are
-// real, non-grandfathered violations; this function then re-runs the exact
-// same regexes and the exact same lineAt checkThemeToken itself uses, and
-// only accepts a match whose line is one of those flagged ones. A match on
-// a flagged line is guaranteed to be a real violation — grandfathering is
+// package. Instead, findings' Path+Offset say precisely which declarations
+// are real, non-grandfathered violations; this function then re-runs the
+// exact same regexes checkThemeToken itself uses, and only accepts a match
+// whose start offset (m[0]) is one of those flagged ones. Scoping by byte
+// offset rather than line matters: checkThemeToken's declRe has no newline
+// anchor, so two declarations can share one line with only one of them
+// flagged (new) and the other grandfathered (pre-existing) — line-level
+// scoping can't tell them apart and would rewrite both. A match at a
+// flagged offset is guaranteed to be a real violation — grandfathering is
 // never reimplemented, only deferred to.
 //
 // Both fix kinds resolve against defaults.json's colors map only — never
@@ -45,26 +49,26 @@ func AutoFixThemeTokens(p Proposal, snap Snapshot, findings []Finding) (fixed ma
 		return nil, false
 	}
 
-	flaggedLines := make(map[string]map[int]bool) // path -> flagged line numbers
+	flaggedOffsets := make(map[string]map[int]bool) // path -> flagged byte offsets
 	for _, f := range findings {
 		if f.Rule != ruleIDThemeToken || f.Severity != SeverityError || f.Line <= 0 {
 			continue
 		}
-		if flaggedLines[f.Path] == nil {
-			flaggedLines[f.Path] = make(map[int]bool)
+		if flaggedOffsets[f.Path] == nil {
+			flaggedOffsets[f.Path] = make(map[int]bool)
 		}
-		flaggedLines[f.Path][f.Line] = true
+		flaggedOffsets[f.Path][f.Offset] = true
 	}
 
 	fixed = make(map[string]string)
 	var paths []string
 	totalFixed := 0
 	for _, f := range p.Files {
-		lines := flaggedLines[f.Path]
-		if len(lines) == 0 {
+		offsets := flaggedOffsets[f.Path]
+		if len(offsets) == 0 {
 			continue
 		}
-		if newContent, count, ok := autoFixThemeTokensInFile(f.Content, lines, colors); ok {
+		if newContent, count, ok := autoFixThemeTokensInFile(f.Content, offsets, colors); ok {
 			fixed[f.Path] = newContent
 			anyFixed = true
 			paths = append(paths, f.Path)
@@ -88,8 +92,9 @@ type themeTokenFix struct {
 }
 
 // autoFixThemeTokensInFile finds every fixable var()-no-fallback and raw-
-// color-in-a-color-property match on a flagged line, then applies them all
-// at once, back-to-front by start offset. All fix ranges are computed
+// color-in-a-color-property match starting at a flagged offset, then
+// applies them all at once, back-to-front by start offset. All fix ranges
+// are computed
 // against the SAME original, unmodified content — never against a
 // partially-patched copy — so every offset stays valid regardless of how
 // many earlier (lower-offset) fixes are still pending; applying back-to-
@@ -101,11 +106,11 @@ type themeTokenFix struct {
 // withoutVarCalls exclusion) — so a color Fix 1 is about to insert as a
 // fallback can never be mistaken by Fix 2 for a pre-existing raw literal,
 // without either fix needing to know about the other.
-func autoFixThemeTokensInFile(content string, flaggedLines map[int]bool, colors map[string]string) (result string, fixCount int, ok bool) {
+func autoFixThemeTokensInFile(content string, flaggedOffsets map[int]bool, colors map[string]string) (result string, fixCount int, ok bool) {
 	var fixes []themeTokenFix
 
 	for _, m := range themeVarNoFallbackRe.FindAllStringSubmatchIndex(content, -1) {
-		if !flaggedLines[lineAt(content, m[0])] {
+		if !flaggedOffsets[m[0]] {
 			continue
 		}
 		token := content[m[2]:m[3]] // e.g. "--theme-footer-bg"
@@ -117,7 +122,7 @@ func autoFixThemeTokensInFile(content string, flaggedLines map[int]bool, colors 
 	}
 
 	for _, m := range declRe.FindAllStringSubmatchIndex(content, -1) {
-		if !flaggedLines[lineAt(content, m[0])] {
+		if !flaggedOffsets[m[0]] {
 			continue
 		}
 		prop := strings.ToLower(strings.TrimSpace(content[m[2]:m[3]]))

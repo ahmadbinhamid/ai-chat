@@ -144,7 +144,8 @@ func (s *Service) generateValidProposal(
 						"following the earlier instructions exactly. Never invent a placeholder path or "+
 						"partial content — if you don't have a complete, verified proposal ready, call "+
 						"propose_changes with needs_clarification: true, files: [], and explain why instead "+
-						"of guessing.", err)},
+						"of guessing. Action \"edit\" is fine for this — it isn't a diff, it still produces the "+
+						"complete corrected file, just via old_string/new_string instead of retyping it whole.", err)},
 			)
 			nextPrompt = "Please resubmit a corrected, complete proposal as instructed above."
 			continue
@@ -378,7 +379,8 @@ func (s *Service) checkAndRepair(
 					"following the earlier instructions exactly. Never invent a placeholder path or "+
 					"partial content — if you don't have a complete, verified proposal ready, call "+
 					"propose_changes with needs_clarification: true, files: [], and explain why instead "+
-					"of guessing.", err)})
+					"of guessing. Action \"edit\" is fine for this — it isn't a diff, it still produces the "+
+					"complete corrected file, just via old_string/new_string instead of retyping it whole.", err)})
 			continue
 		}
 		result = retried

@@ -231,6 +231,63 @@ func TestAutoFixThemeTokens_SixFindingsAllFixableEndToEnd(t *testing.T) {
 	}
 }
 
+// TestAutoFixThemeTokens_TwoDeclarationsOneLineOnlySecondNewRewritten is the
+// case that motivates the byte-offset scoping fix: declRe has no newline
+// anchor, so two declarations can share one line with only the second one
+// new. checkThemeToken already grandfathers the first correctly (it's
+// byte-identical to prevContent); the fixer must scope to that same
+// granularity, or it rewrites both just because they share a flagged line.
+func TestAutoFixThemeTokens_TwoDeclarationsOneLineOnlySecondNewRewritten(t *testing.T) {
+	prevContent := "a { color: #1e3a8a; }\n"
+	content := "a { color: #1e3a8a; border-color: #dc2626; }\n"
+	p := Proposal{Files: []ProposedFile{{Path: "components/css/x.css", Action: "update", Content: content}}}
+	snap := Snapshot{Files: map[string]string{
+		"defaults.json":        testDefaultsJSON,
+		"components/css/x.css": prevContent,
+	}}
+
+	findings := checkThemeToken(p, snap)
+	if len(findings) != 1 {
+		t.Fatalf("expected exactly 1 finding (the new declaration only, first grandfathered), got %+v", findings)
+	}
+
+	fixed, any := AutoFixThemeTokens(p, snap, findings)
+	if !any {
+		t.Fatal("expected a fix")
+	}
+	want := "a { color: #1e3a8a; border-color: var(--theme-danger, #dc2626); }\n"
+	if got := fixed["components/css/x.css"]; got != want {
+		t.Errorf("got %q, want %q — the grandfathered first declaration must stay byte-identical", got, want)
+	}
+}
+
+// TestAutoFixThemeTokens_TwoVarRefsOneLineOnlySecondNewRewritten is the same
+// case for the no-fallback var() loop: two var(--theme-*) references
+// sharing a line, only the second one new.
+func TestAutoFixThemeTokens_TwoVarRefsOneLineOnlySecondNewRewritten(t *testing.T) {
+	prevContent := "a { color: var(--theme-primary); }\n"
+	content := "a { color: var(--theme-primary); border-color: var(--theme-danger); }\n"
+	p := Proposal{Files: []ProposedFile{{Path: "components/css/x.css", Action: "update", Content: content}}}
+	snap := Snapshot{Files: map[string]string{
+		"defaults.json":        testDefaultsJSON,
+		"components/css/x.css": prevContent,
+	}}
+
+	findings := checkThemeToken(p, snap)
+	if len(findings) != 1 {
+		t.Fatalf("expected exactly 1 finding (the new var ref only, first grandfathered), got %+v", findings)
+	}
+
+	fixed, any := AutoFixThemeTokens(p, snap, findings)
+	if !any {
+		t.Fatal("expected a fix")
+	}
+	want := "a { color: var(--theme-primary); border-color: var(--theme-danger, #dc2626); }\n"
+	if got := fixed["components/css/x.css"]; got != want {
+		t.Errorf("got %q, want %q — the grandfathered first var ref must stay byte-identical (still no fallback)", got, want)
+	}
+}
+
 func TestKebabToCamel(t *testing.T) {
 	cases := map[string]string{
 		"primary":       "primary",
