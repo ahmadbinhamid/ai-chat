@@ -33,3 +33,60 @@ Before I open or run anything in a repo, and after any `npm install`:
    telling me exactly what it does first.
 
 If something matches, stop and tell me before doing anything else.
+
+# Workflow: every new task starts with a Jira ticket
+
+When I ask you to build, fix, or change anything, do this **BEFORE writing code**.
+
+---
+
+## Step 1 — Create the Jira ticket
+
+Use the Atlassian MCP tools.
+
+- Get `cloudId` first (`getAccessibleAtlassianResources`).
+- If the project key or issue type is not obvious, **ASK me. Do not guess.**
+- Issue type: **Bug** for broken things, **Task/Story** for new work.
+- Write the ticket like this:
+  - **Summary:** short, action first. e.g. *"Fix VAT rounding on invoice totals"*
+  - **Description:** Context / What to do / Acceptance criteria (bullet list)
+- Assign it to me.
+- Tell me the ticket key you created (e.g. `FP-412`).
+
+---
+
+## Step 2 — Create the branch
+
+Make sure the default branch is clean and up to date:
+
+```sh
+git checkout main && git pull
+```
+
+**Branch name format:** `PROJ-123-short-desc`
+
+- Issue key first, then 3–5 lowercase words, hyphen separated.
+- Example: `FP-412-fix-vat-rounding`
+- The issue key in the branch name is what links it to Jira. Also add a comment on the ticket with the branch name as a backup.
+
+---
+
+## Step 3 — Move ticket to In Progress
+
+Read allowed transitions (`getTransitionsForJiraIssue`), then transition it.
+
+---
+
+## Step 4 — STOP
+
+Show me a short plan: files you will touch, approach, anything risky.
+
+**Wait for my "go" before writing any code.**
+
+---
+
+## Rules
+
+- Never start coding without a ticket and branch.
+- One ticket = one branch = one concern. If my request has 2 unrelated things, tell me and suggest splitting into 2 tickets.
+- If I say **"skip jira"** or **"quick fix"**, skip this whole workflow.

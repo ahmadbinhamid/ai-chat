@@ -53,32 +53,34 @@ func checkNoFramework(p Proposal, _ Snapshot) []Finding {
 	for _, f := range p.Files {
 		for _, sig := range frameworkSignals {
 			if loc := sig.re.FindStringIndex(f.Content); loc != nil {
-				findings = append(findings, noFrameworkFinding(f.Path, fmt.Sprintf(
+				line := lineAt(f.Content, loc[0])
+				findings = append(findings, noFrameworkFinding(f.Path, line, fmt.Sprintf(
 					"line %d looks like %s — this theme is plain Liquid/CSS/vanilla JS only (§1/§9/§10), no frontend "+
-						"framework or library.", lineAt(f.Content, loc[0]), sig.name)))
+						"framework or library.", line, sig.name)))
 			}
 		}
 
 		if strings.HasSuffix(f.Path, ".js") {
 			base := strings.TrimSuffix(path.Base(f.Path), ".js")
 			if buildToolConfigBasenames[base] {
-				findings = append(findings, noFrameworkFinding(f.Path,
+				findings = append(findings, noFrameworkFinding(f.Path, 0,
 					"this looks like a build-tool config file — this theme has no build step (§10: vanilla JS only, no bundler)."))
 			}
 		}
 
 		if strings.HasSuffix(f.Path, ".liquid") {
 			for _, m := range externalScriptSrcRe.FindAllStringSubmatchIndex(f.Content, -1) {
-				findings = append(findings, noFrameworkFinding(f.Path, fmt.Sprintf(
+				line := lineAt(f.Content, m[0])
+				findings = append(findings, noFrameworkFinding(f.Path, line, fmt.Sprintf(
 					"line %d: <script src=\"%s\"> doesn't load from this theme's own assets — every script must be "+
 						"'{{ 'js/<name>.js' | asset_url }}', never an external/CDN URL.",
-					lineAt(f.Content, m[0]), f.Content[m[2]:m[3]])))
+					line, f.Content[m[2]:m[3]])))
 			}
 		}
 	}
 	return findings
 }
 
-func noFrameworkFinding(path, message string) Finding {
-	return Finding{Path: path, Rule: ruleIDNoFramework, Severity: SeverityError, Message: message}
+func noFrameworkFinding(path string, line int, message string) Finding {
+	return Finding{Path: path, Rule: ruleIDNoFramework, Severity: SeverityError, Message: message, Line: line}
 }

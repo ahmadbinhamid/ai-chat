@@ -48,7 +48,7 @@ func checkBalancedTagsInFile(path, content string) []Finding {
 
 		case t.Name == "elsif" || t.Name == "else":
 			if len(stack) == 0 || stack[len(stack)-1].name != "if" {
-				findings = append(findings, balancedTagsFinding(path, fmt.Sprintf(
+				findings = append(findings, balancedTagsFinding(path, t.Line, fmt.Sprintf(
 					"'{%% %s %%}' on line %d has no enclosing '{%% if %%}' — it must appear directly inside an if-block.",
 					t.Name, t.Line)))
 			}
@@ -56,13 +56,13 @@ func checkBalancedTagsInFile(path, content string) []Finding {
 		case blockClosers[t.Name] != "":
 			opener := blockClosers[t.Name]
 			if len(stack) == 0 {
-				findings = append(findings, balancedTagsFinding(path, fmt.Sprintf(
+				findings = append(findings, balancedTagsFinding(path, t.Line, fmt.Sprintf(
 					"'{%% %s %%}' on line %d has no matching '{%% %s %%}' to close.", t.Name, t.Line, opener)))
 				continue
 			}
 			top := stack[len(stack)-1]
 			if top.name != opener {
-				findings = append(findings, balancedTagsFinding(path, fmt.Sprintf(
+				findings = append(findings, balancedTagsFinding(path, t.Line, fmt.Sprintf(
 					"'{%% %s %%}' on line %d closes '{%% %s %%}' but the innermost open block is '{%% %s %%}' opened on "+
 						"line %d — tags must nest correctly.", t.Name, t.Line, opener, top.name, top.line)))
 				continue
@@ -72,13 +72,13 @@ func checkBalancedTagsInFile(path, content string) []Finding {
 	}
 
 	for _, open := range stack {
-		findings = append(findings, balancedTagsFinding(path, fmt.Sprintf(
+		findings = append(findings, balancedTagsFinding(path, open.line, fmt.Sprintf(
 			"'{%% %s %%}' opened on line %d is never closed with '{%% %s %%}'.", open.name, open.line, blockOpeners[open.name])))
 	}
 
 	return findings
 }
 
-func balancedTagsFinding(path, message string) Finding {
-	return Finding{Path: path, Rule: ruleIDBalancedTags, Severity: SeverityError, Message: message}
+func balancedTagsFinding(path string, line int, message string) Finding {
+	return Finding{Path: path, Rule: ruleIDBalancedTags, Severity: SeverityError, Message: message, Line: line}
 }

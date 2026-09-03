@@ -2,6 +2,7 @@ package themecheck
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -110,6 +111,8 @@ const layoutEndRenderTag = `{% render 'liquid/layout-end', theme: theme, store: 
 // function never mutates p.
 func AutoFixMissingBoilerplate(p Proposal) (fixed map[string]string, anyFixed bool) {
 	fixed = make(map[string]string)
+	var paths []string
+	fixCount := 0
 	for _, f := range p.Files {
 		if !isPagesLiquidFile(f.Path) {
 			continue
@@ -137,7 +140,17 @@ func AutoFixMissingBoilerplate(p Proposal) (fixed map[string]string, anyFixed bo
 		if startChanged || endChanged {
 			fixed[f.Path] = content
 			anyFixed = true
+			paths = append(paths, f.Path)
+			if startChanged {
+				fixCount++
+			}
+			if endChanged {
+				fixCount++
+			}
 		}
+	}
+	if anyFixed {
+		slog.Info("themecheck: auto-fixed findings", "rule", ruleIDPageBoilerplate, "paths", paths, "fixed_count", fixCount)
 	}
 	return fixed, anyFixed
 }

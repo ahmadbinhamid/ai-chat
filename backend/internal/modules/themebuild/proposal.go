@@ -50,6 +50,35 @@ func clearIfNeedsClarification(result *ai.Result) {
 	result.LayoutScriptsToAdd = nil
 }
 
+// emptyProposalFallbackSummary replaces the model's own summary when an
+// unexplored, empty proposal (see isUnexploredEmptyProposal) survives every
+// retry — the merchant-facing admission that nothing happened, instead of
+// the model's own fabricated description of work it never did.
+const emptyProposalFallbackSummary = "I wasn't able to make that change — try rephrasing, or be more specific about which page or section you mean."
+
+// isUnexploredEmptyProposal reports whether result is the hallucinated-
+// success shape this whole mechanism exists to catch: needs_clarification
+// is false (the model isn't correctly signaling "nothing to change" the
+// documented way), proposalHasChanges is false (no files, no page
+// registration, no layout links — genuinely nothing proposed), AND the
+// model made zero exploration tool calls (list_theme_files/read_theme_file/
+// grep_theme — see ai.Result.ExplorationToolCalls) before proposing.
+//
+// That last condition is the actual distinguishing rule, and it's the part
+// that matters: reading nothing isn't proof of a hallucination by itself —
+// a trivial request could legitimately need no exploration — but a model
+// that explored NOTHING and still describes specific work ("added an
+// animated hero, a sticky sidebar...") is fabricating, while a model that
+// read the relevant files and THEN concluded there's nothing to change (a
+// real "that's already true" or "that's out of scope" answer — see the
+// out_of_scope/unrelated_technical_question eval tasks) is behaving
+// reasonably and its own summary is trustworthy. Zero exploration is the
+// one signal available in an ai.Result that separates the two without
+// flagging every legitimate empty answer along with the real hallucination.
+func isUnexploredEmptyProposal(result *ai.Result) bool {
+	return !result.NeedsClarification && !proposalHasChanges(result) && result.ExplorationToolCalls == 0
+}
+
 // generateValidProposal makes doGenerate's very first Generate call and
 // retries it, up to maxThemeCheckRetries times, if the reply fails
 // validateProposal — the same bounded treatment checkAndRepair's own retry
@@ -65,18 +94,31 @@ func (s *Service) generateValidProposal(
 	turns []ai.Turn,
 	prompt string,
 	toolExec ai.ToolExecutor,
+	readFile ai.FileReader,
 	emitter *eventEmitter,
 	in GenerateInput,
 ) (*ai.Result, []ai.Turn, error) {
 	nextPrompt := prompt
+	// Only for the two Warn lines below — emitter's own emit is already
+	// nil-safe, but a direct field read on a nil *eventEmitter (tests pass
+	// nil — see generate_valid_proposal_test.go) is not.
+	chatID := ""
+	if emitter != nil {
+		chatID = emitter.chatID
+	}
 
 	// attempt counts total Generate calls made here, including the first —
 	// mirrors checkAndRepair's own budget: maxThemeCheckRetries+1 total
 	// calls (the original attempt plus this many retries), independent of
 	// checkAndRepair's own separate retry budget for themecheck rejections
-	// (see doGenerate's structure: these are two distinct stages).
+	// (see doGenerate's structure: these are two distinct stages). Shared,
+	// not duplicated, by the invalid-proposal retry below AND the
+	// unexplored-empty-proposal retry further down — see
+	// isUnexploredEmptyProposal's own doc comment for why an otherwise-valid
+	// but suspiciously empty proposal needs its own check here rather than
+	// being accepted as a real answer.
 	for attempt := 1; ; attempt++ {
-		result, genErr := s.gen.Generate(ctx, tc, turns, nextPrompt, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec)
+		result, genErr := s.gen.Generate(ctx, tc, turns, nextPrompt, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
 		if genErr != nil {
 			// A hard API/transport error is a different failure mode from an
 			// invalid proposal — already handled by the caller/reaper, not
@@ -85,11 +127,11 @@ func (s *Service) generateValidProposal(
 		}
 
 		clearIfNeedsClarification(result)
-		if err := validateProposal(result, tc.GenerationMode); err == nil {
-			return result, turns, nil
-		} else if attempt >= maxThemeCheckRetries+1 {
-			return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
-		} else {
+
+		if err := validateProposal(result, tc.GenerationMode); err != nil {
+			if attempt >= maxThemeCheckRetries+1 {
+				return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
+			}
 			slog.Warn("initial generation produced an invalid proposal, retrying if budget remains",
 				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
 			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
@@ -105,7 +147,48 @@ func (s *Service) generateValidProposal(
 						"of guessing.", err)},
 			)
 			nextPrompt = "Please resubmit a corrected, complete proposal as instructed above."
+			continue
 		}
+
+		if isUnexploredEmptyProposal(result) {
+			if attempt >= maxThemeCheckRetries+1 {
+				// Fail open, per this whole mechanism's own rule: never turn
+				// a working generation into a failed one. The merchant sees
+				// an honest "nothing happened" instead of the model's own
+				// fabricated summary — see emptyProposalFallbackSummary.
+				// Replacing it HERE (not further down doGenerate) is what
+				// keeps the chat transcript consistent: whatever gets
+				// recorded as the assistant message is exactly result.Summary
+				// from this point on, nothing downstream ever sees the
+				// original fabricated text.
+				slog.Warn("generateValidProposal: empty proposal with no exploration survived every retry, replacing summary with an honest fallback",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "chat_id", chatID, "attempts_used", attempt)
+				result.Summary = emptyProposalFallbackSummary
+				return result, turns, nil
+			}
+			slog.Warn("generateValidProposal: empty proposal with no exploration, retrying if budget remains",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "chat_id", chatID, "attempt", attempt)
+			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+				"attempt": attempt, "message": "proposal described changes but made no changes and explored no files",
+			})
+			turns = append(turns,
+				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
+				ai.Turn{Role: "user", Content: "Your last reply described a change but proposed an empty files array " +
+					"without reading or exploring any theme files first. If you have a real change to make, read the " +
+					"relevant files (or use grep_theme/list_theme_files to find them) and propose it fully. If there " +
+					"is genuinely nothing to change for this request, call propose_changes again with " +
+					"needs_clarification: true, files: [], and a summary explaining why — never describe changes " +
+					"that were not made."},
+			)
+			nextPrompt = "Please try again as instructed above."
+			continue
+		}
+
+		// Distinguishes a first-try success from one that only passed after
+		// retrying an invalid proposal — see theory 4 (retries) in the
+		// diagnostics task this instruments.
+		slog.Info("generateValidProposal succeeded", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempts_used", attempt)
+		return result, turns, nil
 	}
 }
 
@@ -127,6 +210,7 @@ func (s *Service) checkAndRepair(
 	result *ai.Result,
 	snap themecheck.Snapshot,
 	toolExec ai.ToolExecutor,
+	readFile ai.FileReader,
 	emitter *eventEmitter,
 ) (*ai.Result, []themecheck.Finding, error) {
 	turns := append([]ai.Turn(nil), history...)
@@ -145,7 +229,11 @@ func (s *Service) checkAndRepair(
 
 		emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": attempt})
 		findings := themecheck.Check(toProposal(result), snap)
-		errorFindings, warningFindings := splitFindings(findings)
+		// Only the raw error COUNT is needed here, to gate the auto-fixer
+		// block below — the real errorFindings/warningFindings that drive
+		// this attempt's repair decision are computed once, after
+		// filtering, further down.
+		rawErrorFindings, _ := splitFindings(findings)
 
 		// A missing layout-start/layout-end render is mechanical, not a
 		// judgment call — the required text is fixed and known, so patch it
@@ -155,7 +243,7 @@ func (s *Service) checkAndRepair(
 		// Free (no extra Generate call): just re-run Check on the patched
 		// content before deciding whether a real repair round-trip is
 		// needed at all.
-		if len(errorFindings) > 0 {
+		if len(rawErrorFindings) > 0 {
 			fixedAny := false
 			if fixedContent, any := themecheck.AutoFixMissingBoilerplate(toProposal(result)); any {
 				for i, f := range result.Files {
@@ -173,17 +261,62 @@ func (s *Service) checkAndRepair(
 				result.LayoutScriptsToAdd = append(result.LayoutScriptsToAdd, scripts...)
 				fixedAny = true
 			}
+			// A hardcoded color the model could have reached for a real
+			// token instead is the most common single repair trigger in
+			// production, and the most expensive one to send back to the
+			// model — fixing six colors means re-emitting every touched
+			// file in full. See themecheck.AutoFixThemeTokens' own doc
+			// comment. Runs against `findings`, the SAME pre-auto-fixer
+			// Check() result rawErrorFindings above was split from —
+			// deliberately not re-Check()'d against the two fixers above
+			// first, because neither touches a .css file's Content
+			// (boilerplate only rewrites pages/*.liquid; asset
+			// registration only appends to LayoutLinksToAdd/
+			// LayoutScriptsToAdd), so the theme-token findings already
+			// computed above are still exactly accurate either way.
+			if fixedContent, any := themecheck.AutoFixThemeTokens(toProposal(result), snap, findings); any {
+				for i, f := range result.Files {
+					if patched, ok := fixedContent[f.Path]; ok {
+						result.Files[i].Content = patched
+					}
+				}
+				fixedAny = true
+			}
 			if fixedAny {
 				findings = themecheck.Check(toProposal(result), snap)
-				errorFindings, warningFindings = splitFindings(findings)
 			}
 		}
+
+		// Downgrade findings the merchant's own theme already had before
+		// this proposal touched the file — see
+		// themecheck.DowngradePreExistingFindings's own doc comment for the
+		// matching rule and why it's deliberately biased toward
+		// "pre-existing" (the Trustpilot-widget incident this exists to
+		// prevent). Deliberately AFTER the auto-fixer block above (which
+		// gates on rawErrorFindings, not this), not before: both auto-fixers
+		// decide whether to run off the RAW error count, independent of
+		// which specific findings caused it — filtering first would risk
+		// zeroing that count down to 0 on a proposal that still has a
+		// genuine missing-boilerplate/asset-registration problem, skipping a
+		// free fix it would otherwise have gotten. snap.Files is the
+		// baseline source (see buildSnapshot, which fetches each "update"
+		// file's pre-change content into it) — snap itself is computed once
+		// before this whole retry loop starts, so every attempt here checks
+		// against the ORIGINAL pre-generation content, never a prior failed
+		// attempt's own output.
+		findings = themecheck.DowngradePreExistingFindings(findings, toProposal(result), snap.Files)
+		errorFindings, warningFindings := splitFindings(findings)
 
 		if len(errorFindings) == 0 {
 			if attempt > 1 {
 				slog.Info("themecheck accepted proposal after retry",
 					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "warning_count", len(warningFindings))
 			}
+			// Unconditional (unlike the log above, which only fires on
+			// attempt > 1) so a first-try success is distinguishable from a
+			// retried one in the logs — see theory 4 in the diagnostics task
+			// this instruments.
+			slog.Info("checkAndRepair succeeded", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempts_used", attempt)
 			result.InputTokens, result.OutputTokens = totalInput, totalOutput
 			return result, warningFindings, nil
 		}
@@ -203,7 +336,7 @@ func (s *Service) checkAndRepair(
 		repair := repairPrompt(errorFindings)
 
 		repairStart := time.Now()
-		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec)
+		retried, genErr := s.gen.Generate(ctx, tc, turns, repair, onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
 		repairElapsed := time.Since(repairStart)
 		if genErr != nil {
 			// Surfaced distinctly from the generic reaper cleanup: without
@@ -326,6 +459,16 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 	b.WriteString("\nIf you're unsure of a file's exact current content, call read_theme_file on it again " +
 		"before resubmitting — don't reconstruct it from memory, that's how boilerplate like the layout " +
 		"renders above gets silently dropped.")
+	// A themecheck rejection is exactly the case action "edit" is for: the
+	// findings above already say precisely which line(s) are wrong, so a
+	// targeted old_string/new_string fix is normally both correct and far
+	// smaller than resubmitting the whole file — see the intro sentence
+	// above, which still applies (edit's server-side materialization always
+	// produces that same complete, corrected file; it's just a cheaper way
+	// to submit it, not a partial one).
+	b.WriteString("\n\nFor most of these, action \"edit\" on the file you already have (a precise old_string/" +
+		"new_string pair per finding) is the right fix — resubmit the whole file as action \"update\" only if the " +
+		"correction is broad enough that a full rewrite is genuinely simpler.")
 	return b.String()
 }
 

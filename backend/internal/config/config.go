@@ -53,18 +53,42 @@ type Config struct {
 	// Anthropic / Claude
 	AnthropicAPIKey string
 	AnthropicModel  string
-	AnthropicEffort string
-	// AnthropicMaxTokens is the Claude call's max_tokens (see
-	// ai.defaultMaxTokens for the fallback when unset/invalid). Raise this if
-	// a generation is failing with "truncated at the max_tokens limit" more
-	// than occasionally on complex prompts. Reused as-is for DeepSeek too —
-	// its compat endpoint accepts the identical max_tokens/effort shape.
-	AnthropicMaxTokens int64
+
+	// Effort/MaxTokens are provider-neutral despite living next to the
+	// Anthropic/DeepSeek fields above: both providers speak the same
+	// Anthropic Messages API request shape (see ai.New's own doc comment),
+	// so the same two values control reasoning effort and output cap
+	// regardless of which one AIProvider selects — see their read in Load
+	// below (AI_EFFORT/AI_MAX_TOKENS, falling back to the older
+	// ANTHROPIC_EFFORT/ANTHROPIC_MAX_TOKENS names for compatibility) for
+	// why they aren't named AnthropicEffort/AnthropicMaxTokens: that
+	// naming genuinely cost debugging time once already, on a
+	// AI_PROVIDER=deepseek deployment where "Anthropic-only" was assumed
+	// and wrongly ruled out as a cause of DeepSeek latency.
+	Effort string
+	// MaxTokens is the model call's max_tokens (see ai.defaultMaxTokens for
+	// the fallback when unset/invalid). Raise this if a generation is
+	// failing with "truncated at the max_tokens limit" more than
+	// occasionally on complex prompts.
+	MaxTokens int64
 
 	// DeepSeek — only read/required when AIProvider == "deepseek".
 	DeepSeekAPIKey  string
 	DeepSeekModel   string
 	DeepSeekBaseURL string
+	// HistorySummarizationEnabled gates themebuild's collapsed-history-turn
+	// summarization (see themebuild.Service.summarizeOldTurnsCached).
+	// Defaults to enabled for both providers, not just Anthropic — the
+	// summary is now cached per chat (keyed by how many older turns it
+	// covers), so the same synthetic turn is resent on every call instead
+	// of a freshly-generated one each time. That matters specifically for
+	// DeepSeek: its compat endpoint caches on request-prefix match rather
+	// than honoring cache_control, so a summary that changed text on every
+	// call used to invalidate that prefix cache for the whole conversation
+	// — see .env.example's own note on this var. Set to false to disable
+	// summarization outright (full history is always resent verbatim) if a
+	// deployment still finds it not worth the tradeoff.
+	HistorySummarizationEnabled bool
 	// FakeAIMode, when true, skips the real Claude API entirely — see
 	// ai.NewFake. For debugging the surrounding plumbing (the async
 	// generation lifecycle, the stream WebSocket, the dashboard) without
@@ -144,16 +168,18 @@ func Load() Config {
 
 		AIProvider: aiProvider,
 
-		AnthropicAPIKey:    os.Getenv("ANTHROPIC_API_KEY"),
-		AnthropicModel:     getenv("ANTHROPIC_MODEL", "claude-opus-5"),
-		AnthropicEffort:    getenv("ANTHROPIC_EFFORT", "xhigh"),
-		AnthropicMaxTokens: int64(getenvInt("ANTHROPIC_MAX_TOKENS", 64000)),
-		FakeAIMode:         getenvBool("AI_CHAT_FAKE_MODE", false),
-		FakeAIDelay:        time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
+		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
+		AnthropicModel:  getenv("ANTHROPIC_MODEL", "claude-opus-5"),
+		Effort:          getenvDeprecated("AI_EFFORT", "ANTHROPIC_EFFORT", "xhigh"),
+		MaxTokens:       int64(getenvIntDeprecated("AI_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS", 64000)),
+		FakeAIMode:      getenvBool("AI_CHAT_FAKE_MODE", false),
+		FakeAIDelay:     time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
 		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
 		DeepSeekModel:   getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
 		DeepSeekBaseURL: getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
+
+		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 
@@ -187,6 +213,57 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getenvDeprecated resolves a value that has moved from oldKey to newKey:
+// newKey wins if set, oldKey is used (with a deprecation warning) if newKey
+// isn't, and fallback applies if neither is — same "" -> unset treatment
+// getenv already uses, so newKey set to an empty string falls through to
+// oldKey exactly like an unset newKey would. Warns via the standard log
+// package, not slog: Load runs before cmd/server/main.go calls
+// slog.SetDefault, so an slog call here would go through slog's
+// unconfigured default handler and look inconsistent with every other line
+// this process logs — see getenvBool/getenvInt's own WARNING lines above,
+// the same reasoning already applied to invalid values in this file.
+func getenvDeprecated(newKey, oldKey, fallback string) string {
+	newVal := os.Getenv(newKey)
+	oldVal := os.Getenv(oldKey)
+	switch {
+	case newVal != "" && oldVal != "":
+		log.Printf("WARNING: both %s and %s are set — using %s (%q), ignoring %s. Remove %s once you've moved off it.",
+			newKey, oldKey, newKey, newVal, oldKey, oldKey)
+		return newVal
+	case newVal != "":
+		return newVal
+	case oldVal != "":
+		log.Printf("WARNING: %s is deprecated, use %s instead — still honoring %s (%q) for now.", oldKey, newKey, oldKey, oldVal)
+		return oldVal
+	default:
+		return fallback
+	}
+}
+
+// getenvIntDeprecated is getenvDeprecated for an integer value, reusing
+// getenvInt itself (not os.Getenv + strconv directly) so an invalid value
+// under whichever key actually supplied it still gets getenvInt's own
+// existing invalid-value WARNING and fallback behavior — unchanged by this
+// rename, per Load's own doc comment on not adding new validation here.
+func getenvIntDeprecated(newKey, oldKey string, fallback int) int {
+	newVal := os.Getenv(newKey)
+	oldVal := os.Getenv(oldKey)
+	switch {
+	case newVal != "" && oldVal != "":
+		log.Printf("WARNING: both %s and %s are set — using %s, ignoring %s. Remove %s once you've moved off it.",
+			newKey, oldKey, newKey, oldKey, oldKey)
+		return getenvInt(newKey, fallback)
+	case newVal != "":
+		return getenvInt(newKey, fallback)
+	case oldVal != "":
+		log.Printf("WARNING: %s is deprecated, use %s instead — still honoring %s for now.", oldKey, newKey, oldKey)
+		return getenvInt(oldKey, fallback)
+	default:
+		return fallback
+	}
 }
 
 func getenvBool(key string, fallback bool) bool {

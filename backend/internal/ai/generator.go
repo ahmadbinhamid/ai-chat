@@ -38,11 +38,28 @@ type Turn struct {
 	Content string
 }
 
-// GeneratedFile is one file the model proposes creating or updating.
+// GeneratedFile is one file the model proposes creating, updating, or
+// editing. Action "edit" is a wire-format optimization only — see
+// materializeEdits, which Generate calls immediately after parsing
+// propose_changes' input: by the time a *Result leaves Generate, every file
+// is "create" or "update" with real Content, and Edits is always empty.
+// Nothing downstream of Generate (themebuild, themecheck, the write plan)
+// ever sees "edit" — this field's zero value (nil) already behaves as "no
+// edits", so a fake generator or eval fixture built directly in Go, never
+// through JSON, needs no special-casing.
 type GeneratedFile struct {
 	Path    string `json:"path"`
-	Action  string `json:"action"` // "create" | "update"
+	Action  string `json:"action"` // "create" | "update" | "edit"
 	Content string `json:"content"`
+	Edits   []Edit `json:"edits"`
+}
+
+// Edit is one find/replace pair for GeneratedFile's "edit" action —
+// old_string must match the file's current content exactly once (see
+// applyEdits); new_string may be empty (a deletion).
+type Edit struct {
+	OldString string `json:"old_string"`
+	NewString string `json:"new_string"`
 }
 
 // Result is the model's final answer for a turn, delivered as the input of
@@ -58,6 +75,14 @@ type Result struct {
 	LayoutScriptsToAdd []string           `json:"layout_scripts_to_add"`
 	InputTokens        int64              `json:"-"`
 	OutputTokens       int64              `json:"-"`
+	// ExplorationToolCalls is how many list_theme_files/read_theme_file/
+	// grep_theme calls this whole Generate call made before propose_changes
+	// — never part of the model's own JSON, set here from the tool loop's
+	// own count. Callers use it to tell a model that explored nothing before
+	// proposing (a real hallucination risk) from one that read files and
+	// reasonably concluded there was nothing to change — see themebuild's
+	// isUnexploredEmptyProposal.
+	ExplorationToolCalls int `json:"-"`
 }
 
 // GenerationMode restricts what a turn is allowed to touch — see
@@ -111,7 +136,8 @@ type Generator struct {
 	fake      bool
 	fakeDelay time.Duration
 	// maxTokens is the Claude call's max_tokens — see defaultMaxTokens and
-	// config.Config.AnthropicMaxTokens (ANTHROPIC_MAX_TOKENS env var).
+	// config.Config.MaxTokens (AI_MAX_TOKENS env var, falling back to the
+	// deprecated ANTHROPIC_MAX_TOKENS).
 	maxTokens int64
 }
 
@@ -147,6 +173,16 @@ func New(apiKey, baseURL, model, effort string, maxTokens int64) (*Generator, er
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}
+	// One-time record of which configuration this process's Generate calls
+	// will use — see theory 1 (reasoning tax) in the diagnostics task this
+	// instruments. base_url_set only (not the URL itself) since it's not
+	// sensitive but also not needed to answer the question.
+	slog.Info("ai: generator configured",
+		"model", model,
+		"effort", effort,
+		"max_tokens", maxTokens,
+		"base_url_set", baseURL != "",
+		"adaptive_thinking_supported", modelSupportsAdaptiveThinking(model))
 	return &Generator{
 		client:    anthropic.NewClient(opts...),
 		model:     model,
@@ -216,16 +252,55 @@ var resultSchema = map[string]any{
 			"type":        "boolean",
 			"description": "true if the request conflicts with a hard rule in the spec or is too ambiguous to safely generate. When true, files must be empty.",
 		},
+		// Strict: true + additionalProperties: false (see proposeChangesTool)
+		// means every property here must be present on every files[] item —
+		// content and edits are both always required, their meaning set by
+		// action rather than by which one is present. Deliberately not an
+		// anyOf/oneOf split keyed on action: DeepSeek's Anthropic-compat
+		// endpoint (the actual target for this schema) has unverified
+		// support for conditional subschemas, so the contract is documented
+		// in each field's description instead and enforced server-side by
+		// materializeEdits, not by the schema itself.
 		"files": map[string]any{
 			"type": "array",
 			"items": map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
-				"required":             []string{"path", "action", "content"},
+				"required":             []string{"path", "action", "content", "edits"},
 				"properties": map[string]any{
-					"path":    map[string]any{"type": "string", "description": "Theme-root-relative path, e.g. 'pages/offers.liquid'."},
-					"action":  map[string]any{"type": "string", "enum": []string{"create", "update"}},
-					"content": map[string]any{"type": "string", "description": "Full file content — never a diff or partial snippet."},
+					"path": map[string]any{"type": "string", "description": "Theme-root-relative path, e.g. 'pages/offers.liquid'."},
+					"action": map[string]any{
+						"type": "string", "enum": []string{"create", "update", "edit"},
+						"description": "'create'/'update': content is the full file, edits is []. 'edit': content is \"\", " +
+							"edits is a non-empty list of find/replace pairs applied to the file's current content.",
+					},
+					"content": map[string]any{
+						"type": "string",
+						"description": "Full file content for 'create'/'update' — never a diff or partial snippet. " +
+							"\"\" for 'edit', where edits carries the change instead.",
+					},
+					"edits": map[string]any{
+						"type":        "array",
+						"description": "Find/replace pairs for action 'edit' — [] for 'create'/'update'. Applied in order.",
+						"items": map[string]any{
+							"type":                 "object",
+							"additionalProperties": false,
+							"required":             []string{"old_string", "new_string"},
+							"properties": map[string]any{
+								"old_string": map[string]any{
+									"type": "string",
+									"description": "Exact text to find. Must match the file's real current content " +
+										"exactly once — whitespace and indentation included. Include enough surrounding " +
+										"context to make it unique; a single line that repeats elsewhere in the file will " +
+										"be rejected.",
+								},
+								"new_string": map[string]any{
+									"type":        "string",
+									"description": "Replacement text. Empty string deletes old_string.",
+								},
+							},
+						},
+					},
 				},
 			},
 		},
@@ -296,6 +371,42 @@ const maxToolIterations = 28
 // the budget with nothing to show for it.
 const forceProposeWithinLastN = 3
 
+// thrashOutputTokenThreshold flags a tool-loop iteration that called only
+// read-only exploration tools (list_theme_files/read_theme_file/grep_theme
+// — see allExplorationTools) with no propose_changes, yet still burned a
+// large amount of output — narration/reasoning the model produced
+// alongside tool calls whose own arguments carry almost none of it.
+// Observed in production: one iteration of 6 grep_theme calls (whose
+// arguments are maybe 200 tokens combined) cost 24,315 output tokens and
+// 285 of a 477-second generation's total wall clock — 60% of the run, with
+// no file changed. This constant only backs a diagnostic slog.Warn
+// (see Generate) so the pattern's real-world frequency can be measured; it
+// does not abort, truncate, or otherwise change the loop's behavior.
+const thrashOutputTokenThreshold = 5000
+
+// explorationToolNames are the read-only tools a tool-loop iteration can
+// call besides propose_changes — see tools.go's toolName* constants.
+var explorationToolNames = map[string]bool{
+	toolNameListThemeFiles: true,
+	toolNameReadThemeFile:  true,
+	toolNameGrepTheme:      true,
+}
+
+// allExplorationTools reports whether names is non-empty and every entry is
+// a read-only exploration tool — i.e. this iteration explored but never
+// called propose_changes.
+func allExplorationTools(names []string) bool {
+	if len(names) == 0 {
+		return false
+	}
+	for _, n := range names {
+		if !explorationToolNames[n] {
+			return false
+		}
+	}
+	return true
+}
+
 // streamAccumulateMaxAttempts is how many times a single tool-loop
 // iteration's streaming call is attempted when the provider's stream itself
 // arrives truncated/garbled mid-chunk (see isRetryableAccumulateErr) —
@@ -315,7 +426,8 @@ func isRetryableAccumulateErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "accumulate stream")
 }
 
-// defaultMaxTokens is used when ANTHROPIC_MAX_TOKENS is unset — comfortably
+// defaultMaxTokens is used when AI_MAX_TOKENS (or the deprecated
+// ANTHROPIC_MAX_TOKENS) is unset — comfortably
 // below Opus-tier's real ceiling (per Anthropic's docs, 64000 is nowhere
 // near the effective context/output limit for claude-opus-* models) while
 // still well above the prior fixed 32000, which was observed truncating
@@ -334,17 +446,28 @@ var errMaxTokensTruncated = errors.New("model response was truncated at the max_
 // each call may return one or more tool_use blocks, which toolExec executes
 // (list_theme_files/read_theme_file/grep_theme — ai never touches themefs
 // itself, see ToolExecutor), with the results fed back as a new turn, until
-// the model calls propose_changes, whose input becomes Result. onDelta, if
-// non-nil, is called with each new chunk of raw text the model streams
-// (thinking-style narration, not the proposal itself) across every
-// iteration — mainly useful for a live "..." progress indicator. progress,
-// if non-nil, is notified around every toolExec call — see ToolProgress's
-// doc comment for why the caller (not this method) decides what to do with
-// that.
-func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string), progress ToolProgress, toolExec ToolExecutor) (*Result, error) {
+// the model calls propose_changes, whose input becomes Result — with one
+// extra step first: any "edit"-action file is materialized into "update"
+// via materializeEdits(readFile) before the result is returned, so callers
+// never see "edit" (see GeneratedFile's doc comment). A materialization
+// failure does NOT return an error or end the turn: it's fed back as this
+// propose_changes call's own tool_result, and the loop continues exactly
+// like an ordinary tool call would, giving the model a chance to correct
+// itself — see the propose_changes handling below. onDelta, if non-nil, is
+// called with each new chunk of raw text the model streams (thinking-style
+// narration, not the proposal itself) across every iteration — mainly
+// useful for a live "..." progress indicator. progress, if non-nil, is
+// notified around every toolExec call — see ToolProgress's doc comment for
+// why the caller (not this method) decides what to do with that.
+func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string), progress ToolProgress, toolExec ToolExecutor, readFile FileReader) (*Result, error) {
 	if g.fake {
 		return g.fakeGenerate(ctx, prompt)
 	}
+	// Keyed by path, persists across every iteration of this one Generate
+	// call — see materializeEdits' own doc comment on why a path that keeps
+	// failing needs to fall back to requesting full content rather than
+	// retrying forever.
+	editFailureCounts := make(map[string]int)
 	// Anthropic rejects any empty text content block outright ("text content
 	// blocks must be non-empty") — not just for the cache_control
 	// breakpoint below, for any message anywhere in the request — so an
@@ -398,7 +521,39 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	system := []anthropic.TextBlockParam{staticSystemPromptBlock(), dynamicBlock}
 
 	var totalInputTokens, totalOutputTokens int64
+	// explorationToolCalls counts every list_theme_files/read_theme_file/
+	// grep_theme call across the whole Generate call (never propose_changes
+	// itself) — see Result.ExplorationToolCalls' own doc comment for what
+	// this backs. Incremented once per call regardless of whether that call
+	// errored: an attempted read that failed is still evidence the model
+	// tried to look before proposing.
+	explorationToolCalls := 0
+	// generateStart/totalModelElapsed/totalToolElapsed/iterationsUsed back
+	// the single summary line the deferred log below emits on every return
+	// path (success or error) — see theories 1-4 in the diagnostics task
+	// this instruments; none of these affect control flow.
+	generateStart := time.Now()
+	var totalModelElapsed, totalToolElapsed time.Duration
+	iterationsUsed := 0
+	// totalReasoningTokens/reasoningTokensReported back theory 1 (reasoning
+	// tax) directly — see the per-iteration "ai: model call timing" log
+	// below for what sets reasoningTokensReported and why a false there
+	// means "not reported by this provider," not "confirmed zero."
+	var totalReasoningTokens int64
+	reasoningTokensReported := false
+	defer func() {
+		slog.Info("ai: generate call finished",
+			"iterations_used", iterationsUsed,
+			"elapsed_ms", time.Since(generateStart).Milliseconds(),
+			"model_elapsed_ms", totalModelElapsed.Milliseconds(),
+			"tool_elapsed_ms", totalToolElapsed.Milliseconds(),
+			"total_input_tokens", totalInputTokens,
+			"total_output_tokens", totalOutputTokens,
+			"total_reasoning_tokens", totalReasoningTokens,
+			"reasoning_tokens_reported", reasoningTokensReported)
+	}()
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
+		iterationsUsed = iteration + 1
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
 		forcingPropose := iteration >= maxToolIterations-forceProposeWithinLastN
 		if forcingPropose {
@@ -452,7 +607,14 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			params.OutputConfig = anthropic.OutputConfigParam{Effort: g.effort}
 		}
 		var message anthropic.Message
+		// modelCallStart/attemptsUsed cover every streamAccumulateMaxAttempts
+		// retry within this one iteration — a slow iteration due to a
+		// retried stream isn't misread as slow inference, since
+		// attempts_used is logged alongside elapsed_ms below.
+		modelCallStart := time.Now()
+		attemptsUsed := 0
 		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
+			attemptsUsed = attempt
 			stream := g.client.Messages.NewStreaming(ctx, params)
 			message = anthropic.Message{}
 			emitted := 0
@@ -503,12 +665,41 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			case <-time.After(streamAccumulateRetryDelay):
 			}
 		}
+		modelElapsed := time.Since(modelCallStart)
+		totalModelElapsed += modelElapsed
 		totalInputTokens += message.Usage.InputTokens
 		totalOutputTokens += message.Usage.OutputTokens
+		// OutputTokensDetails is a plain value struct (never nil), and
+		// ThinkingTokens a plain int64 — no pointer to guard. Whether the
+		// provider actually populated it is instead tracked by the SDK's own
+		// presence marker (respjson.Field.Valid, same mechanism used for
+		// every other optional field on Usage): reasoningTokensValid is
+		// false when DeepSeek's response omitted output_tokens_details (or
+		// its thinking_tokens) entirely, distinguishing that from a
+		// genuinely-reported 0.
+		reasoningTokens := message.Usage.OutputTokensDetails.ThinkingTokens
+		reasoningTokensValid := message.Usage.OutputTokensDetails.JSON.ThinkingTokens.Valid()
+		totalReasoningTokens += reasoningTokens
+		if reasoningTokensValid {
+			reasoningTokensReported = true
+		}
 
 		var toolUses []anthropic.ContentBlockUnion
 		var proposeInput json.RawMessage
+		// textBlockCount/textChars are counted here, off the fully
+		// accumulated message.Content for this iteration (after the
+		// attempt loop above has already finished reassembling the whole
+		// streamed response) — the same source toolUses/toolNames below
+		// already reads, not raw incremental SSE deltas, so a still-in-
+		// progress or retried attempt is never double-counted.
+		textBlockCount := 0
+		textChars := 0
 		for _, block := range message.Content {
+			if block.Type == "text" {
+				textBlockCount++
+				textChars += len(block.Text)
+				continue
+			}
 			if block.Type != "tool_use" {
 				continue
 			}
@@ -523,6 +714,36 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			toolNames[i] = tu.Name
 		}
 		slog.Info("ai: tool-loop iteration", "iteration", iteration, "tools_called", toolNames, "stop_reason", message.StopReason)
+		// Model-call latency/token breakdown for this iteration only — see
+		// theories 1 (reasoning tax) and 2 (prompt caching) in the
+		// diagnostics task this instruments. cache_read_input_tokens > 0 on
+		// iteration 2+ means caching is actually working (whether or not
+		// Anthropic's cache_control is what triggered it).
+		slog.Info("ai: model call timing",
+			"iteration", iteration,
+			"elapsed_ms", modelElapsed.Milliseconds(),
+			"attempts_used", attemptsUsed,
+			"forcing_propose", forcingPropose,
+			"input_tokens", message.Usage.InputTokens,
+			"output_tokens", message.Usage.OutputTokens,
+			"cache_read_input_tokens", message.Usage.CacheReadInputTokens,
+			"cache_creation_input_tokens", message.Usage.CacheCreationInputTokens,
+			"reasoning_tokens", reasoningTokens,
+			"reasoning_tokens_reported", reasoningTokensValid,
+			"text_block_count", textBlockCount,
+			"text_chars", textChars,
+			"tool_use_count", len(toolUses))
+
+		// Flags, never controls: an iteration that called only read-only
+		// exploration tools (no propose_changes) yet still burned a large
+		// amount of output is the "thrash" pattern observed in production
+		// — see thrashOutputTokenThreshold's own doc comment for the
+		// 24,315-token/6-grep-call case that motivated this. Purely
+		// diagnostic — nothing about the loop's own behavior changes here.
+		if allExplorationTools(toolNames) && message.Usage.OutputTokens > thrashOutputTokenThreshold {
+			slog.Warn("ai: tool-loop iteration spent unusually many output tokens on exploration only",
+				"iteration", iteration, "output_tokens", message.Usage.OutputTokens, "tools_called", toolNames)
+		}
 
 		// StopReason == "max_tokens" means Claude was cut off mid-stream —
 		// propose_changes' input (if any tool_use block even parsed as valid
@@ -534,17 +755,32 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			return nil, errMaxTokensTruncated
 		}
 
+		// materializeFailureMsg, when non-empty, is fed back below as the
+		// propose_changes tool_use's own tool_result (isError: true) instead
+		// of returning — see materializeEdits' doc comment. Declared here
+		// (not inside the if) so the general toolUses loop further down can
+		// see it regardless of which branch set it.
+		var materializeFailureMsg string
 		if proposeInput != nil {
 			var result Result
 			if err := json.Unmarshal(proposeInput, &result); err != nil {
 				return nil, fmt.Errorf("could not parse propose_changes input: %w", err)
 			}
-			result.InputTokens = totalInputTokens
-			result.OutputTokens = totalOutputTokens
-			return &result, nil
+			ok, retryMsg := materializeEdits(ctx, &result, readFile, editFailureCounts)
+			if ok {
+				result.InputTokens = totalInputTokens
+				result.OutputTokens = totalOutputTokens
+				result.ExplorationToolCalls = explorationToolCalls
+				return &result, nil
+			}
+			slog.Warn("ai: propose_changes edit materialization failed, retrying", "iteration", iteration)
+			materializeFailureMsg = retryMsg
 		}
 
 		if len(toolUses) == 0 {
+			// Counts how often this nudge fires — see theory 3 (wasted
+			// round-trips) in the diagnostics task this instruments.
+			slog.Warn("ai: tool-loop nudge fired (zero tool calls despite forced tool_choice)", "iteration", iteration)
 			// Real Anthropic's ToolChoice: OfAny guarantees at least one tool
 			// call. DeepSeek's Anthropic-compat endpoint does NOT honor that
 			// guarantee — confirmed empirically: a plain "hello"/"hi" gets a
@@ -577,10 +813,28 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		resultBlocks := make([]anthropic.ContentBlockParamUnion, 0, len(toolUses))
 		for _, tu := range toolUses {
+			// propose_changes was already "executed" above (parsed, edits
+			// materialized) — reaching this loop for it at all means that
+			// failed, so its tool_result is the failure description rather
+			// than a real toolExec call (propose_changes isn't one of
+			// ToolExecutor's tools; calling toolExec with it would just
+			// error "unknown tool").
+			if tu.Name == toolNameProposeChanges {
+				resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, materializeFailureMsg, true))
+				continue
+			}
+			explorationToolCalls++
 			if progress != nil {
 				progress.ToolStarted(tu.Name, tu.Input)
 			}
+			toolCallStart := time.Now()
 			output, err := toolExec(ctx, tu.Name, tu.Input)
+			toolElapsed := time.Since(toolCallStart)
+			totalToolElapsed += toolElapsed
+			// Distinguishes tool-execution latency (an HTTP round trip to
+			// FlowPOS) from model latency logged above — see "ai: model call
+			// timing".
+			slog.Info("ai: tool exec timing", "iteration", iteration, "tool", tu.Name, "elapsed_ms", toolElapsed.Milliseconds(), "error", err != nil)
 			isError := err != nil
 			if progress != nil {
 				// Summarized from output/err before output is overwritten

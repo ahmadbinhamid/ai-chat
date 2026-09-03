@@ -2,6 +2,7 @@ package themecheck
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 )
 
@@ -114,6 +115,10 @@ func AutoFixMissingAssetRegistration(p Proposal, snap Snapshot) (linksToAdd, scr
 				anyFixed = true
 			}
 		}
+	}
+	if anyFixed {
+		paths := append(append([]string{}, linksToAdd...), scriptsToAdd...)
+		slog.Info("themecheck: auto-fixed findings", "rule", ruleIDAssetRegistered, "paths", paths, "fixed_count", len(paths))
 	}
 	return linksToAdd, scriptsToAdd, anyFixed
 }
