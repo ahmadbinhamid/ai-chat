@@ -1002,6 +1002,27 @@ type storeSettingsFetcher interface {
 	FetchStoreSettings(ctx context.Context, auth themefs.RequestAuth) (themefs.StoreSettings, error)
 }
 
+// productsFetcher is the *themefs.Store-only capability FetchPreviewProducts
+// needs, same reasoning as storeSettingsFetcher above: a real products list
+// isn't a theme file, so it's not part of ThemeStore.
+type productsFetcher interface {
+	FetchProducts(ctx context.Context, auth themefs.RequestAuth, limit int) (themefs.ProductsPage, error)
+}
+
+// FetchPreviewProducts fetches the tenant's real published, active products
+// (first page, capped at limit) for PreviewHandler's buildPreviewContext, so
+// the AI-chat preview's shop/product-detail pages show real product data
+// instead of FixtureProducts' canned "Sample Product" — see
+// themefs.Store.FetchProducts' own doc comment for the endpoint and filters
+// used.
+func (s *Service) FetchPreviewProducts(ctx context.Context, storeAuth themefs.RequestAuth, limit int) (themefs.ProductsPage, error) {
+	fetcher, ok := s.store.(productsFetcher)
+	if !ok {
+		return themefs.ProductsPage{}, fmt.Errorf("theme store does not support products fetch")
+	}
+	return fetcher.FetchProducts(ctx, storeAuth, limit)
+}
+
 // FetchStoreSettings fetches the tenant's real store settings (currently
 // just its name) for PreviewHandler's buildPreviewContext, so the AI-chat
 // preview's header shows the merchant's actual store name instead of
