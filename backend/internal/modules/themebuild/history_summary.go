@@ -100,12 +100,17 @@ const historySummaryCacheMaxEntries = 2048
 // uses to serialize concurrent Summarize calls per chat (see
 // summarizeOldTurnsCached) — see stripedMutex's own doc comment (themelock.go)
 // for why a fixed stripe count, not one lock per chat ID, is what this
-// specific key space needs. 64 is generous relative to how many chats are
-// ever concurrently mid-summarization at once on a single replica (the only
-// two callers racing for the same stripe by coincidence, on two genuinely
-// different chats, just serialize briefly — see stripedMutex's own doc
-// comment on why that's an acceptable tradeoff, not a correctness issue).
-const historySummaryLockStripes = 64
+// specific key space needs, and for why a collision isn't cheap here: the
+// lock is held across the full Summarize model call, so two different
+// chats landing on the same stripe stalls the second for that whole call,
+// not a brief spin. 256 keeps a collision rare even with many chats
+// concurrently mid-summarization on one replica at once (birthday-bound:
+// with k concurrent chats and 256 stripes, a collision becomes likely
+// only once k approaches ~19 — sqrt(256), the usual birthday-problem
+// threshold — comfortably above what one replica handles simultaneously in
+// practice) at a cost of a few hundred bytes of *sync.Mutex, not worth
+// trading away for a smaller number.
+const historySummaryLockStripes = 256
 
 // historySummaryCacheEntry is what's cached per chat: the summary text plus
 // how many older turns it covers. A lookup requires both the chat ID (the

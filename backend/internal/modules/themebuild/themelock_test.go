@@ -58,3 +58,22 @@ func TestStripedMutex_SerializesTheSameKey(t *testing.T) {
 		t.Fatal("expected Lock to serialize concurrent callers on the same key, but two overlapped")
 	}
 }
+
+// TestThemeLockKey_DifferentTenantsNeverCollide is the fix for a real
+// cross-tenant contention bug: themeLocks used to be locked by theme slug
+// alone (service.go, apply.go), so two different tenants whose slugs
+// happened to match (plausible — slugs read as human-chosen, e.g. "shop")
+// would serialize against each other's completely unrelated writes.
+// themeLockKey must produce a different key per tenant even for the exact
+// same slug, and a stable, identical key for the same (tenant, slug) pair
+// every time (so the lock still actually works for its own intended case).
+func TestThemeLockKey_DifferentTenantsNeverCollide(t *testing.T) {
+	a := themeLockKey(1, "shop")
+	b := themeLockKey(2, "shop")
+	if a == b {
+		t.Fatalf("expected different tenants with the same slug to produce different lock keys, got %q for both", a)
+	}
+	if got := themeLockKey(1, "shop"); got != a {
+		t.Errorf("expected the same (tenant, slug) pair to always produce the same key, got %q and %q", a, got)
+	}
+}

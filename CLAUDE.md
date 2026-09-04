@@ -19,9 +19,17 @@
    cache (see `historySummaryCache`) or a fixed-size structure (see
    `stripedMutex`) instead, so one chat's/tenant's activity can never grow
    shared process memory without bound. A key space that's naturally
-   bounded on its own (e.g. keyed by theme slug — a tenant has few themes)
-   is fine as a plain map (see `keyedMutex`); the risk is specifically
-   identifiers that keep being created forever.
+   bounded PER TENANT on its own (e.g. theme slug — one tenant has few
+   themes) is fine as a plain map (see `keyedMutex`), but still needs rule
+   9 below — bounded-per-tenant is not the same as safe-to-key-by-alone.
+9. Any lock or cache keyed by something a client can influence (a slug, a
+   name — not a server-generated globally-unique ID like a chat/generation
+   UUID) must include the tenant ID in the key, not just the bare value —
+   see `themeLockKey`. Two different tenants' resources can share the same
+   human-chosen name (two tenants both naming a theme "shop"); without the
+   tenant in the key, their completely unrelated operations serialize
+   against each other. This is a correctness/contention bug even when no
+   data actually crosses tenants — flag it the same as a real leak.
 
 ## Supply chain safety
 

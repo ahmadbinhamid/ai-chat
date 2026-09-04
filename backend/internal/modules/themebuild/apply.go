@@ -84,7 +84,7 @@ func (s *Service) ApplyDraft(ctx context.Context, tenantID uint64, token, chatID
 		return ApplyResult{}, ErrNoPendingChanges
 	}
 
-	unlock, err := s.themeLocks.Lock(ctx, themeSlug)
+	unlock, err := s.themeLocks.Lock(ctx, themeLockKey(tenantID, themeSlug))
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("apply draft: %w", err)
 	}

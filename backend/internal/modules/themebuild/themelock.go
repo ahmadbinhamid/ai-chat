@@ -31,6 +31,22 @@ type themeLocker interface {
 	Lock(ctx context.Context, key string) (unlock func(), err error)
 }
 
+// themeLockKey scopes a theme-slug lock to the tenant that owns it — never
+// pass a bare theme slug to Lock. themeSlug is client-supplied (the
+// "theme_slug" request field — see ValidateThemeSlug's own callers) and
+// only validated for path-traversal safety, not namespaced to a tenant on
+// its own; two different tenants whose slugs happen to collide (plausible —
+// slugs read as human-chosen, e.g. "shop") would otherwise serialize
+// against each other's completely unrelated staging/apply calls, for
+// however long the slower one holds the lock. This is a correctness/
+// contention bug, not a data leak — the actual reads/writes underneath
+// still go through storeAuth.TenantID regardless of the lock key — but the
+// lock stops doing its one job (letting two UNRELATED operations run
+// concurrently) the moment two tenants' slugs collide.
+func themeLockKey(tenantID uint64, themeSlug string) string {
+	return fmt.Sprintf("%d:%s", tenantID, themeSlug)
+}
+
 // themeLockTTL bounds how long a Redis-held lock survives without being
 // explicitly released. The critical sections it guards (buildWritePlan/
 // commitWritePlan, revertAppliedHistory's write loop) are disk-facing HTTP
@@ -171,10 +187,16 @@ func (k *keyedMutex) Lock(_ context.Context, key string) (func(), error) {
 // into one of a small, fixed number of stripes keeps memory O(stripe count)
 // forever instead, at the cost of two DIFFERENT keys occasionally landing
 // on the same stripe and serializing against each other unnecessarily — an
-// acceptable tradeoff here: this lock exists only to stop two concurrent
-// calls for the SAME chat from both paying for the same Summarize call, so
-// an occasional false-contention stall on some unrelated chat costs a few
-// extra ms once in a while, never a correctness problem.
+// acceptable tradeoff, but not a cheap one at historySummaryLocks' actual
+// hold time: that lock is held across the full Summarize model call (a
+// multi-second LLM round trip), by design (see summarizeOldTurnsCached's
+// own doc comment on why — it's what stops two concurrent calls on the SAME
+// chat from both paying for the same summary), so a stripe collision
+// between two DIFFERENT chats stalls the second one for that whole call,
+// not "a few ms" as an earlier version of this comment claimed. Rare (see
+// historySummaryLockStripes' own doc comment on the odds), never a
+// correctness problem, but real when it happens — size the stripe count
+// with that actual cost in mind, not a briefer one.
 type stripedMutex struct {
 	stripes []sync.Mutex
 }

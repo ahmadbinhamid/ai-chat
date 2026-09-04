@@ -883,7 +883,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// tightly to just this section per its existing convention (see
 		// themeLocks' own doc comment) — the Claude call above can take
 		// minutes, and a second tab's turn shouldn't queue behind that.
-		unlock, err := s.themeLocks.Lock(ctx, in.ThemeSlug)
+		unlock, err := s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
