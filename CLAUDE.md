@@ -13,6 +13,15 @@
 6. Every phase ends with `make test` and `make lint` passing.
 7. If a requirement here conflicts with the spec or the existing code, stop and
    say so instead of guessing.
+8. Isolate per-key state from a high-cardinality, ever-growing identifier
+   (chat ID, tenant ID, request ID) — never a plain map keyed by one of
+   these that only grows for the life of the process. Use a capped+evicting
+   cache (see `historySummaryCache`) or a fixed-size structure (see
+   `stripedMutex`) instead, so one chat's/tenant's activity can never grow
+   shared process memory without bound. A key space that's naturally
+   bounded on its own (e.g. keyed by theme slug — a tenant has few themes)
+   is fine as a plain map (see `keyedMutex`); the risk is specifically
+   identifiers that keep being created forever.
 
 ## Supply chain safety
 

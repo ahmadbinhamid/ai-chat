@@ -133,7 +133,7 @@ type Service struct {
 	// SetHistorySummarizationEnabled, called once by server.go's wiring.
 	historySummarizationEnabled bool
 	historySummaries            *historySummaryCache
-	historySummaryLocks         *keyedMutex
+	historySummaryLocks         *stripedMutex
 }
 
 // SetHistorySummarizationEnabled overrides the default (enabled) — see the
@@ -178,7 +178,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		tokens:                      newPendingTokens(),
 		historySummarizationEnabled: true,
 		historySummaries:            newHistorySummaryCache(),
-		historySummaryLocks:         newKeyedMutex(),
+		historySummaryLocks:         newStripedMutex(historySummaryLockStripes),
 	}
 }
 

@@ -3,6 +3,7 @@ package themebuild
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -130,12 +131,15 @@ func (l *redisThemeLock) release(redisKey, key, token string) {
 // keyedMutex is the in-process themeLocker fallback used when REDIS_URL
 // isn't set (see NewService) — hands out one *sync.Mutex per key, created
 // lazily. The map grows by one entry per distinct key ever seen by this
-// process, not per request — bounded by how many themes/chats actually
-// exist, unlike a per-token cache, so no sweep/eviction is needed here.
-// ctx is accepted only to satisfy themeLocker; a plain mutex has no way to
-// respect cancellation while blocked, so it's ignored, matching this
-// fallback's existing single-replica-only limitation (see eventBus's own
-// in-process fallback for the same tradeoff).
+// process, not per request — bounded by how many themes actually exist
+// (this is only ever keyed by theme slug), unlike a per-token cache, so no
+// sweep/eviction is needed here. A key space that ISN'T naturally bounded
+// this way (e.g. one that grows with every chat ever created) needs
+// stripedMutex below instead, not this — see its own doc comment. ctx is
+// accepted only to satisfy themeLocker; a plain mutex has no way to respect
+// cancellation while blocked, so it's ignored, matching this fallback's
+// existing single-replica-only limitation (see eventBus's own in-process
+// fallback for the same tradeoff).
 type keyedMutex struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -156,4 +160,33 @@ func (k *keyedMutex) Lock(_ context.Context, key string) (func(), error) {
 
 	lock.Lock()
 	return lock.Unlock, nil
+}
+
+// stripedMutex is a fixed-size alternative to keyedMutex for a lock whose
+// key space is NOT bounded the way keyedMutex's own doc comment describes
+// — historySummaryLocks (see history_summary.go) is keyed by chat ID, which
+// grows for the life of a long-running process with no natural ceiling, so
+// reusing keyedMutex there grew one permanent *sync.Mutex entry per chat
+// that ever crossed summarizeHistoryThreshold, never freed. Hashing the key
+// into one of a small, fixed number of stripes keeps memory O(stripe count)
+// forever instead, at the cost of two DIFFERENT keys occasionally landing
+// on the same stripe and serializing against each other unnecessarily — an
+// acceptable tradeoff here: this lock exists only to stop two concurrent
+// calls for the SAME chat from both paying for the same Summarize call, so
+// an occasional false-contention stall on some unrelated chat costs a few
+// extra ms once in a while, never a correctness problem.
+type stripedMutex struct {
+	stripes []sync.Mutex
+}
+
+func newStripedMutex(n int) *stripedMutex {
+	return &stripedMutex{stripes: make([]sync.Mutex, n)}
+}
+
+func (s *stripedMutex) Lock(_ context.Context, key string) (func(), error) {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	stripe := &s.stripes[h.Sum32()%uint32(len(s.stripes))]
+	stripe.Lock()
+	return stripe.Unlock, nil
 }
