@@ -96,6 +96,22 @@ func summarizeOldTurns(ctx context.Context, gen generator, turns []ai.Turn) []ai
 // a correctness problem.
 const historySummaryCacheMaxEntries = 2048
 
+// historySummaryLockStripes sizes the stripedMutex historySummaryLocks
+// uses to serialize concurrent Summarize calls per chat (see
+// summarizeOldTurnsCached) — see stripedMutex's own doc comment (themelock.go)
+// for why a fixed stripe count, not one lock per chat ID, is what this
+// specific key space needs, and for why a collision isn't cheap here: the
+// lock is held across the full Summarize model call, so two different
+// chats landing on the same stripe stalls the second for that whole call,
+// not a brief spin. 256 keeps a collision rare even with many chats
+// concurrently mid-summarization on one replica at once (birthday-bound:
+// with k concurrent chats and 256 stripes, a collision becomes likely
+// only once k approaches ~19 — sqrt(256), the usual birthday-problem
+// threshold — comfortably above what one replica handles simultaneously in
+// practice) at a cost of a few hundred bytes of *sync.Mutex, not worth
+// trading away for a smaller number.
+const historySummaryLockStripes = 256
+
 // historySummaryCacheEntry is what's cached per chat: the summary text plus
 // how many older turns it covers. A lookup requires both the chat ID (the
 // map key) and this count to match — see historySummaryCache.get — so a
@@ -174,7 +190,7 @@ func (c *historySummaryCache) set(chatID string, olderTurnCount int, summary str
 // the same turns; a chat that has grown past a new threshold multiple, or
 // shrunk via discard/revert, misses and regenerates. Concurrent generations
 // on the same chat are serialized through historySummaryLocks (an
-// in-process keyedMutex, not the distributed themeLocks — this cache is
+// in-process stripedMutex, not the distributed themeLocks — this cache is
 // itself in-process only, so cross-replica locking would guard nothing) so
 // two in-flight calls don't both pay for the same summary; the cache is
 // re-checked after acquiring the lock in case a concurrent call already
@@ -208,6 +224,7 @@ func (s *Service) summarizeOldTurnsCached(ctx context.Context, chatID string, tu
 	// duplicate Summarize call, never a crash or a race on the cache itself
 	// (historySummaryCache is safe for concurrent use on its own).
 	if s.historySummaryLocks != nil {
+		// Error discarded safely: historySummaryLocks is the concrete *stripedMutex (always returns nil error), not the themeLocker interface, whose Redis implementation does return errors.
 		unlock, _ := s.historySummaryLocks.Lock(ctx, chatID)
 		defer unlock()
 

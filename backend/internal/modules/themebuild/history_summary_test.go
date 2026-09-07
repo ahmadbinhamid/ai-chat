@@ -153,7 +153,7 @@ func newCachedTestService(fg generator, enabled bool) *Service {
 		gen:                         fg,
 		historySummarizationEnabled: enabled,
 		historySummaries:            newHistorySummaryCache(),
-		historySummaryLocks:         newKeyedMutex(),
+		historySummaryLocks:         newStripedMutex(historySummaryLockStripes),
 	}
 }
 

@@ -32,6 +32,17 @@ type Finding struct {
 	// which stays free to reword. See DowngradePreExistingFindings, the one
 	// consumer that needs this as data rather than prose.
 	Line int
+	// Offset is the 0-based byte offset into that file's proposed content
+	// where the violation starts, or 0 when a rule has no meaningful offset
+	// for it — same convention as Line, with one difference: Line is
+	// 1-based so 0 unambiguously means "unset", but a real match CAN start
+	// at byte 0, so Offset's zero value isn't itself proof of "unset". Only
+	// rely on it once Rule/Severity are already known to be ones that always
+	// populate it. See AutoFixThemeTokens, the one consumer that needs
+	// scoping precise to the byte — a flagged declaration sharing a line
+	// with a grandfathered one is exactly the ambiguity Line alone can't
+	// resolve.
+	Offset int
 }
 
 // Snapshot is the current theme state a Proposal is checked against.

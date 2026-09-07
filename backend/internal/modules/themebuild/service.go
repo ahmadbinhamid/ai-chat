@@ -133,7 +133,7 @@ type Service struct {
 	// SetHistorySummarizationEnabled, called once by server.go's wiring.
 	historySummarizationEnabled bool
 	historySummaries            *historySummaryCache
-	historySummaryLocks         *keyedMutex
+	historySummaryLocks         *stripedMutex
 }
 
 // SetHistorySummarizationEnabled overrides the default (enabled) — see the
@@ -178,7 +178,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		tokens:                      newPendingTokens(),
 		historySummarizationEnabled: true,
 		historySummaries:            newHistorySummaryCache(),
-		historySummaryLocks:         newKeyedMutex(),
+		historySummaryLocks:         newStripedMutex(historySummaryLockStripes),
 	}
 }
 
@@ -883,7 +883,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// tightly to just this section per its existing convention (see
 		// themeLocks' own doc comment) — the Claude call above can take
 		// minutes, and a second tab's turn shouldn't queue behind that.
-		unlock, err := s.themeLocks.Lock(ctx, in.ThemeSlug)
+		unlock, err := s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
@@ -1000,6 +1000,27 @@ type rawAssetReader interface {
 // settings aren't a theme file, so they're not part of ThemeStore.
 type storeSettingsFetcher interface {
 	FetchStoreSettings(ctx context.Context, auth themefs.RequestAuth) (themefs.StoreSettings, error)
+}
+
+// productsFetcher is the *themefs.Store-only capability FetchPreviewProducts
+// needs, same reasoning as storeSettingsFetcher above: a real products list
+// isn't a theme file, so it's not part of ThemeStore.
+type productsFetcher interface {
+	FetchProducts(ctx context.Context, auth themefs.RequestAuth, limit int) (themefs.ProductsPage, error)
+}
+
+// FetchPreviewProducts fetches the tenant's real published, active products
+// (first page, capped at limit) for PreviewHandler's buildPreviewContext, so
+// the AI-chat preview's shop/product-detail pages show real product data
+// instead of FixtureProducts' canned "Sample Product" — see
+// themefs.Store.FetchProducts' own doc comment for the endpoint and filters
+// used.
+func (s *Service) FetchPreviewProducts(ctx context.Context, storeAuth themefs.RequestAuth, limit int) (themefs.ProductsPage, error) {
+	fetcher, ok := s.store.(productsFetcher)
+	if !ok {
+		return themefs.ProductsPage{}, fmt.Errorf("theme store does not support products fetch")
+	}
+	return fetcher.FetchProducts(ctx, storeAuth, limit)
 }
 
 // FetchStoreSettings fetches the tenant's real store settings (currently
@@ -1258,7 +1279,10 @@ func (s *Service) CreateThemeFromBase(ctx context.Context, tenantID uint64, toke
 // ever needed templates (nothing but a template is a render target for the
 // Go engine — see liquidrender). LiquidJS's frontend preview needs CSS/JS
 // too, to inline draft stylesheets/scripts (see asset_url's doc comment in
-// liquid-engine.ts).
+// liquid-engine.ts). pages.json is always included, regardless of
+// includeAssets — a route's slug can differ from its liquid file's name
+// (PageEntry.Slug vs .Page), so any caller resolving a URL to an entry file
+// needs it to do that correctly.
 //
 // Reads run concurrently (errgroup, capped at 8 in flight) rather than one
 // HTTP round trip at a time — sequential reads of a real theme's full file
@@ -1282,6 +1306,17 @@ func (s *Service) LoadThemeFiles(ctx context.Context, store themefs.ThemeStore, 
 		if includeAssets && (strings.HasSuffix(path, ".css") || strings.HasSuffix(path, ".js")) {
 			wanted = append(wanted, path)
 		}
+	}
+	// pages.json unconditionally, not gated behind includeAssets: a route's
+	// slug and its actual liquid file name can differ (e.g. slug "shop" ->
+	// page "products" — see PageEntry.Slug vs .Page), and any caller that
+	// resolves a URL path to an entry file needs this to do it correctly
+	// instead of guessing pages/<slug>.liquid, which breaks for exactly that
+	// case. Harmless for callers that don't: the Go liquidrender.Renderer
+	// this also feeds (handlers/preview.go) never references a "pages.json"
+	// key from a {% render %}/{% include %} tag.
+	if paths[pathPagesJSON] {
+		wanted = append(wanted, pathPagesJSON)
 	}
 
 	files := make(map[string]string, len(wanted))

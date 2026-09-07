@@ -521,3 +521,64 @@ func TestMaterializeEdits_TwoFailuresFallsBackToUpdateAdvice(t *testing.T) {
 		t.Errorf("expected the SECOND failure for the same file to fall back to requesting full content, got: %q", secondMsg)
 	}
 }
+
+// TestMaterializeEdits_DuplicatePathsTwiceFailsGeneration confirms the
+// duplicate-paths failure is strike-limited too — it used to return before
+// any counting at all, so a model repeating the same mistake had no bound
+// on how many propose_changes round trips it could burn.
+func TestMaterializeEdits_DuplicatePathsTwiceFailsGeneration(t *testing.T) {
+	result := func() *Result {
+		return &Result{Files: []GeneratedFile{
+			{Path: "components/footer.liquid", Action: "edit", Edits: []Edit{{OldString: "x", NewString: "y"}}},
+			{Path: "components/footer.liquid", Action: "update", Content: "z"},
+		}}
+	}
+	readFile := fixedFileReader(map[string]string{"components/footer.liquid": "x"})
+	counts := map[string]int{}
+
+	_, firstMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	if strings.Contains(firstMsg, "fail the generation") {
+		t.Errorf("expected the FIRST duplicate-paths failure to just describe the problem, got: %q", firstMsg)
+	}
+
+	_, secondMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	if !strings.Contains(secondMsg, "fail the generation") {
+		t.Errorf("expected the SECOND duplicate-paths failure in a row to warn the generation will fail, got: %q", secondMsg)
+	}
+	// The original guidance must still be there — the correct fix (merge
+	// the entries) never changes, unlike the edit-vs-update case.
+	if !strings.Contains(secondMsg, "combine every change to one file into a single files[] entry") {
+		t.Errorf("expected the original merge guidance to still be present at the limit, got: %q", secondMsg)
+	}
+}
+
+// TestMaterializeEdits_NonexistentFileTwiceFailsGeneration confirms the
+// file-not-found failure is strike-limited too — it was deliberately never
+// counted (the comment explained the escape is "create", not "update"), but
+// nothing bounded how many times a model could keep proposing "edit" for a
+// path that doesn't exist.
+func TestMaterializeEdits_NonexistentFileTwiceFailsGeneration(t *testing.T) {
+	result := func() *Result {
+		return &Result{Files: []GeneratedFile{
+			{Path: "components/ghost.liquid", Action: "edit", Edits: []Edit{{OldString: "x", NewString: "y"}}},
+		}}
+	}
+	readFile := fixedFileReader(nil) // "" for every path — nothing exists
+	counts := map[string]int{}
+
+	_, firstMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	if strings.Contains(firstMsg, "fail the generation") {
+		t.Errorf("expected the FIRST file-not-found failure to just describe the problem, got: %q", firstMsg)
+	}
+	if !strings.Contains(firstMsg, `action "create"`) {
+		t.Errorf("expected the original create-instead-of-edit guidance, got: %q", firstMsg)
+	}
+
+	_, secondMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	if !strings.Contains(secondMsg, "fail the generation") {
+		t.Errorf("expected the SECOND file-not-found failure in a row to warn the generation will fail, got: %q", secondMsg)
+	}
+	if !strings.Contains(secondMsg, `action "create"`) {
+		t.Errorf("expected the original create-instead-of-edit guidance to still be present at the limit, got: %q", secondMsg)
+	}
+}

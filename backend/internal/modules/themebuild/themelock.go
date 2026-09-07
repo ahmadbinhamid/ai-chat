@@ -3,6 +3,7 @@ package themebuild
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"time"
@@ -28,6 +29,22 @@ type themeLocker interface {
 	// first — callers must treat that like any other failure to complete
 	// the operation, never enter the critical section anyway.
 	Lock(ctx context.Context, key string) (unlock func(), err error)
+}
+
+// themeLockKey scopes a theme-slug lock to the tenant that owns it — never
+// pass a bare theme slug to Lock. themeSlug is client-supplied (the
+// "theme_slug" request field — see ValidateThemeSlug's own callers) and
+// only validated for path-traversal safety, not namespaced to a tenant on
+// its own; two different tenants whose slugs happen to collide (plausible —
+// slugs read as human-chosen, e.g. "shop") would otherwise serialize
+// against each other's completely unrelated staging/apply calls, for
+// however long the slower one holds the lock. This is a correctness/
+// contention bug, not a data leak — the actual reads/writes underneath
+// still go through storeAuth.TenantID regardless of the lock key — but the
+// lock stops doing its one job (letting two UNRELATED operations run
+// concurrently) the moment two tenants' slugs collide.
+func themeLockKey(tenantID uint64, themeSlug string) string {
+	return fmt.Sprintf("%d:%s", tenantID, themeSlug)
 }
 
 // themeLockTTL bounds how long a Redis-held lock survives without being
@@ -130,12 +147,15 @@ func (l *redisThemeLock) release(redisKey, key, token string) {
 // keyedMutex is the in-process themeLocker fallback used when REDIS_URL
 // isn't set (see NewService) — hands out one *sync.Mutex per key, created
 // lazily. The map grows by one entry per distinct key ever seen by this
-// process, not per request — bounded by how many themes/chats actually
-// exist, unlike a per-token cache, so no sweep/eviction is needed here.
-// ctx is accepted only to satisfy themeLocker; a plain mutex has no way to
-// respect cancellation while blocked, so it's ignored, matching this
-// fallback's existing single-replica-only limitation (see eventBus's own
-// in-process fallback for the same tradeoff).
+// process, not per request — bounded by how many themes actually exist
+// (this is only ever keyed by theme slug), unlike a per-token cache, so no
+// sweep/eviction is needed here. A key space that ISN'T naturally bounded
+// this way (e.g. one that grows with every chat ever created) needs
+// stripedMutex below instead, not this — see its own doc comment. ctx is
+// accepted only to satisfy themeLocker; a plain mutex has no way to respect
+// cancellation while blocked, so it's ignored, matching this fallback's
+// existing single-replica-only limitation (see eventBus's own in-process
+// fallback for the same tradeoff).
 type keyedMutex struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -156,4 +176,39 @@ func (k *keyedMutex) Lock(_ context.Context, key string) (func(), error) {
 
 	lock.Lock()
 	return lock.Unlock, nil
+}
+
+// stripedMutex is a fixed-size alternative to keyedMutex for a lock whose
+// key space is NOT bounded the way keyedMutex's own doc comment describes
+// — historySummaryLocks (see history_summary.go) is keyed by chat ID, which
+// grows for the life of a long-running process with no natural ceiling, so
+// reusing keyedMutex there grew one permanent *sync.Mutex entry per chat
+// that ever crossed summarizeHistoryThreshold, never freed. Hashing the key
+// into one of a small, fixed number of stripes keeps memory O(stripe count)
+// forever instead, at the cost of two DIFFERENT keys occasionally landing
+// on the same stripe and serializing against each other unnecessarily — an
+// acceptable tradeoff, but not a cheap one at historySummaryLocks' actual
+// hold time: that lock is held across the full Summarize model call (a
+// multi-second LLM round trip), by design (see summarizeOldTurnsCached's
+// own doc comment on why — it's what stops two concurrent calls on the SAME
+// chat from both paying for the same summary), so a stripe collision
+// between two DIFFERENT chats stalls the second one for that whole call,
+// not "a few ms" as an earlier version of this comment claimed. Rare (see
+// historySummaryLockStripes' own doc comment on the odds), never a
+// correctness problem, but real when it happens — size the stripe count
+// with that actual cost in mind, not a briefer one.
+type stripedMutex struct {
+	stripes []sync.Mutex
+}
+
+func newStripedMutex(n int) *stripedMutex {
+	return &stripedMutex{stripes: make([]sync.Mutex, n)}
+}
+
+func (s *stripedMutex) Lock(_ context.Context, key string) (func(), error) {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	stripe := &s.stripes[h.Sum32()%uint32(len(s.stripes))]
+	stripe.Lock()
+	return stripe.Unlock, nil
 }

@@ -46,7 +46,12 @@ func FixtureProduct() map[string]any {
 		},
 		"default_variant_id": "v1",
 		"variants_json":      `[{"id":"v1"},{"id":"v2"}]`,
-		"url":                "/products/sample-product",
+		// Singular "product/", not "products/" — matches
+		// PageResolver::RESOURCE_ROUTES' hardcoded '#^product/([^/]+)$#' in
+		// flowpos-backend exactly; that pattern is fixed infrastructure, not
+		// something a theme's pages.json can configure, so this is the one
+		// correct value for every theme, not a per-theme guess.
+		"url": "/product/sample-product",
 	}
 }
 

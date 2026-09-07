@@ -78,11 +78,11 @@ func TestLoadThemeFiles_ReturnsAssetsAndReadsConcurrently(t *testing.T) {
 	if _, ok := result["js/app.js"]; !ok {
 		t.Error("expected js/app.js to be included with includeAssets: true")
 	}
-	if _, ok := result["pages.json"]; ok {
-		t.Error("expected pages.json (neither .liquid, .css, nor .js) to be excluded")
+	if _, ok := result["pages.json"]; !ok {
+		t.Error("expected pages.json to be included unconditionally, even though it's neither .liquid, .css, nor .js")
 	}
-	if len(result) != 4 {
-		t.Errorf("expected exactly the 2 liquid + 2 asset files, got %d: %+v", len(result), result)
+	if len(result) != 5 {
+		t.Errorf("expected exactly the 2 liquid + 2 asset files + pages.json, got %d: %+v", len(result), result)
 	}
 
 	if got := atomic.LoadInt32(&maxInFlight); got < 2 {
@@ -91,11 +91,14 @@ func TestLoadThemeFiles_ReturnsAssetsAndReadsConcurrently(t *testing.T) {
 }
 
 // TestLoadThemeFiles_LiquidOnlyByDefault confirms includeAssets: false
-// keeps the original .liquid-only behavior existing callers relied on.
+// keeps the original .liquid-only behavior existing callers relied on for
+// CSS/JS, while pages.json is still included regardless — see
+// LoadThemeFiles's doc comment on why that one's unconditional.
 func TestLoadThemeFiles_LiquidOnlyByDefault(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{
 		"pages/home.liquid": "<html/>",
 		"css/style.css":     "body{}",
+		"pages.json":        "[]",
 	})
 	defer ts.Close()
 
@@ -109,5 +112,8 @@ func TestLoadThemeFiles_LiquidOnlyByDefault(t *testing.T) {
 	}
 	if _, ok := result["pages/home.liquid"]; !ok {
 		t.Error("expected the liquid file included")
+	}
+	if _, ok := result["pages.json"]; !ok {
+		t.Error("expected pages.json included even when includeAssets is false")
 	}
 }

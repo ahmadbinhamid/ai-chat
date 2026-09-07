@@ -20,13 +20,23 @@ import (
 // just that method with auth curried in, nothing extra to implement.
 type FileReader func(ctx context.Context, path string) (content string, err error)
 
-// maxEditMaterializationFailures bounds how many times ONE file's edits are
-// allowed to fail materialization (a bad old_string, not a read error)
-// before materializeEdits stops asking for a corrected edit and tells the
-// model to resubmit that file as a full "update" instead — see
+// maxEditMaterializationFailures bounds how many times a materialization
+// failure is allowed to repeat — a bad old_string, a read error, a
+// nonexistent edit target — before materializeEdits stops just repeating
+// its usual guidance and tells the model plainly that doing it again will
+// fail the generation. Keyed per file path for those; the duplicate-paths
+// failure below isn't about any single file, so it gets its own reserved
+// key (duplicatePathsFailureKey) in the same map instead. See
 // materializeEdits' own doc comment on why this is the safe fallback rather
-// than looping indefinitely on a find/replace the model can't get right.
+// than looping indefinitely on something the model can't get right.
 const maxEditMaterializationFailures = 2
+
+// duplicatePathsFailureKey is the failureCounts key used to strike-count the
+// duplicate-paths failure below, which isn't about any single file so it
+// can't be keyed by path the way every other failure here is. Angle
+// brackets never appear in a theme-relative file path, so this can never
+// collide with a real per-file count sharing the same map.
+const duplicatePathsFailureKey = "<duplicate-paths>"
 
 // materializeEdits turns every "edit"-action file in result into "update"
 // with real content, in place — see GeneratedFile's own doc comment for why
@@ -44,10 +54,15 @@ const maxEditMaterializationFailures = 2
 // call (not be reset per attempt) — see the constant above.
 func materializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
 	if dupes := duplicateFilePaths(result.Files); len(dupes) > 0 {
-		return false, fmt.Sprintf(
+		failureCounts[duplicatePathsFailureKey]++
+		msg := fmt.Sprintf(
 			"files[] proposes the same path more than once, which is ambiguous: %s. Each path must appear at most "+
 				"once — combine every change to one file into a single files[] entry (multiple edits[] pairs on one "+
 				"entry are fine).", strings.Join(dupes, ", "))
+		if failureCounts[duplicatePathsFailureKey] >= maxEditMaterializationFailures {
+			msg += " This has now failed repeatedly — repeating it again will fail the generation."
+		}
+		return false, msg
 	}
 
 	var problems []string
@@ -72,12 +87,21 @@ func materializeEdits(ctx context.Context, result *Result, readFile FileReader, 
 		if content == "" {
 			// readFile returns "" for a path that doesn't exist (see
 			// FileReader's doc comment) — an edit target must already
-			// exist, that's the whole premise of a find/replace. Not
-			// counted toward failureCounts: falling back to "update" isn't
-			// a fix here, "create" already is.
-			slog.Warn("ai: edit materialization failed", "path", f.Path, "reason", "file_not_found")
-			problems = append(problems, fmt.Sprintf(
-				`%s: does not exist — use action "create" with full content instead of "edit" for a new file`, f.Path))
+			// exist, that's the whole premise of a find/replace. The
+			// correct escape is "create", not "update" (the applyErr
+			// fallback below), but a model that keeps proposing "edit" for
+			// a nonexistent path still needs a hard stop after
+			// maxEditMaterializationFailures like every other
+			// materialization failure — the fix being different from
+			// applyErr's doesn't mean it should retry forever.
+			failureCounts[f.Path]++
+			slog.Warn("ai: edit materialization failed", "path", f.Path, "reason", "file_not_found", "failure_count", failureCounts[f.Path])
+			msg := fmt.Sprintf(
+				`%s: does not exist — use action "create" with full content instead of "edit" for a new file`, f.Path)
+			if failureCounts[f.Path] >= maxEditMaterializationFailures {
+				msg += " This has now failed repeatedly — resubmitting \"edit\" for this path again will fail the generation."
+			}
+			problems = append(problems, msg)
 			continue
 		}
 
