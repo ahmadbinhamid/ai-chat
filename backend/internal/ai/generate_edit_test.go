@@ -48,7 +48,7 @@ func TestGenerate_EditMaterializesWithoutExtraAPICall(t *testing.T) {
 		return "<footer>Copyright 2024</footer>", nil
 	}
 
-	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "update copyright year", nil, nil, nil, readFile)
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "update copyright year", nil, nil, nil, nil, readFile)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestGenerate_ZeroMatchOldStringRetriesNotFails(t *testing.T) {
 	g := newTestGenerator(client)
 	readFile := func(context.Context, string) (string, error) { return "<footer>original</footer>", nil }
 
-	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "prompt", nil, nil, nil, readFile)
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "prompt", nil, nil, nil, nil, readFile)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestGenerate_MultipleMatchesRetriesNotFails(t *testing.T) {
 	g := newTestGenerator(client)
 	readFile := func(context.Context, string) (string, error) { return "dup one, dup two", nil }
 
-	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "prompt", nil, nil, nil, readFile)
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "prompt", nil, nil, nil, nil, readFile)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestGenerate_TwoFailedEditsFallBackToFullContentRequest(t *testing.T) {
 	g := newTestGenerator(client)
 	readFile := func(context.Context, string) (string, error) { return "<footer>original</footer>", nil }
 
-	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "prompt", nil, nil, nil, readFile)
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "prompt", nil, nil, nil, nil, readFile)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}

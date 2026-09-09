@@ -90,4 +90,28 @@ type Message struct {
 	ApplyStatus  ApplyStatus   `json:"apply_status"`
 	AppliedAt    *time.Time    `json:"applied_at"`
 	CreatedAt    time.Time     `json:"created_at"`
+	// Images is only ever non-empty on a user-role turn that attached one
+	// or more images (see the image-attachment feature; capped at
+	// maxImagesPerMessage) — nil/empty on every other turn. Only ever read
+	// back for THIS turn's own re-send to the model on a retry within the
+	// same generation; never resurfaced to later turns via toTurns (see
+	// themebuild's history-building).
+	Images []MessageImage `json:"images,omitempty"`
+	// HTMLAttachmentFilename/HTMLAttachmentContent are only ever set
+	// together, on a user-role turn that attached one reference HTML file
+	// (see the HTML-attachment feature — at most one per message, unlike
+	// Images' cap of maxImagesPerMessage: raw text tokens cost far more
+	// per byte than an image's flat per-image token cost, so this stays
+	// deliberately tighter). Same non-resurfacing rule as Images — read
+	// back only for THIS turn's own retries, never replayed via toTurns.
+	HTMLAttachmentFilename *string `json:"html_attachment_filename,omitempty"`
+	HTMLAttachmentContent  *string `json:"html_attachment_content,omitempty"`
+}
+
+// MessageImage is one attached image — Base64 is raw (no data: URI
+// prefix). Stored as a JSON array in chat_messages.images (LONGTEXT) —
+// see the repository's imagesToJSON/imagesFromJSON.
+type MessageImage struct {
+	Base64    string `json:"base64"`
+	MediaType string `json:"media_type"`
 }

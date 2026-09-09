@@ -38,6 +38,19 @@ type Turn struct {
 	Content string
 }
 
+// Image is one attached image, passed to Generate as a []Image (capped at
+// themebuild.maxImagesPerMessage) — never part of Turn, since history is
+// replayed as plain text (see toTurns in themebuild) and an old turn's
+// images are deliberately never resurfaced on a later call (keeps token
+// cost and blast radius bounded — see the image-attachment feature's scope
+// notes). MediaType must be one of the SDK's supported
+// Base64ImageSourceMediaType values (image/jpeg, image/png, image/gif,
+// image/webp).
+type Image struct {
+	Base64    string
+	MediaType string
+}
+
 // GeneratedFile is one file the model proposes creating, updating, or
 // editing. Action "edit" is a wire-format optimization only — see
 // materializeEdits, which Generate calls immediately after parsing
@@ -130,6 +143,14 @@ type Generator struct {
 	client anthropic.Client
 	model  anthropic.Model
 	effort anthropic.OutputConfigEffort
+	// visionModel is used instead of model for any call that carries an
+	// Image — empty means this deployment has no vision-capable model
+	// configured (see SupportsVision). A separate model, not a capability
+	// flag on model itself, because a normal text-only turn should keep
+	// using the configured text model even when a vision model is also
+	// available — swapping unconditionally would trade proven output
+	// quality for vision support on every turn, not just image-bearing ones.
+	visionModel anthropic.Model
 	// fake, when true, makes Generate return a canned Result after
 	// fakeDelay — no Anthropic API call, no tokens spent — see NewFake and
 	// its doc comment for what this is for.
@@ -162,7 +183,7 @@ type Generator struct {
 // OfAny; DeepSeek's model will still reason its way to skipping one anyway.
 // See Generate's "len(toolUses) == 0" handling, which nudges rather than
 // fails outright specifically to route around this.
-func New(apiKey, baseURL, model, effort string, maxTokens int64) (*Generator, error) {
+func New(apiKey, baseURL, model, effort, visionModel string, maxTokens int64) (*Generator, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("API key is not set")
 	}
@@ -182,13 +203,22 @@ func New(apiKey, baseURL, model, effort string, maxTokens int64) (*Generator, er
 		"effort", effort,
 		"max_tokens", maxTokens,
 		"base_url_set", baseURL != "",
-		"adaptive_thinking_supported", modelSupportsAdaptiveThinking(model))
+		"adaptive_thinking_supported", modelSupportsAdaptiveThinking(model),
+		"vision_model", visionModel)
 	return &Generator{
-		client:    anthropic.NewClient(opts...),
-		model:     model,
-		effort:    anthropic.OutputConfigEffort(effort),
-		maxTokens: maxTokens,
+		client:      anthropic.NewClient(opts...),
+		model:       model,
+		effort:      anthropic.OutputConfigEffort(effort),
+		maxTokens:   maxTokens,
+		visionModel: visionModel,
 	}, nil
+}
+
+// SupportsVision reports whether this Generator was configured with a
+// vision-capable model — Generate rejects an Image when this is false
+// rather than silently sending it to a model that can't use it.
+func (g *Generator) SupportsVision() bool {
+	return g.visionModel != ""
 }
 
 // NewFake builds a Generator that never calls Claude — Generate instead
@@ -459,9 +489,23 @@ var errMaxTokensTruncated = errors.New("model response was truncated at the max_
 // useful for a live "..." progress indicator. progress, if non-nil, is
 // notified around every toolExec call — see ToolProgress's doc comment for
 // why the caller (not this method) decides what to do with that.
-func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, onDelta func(string), progress ToolProgress, toolExec ToolExecutor, readFile FileReader) (*Result, error) {
+func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, images []Image, onDelta func(string), progress ToolProgress, toolExec ToolExecutor, readFile FileReader) (*Result, error) {
 	if g.fake {
 		return g.fakeGenerate(ctx, prompt)
+	}
+	// Defense in depth beyond themebuild.Service.Generate's own check —
+	// this method is a public API other callers could hit directly.
+	if len(images) > 0 && !g.SupportsVision() {
+		return nil, fmt.Errorf("image attached but no vision model is configured")
+	}
+	// Which model THIS call uses — the configured vision model when at
+	// least one image is attached, the normal text model otherwise.
+	// Deliberately not g.model unconditionally: see visionModel's own doc
+	// comment on why a normal text-only turn must keep using the proven
+	// text model even when a vision model happens to also be configured.
+	callModel := g.model
+	if len(images) > 0 {
+		callModel = g.visionModel
 	}
 	// Keyed by path, persists across every iteration of this one Generate
 	// call — see materializeEdits' own doc comment on why a path that keeps
@@ -500,7 +544,16 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			lastBlock.OfText.CacheControl = cacheControl
 		}
 	}
-	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)))
+	if len(images) > 0 {
+		blocks := make([]anthropic.ContentBlockParamUnion, 0, len(images)+1)
+		for _, img := range images {
+			blocks = append(blocks, anthropic.NewImageBlockBase64(img.MediaType, img.Base64))
+		}
+		blocks = append(blocks, anthropic.NewTextBlock(prompt))
+		messages = append(messages, anthropic.NewUserMessage(blocks...))
+	} else {
+		messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)))
+	}
 
 	tools := toolsForMode(tc.GenerationMode)
 	// The dynamic block (pages.json, defaults.json, file tree, manifest —
@@ -570,7 +623,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				"iteration", iteration, "max_tool_iterations", maxToolIterations)
 		}
 		params := anthropic.MessageNewParams{
-			Model:      g.model,
+			Model:      callModel,
 			MaxTokens:  g.maxTokens,
 			System:     system,
 			Messages:   messages,
@@ -602,7 +655,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// (400) on Haiku-tier models — leave both fields zero-valued (omitted
 		// from the request, see their "omitzero" json tags) rather than
 		// sending a value that model can't accept.
-		if modelSupportsAdaptiveThinking(g.model) {
+		if modelSupportsAdaptiveThinking(callModel) {
 			params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}}
 			params.OutputConfig = anthropic.OutputConfigParam{Effort: g.effort}
 		}

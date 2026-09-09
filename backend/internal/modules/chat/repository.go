@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -71,11 +72,41 @@ func touchChatUsage(ctx context.Context, e execer, chatID string, inputTokens, o
 	return checkAffected(res)
 }
 
+// imagesToJSON marshals a message's attached images into the column's
+// storage shape — nil for zero images (matches every non-image turn,
+// stored as SQL NULL), a JSON array otherwise.
+func imagesToJSON(images []MessageImage) (*string, error) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	raw, err := json.Marshal(images)
+	if err != nil {
+		return nil, err
+	}
+	s := string(raw)
+	return &s, nil
+}
+
+func imagesFromJSON(raw *string) ([]MessageImage, error) {
+	if raw == nil || *raw == "" {
+		return nil, nil
+	}
+	var images []MessageImage
+	if err := json.Unmarshal([]byte(*raw), &images); err != nil {
+		return nil, err
+	}
+	return images, nil
+}
+
 func createMessage(ctx context.Context, e execer, m Message) error {
-	_, err := e.ExecContext(ctx, `
-		INSERT INTO chat_messages (id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, m.ID, m.ChatID, m.TenantID, m.Role, m.UserID, m.UserName, m.UserEmail, m.Content, m.Status, m.InputTokens, m.OutputTokens, m.ApplyStatus, m.AppliedAt, m.CreatedAt)
+	imagesJSON, err := imagesToJSON(m.Images)
+	if err != nil {
+		return err
+	}
+	_, err = e.ExecContext(ctx, `
+		INSERT INTO chat_messages (id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at, images, html_attachment_filename, html_attachment_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, m.ID, m.ChatID, m.TenantID, m.Role, m.UserID, m.UserName, m.UserEmail, m.Content, m.Status, m.InputTokens, m.OutputTokens, m.ApplyStatus, m.AppliedAt, m.CreatedAt, imagesJSON, m.HTMLAttachmentFilename, m.HTMLAttachmentContent)
 	return err
 }
 
@@ -101,7 +132,7 @@ func (r *Repository) CreateMessageAndTouchUsage(ctx context.Context, m Message, 
 
 func (r *Repository) ListMessagesByChat(ctx context.Context, chatID string) ([]Message, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at
+		SELECT id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at, images, html_attachment_filename, html_attachment_content
 		FROM chat_messages WHERE chat_id = ? ORDER BY created_at ASC
 	`, chatID)
 	if err != nil {
@@ -122,7 +153,7 @@ func (r *Repository) ListMessagesByChat(ctx context.Context, chatID string) ([]M
 
 func (r *Repository) GetMessageByID(ctx context.Context, id string) (Message, error) {
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at
+		SELECT id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at, images, html_attachment_filename, html_attachment_content
 		FROM chat_messages WHERE id = ?
 	`, id)
 	return scanMessage(row)
@@ -145,12 +176,20 @@ func scanChat(s scanner) (Chat, error) {
 
 func scanMessage(s scanner) (Message, error) {
 	var m Message
+	var imagesJSON *string
 	err := s.Scan(&m.ID, &m.ChatID, &m.TenantID, &m.Role, &m.UserID, &m.UserName, &m.UserEmail, &m.Content, &m.Status,
-		&m.InputTokens, &m.OutputTokens, &m.ApplyStatus, &m.AppliedAt, &m.CreatedAt)
+		&m.InputTokens, &m.OutputTokens, &m.ApplyStatus, &m.AppliedAt, &m.CreatedAt, &imagesJSON,
+		&m.HTMLAttachmentFilename, &m.HTMLAttachmentContent)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, ErrNotFound
 	}
-	return m, err
+	if err != nil {
+		return Message{}, err
+	}
+	if m.Images, err = imagesFromJSON(imagesJSON); err != nil {
+		return Message{}, err
+	}
+	return m, nil
 }
 
 func checkAffected(res sql.Result) error {

@@ -132,7 +132,10 @@ func (s *Service) GetMessage(ctx context.Context, chatID, messageID string) (Mes
 // every user on the tenant (see GetOrCreateChat), userName/userEmail are
 // what let the transcript attribute this turn to a person instead of a
 // generic "You".
-func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64, userName, userEmail, content string) (Message, error) {
+func (s *Service) RecordUserMessage(
+	ctx context.Context, c Chat, userID *uint64, userName, userEmail, content string,
+	images []MessageImage, htmlAttachmentFilename, htmlAttachmentContent *string,
+) (Message, error) {
 	now := time.Now().UTC()
 	var namePtr *string
 	if userName != "" {
@@ -143,17 +146,20 @@ func (s *Service) RecordUserMessage(ctx context.Context, c Chat, userID *uint64,
 		emailPtr = &userEmail
 	}
 	m := Message{
-		ID:          uuid.NewString(),
-		ChatID:      c.ID,
-		TenantID:    c.TenantID,
-		Role:        RoleUser,
-		UserID:      userID,
-		UserName:    namePtr,
-		UserEmail:   emailPtr,
-		Content:     content,
-		Status:      MessageStatusCompleted,
-		ApplyStatus: ApplyStatusNotApplicable,
-		CreatedAt:   now,
+		ID:                     uuid.NewString(),
+		ChatID:                 c.ID,
+		TenantID:               c.TenantID,
+		Role:                   RoleUser,
+		UserID:                 userID,
+		UserName:               namePtr,
+		UserEmail:              emailPtr,
+		Content:                content,
+		Status:                 MessageStatusCompleted,
+		ApplyStatus:            ApplyStatusNotApplicable,
+		CreatedAt:              now,
+		Images:                 images,
+		HTMLAttachmentFilename: htmlAttachmentFilename,
+		HTMLAttachmentContent:  htmlAttachmentContent,
 	}
 	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, 0, 0, now); err != nil {
 		return Message{}, err

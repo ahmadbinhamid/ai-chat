@@ -72,9 +72,9 @@ func main() {
 
 	var generator *ai.Generator
 	if cfg.AIProvider == "deepseek" {
-		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.MaxTokens)
+		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens)
 	} else {
-		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.MaxTokens)
+		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens)
 	}
 	if err != nil {
 		// One-shot CLI command exiting the whole process — the OS reclaims

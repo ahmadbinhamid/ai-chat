@@ -2,6 +2,7 @@ package themebuild
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,41 @@ const (
 	// gives up — up to maxThemeCheckRetries+1 total Generate calls (the
 	// original attempt plus this many retries).
 	maxThemeCheckRetries = 2
+
+	// maxImagesPerMessage bounds how many images one prompt can attach —
+	// see the image-attachment feature. Enforced here (not just the
+	// frontend) since a client-side cap alone is trivially bypassable by
+	// anyone calling this API directly.
+	maxImagesPerMessage = 5
+
+	// MaxImageAttachmentBytes bounds one attached image's decoded size —
+	// exported (all attachment size/validation logic lives here in the
+	// service, not the HTTP handler — see the image/HTML-attachment
+	// features' own doc comments) so the handler never needs its own
+	// mirrored literal. The same 5MB tenant-dashboard already enforces
+	// client-side for its own image uploads (MAX_IMAGE_UPLOAD_BYTES) — a
+	// client-side cap alone is trivially bypassable by anyone calling this
+	// API directly, so this is the real enforcement.
+	MaxImageAttachmentBytes = 5 * 1024 * 1024
+
+	// MaxHTMLUploadBytes is what's accepted on the wire, BEFORE
+	// SanitizeHTMLAttachment strips it — generous, since a real "save page
+	// as HTML" export commonly embeds every image as a giant inline base64
+	// data: URI, which stripping removes entirely. MaxHTMLAttachmentBytes
+	// below is the real, much tighter cap that applies AFTER stripping,
+	// since that's what actually reaches the model as prompt text.
+	MaxHTMLUploadBytes = 5 * 1024 * 1024
+
+	// MaxHTMLAttachmentBytes bounds one attached reference HTML file's
+	// content AFTER SanitizeHTMLAttachment strips scripts and inline
+	// base64 assets. Far tighter than an image's cost: raw text tokens
+	// cost roughly 1 per ~4 characters, unlike an image's flat per-image
+	// token cost, so this can't be anywhere near the image size cap
+	// without risking a very expensive single turn — ~300KB is generous
+	// for real markup/CSS once embedded assets are gone, while staying
+	// well under maxTokens' own headroom once combined with the rest of a
+	// turn's prompt/system/tool-loop budget.
+	MaxHTMLAttachmentBytes = 300_000
 
 	pathDefaultsJSON = "defaults.json"
 )
@@ -96,7 +132,12 @@ func heartbeatTickerInterval() time.Duration { return time.Duration(heartbeatTic
 // calls per turn). *ai.Generator satisfies this today with no changes on
 // its side; callers passing one continue to work unchanged.
 type generator interface {
-	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor, readFile ai.FileReader) (*ai.Result, error)
+	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, images []ai.Image, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor, readFile ai.FileReader) (*ai.Result, error)
+	// SupportsVision reports whether this generator was configured with a
+	// vision-capable model — see Generate's own guard using this, which
+	// rejects an image-bearing prompt up front rather than persisting an
+	// image nothing downstream can ever process.
+	SupportsVision() bool
 	// Summarize is used by summarizeOldTurns to collapse old chat history
 	// into one synthetic turn instead of resending it verbatim on every
 	// call — see summarizeOldTurns's doc comment. *ai.Generator's fake mode
@@ -240,6 +281,24 @@ func (p *pendingTokens) discard(generationID string) {
 	delete(p.tokens, generationID)
 }
 
+// ErrVisionNotConfigured means a prompt attached an image but this
+// deployment has no vision-capable model configured (DEEPSEEK_VISION_MODEL/
+// ANTHROPIC_VISION_MODEL) — rejected up front, before RecordUserMessage
+// ever persists an image nothing could process.
+var ErrVisionNotConfigured = errors.New("image attachments aren't enabled on this deployment")
+
+// ErrTooManyImages means a prompt attached more than maxImagesPerMessage
+// images.
+var ErrTooManyImages = errors.New("too many images attached")
+
+// ErrImageTooLarge means one attached image's decoded size exceeded
+// MaxImageAttachmentBytes.
+var ErrImageTooLarge = errors.New("an attached image is too large")
+
+// ErrHTMLAttachmentTooLarge means the attached HTML file's content
+// exceeded MaxHTMLUploadBytes (raw) or MaxHTMLAttachmentBytes (post-strip).
+var ErrHTMLAttachmentTooLarge = errors.New("attached HTML file is too large")
+
 // ErrGenerationInProgress means the tenant's chat already has a background
 // generation running — see the generations table (phase 3a) and
 // Repository.StartGeneration/DequeueNext. Generate itself never returns
@@ -264,6 +323,30 @@ type GenerateInput struct {
 	Token     string
 	ThemeSlug string
 	Prompt    string
+	// Images, when non-empty (capped at maxImagesPerMessage), attaches one
+	// or more images to this turn's prompt — see the image-attachment
+	// feature. Only ever sent to the model for turns processed as part of
+	// THIS generation call (the initial attempt and any invalid-proposal/
+	// repair retries within it, which each call Generate fresh — see
+	// generateValidProposal/checkAndRepair); never resurfaced on a later,
+	// separate prompt.
+	Images []chat.MessageImage
+	// HTMLAttachmentFilename/HTMLAttachmentContent, when both set, attach
+	// one reference HTML file to this turn's prompt — see the
+	// HTML-attachment feature. Same "only this call, never resurfaced
+	// later" rule as Images, folded into the effective prompt text at
+	// each Generate call within this turn (see promptWithHTMLAttachment)
+	// rather than sent as a separate structured param, since it's plain
+	// text — no vision-model plumbing needed for it.
+	HTMLAttachmentFilename *string
+	HTMLAttachmentContent  *string
+	// UserMessageID is set by Generate right after RecordUserMessage and
+	// carried through the queue (Generation.UserMessageID) so doGenerate
+	// can re-resolve Images from chat_messages once this turn actually
+	// runs — runOneQueuedGeneration rebuilds GenerateInput fresh from the
+	// generations row on every dequeue, so Images set here don't otherwise
+	// survive that rebuild. See doGenerate.
+	UserMessageID *string
 	// Mode restricts what this one turn may touch — see the
 	// ai.GenerationMode* constants. Empty (the default, and what every
 	// caller sends today) behaves as ai.GenerationModeEdit: the full
@@ -356,16 +439,47 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if in.ThemeSlug == "" {
 		return GenerateOutcome{}, errors.New("theme_slug is required")
 	}
+	if len(in.Images) > maxImagesPerMessage {
+		return GenerateOutcome{}, fmt.Errorf("%w: at most %d images per message", ErrTooManyImages, maxImagesPerMessage)
+	}
+	// Reject before ever persisting an image nothing downstream can
+	// process — cheaper and clearer than letting it fail deep inside
+	// doGenerate once this turn is dequeued.
+	if len(in.Images) > 0 && !s.gen.SupportsVision() {
+		return GenerateOutcome{}, ErrVisionNotConfigured
+	}
+	// DecodedLen is pure arithmetic on the base64 string's own length — no
+	// need to actually decode just to measure size (the HTTP handler
+	// already validated each Base64 field really is valid base64 at bind
+	// time; this only needs the size).
+	for i, img := range in.Images {
+		if base64.StdEncoding.DecodedLen(len(img.Base64)) > MaxImageAttachmentBytes {
+			return GenerateOutcome{}, fmt.Errorf("%w: image %d", ErrImageTooLarge, i)
+		}
+	}
+	if in.HTMLAttachmentContent != nil {
+		if len(*in.HTMLAttachmentContent) > MaxHTMLUploadBytes {
+			return GenerateOutcome{}, fmt.Errorf("%w: attached HTML file is over %d bytes", ErrHTMLAttachmentTooLarge, MaxHTMLUploadBytes)
+		}
+		sanitized := SanitizeHTMLAttachment(*in.HTMLAttachmentContent)
+		if len(sanitized) > MaxHTMLAttachmentBytes {
+			return GenerateOutcome{}, fmt.Errorf(
+				"%w: still over %d bytes after removing embedded images/scripts",
+				ErrHTMLAttachmentTooLarge, MaxHTMLAttachmentBytes)
+		}
+		in.HTMLAttachmentContent = &sanitized
+	}
 
 	c, err := s.chats.GetOrCreateChat(ctx, in.TenantID, ChatType)
 	if err != nil {
 		return GenerateOutcome{}, err
 	}
 
-	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt)
+	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt, in.Images, in.HTMLAttachmentFilename, in.HTMLAttachmentContent)
 	if err != nil {
 		return GenerateOutcome{}, fmt.Errorf("record user message: %w", err)
 	}
+	in.UserMessageID = &userMsg.ID
 
 	genID := uuid.NewString()
 	position, err := s.repo.EnqueueGeneration(ctx, Generation{
@@ -492,11 +606,12 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	}
 
 	in := GenerateInput{
-		TenantID:  g.TenantID,
-		Token:     token,
-		ThemeSlug: g.ThemeSlug,
-		Prompt:    g.Prompt,
-		Mode:      g.Mode,
+		TenantID:      g.TenantID,
+		Token:         token,
+		ThemeSlug:     g.ThemeSlug,
+		Prompt:        g.Prompt,
+		Mode:          g.Mode,
+		UserMessageID: g.UserMessageID,
 	}
 
 	// Each drain-loop iteration gets its own fresh timeout — one shared
@@ -832,6 +947,25 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
 		return fmt.Errorf("load chat history: %w", err)
+	}
+
+	// in arrives here rebuilt fresh from the generations row (see
+	// runOneQueuedGeneration) — it never carries an image straight from
+	// Generate's own local scope, since a dequeue can happen well after
+	// that scope returns. Re-resolve it from the just-loaded history
+	// instead: in.UserMessageID (carried through Generation.UserMessageID)
+	// points at the exact chat_messages row Generate wrote it to. in is a
+	// value parameter, so this reassignment is local to this call only —
+	// never leaks back to the caller.
+	if in.UserMessageID != nil {
+		for _, m := range priorMessages {
+			if m.ID == *in.UserMessageID {
+				in.Images = m.Images
+				in.HTMLAttachmentFilename = m.HTMLAttachmentFilename
+				in.HTMLAttachmentContent = m.HTMLAttachmentContent
+				break
+			}
+		}
 	}
 
 	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)

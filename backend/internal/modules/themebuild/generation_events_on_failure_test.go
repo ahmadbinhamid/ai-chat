@@ -19,13 +19,15 @@ import (
 // does once retErr is non-nil, not about a real Claude call.
 type alwaysFailGenerator struct{}
 
-func (alwaysFailGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, string, func(string), ai.ToolProgress, ai.ToolExecutor, ai.FileReader) (*ai.Result, error) {
+func (alwaysFailGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, string, []ai.Image, func(string), ai.ToolProgress, ai.ToolExecutor, ai.FileReader) (*ai.Result, error) {
 	return nil, context.Canceled
 }
 
 func (alwaysFailGenerator) Summarize(context.Context, []ai.Turn) (string, error) {
 	return "", nil
 }
+
+func (alwaysFailGenerator) SupportsVision() bool { return false }
 
 // TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext is the
 // mandatory regression test for the emitCtx fix: before it, doGenerate's

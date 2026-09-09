@@ -32,7 +32,7 @@ type scriptedResult struct {
 	err   error
 }
 
-func (g *scriptedGenerator) Generate(ctx context.Context, _ ai.ThemeContext, _ []ai.Turn, prompt string, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
+func (g *scriptedGenerator) Generate(ctx context.Context, _ ai.ThemeContext, _ []ai.Turn, prompt string, _ []ai.Image, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
 	g.mu.Lock()
 	i := g.calls
 	g.calls++
@@ -66,6 +66,8 @@ func (g *scriptedGenerator) callCount() int {
 }
 
 func (*scriptedGenerator) Summarize(context.Context, []ai.Turn) (string, error) { return "", nil }
+
+func (*scriptedGenerator) SupportsVision() bool { return false }
 
 // newQueueTestService builds a Service backed by the real test DB/chat
 // service and a store standing in for flowpos-backend's theme-file API:
