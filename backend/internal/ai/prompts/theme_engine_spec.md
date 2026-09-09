@@ -10,7 +10,9 @@ Every extra tool call is another round trip the merchant waits through. Finish i
 
 **Batch your reads.** `read_theme_file` accepts up to **10 paths in one call**. Work out everything you are likely to need, then read it all at once. Do not read one file, think, then read another — that turns one round trip into five. Two batched calls should cover almost any request.
 
-**Never read or write `liquid/layout-start.liquid` or `liquid/layout-end.liquid`.** They are spliced for you. To register a new stylesheet, return its path in `layout_links_to_add`; for a script, `layout_scripts_to_add`. §3 below is the current, complete page boilerplate, so there is never a reason to open the layout to check it.
+**Prefer never reading or writing `liquid/layout-start.liquid` or `liquid/layout-end.liquid` directly.** For the common case — registering a new stylesheet or script — return its path in `layout_links_to_add`/`layout_scripts_to_add` instead; it's spliced in for you, with no read required. §3 below is the current, complete page boilerplate, so there is rarely a reason to open the layout just to check it.
+
+Direct edits to these two files ARE allowed (via a normal `files[]` entry, same as any other file) when the change is genuinely structural — not just adding an asset link, but changing what the layout itself renders (the header/footer render calls, the `<head>` contents, a new global wrapper element). Read the whole file first, same as any other edit. **If you directly edit one of these files in a turn, do not ALSO return `layout_links_to_add`/`layout_scripts_to_add` for that same file in that turn** — a direct edit already owns that file's content for the turn, and any `<link>`/`<script>` tag you want registered must be included in your own edit instead; a splice submitted alongside a direct edit to the same file is silently ignored, not applied on top of it.
 
 **Where to look, by request type** — read the whole row in one batched call:
 
@@ -64,7 +66,9 @@ Liquid (Shopify-style). The engine is the full [keepsuit/liquid](https://github.
 
 No `layouts/`, `sections/`, `templates/`, or `locales/` folders exist. Single layout, single (English) locale.
 
-The two `liquid/layout-*.liquid` files are listed here so you understand the structure, not so you edit them. See §0.
+`robots.txt` (theme root, alongside `defaults.json`/`pages.json`) is also part of the theme and directly editable — plain-text `User-agent`/`Disallow`/`Allow`/`Sitemap` directives, nothing else; do not add HTML, comments-as-markup, or any other format to it.
+
+The two `liquid/layout-*.liquid` files are directly editable now too — see §0 for when to reach for that instead of `layout_links_to_add`/`layout_scripts_to_add`, and the rule about never combining the two for the same file in the same turn.
 
 ## 3. Mandatory page boilerplate
 
@@ -138,7 +142,11 @@ Both examples above are complete files. For a simple content page you can usuall
 
 ## 5. Routing — `pages.json`
 
-One flat object per route. Adding a page = adding an entry here **and** creating the matching `pages/<slug>.liquid` file (or `pages/auth/<slug>.liquid` if it needs the account-page treatment):
+One flat object per route. Adding a page = adding an entry here **and** creating the matching `pages/<slug>.liquid` file (or `pages/auth/<slug>.liquid` if it needs the account-page treatment).
+
+**For adding or updating one page's own registration, always prefer `page_registry_entry` over a direct `pages.json` edit.** It's a single structured field — you supply that one page's entry, the platform merges it into `pages.json` for you, and every other route's entry is untouched by construction. This is safer than it sounds, not just more convenient: `pages.json` is a single JSON object holding **every route in the theme**, and a direct full-file edit that leaves out (or subtly changes) an unrelated entry silently breaks that route — a routing outage, not a formatting slip, and nothing else will catch it for you.
+
+Reach for a **direct `pages.json` edit** (a normal `files[]` entry, `.json` is an allowed extension) only for what `page_registry_entry` can't do — removing a route entirely, or changing more than one existing entry's fields in the same turn. If you do this: read the current `pages.json` (already in your context — no tool call needed) and reproduce **every existing entry**, changing only the ones the request actually concerns. Never write a `pages.json` that's missing a route that existed before your turn, and never invent, drop, or reorder a field on an entry you weren't asked to touch.
 
 ```json
 {
@@ -261,7 +269,7 @@ This table is the authoritative signature list. You do not need to read a compon
 - `pages/<kebab-case-slug>.liquid` → route `/<kebab-case-slug>`, 1:1, matching `pages.json`'s `slug`/`page` fields for `type: "custom"` entries.
 - Auth/account pages: `pages/auth/<name>.liquid`, `path: "/pages/auth"` in `pages.json`.
 - CSS/JS files mirror their Liquid file's basename exactly (`pages/foo.liquid` ↔ `pages/css/foo.css`; `components/bar.liquid` ↔ `components/css/bar.css`).
-- Never use a `.php`/`.blade.php`/`.twig`/`.jsx`/`.tsx` extension anywhere in a theme — `.liquid`, `.css`, `.js`, `.json`, image extensions only.
+- Never use a `.php`/`.blade.php`/`.twig`/`.jsx`/`.tsx` extension anywhere in a theme — `.liquid`, `.css`, `.js`, `.json`, image extensions, and the one exact-path exception `robots.txt` only. See §14 in the hard rules below: this is a rejection at the platform level, not just a convention.
 
 ## 12. Hard rules (must / must not)
 
@@ -269,8 +277,8 @@ This table is the authoritative signature list. You do not need to read a compon
 2. **Must not** introduce `{% schema %}`, `{% section %}`, `{% include %}`, or any theme-editor JSON block — none of these exist in this Liquid dialect and an unknown *tag* (unlike an unknown filter or variable) is a hard parse error, not a silent no-op. Stick to the tags/filters in §1's vocabulary; the wider standard-library tags/filters mentioned there exist and won't error, but introduce one only when nothing in §1's list can do the job.
 3. **Must not** invent data fields not listed in §7. If new data is required, state that a new backend field is needed instead of fabricating one.
 4. **Must not** introduce a CSS or JS framework/library (no Tailwind, Bootstrap, React, Vue, jQuery, build tooling).
-5. **Must** register any new `pages/css/*.css` or `components/css/*.css` path in `layout_links_to_add`, and any new `js/*.js` path in `layout_scripts_to_add`. **Must not** read or emit `liquid/layout-start.liquid` or `liquid/layout-end.liquid` — the splice is automatic.
-6. **Must** add a matching `pages.json` entry (§5) for any new route, with real (non-placeholder) SEO fields.
+5. **Must** register any new `pages/css/*.css` or `components/css/*.css` path in `layout_links_to_add`, and any new `js/*.js` path in `layout_scripts_to_add`, unless you are directly editing `liquid/layout-start.liquid`/`liquid/layout-end.liquid` yourself in the same turn — in that case include the `<link>`/`<script>` tag in your own edit instead (§0/§2); never both for the same file in the same turn.
+6. **Must** add a matching `pages.json` entry (§5) for any new route, with real (non-placeholder) SEO fields — via `page_registry_entry` for a single new/updated page, a direct edit only for what that can't do, and never a `pages.json` write that drops or corrupts an unrelated existing entry.
 7. **Prefer** composing existing components (§8) over writing new bespoke markup; only add a new component file when nothing existing fits, and give it the same three-file shape (`components/<name>.liquid` + `components/css/<name>.css`, only add JS if genuinely interactive).
 8. **Must** guard boolean-ish fields with `{% if x == true or x == 1 %}` (§1), and guard absent/optional data with `{% if x != blank %}` before rendering it.
 9. **Must not** hardcode a value that already has a `defaults.json`/`--theme-*` equivalent (colors, fonts, spacing) — reference the token with a fallback instead.
@@ -278,6 +286,7 @@ This table is the authoritative signature list. You do not need to read a compon
 11. **Must not** write placeholder, lorem ipsum, or "TODO" text as page content, and must not leave a `pages.json` SEO field as a stand-in. If the request is too vague to write real content, set `needs_clarification: true` with an empty `files` array and ask the merchant, rather than filling a page with a marker.
 12. **Must not** re-emit a file whose content is unchanged, and must not emit a file you have not read. **Prefer** `action: "edit"` over `action: "update"` for a targeted change to an existing file — a full rewrite only when genuinely simpler. Call `propose_changes` exactly once, with the complete final set of changes.
 13. **Must** diagnose and fix a broken page yourself rather than surfacing a technical error to the merchant — see §13. A merchant reporting "this page is broken" or pasting an error/screenshot does not know what Liquid, a template, or a syntax error is; treat it as a bug report to investigate, not a question to relay back.
+14. **Must** stay within this spec's own file vocabulary — `.liquid`, `.css`, `.js`, `.json` (theme config), `robots.txt`, image formats — and the plain-CSS/vanilla-JS/Liquid stack described throughout this document. If a merchant asks for a different file type or technology (React, PHP, TypeScript, a build step, anything not in this vocabulary), decline and explain in the summary that this theme engine only supports Liquid/CSS/JS — do not attempt to approximate their request in an unsupported format, and do not silently substitute a `.liquid` equivalent without saying so.
 
 ## 13. Debugging a broken page
 

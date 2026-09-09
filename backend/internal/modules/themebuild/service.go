@@ -1456,18 +1456,6 @@ func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID
 	return files, nil
 }
 
-// CreateThemeFromBase creates a brand-new theme for the tenant from
-// flowpos-backend's base-theme catalog entry and returns its slug — the
-// entry point for the "start a theme from scratch" flow, before any chat
-// message exists for it (see themefs.Store.CreateThemeFromBase).
-func (s *Service) CreateThemeFromBase(ctx context.Context, tenantID uint64, token string) (string, error) {
-	slug, err := s.store.CreateThemeFromBase(ctx, themefs.RequestAuth{Token: token, TenantID: tenantID})
-	if err != nil {
-		return "", fmt.Errorf("create theme from base: %w", err)
-	}
-	return slug, nil
-}
-
 // LoadThemeFiles fetches every render-relevant theme file's content, keyed
 // by theme-relative path. store lets a caller pass a draft overlay (see
 // themefs.OverlayStore) so a preview reflects unsaved changes instead of

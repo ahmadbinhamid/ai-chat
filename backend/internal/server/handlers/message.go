@@ -35,9 +35,11 @@ type sendMessageRequest struct {
 	// burns input tokens on a request nobody meant to send.
 	Prompt string `json:"prompt" binding:"required,max=6000"`
 	// Mode is optional and empty by default (full edit, no restriction) —
-	// only the guided "start a theme from scratch" flow should ever send
-	// "brand" or "copy" here, and only for that flow's own first two turns.
-	// See themebuild.GenerateInput.Mode's doc comment for why this must be
+	// only a guided setup flow (walking a merchant through brand, then
+	// copy, on a theme they've already installed/activated — the AI
+	// theme builder never creates a theme itself) should ever send "brand"
+	// or "copy" here, and only for that flow's own first two turns. See
+	// themebuild.GenerateInput.Mode's doc comment for why this must be
 	// explicit rather than inferred from the chat's turn count.
 	Mode string `json:"mode" binding:"omitempty,oneof=brand copy edit pages"`
 	// Images attaches up to 5 images to this prompt (matches

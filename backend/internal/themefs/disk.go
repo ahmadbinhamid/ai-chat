@@ -27,7 +27,6 @@ type ThemeStore interface {
 	WriteFile(ctx context.Context, auth RequestAuth, relPath, content string, meta *PageMeta) error
 	DeleteFile(ctx context.Context, auth RequestAuth, relPath string) error
 	ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntry, error)
-	CreateThemeFromBase(ctx context.Context, auth RequestAuth) (string, error)
 }
 
 // Store reads and writes the tenant's active theme's files through
@@ -290,51 +289,6 @@ func (s *Store) ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntr
 		return nil, fmt.Errorf("list files: decode response: %w", err)
 	}
 	return out.Data.Files, nil
-}
-
-type createThemeEnvelope struct {
-	Data struct {
-		Theme struct {
-			Slug string `json:"slug"`
-		} `json:"theme"`
-	} `json:"data"`
-}
-
-// CreateThemeFromBase creates a brand-new theme for the caller's store from
-// flowpos-backend's "AI Base Theme" catalog entry (see
-// ThemeController::createFromBase / Database\Seeders\BaseThemeSeeder) and
-// returns its generated slug. flowpos-backend assigns the slug itself (it's
-// also the on-disk folder name, unique across all stores) — there is no way
-// to request a specific one. Used when a merchant starts a theme from
-// scratch: ai-chat never scaffolds theme files itself, since it doesn't own
-// theme storage (see Store's package doc).
-func (s *Store) CreateThemeFromBase(ctx context.Context, auth RequestAuth) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/store/themes/from-base", nil)
-	if err != nil {
-		return "", fmt.Errorf("create theme from base: build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+auth.Token)
-	req.Header.Set("TID", strconv.FormatUint(auth.TenantID, 10))
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("create theme from base: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("create theme from base: %s", statusErr(resp))
-	}
-
-	var out createThemeEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("create theme from base: decode response: %w", err)
-	}
-	if out.Data.Theme.Slug == "" {
-		return "", fmt.Errorf("create theme from base: response missing theme slug")
-	}
-	return out.Data.Theme.Slug, nil
 }
 
 func (s *Store) newRequest(ctx context.Context, auth RequestAuth, method, relPath string, body io.Reader) (*http.Request, error) {

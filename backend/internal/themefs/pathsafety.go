@@ -14,38 +14,42 @@ import (
 	"unicode/utf8"
 )
 
-// allowedGeneratedExtensions is deliberately narrow: pages.json is never
-// written as a raw generated file (see AI_THEME_BUILDER_PROMPT.md — its
-// entries are merged structurally via a register_page apply action instead,
-// precisely to avoid two chats clobbering each other's routes with a
-// whole-file overwrite). Widen this only if a new file kind is genuinely
-// needed. This restriction applies ONLY to files the AI proposes writing —
-// see ValidateGeneratedFilePath — not to path safety in general: internal
-// code legitimately reads/writes pages.json and defaults.json directly
+// allowedGeneratedExtensions is every file kind THEME_ENGINE_SPEC.md
+// documents as part of a theme's own structure — deliberately still a
+// strict allowlist, not "anything": the point isn't to accept arbitrary
+// content, it's to accept every real theme file kind while still hard-
+// rejecting a different tech stack outright (.php/.jsx/.tsx/.py/etc. all
+// fail this check the same way they always have — see
+// THEME_ENGINE_SPEC.md §11's own "must not" rule, which this enforces at
+// the code level so it isn't just a prompt hope). .json covers both
+// pages.json and defaults.json (see §5/§6) plus any new theme-config file
+// a component genuinely needs — there is deliberately no separate
+// per-file carve-out for either anymore: both are real .json files, this
+// is the one check that governs them, same as every other file kind. This
+// restriction applies ONLY to files the AI proposes writing — see
+// ValidateGeneratedFilePath — not to path safety in general: internal code
+// legitimately reads/writes pages.json and defaults.json directly
 // (building AI context, merging a page registration), and those calls go
 // through ValidatePathSafety instead, which has no extension opinion.
 var allowedGeneratedExtensions = map[string]bool{
 	".liquid": true,
 	".css":    true,
 	".js":     true,
+	".json":   true,
 }
 
 // allowedGeneratedFullPaths is a small allowlist of known, singular
-// theme-root config files the AI may propose a full-content update to,
-// bypassing the extension check above — currently just defaults.json,
-// checked by exact theme-root path (not a directory/glob). pages.json is
-// deliberately NOT here: it's a structured registry the AI registers pages
-// into via page_registry_entry (see propose_changes' schema), never a raw
-// overwrite target — a full-file replacement there would silently drop
-// every other page's registration. Without this, a brand/color/font
-// request has no valid mode to run in: GenerationModeBrand's own validator
-// (validateBrandModeProposal) is the only other place that allows
-// defaults.json, but nothing sets that mode automatically (see
-// themebuild.GenerateInput.Mode's doc comment on why it must be explicit),
-// so nothing besides this allowlist made defaults.json reachable at all in
-// the default (empty/edit) mode every existing chat actually runs in.
+// theme-root files that don't carry an extension in
+// allowedGeneratedExtensions but are still real, structural parts of a
+// theme — checked by exact theme-root path (not a directory/glob).
+// robots.txt is the one entry: a theme-root SEO file, same "one singular
+// file, not a free-form extension" shape as defaults.json used to be here
+// before .json became a generally allowed extension (see
+// allowedGeneratedExtensions's own doc comment) — widen this only for
+// another genuinely singular, extensionless (or unusually-extensioned)
+// theme-root file, not as a general escape hatch.
 var allowedGeneratedFullPaths = map[string]bool{
-	"defaults.json": true,
+	"robots.txt": true,
 }
 
 // maxPathLen matches chat_generated_files.file_path's column width

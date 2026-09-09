@@ -86,10 +86,6 @@ func (o *OverlayStore) ListFiles(ctx context.Context, auth RequestAuth) ([]FileT
 	return root.toEntries(), nil
 }
 
-func (o *OverlayStore) CreateThemeFromBase(ctx context.Context, auth RequestAuth) (string, error) {
-	return o.base.CreateThemeFromBase(ctx, auth)
-}
-
 func collectPaths(entries []FileTreeEntry, into map[string]bool) {
 	for _, e := range entries {
 		if e.Type == "file" {

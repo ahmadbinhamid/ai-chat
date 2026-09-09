@@ -43,9 +43,6 @@ func (f *fakeBaseStore) DeleteFile(context.Context, RequestAuth, string) error {
 func (f *fakeBaseStore) ListFiles(context.Context, RequestAuth) ([]FileTreeEntry, error) {
 	return f.tree, nil
 }
-func (f *fakeBaseStore) CreateThemeFromBase(context.Context, RequestAuth) (string, error) {
-	return "", nil
-}
 
 func TestOverlayStore_ReadFile_DraftHitBeatsBase(t *testing.T) {
 	base := &fakeBaseStore{files: map[string]string{"pages/home.liquid": "SAVED"}}

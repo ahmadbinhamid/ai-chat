@@ -88,7 +88,6 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	revertHandler := handlers.NewRevertHandler(buildSvc)
 	previewHandler := handlers.NewPreviewHandler(buildSvc)
 	previewHandler.SetProductsFetchTimeout(cfg.FlowposHTTPTimeout)
-	themeHandler := handlers.NewThemeHandler(buildSvc)
 	queueHandler := handlers.NewQueueHandler(buildSvc)
 	applyHandler := handlers.NewApplyHandler(buildSvc)
 	draftHandler := handlers.NewDraftHandler(buildSvc)
@@ -153,7 +152,6 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	identified.GET("/preview/context", previewHandler.Context)
 	identified.GET("/theme-assets/*path", assetHandler.Get)
 	identified.POST("/themes/:slug/preview", previewHandler.Preview)
-	identified.POST("/themes", themeHandler.Create)
 
 	// Not in the `identified` group: a browser WebSocket can't set an
 	// Authorization header, so this route authenticates itself via

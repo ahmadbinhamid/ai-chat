@@ -156,7 +156,20 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 		}
 	}
 
-	if len(result.LayoutLinksToAdd) > 0 {
+	// layout-start.liquid/layout-end.liquid are directly editable now (a
+	// files[] entry for either is no longer rejected — see proposal.go's
+	// own doc comment on why that check was removed). A turn that directly
+	// edits one of them has, by doing so, taken full ownership of that
+	// file's content for this turn: skip computing a splice for the same
+	// path here rather than layering it on top. Two reasons, not one — the
+	// documented production crash (a duplicate chat_generated_files audit
+	// row for the same (message_id, file_path), see planToStaged) is the
+	// smaller of them; the real one is that commitWritePlan writes
+	// plan.files first and a layout splice after, against content read
+	// BEFORE the direct edit landed — applying it anyway would silently
+	// overwrite the model's own direct edit with stale content plus the
+	// spliced tag, not just double an audit row.
+	if len(result.LayoutLinksToAdd) > 0 && !hasDirectEdit(plan.files, pathLayoutStart) {
 		current, err := store.ReadFile(ctx, storeAuth, pathLayoutStart)
 		if err != nil {
 			return writePlan{}, fmt.Errorf("add layout css links: %w", err)
@@ -177,7 +190,7 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 		}
 	}
 
-	if len(result.LayoutScriptsToAdd) > 0 {
+	if len(result.LayoutScriptsToAdd) > 0 && !hasDirectEdit(plan.files, pathLayoutEnd) {
 		current, err := store.ReadFile(ctx, storeAuth, pathLayoutEnd)
 		if err != nil {
 			return writePlan{}, fmt.Errorf("add layout js links: %w", err)
@@ -199,6 +212,18 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 	}
 
 	return plan, nil
+}
+
+// hasDirectEdit reports whether files already has an entry for path —
+// checked before computing a layout splice for that same path (see
+// buildWritePlan's own doc comment above).
+func hasDirectEdit(files []planFile, path string) bool {
+	for _, f := range files {
+		if f.path == path {
+			return true
+		}
+	}
+	return false
 }
 
 // commitWritePlan writes everything in plan through flowpos-backend's own
