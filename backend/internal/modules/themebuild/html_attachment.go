@@ -1,16 +1,71 @@
 package themebuild
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
-// scriptTagRe strips <script>...</script> blocks from an attached HTML
-// file before it's ever stored or sent to the model — script content is
-// irrelevant to the design/structure reference the merchant actually wants
-// and is the one part of an HTML file that could otherwise execute
-// somewhere downstream if this content were ever rendered rather than just
-// read as text. This does NOT address prompt injection via plain visible
-// text (see promptWithHTMLAttachment's framing for that) — there's no
-// technical strip for that without destroying the reference value.
-var scriptTagRe = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script\s*>`)
+// executableScriptTypes are the <script type="..."> values a browser will
+// actually execute — an absent/empty type, "module", and the legacy
+// JavaScript MIME types the HTML spec recognizes. Any other type value is
+// inert to the browser: it's never executed, only ever read as data by
+// whatever code goes looking for it (a JSON island, a template, this
+// package's own attachment-content string). Stripping a <script> block
+// unconditionally used to also delete an attached file's actual content
+// whenever that content happened to live inside a non-executable script
+// tag — see e.g. a "bundled" single-file HTML export, which stores its
+// real page markup in <script type="__bundler/template"> and its data in
+// <script type="text/x-dc">: both are inert containers the export's own
+// unpacking script reads as text, never runs, but a blanket script-strip
+// deleted them anyway, leaving nothing but the export's loading-screen
+// markup for the model to read. Keyed by the type's value lowercased with
+// any ";charset=..." (or similar) parameter dropped, matching how a
+// browser itself parses the attribute.
+var executableScriptTypes = map[string]bool{
+	"":                         true,
+	"module":                   true,
+	"text/javascript":          true,
+	"text/ecmascript":          true,
+	"text/jscript":             true,
+	"text/livescript":          true,
+	"text/x-ecmascript":        true,
+	"text/x-javascript":        true,
+	"application/ecmascript":   true,
+	"application/javascript":   true,
+	"application/x-ecmascript": true,
+	"application/x-javascript": true,
+}
+
+// scriptBlockRe matches one whole <script ...>...</script> block —
+// SanitizeHTMLAttachment decides per-match, via isExecutableScriptTag,
+// whether to actually strip it.
+var scriptBlockRe = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script\s*>`)
+
+// scriptOpenTagRe extracts just a script block's opening tag, so
+// isExecutableScriptTag has something to look a type attribute up in
+// without re-scanning the (possibly large) block body.
+var scriptOpenTagRe = regexp.MustCompile(`(?is)^<script\b[^>]*>`)
+
+// scriptTypeAttrRe finds a type="..."/type='...'/type=bare attribute
+// value inside a script tag's opening tag — whichever quoting style is
+// present; HTML permits all three.
+var scriptTypeAttrRe = regexp.MustCompile(`(?is)\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))`)
+
+// isExecutableScriptTag reports whether openTag (a <script ...> opening
+// tag, as matched by scriptOpenTagRe) is one a browser would actually
+// execute — see executableScriptTypes' own doc comment for what that
+// means and why it isn't "every script tag."
+func isExecutableScriptTag(openTag string) bool {
+	m := scriptTypeAttrRe.FindStringSubmatch(openTag)
+	if m == nil {
+		return true // no type attribute at all -> the default, executable type
+	}
+	typ := m[1] + m[2] + m[3] // exactly one of these three groups is non-empty
+	if i := strings.IndexByte(typ, ';'); i >= 0 {
+		typ = typ[:i]
+	}
+	return executableScriptTypes[strings.ToLower(strings.TrimSpace(typ))]
+}
 
 // dataURIRe strips embedded base64 data: URIs — src="data:image/png;
 // base64,...", CSS url(data:...), etc. This is what actually blows up a
@@ -24,11 +79,44 @@ var scriptTagRe = regexp.MustCompile(`(?is)<script\b[^>]*>.*?</script\s*>`)
 // attribute's quotes, a CSS url(...) call — stays syntactically valid.
 var dataURIRe = regexp.MustCompile(`data:[a-zA-Z0-9.+/-]+;base64,[A-Za-z0-9+/=]+`)
 
-// SanitizeHTMLAttachment removes scripts and embedded base64 assets from
-// an uploaded HTML file before it's stored or sent to the model — see
-// Generate's own use of this, right before the post-strip
-// MaxHTMLAttachmentBytes check.
+// longBase64RunRe matches a long run of base64-alphabet characters with no
+// data: URI prefix to key off — the shape a binary asset (a font, an
+// image, a whole minified JS bundle) takes when embedded as a plain JSON
+// string value rather than a data: URI, exactly what a "bundled" single-
+// file HTML export's own asset manifest does (kept in place now by
+// isExecutableScriptTag, since that script type is inert data, not
+// something to delete outright — see its own doc comment). A run this
+// long is never something a model needs verbatim as page content or a
+// design reference; keeping it only spends the byte budget
+// (service.go's MaxHTMLAttachmentBytes) on data nothing downstream reads
+// as text. 400 chars is comfortably above any real copy, config value, or
+// token (a JWT's longest single segment, a hash, a UUID) would ever run
+// contiguously in the base64 alphabet — real prose/JSON/markup breaks
+// that alphabet with spaces, punctuation, or structural characters far
+// sooner. Replaced with nothing (matching dataURIRe's "keep the
+// surrounding syntax valid, drop only the payload" approach — the
+// original was a plain quoted string, and an empty string is still one).
+var longBase64RunRe = regexp.MustCompile(`[A-Za-z0-9+/]{400,}=*`)
+
+// SanitizeHTMLAttachment removes executable scripts and embedded base64
+// assets from an uploaded HTML file before it's stored or sent to the
+// model — see Generate's own use of this, right before the post-strip
+// MaxHTMLAttachmentBytes check. Only strips a <script> block whose type
+// isExecutableScriptTag says a browser would actually run (see that
+// function's own doc comment) — a non-executable one (a JSON/template
+// data island) is left in place, since removing it destroys real content
+// without any safety benefit: it was never going to execute either way.
+// Its payload is still subject to the same long-base64-run stripping as
+// the rest of the document, though — see longBase64RunRe — since a kept
+// script block can just as easily be carrying inlined binary assets as
+// real content.
 func SanitizeHTMLAttachment(html string) string {
-	html = scriptTagRe.ReplaceAllString(html, "")
-	return dataURIRe.ReplaceAllString(html, "data:,")
+	html = scriptBlockRe.ReplaceAllStringFunc(html, func(block string) string {
+		if isExecutableScriptTag(scriptOpenTagRe.FindString(block)) {
+			return ""
+		}
+		return block
+	})
+	html = dataURIRe.ReplaceAllString(html, "data:,")
+	return longBase64RunRe.ReplaceAllString(html, "")
 }

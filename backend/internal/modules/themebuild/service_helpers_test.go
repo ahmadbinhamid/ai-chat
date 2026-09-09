@@ -47,7 +47,7 @@ func TestProposalHasChanges(t *testing.T) {
 	}
 }
 
-func TestClearIfNeedsClarification(t *testing.T) {
+func TestClearIfNoChangesIntended_NeedsClarification(t *testing.T) {
 	result := &ai.Result{
 		NeedsClarification: true,
 		Files:              []ai.GeneratedFile{{Path: "x"}},
@@ -55,17 +55,31 @@ func TestClearIfNeedsClarification(t *testing.T) {
 		LayoutLinksToAdd:   []string{"x"},
 		LayoutScriptsToAdd: []string{"x"},
 	}
-	clearIfNeedsClarification(result)
+	clearIfNoChangesIntended(result)
 	if result.Files != nil || result.PageRegistryEntry != nil || result.LayoutLinksToAdd != nil || result.LayoutScriptsToAdd != nil {
 		t.Errorf("expected all proposed changes cleared, got %+v", result)
 	}
 }
 
-func TestClearIfNeedsClarification_NoOpWhenFalse(t *testing.T) {
+func TestClearIfNoChangesIntended_AnsweredQuestion(t *testing.T) {
+	result := &ai.Result{
+		AnsweredQuestion:   true,
+		Files:              []ai.GeneratedFile{{Path: "x"}},
+		PageRegistryEntry:  &themefs.PageEntry{},
+		LayoutLinksToAdd:   []string{"x"},
+		LayoutScriptsToAdd: []string{"x"},
+	}
+	clearIfNoChangesIntended(result)
+	if result.Files != nil || result.PageRegistryEntry != nil || result.LayoutLinksToAdd != nil || result.LayoutScriptsToAdd != nil {
+		t.Errorf("expected all proposed changes cleared, got %+v", result)
+	}
+}
+
+func TestClearIfNoChangesIntended_NoOpWhenBothFalse(t *testing.T) {
 	result := &ai.Result{Files: []ai.GeneratedFile{{Path: "x"}}}
-	clearIfNeedsClarification(result)
+	clearIfNoChangesIntended(result)
 	if len(result.Files) != 1 {
-		t.Errorf("expected Files untouched when NeedsClarification is false, got %+v", result.Files)
+		t.Errorf("expected Files untouched when neither flag is set, got %+v", result.Files)
 	}
 }
 

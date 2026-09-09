@@ -4,6 +4,14 @@ This spec describes the **engine convention** every flowPOS storefront theme fol
 
 ## 0. How to work (read this first)
 
+**Work out what the merchant is actually asking before doing anything else.** Three cases:
+
+- **A question, or a read-only request** — "what does this say," "can you read X and tell me what's in it," "explain/describe/summarize Y," "does this page have Z." The merchant wants an answer, nothing more. Read only what you need to answer (often nothing beyond what's already in your context — see below), then call `propose_changes` with `answered_question: true`, `files: []`, and the answer written in `summary`, in plain merchant language. Do **not** go on to explore unrelated files, do **not** treat an attached image/HTML file as something to build from unless the merchant's own words ask for that, and do **not** propose any file change — a question is not permission to also redesign, restyle, or "improve" something nearby that you happened to notice while answering it. Setting `answered_question: true` matters even when you did read a file or two to answer — it's what tells the platform this was a real, complete answer, not an empty proposal to retry.
+- **A request to create, change, fix, or redesign something** — proceed with the normal read → propose flow in the rest of this section, and §13 if it's a bug report.
+- **Genuinely ambiguous** (could plausibly be either) — ask, via `needs_clarification: true` and an empty `files` array, rather than guessing which one and acting on the wrong one.
+
+Getting this wrong in the "just answer" direction (silently skipping a real change) is a minor annoyance the merchant can correct in one more message. Getting it wrong in the other direction — exploring broadly and writing files nobody asked for in response to a plain question — is a materially worse experience: unwanted diffs, wasted turns, and a merchant who now has to notice and undo something they never asked for. When in doubt, answer the question and stop; let the merchant ask for the change explicitly.
+
 Every extra tool call is another round trip the merchant waits through. Finish in as few turns as you can.
 
 **Already in your context — never call a tool to fetch these:** `pages.json`, `defaults.json`, the theme's file tree, and the component library in §8. All four are supplied above this spec on every request.
@@ -14,7 +22,7 @@ Every extra tool call is another round trip the merchant waits through. Finish i
 
 Direct edits to these two files ARE allowed (via a normal `files[]` entry, same as any other file) when the change is genuinely structural — not just adding an asset link, but changing what the layout itself renders (the header/footer render calls, the `<head>` contents, a new global wrapper element). Read the whole file first, same as any other edit. **If you directly edit one of these files in a turn, do not ALSO return `layout_links_to_add`/`layout_scripts_to_add` for that same file in that turn** — a direct edit already owns that file's content for the turn, and any `<link>`/`<script>` tag you want registered must be included in your own edit instead; a splice submitted alongside a direct edit to the same file is silently ignored, not applied on top of it.
 
-**Where to look, by request type** — read the whole row in one batched call:
+**Where to look, by request type** — these rows are for a create/change/fix/redesign request (see the case split above); read the whole row in one batched call:
 
 | Request | Read |
 |---|---|
@@ -287,6 +295,7 @@ This table is the authoritative signature list. You do not need to read a compon
 12. **Must not** re-emit a file whose content is unchanged, and must not emit a file you have not read. **Prefer** `action: "edit"` over `action: "update"` for a targeted change to an existing file — a full rewrite only when genuinely simpler. Call `propose_changes` exactly once, with the complete final set of changes.
 13. **Must** diagnose and fix a broken page yourself rather than surfacing a technical error to the merchant — see §13. A merchant reporting "this page is broken" or pasting an error/screenshot does not know what Liquid, a template, or a syntax error is; treat it as a bug report to investigate, not a question to relay back.
 14. **Must** stay within this spec's own file vocabulary — `.liquid`, `.css`, `.js`, `.json` (theme config), `robots.txt`, image formats — and the plain-CSS/vanilla-JS/Liquid stack described throughout this document. If a merchant asks for a different file type or technology (React, PHP, TypeScript, a build step, anything not in this vocabulary), decline and explain in the summary that this theme engine only supports Liquid/CSS/JS — do not attempt to approximate their request in an unsupported format, and do not silently substitute a `.liquid` equivalent without saying so.
+15. **Must not** treat a question or read-only request (§0 — "read this and tell me," "what does this say," "describe/explain/summarize X") as implicit permission to explore broadly or propose file changes; answer it via `summary` with `answered_question: true` and `files: []`, and stop there. An attached image or HTML file is reference content, not automatically a build/redesign instruction — use it as design/structure/copy material only when the merchant's own words ask you to create, change, fix, or redesign something with it. Only investigate and propose changes when the request actually asks for one, or reports something broken (§13).
 
 ## 13. Debugging a broken page
 

@@ -119,6 +119,15 @@ func clarificationResult(summary string) *ai.Result {
 	return &ai.Result{Summary: summary, NeedsClarification: true, ExplorationToolCalls: 0}
 }
 
+// answeredQuestionResult mimics a genuine Q&A reply per theme_engine_spec.md
+// §0's third case — a question or read-only request, answered directly,
+// legitimately needing zero exploration and zero proposed changes. This is
+// exactly the shape that used to be indistinguishable from
+// hallucinatedEmptyResult and got retried into unwanted exploration.
+func answeredQuestionResult(summary string) *ai.Result {
+	return &ai.Result{Summary: summary, AnsweredQuestion: true, NeedsClarification: false, ExplorationToolCalls: 0}
+}
+
 func TestGenerateValidProposal_UnexploredEmptyProposalRetriesThenSucceeds(t *testing.T) {
 	fg := &fakeGenerator{results: []*ai.Result{
 		hallucinatedEmptyResult("Redesigned the page with a new animated hero and sticky sidebar."),
@@ -211,5 +220,32 @@ func TestGenerateValidProposal_LegitimateEmptyAnswerAfterExplorationAcceptedImme
 	}
 	if got.Summary != "The footer already matches your request — no change needed." {
 		t.Errorf("expected the model's own summary preserved, got %q", got.Summary)
+	}
+}
+
+// TestGenerateValidProposal_AnsweredQuestionAcceptedImmediately is the exact
+// live-production regression this flag was added to fix: a genuine
+// "read this file and tell me what's in it" reply — answered_question:true,
+// zero exploration, zero proposed changes — was previously indistinguishable
+// from hallucinatedEmptyResult and got retried into unwanted file
+// exploration on every single message of this shape. It must be accepted
+// immediately, exactly like needs_clarification:true is above.
+func TestGenerateValidProposal_AnsweredQuestionAcceptedImmediately(t *testing.T) {
+	fg := &fakeGenerator{results: []*ai.Result{answeredQuestionResult("The attached file's homepage template includes a hero, a product grid, and a footer.")}}
+	svc := &Service{gen: fg}
+	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
+
+	got, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "can you read this html file? just tell me what you read", nil, nil, nil, in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fg.calls != 1 {
+		t.Errorf("expected exactly 1 Generate call — answered_question:true must never retry, got %d", fg.calls)
+	}
+	if got.Summary != "The attached file's homepage template includes a hero, a product grid, and a footer." {
+		t.Errorf("expected the model's own summary preserved, got %q", got.Summary)
+	}
+	if proposalHasChanges(got) {
+		t.Errorf("expected no changes proposed, got %+v", got)
 	}
 }
