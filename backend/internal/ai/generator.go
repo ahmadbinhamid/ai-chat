@@ -80,8 +80,22 @@ type Edit struct {
 // Generate) — the shape is unchanged from when Structured Outputs enforced
 // it directly.
 type Result struct {
-	Summary            string             `json:"summary"`
-	NeedsClarification bool               `json:"needs_clarification"`
+	Summary            string `json:"summary"`
+	NeedsClarification bool   `json:"needs_clarification"`
+	// AnsweredQuestion is true when summary is a direct answer to a question
+	// or a read-only description — never an attempted or completed change —
+	// per theme_engine_spec.md §0's case split. Same shape as
+	// NeedsClarification (files/page_registry_entry/layout_*_to_add must all
+	// be empty when this is true) but a distinct signal: NeedsClarification
+	// means "I need more information before I can act," AnsweredQuestion
+	// means "there was nothing to act on — the merchant just wanted an
+	// answer." themebuild's isUnexploredEmptyProposal treats both the same
+	// way (a legitimate empty proposal, not the hallucinated-success shape
+	// that retry mechanism exists to catch) — without this flag, a correct,
+	// zero-exploration Q&A reply was indistinguishable from a model
+	// fabricating a "done" summary over an empty proposal, and got retried
+	// into unwanted exploration/edits every time.
+	AnsweredQuestion   bool               `json:"answered_question"`
 	Files              []GeneratedFile    `json:"files"`
 	PageRegistryEntry  *themefs.PageEntry `json:"page_registry_entry"`
 	LayoutLinksToAdd   []string           `json:"layout_links_to_add"`
@@ -272,15 +286,23 @@ func newTestGenerator(client anthropic.Client) *Generator {
 var resultSchema = map[string]any{
 	"type":                 "object",
 	"additionalProperties": false,
-	"required":             []string{"summary", "needs_clarification", "files", "page_registry_entry", "layout_links_to_add", "layout_scripts_to_add"},
+	"required":             []string{"summary", "needs_clarification", "answered_question", "files", "page_registry_entry", "layout_links_to_add", "layout_scripts_to_add"},
 	"properties": map[string]any{
 		"summary": map[string]any{
 			"type":        "string",
-			"description": "1-3 plain-language sentences for the merchant-facing chat UI. If needs_clarification is true, this is the clarifying question instead.",
+			"description": "1-3 plain-language sentences for the merchant-facing chat UI. If needs_clarification is true, this is the clarifying question instead. If answered_question is true, this is the direct answer instead.",
 		},
 		"needs_clarification": map[string]any{
 			"type":        "boolean",
 			"description": "true if the request conflicts with a hard rule in the spec or is too ambiguous to safely generate. When true, files must be empty.",
+		},
+		"answered_question": map[string]any{
+			"type": "boolean",
+			"description": "true when the merchant asked a question or made a read-only request (e.g. \"what does this say\", " +
+				"\"can you read this and describe it\") and summary is your direct answer — not an attempted or completed " +
+				"change. When true, files/page_registry_entry/layout_links_to_add/layout_scripts_to_add must all be empty, " +
+				"the same as needs_clarification. Mutually exclusive with needs_clarification and with actually proposing " +
+				"changes.",
 		},
 		// Strict: true + additionalProperties: false (see proposeChangesTool)
 		// means every property here must be present on every files[] item —
@@ -850,9 +872,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			messages = append(messages, message.ToParam())
 			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(
 				"You must call one of the available tools on every turn — propose_changes if you already have enough "+
-					"to finish (even for a simple greeting or question, propose_changes with no file changes and a "+
-					"reply in `summary` is correct), or a read/explore tool otherwise. A plain text reply with no tool "+
-					"call is not valid here.",
+					"to finish (even for a simple greeting or question, propose_changes with no file changes, "+
+					"answered_question: true, and the reply in `summary` is correct), or a read/explore tool otherwise. "+
+					"A plain text reply with no tool call is not valid here.",
 			)))
 			continue
 		}
@@ -987,7 +1009,9 @@ Rules for every request:
    don't add sections the merchant didn't ask for, don't add narrating code comments.
 7. summary is shown directly to the merchant in a chat UI: 1-3 plain-language sentences, no code,
    no file paths, describing what you built. If you set needs_clarification, summary is your
-   question to the merchant instead.
+   question to the merchant instead. If you set answered_question, summary is your direct answer
+   instead — see the spec's §0 case split for when that applies (a question or read-only request,
+   never an attempted or completed change) and rule 15.
 8. Before you modify any existing file, read it with read_theme_file — never write a file you
    have not read, and never guess at its current content. Emit only files whose content actually
    changes as a result of this request.
