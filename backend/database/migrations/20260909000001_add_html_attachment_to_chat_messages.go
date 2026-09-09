@@ -19,10 +19,12 @@ func init() {
 // competitor/reference page's markup, ask the AI to match its structure).
 // Two plain columns (not a JSON array like `images`) since this is
 // deliberately capped at one file per message, unlike images' 1-5 — see
-// chat.Message's own doc comment for why. content is capped
-// (maxHTMLAttachmentBytes, enforced in themebuild) well below LONGTEXT's
-// real ceiling; LONGTEXT is just this codebase's existing convention for
-// arbitrary-length text content (see chat_generated_files.content).
+// chat.Message's own doc comment for why. content is capped at
+// themebuild.MaxHTMLAttachmentBytes (enforced in Service.Generate, after
+// themebuild.SanitizeHTMLAttachment strips embedded scripts/base64 assets)
+// well below LONGTEXT's real ceiling; LONGTEXT is just this codebase's
+// existing convention for arbitrary-length text content (see
+// chat_generated_files.content).
 func Up_20260909000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE chat_messages

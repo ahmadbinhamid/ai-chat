@@ -144,6 +144,15 @@ func TestGenerate_SecondPromptQueuesWhileFirstRuns(t *testing.T) {
 // Item 6: three queued prompts from one Generate call each all run, in
 // order — proving the drain loop actually dequeues the rest of the queue
 // instead of stopping after the one it started with.
+//
+// Known flaky in this environment (confirmed via `git stash` to fail
+// identically on code with none of the attachment work applied — not a
+// regression from that work). Left unfixed here deliberately (out of scope
+// for the pass that found it) — but flagging it explicitly rather than
+// letting it be rediscovered from scratch: a flake in a test that asserts
+// queue-*ordering* is exactly where a genuine ordering bug would hide
+// behind "just rerun it." Worth a real look before trusting this test's
+// green runs at face value.
 func TestRunGeneration_DrainsWholeQueueInOrder(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &scriptedGenerator{results: []scriptedResult{
@@ -245,6 +254,15 @@ func TestRunGeneration_FailureDoesNotStopLaterQueuedPrompts(t *testing.T) {
 // generateTimeout must all still succeed even though their *combined*
 // runtime exceeds it, proving the budget resets per iteration instead of
 // being computed once for the whole queue.
+//
+// Known flaky in this environment (confirmed via `git stash` to fail
+// identically on code with none of the attachment work applied — not a
+// regression from that work). Left unfixed here deliberately (out of scope
+// for the pass that found it) — but flagging it explicitly rather than
+// letting it be rediscovered from scratch: a flake in a test that asserts
+// queue-*ordering* is exactly where a genuine ordering bug would hide
+// behind "just rerun it." Worth a real look before trusting this test's
+// green runs at face value.
 func TestRunGeneration_EachIterationGetsFreshTimeout(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &scriptedGenerator{results: []scriptedResult{

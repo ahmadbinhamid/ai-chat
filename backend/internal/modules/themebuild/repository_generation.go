@@ -36,10 +36,11 @@ const generationColumns = `
 // index is what actually enforces this atomically, closing the race an
 // in-memory map + mutex could only close within one process.
 func (r *Repository) StartGeneration(ctx context.Context, id, chatID string, tenantID uint64) error {
+	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?)
-	`, id, chatID, tenantID, GenerationStatusRunning, "", time.Now().UTC())
+		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+	`, id, chatID, tenantID, GenerationStatusRunning, "", now, now, now)
 	if err != nil {
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlDuplicateKeyErrNumber {
@@ -92,11 +93,12 @@ func (r *Repository) EnqueueGeneration(ctx context.Context, g Generation) (posit
 		return 0, ErrQueueFull
 	}
 
+	enqueuedAt := time.Now().UTC()
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO generations
-			(id, chat_id, tenant_id, status, attempts, prompt, user_message_id, theme_slug, mode, queued_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
-	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, g.UserMessageID, g.ThemeSlug, g.Mode, time.Now().UTC())
+			(id, chat_id, tenant_id, status, attempts, prompt, user_message_id, theme_slug, mode, queued_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, g.UserMessageID, g.ThemeSlug, g.Mode, enqueuedAt, enqueuedAt, enqueuedAt)
 	if err != nil {
 		return 0, err
 	}
@@ -123,13 +125,14 @@ func (r *Repository) EnqueueGeneration(ctx context.Context, g Generation) (posit
 // which is a normal race outcome across replicas each racing to drain the
 // same chat's queue, not a failure worth logging loudly.
 func (r *Repository) DequeueNext(ctx context.Context, chatID string) (Generation, error) {
+	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE generations
-		SET status = ?, started_at = ?
+		SET status = ?, started_at = ?, updated_at = ?
 		WHERE chat_id = ? AND status = ?
 		ORDER BY queued_at, id
 		LIMIT 1
-	`, GenerationStatusRunning, time.Now().UTC(), chatID, GenerationStatusQueued)
+	`, GenerationStatusRunning, now, now, chatID, GenerationStatusQueued)
 	if err != nil {
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlDuplicateKeyErrNumber {
@@ -163,10 +166,11 @@ func (r *Repository) DequeueNext(ctx context.Context, chatID string) (Generation
 // already finished) row simply matches nothing here and comes back as
 // ErrNotFound, same as a generationID that doesn't exist at all.
 func (r *Repository) CancelQueued(ctx context.Context, chatID, generationID string) error {
+	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `
-		UPDATE generations SET status = ?, finished_at = ?
+		UPDATE generations SET status = ?, finished_at = ?, updated_at = ?
 		WHERE id = ? AND chat_id = ? AND status = ?
-	`, GenerationStatusCancelled, time.Now().UTC(), generationID, chatID, GenerationStatusQueued)
+	`, GenerationStatusCancelled, now, now, generationID, chatID, GenerationStatusQueued)
 	if err != nil {
 		return err
 	}
@@ -264,10 +268,11 @@ func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr er
 		}
 		errMsg = &msg
 	}
+	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE generations SET status = ?, error = ?, finished_at = ?
+		UPDATE generations SET status = ?, error = ?, finished_at = ?, updated_at = ?
 		WHERE chat_id = ? AND status = ?
-	`, status, errMsg, time.Now().UTC(), chatID, GenerationStatusRunning)
+	`, status, errMsg, now, now, chatID, GenerationStatusRunning)
 	return err
 }
 
@@ -277,8 +282,8 @@ func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr er
 // than only via logs (see phase 1's wiring notes).
 func (r *Repository) SetGenerationAttempts(ctx context.Context, chatID string, attempts int) error {
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE generations SET attempts = ? WHERE chat_id = ? AND status = ?
-	`, attempts, chatID, GenerationStatusRunning)
+		UPDATE generations SET attempts = ?, updated_at = ? WHERE chat_id = ? AND status = ?
+	`, attempts, time.Now().UTC(), chatID, GenerationStatusRunning)
 	return err
 }
 
@@ -327,10 +332,11 @@ func (r *Repository) GetGenerationByID(ctx context.Context, chatID, generationID
 // EndGeneration's failed case: cancelling mid-flight is a deliberate
 // merchant action, not a failure.
 func (r *Repository) EndGenerationCancelled(ctx context.Context, chatID string) error {
+	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE generations SET status = ?, finished_at = ?
+		UPDATE generations SET status = ?, finished_at = ?, updated_at = ?
 		WHERE chat_id = ? AND status = ?
-	`, GenerationStatusCancelled, time.Now().UTC(), chatID, GenerationStatusRunning)
+	`, GenerationStatusCancelled, now, now, chatID, GenerationStatusRunning)
 	return err
 }
 
@@ -345,10 +351,11 @@ func (r *Repository) EndGenerationCancelled(ctx context.Context, chatID string) 
 // not-found on the second attempt. A no-op (ErrNotFound) if the row isn't
 // running anymore — nothing left to request against.
 func (r *Repository) RequestGenerationCancellation(ctx context.Context, chatID, generationID string) error {
+	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `
-		UPDATE generations SET cancel_requested_at = ?
+		UPDATE generations SET cancel_requested_at = ?, updated_at = ?
 		WHERE id = ? AND chat_id = ? AND status = ?
-	`, time.Now().UTC(), generationID, chatID, GenerationStatusRunning)
+	`, now, now, generationID, chatID, GenerationStatusRunning)
 	if err != nil {
 		return err
 	}
@@ -388,9 +395,10 @@ func (r *Repository) IsCancellationRequested(ctx context.Context, chatID, genera
 // comment on why). Best-effort: a failure here must never fail the
 // generation itself, so the caller only logs it (see emit).
 func (r *Repository) UpdateGenerationHeartbeat(ctx context.Context, id string) error {
+	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE generations SET last_heartbeat_at = ? WHERE id = ?
-	`, time.Now().UTC(), id)
+		UPDATE generations SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?
+	`, now, now, id)
 	return err
 }
 
@@ -409,13 +417,13 @@ func (r *Repository) ReapStaleGenerations(ctx context.Context, heartbeatTimeout,
 	startedCutoff := now.Add(-startedFallback)
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE generations
-		SET status = ?, error = ?, finished_at = ?
+		SET status = ?, error = ?, finished_at = ?, updated_at = ?
 		WHERE status = ?
 		  AND (
 		    (last_heartbeat_at IS NOT NULL AND last_heartbeat_at < ?)
 		    OR (last_heartbeat_at IS NULL AND started_at < ?)
 		  )
-	`, GenerationStatusFailed, "generation timed out (reaped)", now, GenerationStatusRunning, heartbeatCutoff, startedCutoff)
+	`, GenerationStatusFailed, "generation timed out (reaped)", now, now, GenerationStatusRunning, heartbeatCutoff, startedCutoff)
 	if err != nil {
 		return 0, err
 	}

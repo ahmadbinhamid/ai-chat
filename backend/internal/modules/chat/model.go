@@ -90,27 +90,70 @@ type Message struct {
 	ApplyStatus  ApplyStatus   `json:"apply_status"`
 	AppliedAt    *time.Time    `json:"applied_at"`
 	CreatedAt    time.Time     `json:"created_at"`
-	// Images is only ever non-empty on a user-role turn that attached one
-	// or more images (see the image-attachment feature; capped at
-	// maxImagesPerMessage) — nil/empty on every other turn. Only ever read
-	// back for THIS turn's own re-send to the model on a retry within the
-	// same generation; never resurfaced to later turns via toTurns (see
-	// themebuild's history-building).
-	Images []MessageImage `json:"images,omitempty"`
-	// HTMLAttachmentFilename/HTMLAttachmentContent are only ever set
-	// together, on a user-role turn that attached one reference HTML file
-	// (see the HTML-attachment feature — at most one per message, unlike
-	// Images' cap of maxImagesPerMessage: raw text tokens cost far more
-	// per byte than an image's flat per-image token cost, so this stays
-	// deliberately tighter). Same non-resurfacing rule as Images — read
-	// back only for THIS turn's own retries, never replayed via toTurns.
-	HTMLAttachmentFilename *string `json:"html_attachment_filename,omitempty"`
-	HTMLAttachmentContent  *string `json:"html_attachment_content,omitempty"`
+	// Attachments is only ever non-empty on a user-role turn that attached
+	// one or more files (images and/or one HTML reference — see the
+	// image/HTML-attachment features), stored in chat_message_attachments
+	// (see the 20260909000002 migration) rather than per-type columns on
+	// this row. Every normal read (ListMessagesByChat, hence GET /chat)
+	// populates this with METADATA ONLY — no bytes; see
+	// MessageAttachment's own doc comment for why, and for the one caller
+	// (themebuild.Service.doGenerate) that fetches actual bytes, and how.
+	// Never resurfaced to a DIFFERENT, later turn via toTurns (see
+	// themebuild's history-building) — only ever relevant to the turn that
+	// attached it.
+	Attachments []MessageAttachment `json:"attachments,omitempty"`
 }
 
-// MessageImage is one attached image — Base64 is raw (no data: URI
-// prefix). Stored as a JSON array in chat_messages.images (LONGTEXT) —
-// see the repository's imagesToJSON/imagesFromJSON.
+// AttachmentKind identifies what a chat_message_attachments row holds.
+// Adding a new kind (e.g. PDF) is a new value here plus a themebuild
+// validation-limit entry — not a migration, not new Message/GenerateInput
+// fields, not new scan arguments; that's the point of the table this type
+// backs (see the 20260909000002 migration's own doc comment).
+type AttachmentKind string
+
+const (
+	AttachmentKindImage AttachmentKind = "image"
+	AttachmentKindHTML  AttachmentKind = "html"
+)
+
+// MessageAttachment is one file attached to a user-role turn's prompt — an
+// image (up to maxImagesPerMessage per message) or one reference HTML file
+// (see the image/HTML-attachment features). Content carries the
+// attachment's raw, decoded bytes (never base64 — see the 20260909000002
+// migration's own doc comment) and is populated ONLY by a read that
+// explicitly asks for it: Repository.GetAttachmentsContent, called by
+// themebuild.Service.doGenerate immediately before it needs to actually
+// send this attachment to the model — not by ListMessagesByChat, which
+// backs GET /chat and every other transcript read, and returns every other
+// field but leaves Content nil. That split is the entire reason this table
+// exists apart from chat_messages: a page load pays for filenames and
+// sizes, never for a turn's attached bytes.
+//
+// StorageKey is reserved for future external storage (see the migration's
+// own doc comment) — nil on every row today; Content is always what's
+// populated instead.
+type MessageAttachment struct {
+	ID         string         `json:"id"`
+	MessageID  string         `json:"-"`
+	TenantID   uint64         `json:"-"`
+	Kind       AttachmentKind `json:"kind"`
+	Filename   string         `json:"filename"`
+	MediaType  string         `json:"media_type"`
+	SizeBytes  int64          `json:"size_bytes"`
+	Checksum   string         `json:"-"`
+	Position   int            `json:"position"`
+	Content    []byte         `json:"-"`
+	StorageKey *string        `json:"-"`
+	CreatedAt  time.Time      `json:"-"`
+}
+
+// MessageImage is one image attached to an OUTGOING prompt — the wire
+// format both the HTTP request body (sendMessageRequest.Images) and
+// GenerateInput.Images use. Base64 is raw (no data: URI prefix); this is
+// never what's stored or read back — chat.Service decodes it into a
+// MessageAttachment's raw Content bytes at write time (see
+// buildAttachments), and MessageAttachment is what every read path
+// (including doGenerate's re-resolution) deals with from then on.
 type MessageImage struct {
 	Base64    string `json:"base64"`
 	MediaType string `json:"media_type"`

@@ -50,7 +50,8 @@ type sendMessageRequest struct {
 	Images []imageAttachment `json:"images" binding:"omitempty,max=5,dive"`
 	// HTMLAttachment attaches one reference HTML file to this prompt —
 	// see the HTML-attachment feature. Unlike Images, capped at one file
-	// (see chat.Message.HTMLAttachmentFilename's doc comment for why).
+	// (see chat.MessageAttachment's own doc comment, and
+	// themebuild.attachmentLimits, for why).
 	HTMLAttachment *htmlAttachment `json:"html_attachment" binding:"omitempty"`
 }
 

@@ -111,12 +111,15 @@ func PromptPreview(prompt string) string {
 const maxGenerationEventsPerChat = 200
 
 // AppendGenerationEvent inserts one event, then trims chatID's log back to
-// the most recent maxGenerationEventsPerChat rows.
+// the most recent maxGenerationEventsPerChat rows. updated_at is set to
+// ev.CreatedAt at insert (this table is still an append-only durable log —
+// see the 20260909000005 migration's own doc comment for why it has the
+// column anyway).
 func (r *Repository) AppendGenerationEvent(ctx context.Context, ev GenerationEvent) error {
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO generation_events (id, generation_id, chat_id, seq, type, payload, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, ev.ID, ev.GenerationID, ev.ChatID, ev.Seq, ev.Type, []byte(ev.Payload), ev.CreatedAt)
+		INSERT INTO generation_events (id, generation_id, chat_id, seq, type, payload, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, ev.ID, ev.GenerationID, ev.ChatID, ev.Seq, ev.Type, []byte(ev.Payload), ev.CreatedAt, ev.CreatedAt)
 	if err != nil {
 		return err
 	}

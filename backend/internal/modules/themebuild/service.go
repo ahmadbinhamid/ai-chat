@@ -85,6 +85,40 @@ const (
 	pathDefaultsJSON = "defaults.json"
 )
 
+// attachmentKindLimit is one kind's count/size caps — see attachmentLimits.
+// PostStripMaxBytes is zero for a kind with no post-sanitize pass (today,
+// only HTML has one: SanitizeHTMLAttachment). Both byte fields are decoded/
+// raw-byte sizes, never base64 length — MaxImageAttachmentBytes is checked
+// via base64.StdEncoding.DecodedLen (the wire value is base64, the check
+// isn't), and MaxHTMLUploadBytes/MaxHTMLAttachmentBytes were already
+// decoded-size checks even before this restructuring: HTMLAttachmentContent
+// is plain UTF-8 text on the wire, never base64, so len() on it already
+// measured raw bytes.
+type attachmentKindLimit struct {
+	MaxCount          int
+	MaxBytes          int64
+	PostStripMaxBytes int64
+}
+
+// attachmentLimits keys maxImagesPerMessage/MaxImageAttachmentBytes/
+// MaxHTMLUploadBytes/MaxHTMLAttachmentBytes by chat.AttachmentKind — adding
+// a new kind's count/size caps (e.g. PDF) is one more map entry, not a new
+// exported const plus a new `if` in Generate. The numbers and their
+// reasoning are unchanged from before this restructuring — see each const's
+// own doc comment above; this just gives Generate one place to look them up
+// by kind instead of a literal per attachment type.
+var attachmentLimits = map[chat.AttachmentKind]attachmentKindLimit{
+	chat.AttachmentKindImage: {
+		MaxCount: maxImagesPerMessage,
+		MaxBytes: MaxImageAttachmentBytes,
+	},
+	chat.AttachmentKindHTML: {
+		MaxCount:          1,
+		MaxBytes:          MaxHTMLUploadBytes,
+		PostStripMaxBytes: MaxHTMLAttachmentBytes,
+	},
+}
+
 // generateTimeoutNanos backs generateTimeout()/setGenerateTimeoutForTest —
 // an atomic.Int64 (nanoseconds), not a plain time.Duration var: production
 // code never writes it, but TestRunGeneration_EachIterationGetsFreshTimeout
@@ -439,8 +473,9 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if in.ThemeSlug == "" {
 		return GenerateOutcome{}, errors.New("theme_slug is required")
 	}
-	if len(in.Images) > maxImagesPerMessage {
-		return GenerateOutcome{}, fmt.Errorf("%w: at most %d images per message", ErrTooManyImages, maxImagesPerMessage)
+	imageLimit := attachmentLimits[chat.AttachmentKindImage]
+	if len(in.Images) > imageLimit.MaxCount {
+		return GenerateOutcome{}, fmt.Errorf("%w: at most %d images per message", ErrTooManyImages, imageLimit.MaxCount)
 	}
 	// Reject before ever persisting an image nothing downstream can
 	// process — cheaper and clearer than letting it fail deep inside
@@ -453,19 +488,20 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	// already validated each Base64 field really is valid base64 at bind
 	// time; this only needs the size).
 	for i, img := range in.Images {
-		if base64.StdEncoding.DecodedLen(len(img.Base64)) > MaxImageAttachmentBytes {
+		if int64(base64.StdEncoding.DecodedLen(len(img.Base64))) > imageLimit.MaxBytes {
 			return GenerateOutcome{}, fmt.Errorf("%w: image %d", ErrImageTooLarge, i)
 		}
 	}
 	if in.HTMLAttachmentContent != nil {
-		if len(*in.HTMLAttachmentContent) > MaxHTMLUploadBytes {
-			return GenerateOutcome{}, fmt.Errorf("%w: attached HTML file is over %d bytes", ErrHTMLAttachmentTooLarge, MaxHTMLUploadBytes)
+		htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
+		if int64(len(*in.HTMLAttachmentContent)) > htmlLimit.MaxBytes {
+			return GenerateOutcome{}, fmt.Errorf("%w: attached HTML file is over %d bytes", ErrHTMLAttachmentTooLarge, htmlLimit.MaxBytes)
 		}
 		sanitized := SanitizeHTMLAttachment(*in.HTMLAttachmentContent)
-		if len(sanitized) > MaxHTMLAttachmentBytes {
+		if int64(len(sanitized)) > htmlLimit.PostStripMaxBytes {
 			return GenerateOutcome{}, fmt.Errorf(
 				"%w: still over %d bytes after removing embedded images/scripts",
-				ErrHTMLAttachmentTooLarge, MaxHTMLAttachmentBytes)
+				ErrHTMLAttachmentTooLarge, htmlLimit.PostStripMaxBytes)
 		}
 		in.HTMLAttachmentContent = &sanitized
 	}
@@ -957,14 +993,46 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// points at the exact chat_messages row Generate wrote it to. in is a
 	// value parameter, so this reassignment is local to this call only —
 	// never leaks back to the caller.
+	//
+	// priorMessages carries attachment METADATA only (see
+	// chat.MessageAttachment's own doc comment) — the len(m.Attachments) >
+	// 0 check below is what keeps the overwhelmingly common
+	// zero-attachment turn from costing a second query: GetAttachmentsContent
+	// (the one call that actually pulls bytes out of MySQL) only runs when
+	// this turn's own message is known, from metadata already in hand, to
+	// have something to fetch.
 	if in.UserMessageID != nil {
 		for _, m := range priorMessages {
-			if m.ID == *in.UserMessageID {
-				in.Images = m.Images
-				in.HTMLAttachmentFilename = m.HTMLAttachmentFilename
-				in.HTMLAttachmentContent = m.HTMLAttachmentContent
+			if m.ID != *in.UserMessageID {
+				continue
+			}
+			if len(m.Attachments) == 0 {
 				break
 			}
+			full, attErr := s.chats.GetAttachmentsContent(ctx, *in.UserMessageID)
+			if attErr != nil {
+				return fmt.Errorf("load attachment content: %w", attErr)
+			}
+			for _, a := range full {
+				switch a.Kind {
+				case chat.AttachmentKindImage:
+					in.Images = append(in.Images, chat.MessageImage{
+						Base64:    base64.StdEncoding.EncodeToString(a.Content),
+						MediaType: a.MediaType,
+					})
+				case chat.AttachmentKindHTML:
+					filename := a.Filename
+					content := string(a.Content)
+					in.HTMLAttachmentFilename = &filename
+					in.HTMLAttachmentContent = &content
+				default:
+					// Repository already filters unknown kinds before they
+					// get here — this is defense in depth, not the primary
+					// enforcement (see Repository.GetAttachmentsContent).
+					slog.Warn("doGenerate: unknown attachment kind, skipping", "kind", a.Kind, "attachment_id", a.ID)
+				}
+			}
+			break
 		}
 	}
 

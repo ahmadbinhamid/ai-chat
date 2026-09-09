@@ -2,7 +2,11 @@ package chat
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -126,12 +130,92 @@ func (s *Service) GetMessage(ctx context.Context, chatID, messageID string) (Mes
 	return m, nil
 }
 
+// imageExtensions maps the exact media types sendMessageRequest.Images
+// accepts (see the handler's oneof binding) to a filename extension — used
+// only by filenameForImage. Deliberately the same set the handler validates
+// against: an unrecognized media type can't reach here.
+var imageExtensions = map[string]string{
+	"image/png":  "png",
+	"image/jpeg": "jpg",
+	"image/gif":  "gif",
+	"image/webp": "webp",
+}
+
+// filenameForImage derives a stable, deterministic filename for an attached
+// image — the wire format (MessageImage) carries only base64 + media_type,
+// no client-supplied name (neither a file picker nor a clipboard paste
+// gives one), so one must be synthesized. "image-N.ext" where N is the
+// image's 1-based position in this message and ext comes from media_type —
+// the same rule the 20260909000002 migration's backfill uses for existing
+// rows (ord, JSON_TABLE's own 1-based index, directly as N), so a
+// backfilled row and one attached going forward name themselves
+// identically.
+func filenameForImage(mediaType string, position int) string {
+	ext := imageExtensions[mediaType]
+	if ext == "" {
+		ext = "bin"
+	}
+	return fmt.Sprintf("image-%d.%s", position+1, ext)
+}
+
+// buildAttachments decodes the wire-format images/HTML attachment (base64
+// and plain text respectively — see MessageImage's own doc comment) into
+// the raw-bytes MessageAttachment rows RecordUserMessage persists. Base64
+// decoding happens here, once, at the write boundary — every downstream
+// consumer (including themebuild.Service.doGenerate's re-resolution) works
+// with already-decoded bytes and re-encodes only transiently, right before
+// an API call.
+func buildAttachments(images []MessageImage, htmlAttachmentFilename, htmlAttachmentContent *string) ([]MessageAttachment, error) {
+	var attachments []MessageAttachment
+	now := time.Now().UTC()
+
+	for i, img := range images {
+		raw, err := base64.StdEncoding.DecodeString(img.Base64)
+		if err != nil {
+			return nil, fmt.Errorf("decode image %d: %w", i, err)
+		}
+		sum := sha256.Sum256(raw)
+		attachments = append(attachments, MessageAttachment{
+			ID:        uuid.NewString(),
+			Kind:      AttachmentKindImage,
+			Filename:  filenameForImage(img.MediaType, i),
+			MediaType: img.MediaType,
+			SizeBytes: int64(len(raw)),
+			Checksum:  hex.EncodeToString(sum[:]),
+			Position:  i,
+			Content:   raw,
+			CreatedAt: now,
+		})
+	}
+
+	if htmlAttachmentFilename != nil && htmlAttachmentContent != nil {
+		raw := []byte(*htmlAttachmentContent)
+		sum := sha256.Sum256(raw)
+		attachments = append(attachments, MessageAttachment{
+			ID:        uuid.NewString(),
+			Kind:      AttachmentKindHTML,
+			Filename:  *htmlAttachmentFilename,
+			MediaType: "text/html",
+			SizeBytes: int64(len(raw)),
+			Checksum:  hex.EncodeToString(sum[:]),
+			Position:  0,
+			Content:   raw,
+			CreatedAt: now,
+		})
+	}
+
+	return attachments, nil
+}
+
 // RecordUserMessage appends the merchant's prompt to the thread and folds
 // it into the chat's recency ordering (no tokens are billed for a user
 // turn, so the running totals are untouched). Since a chat is now shared by
 // every user on the tenant (see GetOrCreateChat), userName/userEmail are
 // what let the transcript attribute this turn to a person instead of a
-// generic "You".
+// generic "You". images/htmlAttachment* are the wire-format attachment(s),
+// if any — decoded and persisted as chat_message_attachments rows (see
+// buildAttachments), the only representation now (chat_messages no longer
+// carries any attachment columns of its own).
 func (s *Service) RecordUserMessage(
 	ctx context.Context, c Chat, userID *uint64, userName, userEmail, content string,
 	images []MessageImage, htmlAttachmentFilename, htmlAttachmentContent *string,
@@ -146,25 +230,40 @@ func (s *Service) RecordUserMessage(
 		emailPtr = &userEmail
 	}
 	m := Message{
-		ID:                     uuid.NewString(),
-		ChatID:                 c.ID,
-		TenantID:               c.TenantID,
-		Role:                   RoleUser,
-		UserID:                 userID,
-		UserName:               namePtr,
-		UserEmail:              emailPtr,
-		Content:                content,
-		Status:                 MessageStatusCompleted,
-		ApplyStatus:            ApplyStatusNotApplicable,
-		CreatedAt:              now,
-		Images:                 images,
-		HTMLAttachmentFilename: htmlAttachmentFilename,
-		HTMLAttachmentContent:  htmlAttachmentContent,
+		ID:          uuid.NewString(),
+		ChatID:      c.ID,
+		TenantID:    c.TenantID,
+		Role:        RoleUser,
+		UserID:      userID,
+		UserName:    namePtr,
+		UserEmail:   emailPtr,
+		Content:     content,
+		Status:      MessageStatusCompleted,
+		ApplyStatus: ApplyStatusNotApplicable,
+		CreatedAt:   now,
 	}
-	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, 0, 0, now); err != nil {
+	attachments, err := buildAttachments(images, htmlAttachmentFilename, htmlAttachmentContent)
+	if err != nil {
+		return Message{}, fmt.Errorf("build attachments: %w", err)
+	}
+	for i := range attachments {
+		attachments[i].MessageID = m.ID
+		attachments[i].TenantID = m.TenantID
+	}
+	m.Attachments = attachments
+	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, attachments, 0, 0, now); err != nil {
 		return Message{}, err
 	}
 	return m, nil
+}
+
+// GetAttachmentsContent returns messageID's attachments WITH their raw
+// bytes — see Repository.GetAttachmentsContent's own doc comment. The only
+// caller is themebuild.Service.doGenerate, and only when it already knows
+// (from a metadata-only Message.Attachments it just loaded) that this
+// message actually has attachments to fetch.
+func (s *Service) GetAttachmentsContent(ctx context.Context, messageID string) ([]MessageAttachment, error) {
+	return s.repo.GetAttachmentsContent(ctx, messageID)
 }
 
 // RecordManualEditMessage appends a bookkeeping turn for a file the merchant
@@ -188,7 +287,7 @@ func (s *Service) RecordManualEditMessage(ctx context.Context, c Chat, filePath 
 		ApplyStatus: ApplyStatusPending,
 		CreatedAt:   now,
 	}
-	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, 0, 0, now); err != nil {
+	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, nil, 0, 0, now); err != nil {
 		return Message{}, err
 	}
 	return m, nil
@@ -220,7 +319,7 @@ func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content st
 	if applyStatus == ApplyStatusApplied {
 		m.AppliedAt = &now
 	}
-	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, inputTokens, outputTokens, now); err != nil {
+	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, nil, inputTokens, outputTokens, now); err != nil {
 		return Message{}, err
 	}
 	return m, nil
