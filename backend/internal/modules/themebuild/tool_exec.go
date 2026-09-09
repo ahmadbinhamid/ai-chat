@@ -97,6 +97,21 @@ func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStor
 	var b strings.Builder
 	total := 0
 	for _, p := range args.Paths {
+		// pages.json/defaults.json are rejected here for a reason that has
+		// nothing to do with whether they're writable (see
+		// themefs.ValidateGeneratedFilePath below, which now allows both as
+		// real .json files — the AI theme builder can edit every real theme
+		// file, including these two): they're already supplied directly in
+		// this call's own context (see THEME_ENGINE_SPEC.md §0 — "never
+		// call a tool to fetch these"), so a read_theme_file call for
+		// either is always a wasted round trip, not a blocked one. Checked
+		// explicitly, ahead of and independent from the write-side
+		// allowlist, so a future change to what's writable never silently
+		// changes what's worth re-reading via this tool.
+		if p == pathPagesJSON || p == pathDefaultsJSON {
+			fmt.Fprintf(&b, "### %s\nERROR: %s is already in your context — do not read it via this tool.\n\n", p, p)
+			continue
+		}
 		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
 			fmt.Fprintf(&b, "### %s\nERROR: %s\n\n", p, err.Error())
 			continue

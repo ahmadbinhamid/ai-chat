@@ -46,6 +46,14 @@ func respondErr(c *gin.Context, err error) {
 		httpresponse.Error(c, http.StatusConflict, err.Error(), "NO_PENDING_CHANGES")
 	case errors.Is(err, themebuild.ErrManualEditFileNotFound):
 		httpresponse.Error(c, http.StatusNotFound, err.Error(), "FILE_NOT_FOUND")
+	case errors.Is(err, themebuild.ErrVisionNotConfigured):
+		httpresponse.Error(c, http.StatusUnprocessableEntity, err.Error(), "VISION_NOT_CONFIGURED")
+	case errors.Is(err, themebuild.ErrTooManyImages):
+		httpresponse.Error(c, http.StatusUnprocessableEntity, err.Error(), "TOO_MANY_IMAGES")
+	case errors.Is(err, themebuild.ErrImageTooLarge):
+		httpresponse.Error(c, http.StatusRequestEntityTooLarge, err.Error(), "IMAGE_TOO_LARGE")
+	case errors.Is(err, themebuild.ErrHTMLAttachmentTooLarge):
+		httpresponse.Error(c, http.StatusRequestEntityTooLarge, err.Error(), "HTML_ATTACHMENT_TOO_LARGE")
 	// isUpstreamUnavailable is checked before the generic default branch —
 	// a merchant seeing "the theme service is temporarily unavailable,
 	// please try again" (a real, actionable, non-scary explanation) instead

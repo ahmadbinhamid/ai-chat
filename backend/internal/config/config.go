@@ -53,6 +53,12 @@ type Config struct {
 	// Anthropic / Claude
 	AnthropicAPIKey string
 	AnthropicModel  string
+	// AnthropicVisionModel, when set, is used instead of AnthropicModel for
+	// any turn that attaches an image — see ai.Generator.visionModel's own
+	// doc comment for why a separate model rather than always using this
+	// one. Empty (the default) means image attachments are rejected
+	// outright for this provider — see themebuild.ErrVisionNotConfigured.
+	AnthropicVisionModel string
 
 	// Effort/MaxTokens are provider-neutral despite living next to the
 	// Anthropic/DeepSeek fields above: both providers speak the same
@@ -76,6 +82,14 @@ type Config struct {
 	DeepSeekAPIKey  string
 	DeepSeekModel   string
 	DeepSeekBaseURL string
+	// DeepSeekVisionModel — see AnthropicVisionModel's doc comment; same
+	// role, DeepSeek side. Defaults to DeepSeek's own documented
+	// experimental vision model (confirmed working against the real
+	// tool-loop pipeline via a one-off smoke test — see
+	// internal/ai/vision_smoke_test.go), NOT the same tier as DeepSeekModel
+	// — DeepSeek's vision support lives on a separate, lesser-tier,
+	// experimental model, not on deepseek-v4-pro itself.
+	DeepSeekVisionModel string
 	// HistorySummarizationEnabled gates themebuild's collapsed-history-turn
 	// summarization (see themebuild.Service.summarizeOldTurnsCached).
 	// Defaults to enabled for both providers, not just Anthropic — the
@@ -130,10 +144,15 @@ type Config struct {
 	// by the HTTP server's own read timeout) and force a large in-memory
 	// allocation before struct-tag validation (e.g. sendMessageRequest's
 	// Prompt max=6000) ever runs, since c.ShouldBindJSON fully unmarshals
-	// first. 10MB comfortably covers the largest legitimate payload today
-	// (POST /themes/:slug/preview's Files map — a full draft theme's
-	// Liquid/CSS/JS text content) with headroom, while still being far
-	// short of "an attacker can meaningfully exhaust memory with one call."
+	// first. 45MB is sized for POST /chats/messages' own worst case, the
+	// largest legitimate payload today: up to 5 images at
+	// maxImageAttachmentBytes (5MB) each — base64 inflates that ~4/3, so
+	// ~33MB just for images — plus one HTML attachment up to
+	// maxHTMLUploadBytes (5MB raw, before stripping), plus JSON/field
+	// overhead. (POST /themes/:slug/preview's own full draft theme
+	// Files map is comfortably smaller than that and was this cap's
+	// previous 10MB high-water mark.) Still far short of "an attacker can
+	// meaningfully exhaust memory with one call."
 	MaxRequestBodyBytes int64
 }
 
@@ -168,16 +187,18 @@ func Load() Config {
 
 		AIProvider: aiProvider,
 
-		AnthropicAPIKey: os.Getenv("ANTHROPIC_API_KEY"),
-		AnthropicModel:  getenv("ANTHROPIC_MODEL", "claude-opus-5"),
-		Effort:          getenvDeprecated("AI_EFFORT", "ANTHROPIC_EFFORT", "xhigh"),
-		MaxTokens:       int64(getenvIntDeprecated("AI_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS", 64000)),
-		FakeAIMode:      getenvBool("AI_CHAT_FAKE_MODE", false),
-		FakeAIDelay:     time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
+		AnthropicAPIKey:      os.Getenv("ANTHROPIC_API_KEY"),
+		AnthropicModel:       getenv("ANTHROPIC_MODEL", "claude-opus-5"),
+		AnthropicVisionModel: getenv("ANTHROPIC_VISION_MODEL", ""),
+		Effort:               getenvDeprecated("AI_EFFORT", "ANTHROPIC_EFFORT", "xhigh"),
+		MaxTokens:            int64(getenvIntDeprecated("AI_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS", 64000)),
+		FakeAIMode:           getenvBool("AI_CHAT_FAKE_MODE", false),
+		FakeAIDelay:          time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
-		DeepSeekAPIKey:  os.Getenv("DEEPSEEK_API_KEY"),
-		DeepSeekModel:   getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
-		DeepSeekBaseURL: getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
+		DeepSeekAPIKey:      os.Getenv("DEEPSEEK_API_KEY"),
+		DeepSeekModel:       getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+		DeepSeekVisionModel: getenv("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
+		DeepSeekBaseURL:     getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
 
 		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
 
@@ -187,7 +208,7 @@ func Load() Config {
 
 		RedisURL: os.Getenv("REDIS_URL"),
 
-		MaxRequestBodyBytes: int64(getenvInt("MAX_REQUEST_BODY_BYTES", 10*1024*1024)),
+		MaxRequestBodyBytes: int64(getenvInt("MAX_REQUEST_BODY_BYTES", 45*1024*1024)),
 	}
 }
 

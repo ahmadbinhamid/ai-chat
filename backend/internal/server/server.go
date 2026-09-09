@@ -48,13 +48,13 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 		generator = ai.NewFake(cfg.FakeAIDelay)
 	case cfg.AIProvider == "deepseek":
 		var err error
-		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.MaxTokens)
+		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens)
 		if err != nil {
 			return nil, err
 		}
 	default:
 		var err error
-		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.MaxTokens)
+		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens)
 		if err != nil {
 			return nil, err
 		}
@@ -88,11 +88,11 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	revertHandler := handlers.NewRevertHandler(buildSvc)
 	previewHandler := handlers.NewPreviewHandler(buildSvc)
 	previewHandler.SetProductsFetchTimeout(cfg.FlowposHTTPTimeout)
-	themeHandler := handlers.NewThemeHandler(buildSvc)
 	queueHandler := handlers.NewQueueHandler(buildSvc)
 	applyHandler := handlers.NewApplyHandler(buildSvc)
 	draftHandler := handlers.NewDraftHandler(buildSvc)
 	assetHandler := handlers.NewAssetHandler(buildSvc)
+	attachmentHandler := handlers.NewAttachmentHandler(buildSvc)
 
 	r := gin.New()
 	r.Use(gin.Recovery(), logging.Middleware(logger), maxBodySize(cfg.MaxRequestBodyBytes))
@@ -142,6 +142,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	identified.GET("/chat/status", chatHandler.Status)
 	identified.POST("/chats/messages", messageHandler.Send)
 	identified.POST("/chats/:chatId/messages/:messageId/revert", revertHandler.Revert)
+	identified.GET("/chats/:chatId/messages/:messageId/attachments/:attachmentId", attachmentHandler.Get)
 	identified.DELETE("/chats/:chatId/queue/:generationId", queueHandler.Cancel)
 	identified.DELETE("/chats/:chatId/queue", queueHandler.CancelAll)
 	identified.POST("/chats/:chatId/apply", applyHandler.Apply)
@@ -151,7 +152,6 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	identified.GET("/preview/context", previewHandler.Context)
 	identified.GET("/theme-assets/*path", assetHandler.Get)
 	identified.POST("/themes/:slug/preview", previewHandler.Preview)
-	identified.POST("/themes", themeHandler.Create)
 
 	// Not in the `identified` group: a browser WebSocket can't set an
 	// Authorization header, so this route authenticates itself via

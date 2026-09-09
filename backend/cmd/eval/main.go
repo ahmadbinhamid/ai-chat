@@ -63,6 +63,17 @@ func main() {
 	if err != nil {
 		log.Fatalf("EVAL_TENANT_ID must be a valid tenant id: %v", err)
 	}
+	// The AI theme builder never creates a theme itself — only edits one a
+	// merchant already installed/activated (see themebuild.GenerateInput.
+	// ThemeSlug's own doc comment) — so eval needs the same precondition
+	// EVAL_TENANT_ID already does: a human sets this up for real first
+	// (install or import a theme for that tenant through the normal
+	// flowpos-backend flow, activate it), then points eval at its slug.
+	themeSlug := os.Getenv("EVAL_THEME_SLUG")
+	if themeSlug == "" {
+		log.Fatal("EVAL_THEME_SLUG is required — install/activate a real theme for EVAL_TENANT_ID first " +
+			"(the AI theme builder never creates one itself), then set this to its slug")
+	}
 
 	conn, err := db.Connect(cfg)
 	if err != nil {
@@ -72,9 +83,9 @@ func main() {
 
 	var generator *ai.Generator
 	if cfg.AIProvider == "deepseek" {
-		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.MaxTokens)
+		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens)
 	} else {
-		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.MaxTokens)
+		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens)
 	}
 	if err != nil {
 		// One-shot CLI command exiting the whole process — the OS reclaims
@@ -99,7 +110,7 @@ func main() {
 
 	results := make([]taskResult, 0, len(evals.Tasks))
 	for _, task := range evals.Tasks {
-		res := runTask(ctx, buildSvc, chatSvc, tenantID, token, task)
+		res := runTask(ctx, buildSvc, chatSvc, tenantID, token, themeSlug, task)
 		results = append(results, res)
 
 		status := "FAIL"
@@ -124,20 +135,19 @@ func main() {
 	}
 }
 
-// runTask creates a fresh test theme, sends the task's prompt, waits for the
-// background generation to finish, and checks whether files were actually
-// written to this specific turn against task.ExpectedOK.
-func runTask(ctx context.Context, buildSvc *themebuild.Service, chatSvc *chat.Service, tenantID uint64, token string, task evals.Task) taskResult {
-	slug, err := buildSvc.CreateThemeFromBase(ctx, tenantID, token)
-	if err != nil {
-		return taskResult{task: task, passed: false, detail: fmt.Sprintf("create theme: %v", err)}
-	}
-
+// runTask sends the task's prompt against themeSlug (an already-existing,
+// already-activated theme — see EVAL_THEME_SLUG in main; the AI theme
+// builder never creates a theme itself, only edits one a merchant already
+// installed, and eval exercises the exact same real pipeline, so it needs
+// the same precondition), waits for the background generation to finish,
+// and checks whether files were actually written to this specific turn
+// against task.ExpectedOK.
+func runTask(ctx context.Context, buildSvc *themebuild.Service, chatSvc *chat.Service, tenantID uint64, token, themeSlug string, task evals.Task) taskResult {
 	outcome, err := buildSvc.Generate(ctx, themebuild.GenerateInput{
 		TenantID:  tenantID,
 		UserName:  "eval",
 		Token:     token,
-		ThemeSlug: slug,
+		ThemeSlug: themeSlug,
 		Prompt:    task.Prompt,
 		Mode:      task.Mode,
 	})
@@ -158,7 +168,7 @@ func runTask(ctx context.Context, buildSvc *themebuild.Service, chatSvc *chat.Se
 	actualOK := genErr == "" && filesWritten
 	passed := actualOK == task.ExpectedOK
 
-	detail := fmt.Sprintf("theme=%s files_written=%v", slug, filesWritten)
+	detail := fmt.Sprintf("theme=%s files_written=%v", themeSlug, filesWritten)
 	if genErr != "" {
 		detail += fmt.Sprintf(" generation_error=%q", genErr)
 	}

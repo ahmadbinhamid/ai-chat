@@ -125,9 +125,14 @@ func TestExecReadThemeFile_RejectsDisallowedExtension(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	// pages.json is a real, readable theme file, but read_theme_file only
-	// accepts the extensions ValidateGeneratedFilePath allows (.liquid/.css/
-	// .js) — pages.json/defaults.json go through buildThemeContext instead.
+	// pages.json is a real, readable (and now writable) theme file, but
+	// read_theme_file still rejects it — not because of any extension
+	// restriction (pages.json is a legitimate .json file, same as any
+	// other now — see themefs.allowedGeneratedExtensions), but because
+	// it's already supplied directly in context (THEME_ENGINE_SPEC.md
+	// §0), so fetching it again through this tool is always a wasted
+	// round trip. See execReadThemeFile's own explicit pathPagesJSON/
+	// pathDefaultsJSON check.
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"pages.json"}})
 	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {

@@ -81,7 +81,12 @@ func TestNew_MountsExpectedRoutes(t *testing.T) {
 		http.MethodPost + " /api/v1/chats/:chatId/apply": false,
 		http.MethodGet + " /api/v1/chats/:chatId/draft":  false,
 		http.MethodGet + " /api/v1/chats/:chatId/stream": false,
-		http.MethodPost + " /api/v1/themes":              false,
+		// /api/v1/themes (POST, create-from-base) was removed — the AI
+		// theme builder never creates a theme itself, only edits one a
+		// merchant already installed/activated. /themes/:slug/preview
+		// stays as this test's representative route for the same handler
+		// group.
+		http.MethodPost + " /api/v1/themes/:slug/preview": false,
 	}
 
 	for _, ri := range srv.engine.Routes() {

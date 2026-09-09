@@ -16,9 +16,14 @@ import (
 type fakeGenerator struct {
 	calls   int
 	results []*ai.Result // returned in order; the last one repeats once exhausted
+	// visionSupported backs SupportsVision — zero-value false, matching
+	// every existing test's expectation (none of them attach an image, so
+	// none of them care); set true only in a test that specifically needs
+	// Generate's own len(in.Images) > 0 && !SupportsVision() gate to pass.
+	visionSupported bool
 }
 
-func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
+func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ []ai.Image, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
 	f.calls++
 	idx := f.calls - 1
 	if idx >= len(f.results) {
@@ -26,6 +31,8 @@ func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Tu
 	}
 	return f.results[idx], nil
 }
+
+func (f *fakeGenerator) SupportsVision() bool { return f.visionSupported }
 
 // Summarize satisfies the generator interface's history-summarization hook
 // (see history_summary.go) — this fake never needs it for real, since

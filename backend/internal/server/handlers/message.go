@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"net/http"
 
 	"ai-chat/internal/auth"
 	"ai-chat/internal/httpresponse"
+	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/modules/themebuild"
 	"ai-chat/internal/ratelimit"
 	"ai-chat/internal/themefs"
@@ -33,11 +35,38 @@ type sendMessageRequest struct {
 	// burns input tokens on a request nobody meant to send.
 	Prompt string `json:"prompt" binding:"required,max=6000"`
 	// Mode is optional and empty by default (full edit, no restriction) —
-	// only the guided "start a theme from scratch" flow should ever send
-	// "brand" or "copy" here, and only for that flow's own first two turns.
-	// See themebuild.GenerateInput.Mode's doc comment for why this must be
+	// only a guided setup flow (walking a merchant through brand, then
+	// copy, on a theme they've already installed/activated — the AI
+	// theme builder never creates a theme itself) should ever send "brand"
+	// or "copy" here, and only for that flow's own first two turns. See
+	// themebuild.GenerateInput.Mode's doc comment for why this must be
 	// explicit rather than inferred from the chat's turn count.
 	Mode string `json:"mode" binding:"omitempty,oneof=brand copy edit pages"`
+	// Images attaches up to 5 images to this prompt (matches
+	// themebuild.maxImagesPerMessage — kept as a literal here since gin's
+	// `max=` binding tag needs one, not a cross-package const expression)
+	// — see the image-attachment feature. `max=5,dive` bounds the list AND
+	// validates every entry in it. Size/count limits beyond this shape are
+	// themebuild.Service.Generate's own job, not this handler's — see its
+	// doc comment on why all attachment business rules live there.
+	Images []imageAttachment `json:"images" binding:"omitempty,max=5,dive"`
+	// HTMLAttachment attaches one reference HTML file to this prompt —
+	// see the HTML-attachment feature. Unlike Images, capped at one file
+	// (see chat.MessageAttachment's own doc comment, and
+	// themebuild.attachmentLimits, for why).
+	HTMLAttachment *htmlAttachment `json:"html_attachment" binding:"omitempty"`
+}
+
+type htmlAttachment struct {
+	Filename string `json:"filename" binding:"required,max=255"`
+	Content  string `json:"content" binding:"required"`
+}
+
+type imageAttachment struct {
+	Base64 string `json:"base64" binding:"required"`
+	// MediaType is restricted to exactly the SDK's supported
+	// Base64ImageSourceMediaType values.
+	MediaType string `json:"media_type" binding:"required,oneof=image/png image/jpeg image/gif image/webp"`
 }
 
 type sendMessageResponse struct {
@@ -96,6 +125,29 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		return
 	}
 
+	// Only a wire-format check (is this actually valid base64) — belongs
+	// here since it's about whether the request body itself is
+	// well-formed, distinct from business rules like size/count limits,
+	// which are themebuild.Service.Generate's own job (see its doc
+	// comment) so every caller of Generate gets them, not just this one
+	// HTTP route.
+	for _, img := range in.Images {
+		if _, err := base64.StdEncoding.DecodeString(img.Base64); err != nil {
+			respondBindErr(c, err)
+			return
+		}
+	}
+	images := make([]chat.MessageImage, len(in.Images))
+	for i, img := range in.Images {
+		images[i] = chat.MessageImage{Base64: img.Base64, MediaType: img.MediaType}
+	}
+
+	var htmlFilename, htmlContent *string
+	if in.HTMLAttachment != nil {
+		htmlFilename = &in.HTMLAttachment.Filename
+		htmlContent = &in.HTMLAttachment.Content
+	}
+
 	tenantID := auth.TenantID(c)
 	if !h.limiter.Allow(tenantID) {
 		httpresponse.Error(c, http.StatusTooManyRequests, "generation rate limit exceeded for this tenant, try again shortly", "RATE_LIMITED")
@@ -103,14 +155,17 @@ func (h *MessageHandler) Send(c *gin.Context) {
 	}
 
 	outcome, err := h.builder.Generate(c.Request.Context(), themebuild.GenerateInput{
-		TenantID:  tenantID,
-		UserID:    auth.UserID(c),
-		UserName:  auth.UserName(c),
-		UserEmail: auth.Email(c),
-		Token:     auth.Token(c),
-		ThemeSlug: in.ThemeSlug,
-		Prompt:    in.Prompt,
-		Mode:      in.Mode,
+		TenantID:               tenantID,
+		UserID:                 auth.UserID(c),
+		UserName:               auth.UserName(c),
+		UserEmail:              auth.Email(c),
+		Token:                  auth.Token(c),
+		ThemeSlug:              in.ThemeSlug,
+		Prompt:                 in.Prompt,
+		Mode:                   in.Mode,
+		Images:                 images,
+		HTMLAttachmentFilename: htmlFilename,
+		HTMLAttachmentContent:  htmlContent,
 	})
 	if err != nil {
 		respondErr(c, err)

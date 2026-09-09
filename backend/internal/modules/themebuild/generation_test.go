@@ -128,10 +128,11 @@ func TestGenerationRepository_ReapStaleGenerations(t *testing.T) {
 	chatID := uuid.NewString()
 	genID := uuid.NewString()
 
+	staleStartedAt := time.Now().UTC().Add(-10 * time.Minute)
 	if _, err := conn.ExecContext(ctx, `
-		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at)
-		VALUES (?, ?, 1, ?, 0, ?, ?)
-	`, genID, chatID, GenerationStatusRunning, "", time.Now().UTC().Add(-10*time.Minute)); err != nil {
+		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at, created_at, updated_at)
+		VALUES (?, ?, 1, ?, 0, ?, ?, ?, ?)
+	`, genID, chatID, GenerationStatusRunning, "", staleStartedAt, staleStartedAt, staleStartedAt); err != nil {
 		t.Fatalf("failed to seed a stale running generation: %v", err)
 	}
 
@@ -166,10 +167,12 @@ func TestGenerationRepository_ReapStaleGenerations_HeartbeatOverridesStartedAt(t
 	chatID := uuid.NewString()
 	genID := uuid.NewString()
 
+	oldStartedAt := time.Now().UTC().Add(-1 * time.Hour)
+	freshHeartbeat := time.Now().UTC()
 	if _, err := conn.ExecContext(ctx, `
-		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at, last_heartbeat_at)
-		VALUES (?, ?, 1, ?, 0, ?, ?, ?)
-	`, genID, chatID, GenerationStatusRunning, "", time.Now().UTC().Add(-1*time.Hour), time.Now().UTC()); err != nil {
+		INSERT INTO generations (id, chat_id, tenant_id, status, attempts, prompt, started_at, last_heartbeat_at, created_at, updated_at)
+		VALUES (?, ?, 1, ?, 0, ?, ?, ?, ?, ?)
+	`, genID, chatID, GenerationStatusRunning, "", oldStartedAt, freshHeartbeat, oldStartedAt, freshHeartbeat); err != nil {
 		t.Fatalf("failed to seed a generation with an old started_at but fresh heartbeat: %v", err)
 	}
 

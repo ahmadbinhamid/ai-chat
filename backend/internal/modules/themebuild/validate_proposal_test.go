@@ -57,28 +57,27 @@ func TestValidateProposal_BrandModeRejectsPageRegistration(t *testing.T) {
 	}
 }
 
-// Regression test: a files[] entry targeting layout-start.liquid (or
-// layout-end.liquid) directly must be rejected here, before a single
-// themecheck/repair round-trip is spent on it — see validateProposal's own
-// comment on why. Observed in production: a model proposal with BOTH a
-// files[] edit to liquid/layout-start.liquid AND a layout_links_to_add
-// entry produced two audit rows for the same (message_id, file_path) pair,
-// which only failed later at the database's uniqueness constraint with an
-// opaque error the merchant couldn't act on.
-func TestValidateProposal_EditModeRejectsDirectLayoutStartEdit(t *testing.T) {
+// A files[] entry targeting layout-start.liquid (or layout-end.liquid)
+// directly is allowed now — the AI theme builder can edit every real theme
+// file, including these two (a deliberate decision; see
+// pathsafety.go/writeplan.go's own doc comments for the history and the
+// safety net that replaced the old outright rejection tested here before:
+// buildWritePlan's hasDirectEdit guard, covered separately in
+// service_test.go, not this function at all anymore).
+func TestValidateProposal_EditModeAllowsDirectLayoutStartEdit(t *testing.T) {
 	r := &ai.Result{
 		Files:            []ai.GeneratedFile{{Path: pathLayoutStart, Action: "update", Content: "<html></html>"}},
 		LayoutLinksToAdd: []string{"pages/css/offers.css"},
 	}
-	if err := validateProposal(r, ""); err == nil {
-		t.Error("expected a files[] entry targeting layout-start.liquid to be rejected")
+	if err := validateProposal(r, ""); err != nil {
+		t.Errorf("expected a files[] entry targeting layout-start.liquid to be allowed, got: %v", err)
 	}
 }
 
-func TestValidateProposal_EditModeRejectsDirectLayoutEndEdit(t *testing.T) {
+func TestValidateProposal_EditModeAllowsDirectLayoutEndEdit(t *testing.T) {
 	r := &ai.Result{Files: []ai.GeneratedFile{{Path: pathLayoutEnd, Action: "update", Content: "</html>"}}}
-	if err := validateProposal(r, ""); err == nil {
-		t.Error("expected a files[] entry targeting layout-end.liquid to be rejected")
+	if err := validateProposal(r, ""); err != nil {
+		t.Errorf("expected a files[] entry targeting layout-end.liquid to be allowed, got: %v", err)
 	}
 }
 
