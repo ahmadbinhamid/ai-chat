@@ -145,11 +145,7 @@ var imageExtensions = map[string]string{
 // image — the wire format (MessageImage) carries only base64 + media_type,
 // no client-supplied name (neither a file picker nor a clipboard paste
 // gives one), so one must be synthesized. "image-N.ext" where N is the
-// image's 1-based position in this message and ext comes from media_type —
-// the same rule the 20260909000002 migration's backfill uses for existing
-// rows (ord, JSON_TABLE's own 1-based index, directly as N), so a
-// backfilled row and one attached going forward name themselves
-// identically.
+// image's 1-based position in this message and ext comes from media_type.
 func filenameForImage(mediaType string, position int) string {
 	ext := imageExtensions[mediaType]
 	if ext == "" {

@@ -58,13 +58,26 @@ func init() {
 // is deleted. That cascade is a real advantage over external storage: no
 // orphan-blob sweeper needed, the database reclaims the bytes itself.
 //
-// Old columns are deliberately NOT dropped here — see Down and the
-// migration's own backfill below. A migration that both moves data and
-// destroys the source in one step has no recovery path; dropping
-// images/html_attachment_* is a separate, later migration once the backfill
-// is verified in production.
+// Old columns (images, html_attachment_filename/content) are deliberately
+// NOT dropped here — see the 20260909000004 migration, which drops all
+// three in a separate step.
+//
+// No backfill: this migration originally included one (unnest the old
+// images JSON array via JSON_TABLE/FROM_BASE64, copy the single
+// html_attachment_* pair), written when this feature was believed to have
+// live data in those columns somewhere it needed to preserve. It never did
+// — this whole feature has only ever run against one developer's local
+// database, and confirmed before removing the backfill: production has
+// never had this feature deployed, so the old columns hold nothing there
+// either. Removed rather than left as dead-but-harmless code: a backfill
+// that never runs against real data is still a real maintenance/review
+// burden (JSON_TABLE/FROM_BASE64 correctness, filename-derivation rules)
+// for a codepath nothing will ever execute meaningfully. If a real backfill
+// need ever resurfaces, write a fresh migration for it rather than
+// resurrecting this one — by then the old columns may not even exist
+// anymore (see the 20260909000004 migration).
 func Up_20260909000002(db *sql.DB) error {
-	if _, err := db.Exec(`
+	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chat_message_attachments (
 		  id           CHAR(36)        NOT NULL PRIMARY KEY,
 		  message_id   CHAR(36)        NOT NULL,
@@ -82,92 +95,10 @@ func Up_20260909000002(db *sql.DB) error {
 		  INDEX idx_cma_message_position (message_id, position),
 		  INDEX idx_cma_tenant_checksum (tenant_id, checksum)
 		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-	`); err != nil {
+	`)
+	if err != nil {
 		return fmt.Errorf("create chat_message_attachments: %w", err)
 	}
-
-	// Backfill images: one row per images[] array entry, decoded straight
-	// from base64 to bytes via JSON_TABLE + FROM_BASE64 — no application
-	// code, no auth, pure SQL (confirmed available on this deployment's
-	// MySQL: JSON_TABLE, FROM_BASE64, SHA2, UUID() are all stdlib SQL
-	// functions here, not an extension). ord is JSON_TABLE's own 1-based
-	// array index — position stores it 0-based (ord - 1) to match
-	// chat.MessageAttachment.Position's own indexing, and the filename's
-	// display number (image-N) uses ord directly, which is exactly
-	// position+1 — the same rule chat.filenameForImage uses for images
-	// attached going forward, so a backfilled row and a freshly-written row
-	// name themselves identically. The old images column carried no
-	// filename at all (see the 20260908000001 migration), so this is a
-	// synthesized-but-stable name, not a recovered one.
-	if _, err := db.Exec(`
-		INSERT INTO chat_message_attachments
-		  (id, message_id, tenant_id, kind, filename, media_type, size_bytes, checksum, position, content, storage_key, created_at)
-		SELECT
-		  UUID(),
-		  cm.id,
-		  cm.tenant_id,
-		  'image',
-		  CONCAT('image-', jt.ord, '.',
-		    CASE jt.media_type
-		      WHEN 'image/png'  THEN 'png'
-		      WHEN 'image/jpeg' THEN 'jpg'
-		      WHEN 'image/gif'  THEN 'gif'
-		      WHEN 'image/webp' THEN 'webp'
-		      ELSE 'bin'
-		    END
-		  ),
-		  jt.media_type,
-		  LENGTH(FROM_BASE64(jt.base64)),
-		  SHA2(FROM_BASE64(jt.base64), 256),
-		  jt.ord - 1,
-		  FROM_BASE64(jt.base64),
-		  NULL,
-		  cm.created_at
-		FROM chat_messages cm
-		JOIN JSON_TABLE(
-		  cm.images,
-		  '$[*]' COLUMNS (
-		    ord        FOR ORDINALITY,
-		    base64     LONGTEXT     PATH '$.base64',
-		    media_type VARCHAR(127) PATH '$.media_type'
-		  )
-		) AS jt
-		WHERE cm.images IS NOT NULL;
-	`); err != nil {
-		return fmt.Errorf("backfill image attachments: %w", err)
-	}
-
-	// Backfill the single HTML attachment pair, kind='html', position 0
-	// (there was and is never more than one per message — see
-	// chat.MessageAttachment's own doc comment on why HTML stays capped
-	// tighter than images). filename carries straight over: unlike images,
-	// the old columns already had a real client-supplied filename.
-	// CAST(... AS BINARY) takes the utf8mb4 TEXT column's own raw bytes
-	// into the BLOB column — the same bytes LENGTH()/SHA2() below measure
-	// and hash, so size_bytes/checksum describe exactly what's stored.
-	if _, err := db.Exec(`
-		INSERT INTO chat_message_attachments
-		  (id, message_id, tenant_id, kind, filename, media_type, size_bytes, checksum, position, content, storage_key, created_at)
-		SELECT
-		  UUID(),
-		  cm.id,
-		  cm.tenant_id,
-		  'html',
-		  cm.html_attachment_filename,
-		  'text/html',
-		  LENGTH(cm.html_attachment_content),
-		  SHA2(CAST(cm.html_attachment_content AS BINARY), 256),
-		  0,
-		  CAST(cm.html_attachment_content AS BINARY),
-		  NULL,
-		  cm.created_at
-		FROM chat_messages cm
-		WHERE cm.html_attachment_content IS NOT NULL
-		  AND cm.html_attachment_filename IS NOT NULL;
-	`); err != nil {
-		return fmt.Errorf("backfill html attachments: %w", err)
-	}
-
 	return nil
 }
 

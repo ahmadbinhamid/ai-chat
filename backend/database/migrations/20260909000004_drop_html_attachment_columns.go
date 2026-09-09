@@ -62,11 +62,15 @@ func init() {
 // 20260908000001/20260909000001 migrations), so a rollback restores the
 // SCHEMA. It cannot restore the DATA: none of the three columns' content is
 // retained anywhere Down could read it back from — a rollback after this
-// has run gets three empty columns, not the original values. (Data is not
-// actually lost by Up itself: everything that was ever in these columns
-// was already copied into chat_message_attachments by the 20260909000002
-// migration's own backfill, which ran first and is never undone by this
-// Down.)
+// has run gets three empty columns, not the original values. Unlike an
+// earlier draft of this migration's own comment claimed, this is a genuine,
+// one-way data loss for any row that actually had content in these columns
+// — the 20260909000002 migration's backfill (which used to copy that
+// content into chat_message_attachments first) has been removed, since no
+// database this feature has ever run against (including production, never
+// deployed) had real data in these columns to preserve. If that's no
+// longer true when this actually runs somewhere, stop and write a backfill
+// migration first rather than trusting this comment.
 func Up_20260909000004(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE chat_messages
