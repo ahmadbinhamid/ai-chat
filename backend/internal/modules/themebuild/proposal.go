@@ -57,19 +57,25 @@ func promptWithHTMLAttachment(prompt string, in GenerateInput) string {
 			// (HTMLAttachmentIsExternalLink) — that would make the model
 			// falsely claim it read a page it never actually got.
 			//
-			// ReferenceURLBlocked gets the actionable version — repeating
-			// urlfetch.ErrBlocked's own merchant-facing text (a site
-			// refusing an automated request is a different, more specific
-			// situation than being unreachable, with a different thing the
-			// merchant can actually do about it) — rather than a generic
-			// "couldn't reach it" that leaves the model with nothing
-			// useful to suggest.
+			// ReferenceURLBlocked and ReferenceURLEmptyAfterSanitize each get
+			// their own actionable version — repeating urlfetch.ErrBlocked's
+			// own merchant-facing text, or explaining that the page loaded
+			// but its content is JS-rendered — rather than a generic
+			// "couldn't reach it" that leaves the model with nothing useful
+			// to suggest. ReferenceURLEmptyAfterSanitize is checked first:
+			// that page WAS reached (see doGenerate's own reference-URL
+			// block, which sets both flags together for this case) — "could
+			// not reach" would be actively wrong for it.
 			reason := "could not reach or read it"
-			if in.ReferenceURLBlocked {
-				reason = "was refused by that site — it looks like the site blocks automated requests"
-			}
 			suggestion := ""
-			if in.ReferenceURLBlocked {
+			switch {
+			case in.ReferenceURLEmptyAfterSanitize:
+				reason = "loaded, but its content is rendered by JavaScript in the browser rather than present in " +
+					"the page's own HTML, so there was nothing readable to extract"
+				suggestion = " Suggest the merchant open the page, copy the rendered HTML (e.g. via \"Inspect\" > " +
+					"the <body> element), and paste it as an HTML file attachment instead of a link."
+			case in.ReferenceURLBlocked:
+				reason = "was refused by that site — it looks like the site blocks automated requests"
 				suggestion = " Suggest the merchant paste the page's HTML as a file attachment instead of a link."
 			}
 			return fmt.Sprintf(

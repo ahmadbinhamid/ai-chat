@@ -1,6 +1,7 @@
 package urlfetch
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // fetchTimeout bounds the whole fetch — connect, TLS handshake, headers,
@@ -45,15 +47,6 @@ const userAgent = "FlowPOS-AIThemeBuilder/1.0 (+reference-link-fetch)"
 // rate limiter's own window) triggered the retry in the first place.
 const retryDelay = 500 * time.Millisecond
 
-// hardCeilingMultiplier bounds how far over the caller's requested maxBytes
-// Fetch will read before giving up outright with ErrTooLarge instead of
-// truncating (see the Result/Truncated path below). A page 10x over the
-// requested cap reads as a pathological endpoint (an infinite stream, a
-// large asset mislabeled as HTML) truncating doesn't meaningfully help
-// with — better to fail fast than spend the rest of fetchTimeout's budget
-// reading bytes that were always going to be cut anyway.
-const hardCeilingMultiplier = 10
-
 // sniffBytes bounds how much of the body looksLikeHTML inspects when the
 // Content-Type header alone doesn't settle it — enough to see past a
 // <!doctype>/<html> opening tag and any leading whitespace/BOM a real page
@@ -78,7 +71,6 @@ var (
 	ErrBlockedHost = errors.New("that url points at a private or internal address and can't be used as a reference")
 	ErrFetchFailed = errors.New("could not reach that url")
 	ErrNotHTML     = errors.New("that url did not return a webpage")
-	ErrTooLarge    = errors.New("that page is too large to use as a reference")
 	// ErrBlocked is distinct from ErrFetchFailed: a 401/403/429 (after the
 	// one retry — see shouldRetry) means the site itself is actively
 	// refusing an automated request, not that it's unreachable. There's a
@@ -110,7 +102,7 @@ func NewFetcher() *Fetcher {
 // unexported, used only by this package's own tests (see fetch_test.go) to
 // exercise Fetch's real logic (headers, status/content-type/size handling,
 // redirects) against an httptest.Server, whose address is always loopback
-// and would otherwise always be rejected by guardedDialContext itself —
+// and would otherwise always be rejected by guardedDialer's Control hook —
 // correctly; TestFetcher_BlocksLoopback confirms that exact rejection
 // through the real, unmodified NewFetcher instead.
 func newFetcherWithDialContext(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *Fetcher {
@@ -196,18 +188,23 @@ type Result struct {
 
 // Fetch validates rawURL, then performs an SSRF-guarded GET (see the
 // package doc comment) with one retry on a transient failure (see
-// shouldRetry), returning at most maxBytes of the response body. Unlike an
-// earlier version of this function, going over maxBytes is no longer
-// itself a failure — a link a merchant references is not something they
-// control the size of the way an upload is, so Fetch truncates (at a tag
-// boundary — see TruncateAtTagBoundary) instead of rejecting outright, up
-// to hardCeilingMultiplier times maxBytes; only a body that blows even past
-// that hard ceiling still fails with ErrTooLarge, since at that point
-// truncating isn't meaningfully different from just not having fetched it.
-// The caller is still expected to run a successful result through the same
-// sanitization/size checks an uploaded HTML file already gets (see
-// themebuild.SanitizeHTMLAttachment) — Fetch's own maxBytes cap bounds how
-// much this function itself reads and keeps, not a replacement for that.
+// shouldRetry), returning at most maxBytes of the response body. Going over
+// maxBytes is not itself a failure — a link a merchant references is not
+// something they control the size of the way an upload is, so Fetch
+// truncates (at a tag boundary — see TruncateAtTagBoundary) instead of
+// rejecting outright. There is deliberately no separate hard ceiling above
+// maxBytes: an earlier version of this function had one, reasoning that a
+// pathological endpoint should fail fast rather than be truncated — but
+// implementing that meant reading past maxBytes to find out, which made
+// the "fail fast" case slower and more memory-hungry than the truncating
+// case it was trying to protect against. The read below is capped at
+// maxBytes+1, exactly as it was before that ceiling existed: a genuinely
+// endless stream is still bounded by fetchTimeout and by this same read
+// limit, with no second mechanism needed. The caller is still expected to
+// run a successful result through the same sanitization/size checks an
+// uploaded HTML file already gets (see themebuild.SanitizeHTMLAttachment)
+// — Fetch's own maxBytes cap bounds how much this function itself reads
+// and keeps, not a replacement for that.
 func (f *Fetcher) Fetch(ctx context.Context, rawURL string, maxBytes int64) (Result, error) {
 	u, err := ValidateURL(rawURL)
 	if err != nil {
@@ -230,24 +227,34 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string, maxBytes int64) (Res
 		return Result{}, fmt.Errorf("%w: unexpected status %d", ErrFetchFailed, resp.StatusCode)
 	}
 
-	// hardCeiling+1: same "read one byte past the limit" trick as below,
-	// applied to the hard ceiling instead — distinguishes "over maxBytes,
-	// truncate" from "over the hard ceiling too, fail outright" without
-	// ever buffering more than hardCeiling+1 bytes of a possibly much
-	// larger real body.
-	hardCeiling := maxBytes * hardCeilingMultiplier
-	body, err := io.ReadAll(io.LimitReader(resp.Body, hardCeiling+1))
-	if err != nil {
+	// Latency: classify BEFORE reading the rest of the body, not after —
+	// bufio.Reader.Peek looks at the first sniffBytes without consuming
+	// them, so a non-HTML response (a PDF, a video, anything mislabeled or
+	// unlabeled) is rejected after ~512 bytes instead of after downloading
+	// the whole thing. The peeked bytes stay buffered in br and are read
+	// again (not re-fetched over the wire) by the io.ReadAll below, so nothing
+	// is read from the connection twice.
+	br := bufio.NewReaderSize(resp.Body, sniffBytes)
+	peeked, err := br.Peek(sniffBytes)
+	if err != nil && !errors.Is(err, io.EOF) {
+		// A short body (EOF before sniffBytes) is normal and expected —
+		// peeked still holds whatever was actually there. Any other error
+		// is a genuine read failure.
 		return Result{}, fmt.Errorf("%w: %w", ErrFetchFailed, err)
 	}
-	if int64(len(body)) > hardCeiling {
-		return Result{}, fmt.Errorf("%w: over %d bytes even past the truncation ceiling", ErrTooLarge, hardCeiling)
-	}
-
-	if !looksLikeHTML(resp.Header.Get("Content-Type"), body) {
+	if !looksLikeHTML(resp.Header.Get("Content-Type"), peeked) {
 		return Result{}, fmt.Errorf("%w: content-type %q", ErrNotHTML, resp.Header.Get("Content-Type"))
 	}
 
+	// maxBytes+1: reading one byte past the limit is what distinguishes "the
+	// body was exactly maxBytes" from "the body was truncated" without
+	// buffering the whole (possibly much larger) real body first. Reads
+	// from br, not resp.Body directly, so this picks up right after the
+	// peeked prefix rather than re-reading it.
+	body, err := io.ReadAll(io.LimitReader(br, maxBytes+1))
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: %w", ErrFetchFailed, err)
+	}
 	if int64(len(body)) > maxBytes {
 		return Result{HTML: TruncateAtTagBoundary(string(body), maxBytes), Truncated: true}, nil
 	}
@@ -341,12 +348,36 @@ func TruncateAtTagBoundary(html string, maxBytes int64) string {
 	cut := html[:maxBytes]
 	lastOpen := strings.LastIndexByte(cut, '<')
 	if lastOpen < 0 {
-		return cut
+		return trimIncompleteTrailingRune(cut)
 	}
 	if strings.IndexByte(cut[lastOpen:], '>') >= 0 {
-		return cut
+		return trimIncompleteTrailingRune(cut)
 	}
+	// cut[:lastOpen] always ends right before a '<', which is single-byte
+	// ASCII and so can never itself be split mid-rune — no boundary check
+	// needed on this path.
 	return cut[:lastOpen]
+}
+
+// trimIncompleteTrailingRune backs up s to the last valid UTF-8 boundary
+// when a raw byte-index cut (maxBytes above is a byte count, not a rune
+// count) landed inside a multi-byte character — TruncateAtTagBoundary's
+// tag-boundary logic guards against a half-written TAG, not a half-written
+// RUNE, and the two are independent (a cut can land cleanly between tags
+// while still landing mid-character inside one's text content). Checks
+// only the last few bytes (UTF-8's longest encoding is 4 bytes), not the
+// whole string, so this stays O(1) regardless of s's length.
+func trimIncompleteTrailingRune(s string) string {
+	for i := 0; i < utf8.UTFMax && i < len(s); i++ {
+		start := len(s) - 1 - i
+		if utf8.RuneStart(s[start]) {
+			if utf8.FullRuneInString(s[start:]) {
+				return s
+			}
+			return s[:start]
+		}
+	}
+	return s
 }
 
 // looksLikeHTML reports whether contentType or the body's own leading
@@ -367,10 +398,11 @@ func looksLikeHTML(contentType string, body []byte) bool {
 }
 
 // sniffsAsHTML inspects at most the first sniffBytes of body for a real
-// markup opening: an explicit "<!doctype html"/"<html", or — more
-// generally, for a page that opens with something else first (a comment, a
-// different root element) — a leading '<' immediately followed by an
-// ASCII letter, which only a real tag produces; a body that merely
+// markup opening: an explicit "<!doctype html"/"<html"/"<!--" (a page that
+// opens with a comment — an IE conditional comment, a copyright header —
+// before its first real tag), or — more generally, for a page that opens
+// with a different root element first — a leading '<' immediately followed
+// by an ASCII letter, which only a real tag produces; a body that merely
 // contains a stray '<' somewhere (a PDF, a binary blob, plain text about
 // "a < b") does not open with one.
 func sniffsAsHTML(body []byte) bool {
@@ -378,7 +410,7 @@ func sniffsAsHTML(body []byte) bool {
 		body = body[:sniffBytes]
 	}
 	s := strings.TrimSpace(strings.ToLower(string(body)))
-	if strings.HasPrefix(s, "<!doctype html") || strings.HasPrefix(s, "<html") {
+	if strings.HasPrefix(s, "<!doctype html") || strings.HasPrefix(s, "<html") || strings.HasPrefix(s, "<!--") {
 		return true
 	}
 	return len(s) >= 2 && s[0] == '<' && s[1] >= 'a' && s[1] <= 'z'

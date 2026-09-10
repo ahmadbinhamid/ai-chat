@@ -29,7 +29,7 @@ var allowedSchemes = map[string]bool{"http": true, "https": true}
 // http(s) URL — scheme, userinfo, and host shape only. Deliberately does
 // NOT restrict which port a URL may name: the real SSRF boundary is
 // IsBlockedIP (checked separately, against the resolved IP, by
-// guardedDialContext), and that already blocks every private/internal
+// guardedDialer's Control hook), and that already blocks every private/internal
 // address regardless of port — a merchant-supplied URL pointing at a
 // PUBLIC host on an unusual port (a staging site on :3000, shared hosting
 // on :8090) is just an ordinary outbound web request, not a probe of this
@@ -68,8 +68,8 @@ func ValidateURL(raw string) (*url.URL, error) {
 // SSRF payload. Checked against every IP a hostname actually resolves to,
 // not the hostname string itself — a hostname can resolve to a different,
 // unsafe address than whatever it looked like it would (DNS rebinding), so
-// this must run at connect time (see guardedDialContext in fetch.go), not
-// just once up front against the URL's own host string.
+// this must run at connect time (see guardedDialer's Control hook in
+// fetch.go), not just once up front against the URL's own host string.
 func IsBlockedIP(ip net.IP) bool {
 	if ip == nil {
 		return true

@@ -623,3 +623,59 @@ func TestDoGenerate_LinkOverPostStripLimit_TruncatesInsteadOfFailing(t *testing.
 		t.Errorf("expected the truncation note in the prompt, got: %s", gotPrompt)
 	}
 }
+
+// TestDoGenerate_LinkSanitizesToEmpty_TreatedAsFetchFailureNotSuccess covers
+// the client-rendered-SPA case: a page whose entire server-sent HTML is a
+// single executable <script> block (SanitizeHTMLAttachment strips exactly
+// that) sanitizes to nothing. This must take the ReferenceURLFetchFailed
+// path with the distinct JS-rendered note (see promptWithHTMLAttachment),
+// NOT the "you DID access this link" success framing with an empty
+// attachment — the model has nothing to actually read from the page, and
+// the success framing would make it falsely claim otherwise.
+func TestDoGenerate_LinkSanitizesToEmpty_TreatedAsFetchFailureNotSuccess(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &capturingGenerator{}
+	svc.gen = gen
+	// Sanitizes to "" in full: the whole body is one executable <script>
+	// block, which SanitizeHTMLAttachment strips outright, and nothing else
+	// in the page survives to take its place.
+	svc.links = &fakeLinkFetcher{content: `<script>document.body.innerHTML = renderApp();</script>`}
+
+	tenantID := uint64(time.Now().UnixNano())
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "https://example.com can you access this link",
+	})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	messages, err := chatSvc.ListMessages(context.Background(), tenantID, outcome.Chat.ID)
+	if err != nil {
+		t.Fatalf("failed to load messages: %v", err)
+	}
+	var assistant *chat.Message
+	for i := range messages {
+		if messages[i].Role == chat.RoleAssistant {
+			assistant = &messages[i]
+		}
+	}
+	if assistant == nil {
+		t.Fatal("expected an assistant reply even though the page sanitized to nothing")
+	}
+	if assistant.Status != chat.MessageStatusCompleted {
+		t.Errorf("expected a completed turn, got status %q", assistant.Status)
+	}
+
+	captured, gotPrompt, _ := gen.snapshot()
+	if !captured {
+		t.Fatal("expected the background generation to have called gen.Generate")
+	}
+	if !strings.Contains(gotPrompt, "JavaScript") {
+		t.Errorf("expected the JS-rendered-content note in the prompt, got: %s", gotPrompt)
+	}
+	if strings.Contains(gotPrompt, "you already have") {
+		t.Errorf("expected the fetch-failure framing, NOT the \"you DID access this link\" success framing, got: %s", gotPrompt)
+	}
+}

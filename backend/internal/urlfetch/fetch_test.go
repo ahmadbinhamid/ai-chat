@@ -1,6 +1,7 @@
 package urlfetch
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -158,10 +159,9 @@ func TestFetcher_Fetch_AllowsMissingContentType(t *testing.T) {
 	}
 }
 
-// TestFetcher_Fetch_TruncatesOverMaxBytes: over maxBytes but well under the
-// hard ceiling (hardCeilingMultiplier * maxBytes) truncates instead of
-// failing — see Result.Truncated's own doc comment for why a link's size
-// isn't something the merchant controls the way an upload's is.
+// TestFetcher_Fetch_TruncatesOverMaxBytes: a body over maxBytes truncates
+// instead of failing — see Result.Truncated's own doc comment for why a
+// link's size isn't something the merchant controls the way an upload's is.
 func TestFetcher_Fetch_TruncatesOverMaxBytes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -213,22 +213,31 @@ func TestFetcher_Fetch_TruncatesAtTagBoundary(t *testing.T) {
 	}
 }
 
-// TestFetcher_Fetch_HardCeilingStillFails confirms a body that blows even
-// past the truncation ceiling (hardCeilingMultiplier * maxBytes) still
-// fails outright with ErrTooLarge — truncating isn't meaningfully
-// different from not having fetched it at that point, and a pathological
-// endpoint (an infinite stream, a huge asset mislabeled as HTML) shouldn't
-// get to spend the rest of fetchTimeout's budget being read anyway.
-func TestFetcher_Fetch_HardCeilingStillFails(t *testing.T) {
+// TestFetcher_Fetch_TruncatesEvenWayOverMaxBytes replaces what used to be a
+// hard-ceiling test (Phase 2.1 removed the hard ceiling entirely — see
+// Fetch's own doc comment: implementing "fail fast past a ceiling" meant
+// reading past maxBytes to find out, which made that path slower and more
+// memory-hungry than just truncating). A body 20x over the cap still only
+// ever costs maxBytes+1 bytes read and truncates exactly like a body just
+// barely over it — there is no separate "too big even to truncate" case
+// anymore.
+func TestFetcher_Fetch_TruncatesEvenWayOverMaxBytes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(strings.Repeat("x", 20_000)))
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html>" + strings.Repeat("x", 20_000) + "</html>"))
 	}))
 	defer srv.Close()
 
 	f := newFetcherWithDialContext(unguardedDialContext)
-	_, err := f.Fetch(context.Background(), srv.URL, 1000) // hard ceiling: 10,000
-	if !errors.Is(err, ErrTooLarge) {
-		t.Fatalf("expected ErrTooLarge for a 20,000-byte body against a 1000-byte cap (10,000-byte hard ceiling), got: %v", err)
+	got, err := f.Fetch(context.Background(), srv.URL, 1000)
+	if err != nil {
+		t.Fatalf("expected truncation, not an error, for a 20,000-byte body against a 1000-byte cap: %v", err)
+	}
+	if !got.Truncated {
+		t.Error("expected Truncated true")
+	}
+	if len(got.HTML) > 1000 {
+		t.Errorf("expected at most 1000 bytes, got %d", len(got.HTML))
 	}
 }
 
@@ -453,6 +462,68 @@ func TestFetcher_Fetch_RejectsEmptyContentTypeNonHTMLBody(t *testing.T) {
 	_, err := f.Fetch(context.Background(), srv.URL, 1024)
 	if !errors.Is(err, ErrNotHTML) {
 		t.Fatalf("expected ErrNotHTML for a non-markup body with no content-type header, got: %v", err)
+	}
+}
+
+// TestFetcher_Fetch_RejectsNonHTMLWithoutReadingWholeBody is the latency
+// guard for the sniff-before-full-read fix: a large non-HTML/misleadingly-
+// typed body must be rejected after roughly sniffBytes, not after the
+// whole thing is downloaded. Before this fix, looksLikeHTML needed the full
+// body to classify anything, so a multi-megabyte PDF/video served with no
+// (or a wrong) Content-Type was fully read over the wire before Fetch
+// rejected it — slow, and a real memory cost for something that should
+// fail almost immediately.
+//
+// Proven by wall-clock time, not by counting bytes the server managed to
+// write: an earlier version of this test tried to assert on bytes written
+// before the server noticed the client was gone, but TCP send buffers can
+// silently absorb megabytes into the kernel before a close/RST actually
+// propagates back to an io.Writer.Write call on loopback — that made the
+// byte count meaningless as a signal on a fast connection, not just noisy.
+// Pacing the server's own writes with a real per-chunk delay (server-side
+// TEST code, not anything in the fetch path itself — the "no new sleeps"
+// constraint is about Fetch, not about how a test simulates a slow
+// upstream) sidesteps that: draining the whole body would take several
+// seconds at this pace, so a fast return is unambiguous proof Fetch never
+// asked for the rest of it.
+func TestFetcher_Fetch_RejectsNonHTMLWithoutReadingWholeBody(t *testing.T) {
+	const chunkDelay = 10 * time.Millisecond
+	const chunkCount = 1000 // fully draining this takes ~10s at chunkDelay
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		flusher, _ := w.(http.Flusher)
+		chunk := bytes.Repeat([]byte{0xFF}, 4096) // binary, never sniffs as HTML
+		for i := 0; i < chunkCount; i++ {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(chunkDelay):
+			}
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	f := newFetcherWithDialContext(unguardedDialContext)
+	start := time.Now()
+	_, err := f.Fetch(context.Background(), srv.URL, 1024)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrNotHTML) {
+		t.Fatalf("expected ErrNotHTML, got: %v", err)
+	}
+	// Fully draining the paced body would take ~10s (chunkCount *
+	// chunkDelay); rejecting after the sniff-sized first chunk should
+	// return in about one chunkDelay. 2s is a generous bound that's still
+	// unmistakably "did not wait for the rest."
+	if elapsed > 2*time.Second {
+		t.Errorf("expected Fetch to reject quickly after sniffing, took %v — the full (deliberately slow) body may have been read", elapsed)
 	}
 }
 

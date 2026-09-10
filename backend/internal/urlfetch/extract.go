@@ -56,6 +56,26 @@ var referenceCuePhrases = []string{
 	"similar to", "check", "look at", "clone", "inspired by",
 }
 
+// referenceCuePattern matches any referenceCuePhrases entry on WORD
+// boundaries — built once, at package init, from the phrase list above (not
+// per call: ExtractReferenceURL runs on every prompt, so compiling a fresh
+// regexp each time would be a real, avoidable latency cost). \b is what
+// makes this a word-boundary match rather than a substring one: without it,
+// the single-word cue "check" matched inside "checkout"/"checkbox"/
+// "checked" — all common words in an ordinary storefront-theme prompt that
+// have nothing to do with a reference link ("make the checkout button
+// blue, our site is https://…" used to fetch the page on the strength of
+// "check" alone).
+var referenceCuePattern = regexp.MustCompile(buildCuePattern(referenceCuePhrases))
+
+func buildCuePattern(phrases []string) string {
+	quoted := make([]string, len(phrases))
+	for i, p := range phrases {
+		quoted[i] = regexp.QuoteMeta(p)
+	}
+	return `(?i)\b(` + strings.Join(quoted, "|") + `)\b`
+}
+
 // referenceURLDominanceThreshold is how much of the prompt's own
 // non-whitespace characters the URL itself must account for to be treated
 // as a reference on its own, with no cue phrase needed — a prompt that's
@@ -92,11 +112,8 @@ func ExtractReferenceURL(prompt string) (string, bool) {
 		return url, true
 	}
 
-	lower := strings.ToLower(prompt)
-	for _, cue := range referenceCuePhrases {
-		if strings.Contains(lower, cue) {
-			return url, true
-		}
+	if referenceCuePattern.MatchString(prompt) {
+		return url, true
 	}
 	return "", false
 }

@@ -47,6 +47,18 @@ func TestExtractReferenceURL(t *testing.T) {
 		{"cue phrase: reference", "https://example.com use this as a design reference", "https://example.com", true},
 		{"cue phrase: similar to", "we want something similar to https://example.com", "https://example.com", true},
 		{"cue phrase: check", "can you check https://example.com", "https://example.com", true},
+		{
+			"word-boundary: checkout does not match the check cue",
+			"make the checkout button blue, our site is https://example.com", "", false,
+		},
+		{
+			"word-boundary: checkbox does not match the check cue",
+			"add a checkbox to the form, see https://example.com for the field names", "", false,
+		},
+		{
+			"word-boundary: checked does not match the check cue",
+			"the checked state should be blue, our site is https://example.com", "", false,
+		},
 		{"cue phrase: look at", "look at https://example.com and tell me what you think", "https://example.com", true},
 		{"cue phrase: clone", "clone the layout from https://example.com", "https://example.com", true},
 		{"cue phrase: inspired by", "our new design should be inspired by https://example.com", "https://example.com", true},
