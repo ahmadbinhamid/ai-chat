@@ -56,6 +56,8 @@ func respondErr(c *gin.Context, err error) {
 		httpresponse.Error(c, http.StatusRequestEntityTooLarge, err.Error(), "HTML_ATTACHMENT_TOO_LARGE")
 	case errors.Is(err, themebuild.ErrLinkFetchFailed):
 		httpresponse.Error(c, http.StatusUnprocessableEntity, err.Error(), "LINK_FETCH_FAILED")
+	case errors.Is(err, themebuild.ErrLinkFetchBlocked):
+		httpresponse.Error(c, http.StatusUnprocessableEntity, err.Error(), "LINK_FETCH_BLOCKED")
 	// isUpstreamUnavailable is checked before the generic default branch —
 	// a merchant seeing "the theme service is temporarily unavailable,
 	// please try again" (a real, actionable, non-scary explanation) instead

@@ -102,6 +102,25 @@ func createAttachments(ctx context.Context, e execer, attachments []MessageAttac
 	return nil
 }
 
+// UpsertHTMLAttachment inserts messageID's HTML attachment row, replacing
+// any existing one at the same (message_id, kind, position) via ON
+// DUPLICATE KEY UPDATE against uq_cma_message_kind_position — see
+// Service.AttachHTMLToMessage's own doc comment for why this must be an
+// upsert, not a plain insert: a generation restarted (by the reaper, after
+// a crash mid-fetch) must not fail this call with a duplicate-key error the
+// second time around, it should just replace the row with whatever content
+// this attempt fetched.
+func (r *Repository) UpsertHTMLAttachment(ctx context.Context, a MessageAttachment) error {
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO chat_message_attachments (id, message_id, tenant_id, kind, filename, media_type, size_bytes, checksum, position, content, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			filename = VALUES(filename), media_type = VALUES(media_type), size_bytes = VALUES(size_bytes),
+			checksum = VALUES(checksum), content = VALUES(content), updated_at = VALUES(updated_at)
+	`, a.ID, a.MessageID, a.TenantID, a.Kind, a.Filename, a.MediaType, a.SizeBytes, a.Checksum, a.Position, a.Content, a.CreatedAt, a.CreatedAt)
+	return err
+}
+
 // CreateMessageAndTouchUsage does all three writes in one transaction: a
 // message row (and its attachments, if any) existing without its chat's
 // running token totals reflecting it (or vice versa, if these ran as

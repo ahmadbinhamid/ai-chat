@@ -76,6 +76,12 @@ const (
 	// proposal is built (before it's committed to the real theme) — payload:
 	// {"paths": [...]}.
 	EventTypeStaged = "staged"
+	// EventTypeFetchingLink is emitted from doGenerate right before it
+	// fetches a URL found in the merchant's prompt (see the reference-URL
+	// feature) — payload: {"url": "https://..."}. The merchant-facing
+	// equivalent of EventTypeToolCall for this one step, which isn't itself
+	// a model tool call (it happens before the model is even invoked).
+	EventTypeFetchingLink = "fetching_link"
 	// EventTypeThinking is EPHEMERAL — see emitLive. Never pass this to
 	// emit(): it would durably persist every streamed text chunk of every
 	// generation, and worse, burn a seq number per chunk, breaking

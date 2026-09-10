@@ -187,7 +187,7 @@ type generator interface {
 // fake that never makes a real network call, and so this package doesn't
 // need to import urlfetch's concrete type anywhere but NewService.
 type linkFetcher interface {
-	Fetch(ctx context.Context, rawURL string, maxBytes int64) (string, error)
+	Fetch(ctx context.Context, rawURL string, maxBytes int64) (urlfetch.Result, error)
 }
 
 // Service is the AI theme builder's orchestration: turn a prompt into
@@ -205,6 +205,11 @@ type Service struct {
 	// it already treats a turn with no reference link at all, so those
 	// tests need no changes.
 	links linkFetcher
+	// linkCache is a short-TTL cache in front of links.Fetch (see
+	// fetchReferenceURL and referenceURLCache's own doc comment) — nil in
+	// the same struct-literal tests links itself can be nil in;
+	// fetchReferenceURL falls back to an uncached call when either is nil.
+	linkCache *referenceURLCache
 	// store is always the REAL (non-overlay) store — see doGenerate, which
 	// wraps it in a fresh themefs.OverlayStore per generation call rather
 	// than mutating this field. A mutable "current store" field here would
@@ -264,6 +269,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		chats:                       chats,
 		gen:                         gen,
 		links:                       urlfetch.NewFetcher(),
+		linkCache:                   newReferenceURLCache(),
 		store:                       store,
 		themeLocks:                  locks,
 		bus:                         bus,
@@ -358,6 +364,16 @@ var ErrHTMLAttachmentTooLarge = errors.New("attached HTML file is too large")
 // sentinel errors), so nothing here needs to redact or re-explain it.
 var ErrLinkFetchFailed = errors.New("could not use the link in your message as a reference")
 
+// ErrLinkFetchBlocked wraps urlfetch.ErrBlocked specifically — mapped in
+// handlers/errors.go the same way ErrLinkFetchFailed is, for symmetry with
+// that sentinel and in case a future synchronous caller ever needs to
+// surface it directly. Today's actual reference-URL fetch runs inside
+// doGenerate (see its own reference-URL block), which never fails the turn
+// over a blocked site — see GenerateInput.ReferenceURLBlocked's own doc
+// comment — it's swallowed and turned into an actionable note in the
+// prompt instead (see promptWithHTMLAttachment).
+var ErrLinkFetchBlocked = errors.New(urlfetch.ErrBlocked.Error())
+
 // ErrGenerationInProgress means the tenant's chat already has a background
 // generation running — see the generations table (phase 3a) and
 // Repository.StartGeneration/DequeueNext. Generate itself never returns
@@ -426,6 +442,42 @@ type GenerateInput struct {
 	// but is still the active one — without this, the model has no way to
 	// know the attachment below wasn't just silently dropped.
 	HTMLAttachmentCarriedForward bool
+	// HTMLAttachmentTruncated is true when a link-fetched attachment had to
+	// be cut short — either the raw fetch itself (see urlfetch.Result.
+	// Truncated) or the post-sanitize content still being over
+	// PostStripMaxBytes (see doGenerate's own reference-URL block; unlike
+	// an uploaded file, which is still hard-rejected over that limit — the
+	// merchant controls what they upload, not how heavy someone else's
+	// homepage is). promptWithHTMLAttachment states this in the framing so
+	// the model doesn't read a missing footer/section as absent from the
+	// real page — it's just past where this turn's copy was cut.
+	HTMLAttachmentTruncated bool
+	// ReferenceURL is a URL Generate found in Prompt (see
+	// urlfetch.ExtractReferenceURL) and validated the shape of, but has not
+	// fetched — carried through the queue via Generation.ReferenceURL
+	// exactly like Prompt itself, since runOneQueuedGeneration rebuilds
+	// GenerateInput fresh from that row on every dequeue. doGenerate does
+	// the actual fetch (see its own reference-URL block) and, on success,
+	// populates HTMLAttachmentFilename/Content/IsExternalLink from it —
+	// this field itself is never read past that point in the same turn.
+	ReferenceURL string
+	// ReferenceURLFetchFailed is set by doGenerate when ReferenceURL was
+	// present but the fetch itself failed — network error, blocked host,
+	// non-HTML response, etc. (never a malformed-URL case; Generate already
+	// rejects that synchronously before ReferenceURL is ever set). Unlike
+	// every other HTML-attachment failure in this service, this one must
+	// NOT fail the turn: the merchant asked a real question and deserves an
+	// answer about everything except the page. promptWithHTMLAttachment
+	// uses this to tell the model plainly that the fetch failed, instead of
+	// silently proceeding as if no link had ever been mentioned.
+	ReferenceURLFetchFailed bool
+	// ReferenceURLBlocked is set alongside ReferenceURLFetchFailed
+	// specifically when the failure was urlfetch.ErrBlocked (the site
+	// itself refused the request — a 401/403/429 — rather than being
+	// unreachable) — promptWithHTMLAttachment uses it to give the model
+	// the actionable version of the note ("ask the merchant to paste the
+	// HTML instead") rather than a generic "couldn't reach it."
+	ReferenceURLBlocked bool
 	// UserMessageID is set by Generate right after RecordUserMessage and
 	// carried through the queue (Generation.UserMessageID) so doGenerate
 	// can re-resolve Images from chat_messages once this turn actually
@@ -545,31 +597,37 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		}
 	}
 	// A merchant pasting a bare reference link directly in their prompt
-	// ("https://example.com can you access this link") is treated almost
-	// exactly like uploading that URL's page as an HTML attachment —
-	// fetched here, then handed to the same sanitize/size-check/prompt-
-	// framing logic just below. The one thing that does differ is the
-	// framing text itself: HTMLAttachmentIsExternalLink tells
-	// promptWithHTMLAttachment to call out that this is a different,
-	// external site, not the merchant's own theme (see that field's own
-	// doc comment for why that call-out matters). Only runs when no HTML
-	// file was explicitly uploaded this turn — an upload is a more
-	// deliberate signal than a URL that merely appears somewhere in the
-	// prompt text, so it always wins rather than being silently
-	// overwritten by a fetch of an unrelated link mentioned in passing.
-	// s.links is nil in tests that construct a Service by struct literal
-	// without setting it (see linkFetcher's own doc comment) — those
-	// simply skip this, same as they already skip store/bus/etc.
-	if in.HTMLAttachmentContent == nil && s.links != nil {
-		if link, ok := urlfetch.ExtractFirstURL(in.Prompt); ok {
-			htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
-			content, ferr := s.links.Fetch(ctx, link, htmlLimit.MaxBytes)
-			if ferr != nil {
-				return GenerateOutcome{}, fmt.Errorf("%w: %s", ErrLinkFetchFailed, ferr.Error())
+	// ("https://example.com can you access this link") gets treated almost
+	// exactly like uploading that URL's page as an HTML attachment — but
+	// the actual fetch does NOT happen here. This method backs POST
+	// /chats/messages, which cmd/server/main.go documents as never doing
+	// slow synchronous work; an outbound HTTP call (urlfetch.fetchTimeout
+	// is 10s) blocking the request, and a fetch failure returning before
+	// RecordUserMessage even runs (silently dropping the merchant's prompt
+	// from the transcript, unlike every other failure this service
+	// records), both violate that. So this only ever DETECTS a URL and
+	// validates its shape — genuinely malformed input (ValidateURL) is the
+	// one case a synchronous 4xx is still correct, since it needs no
+	// network — and carries the URL on the enqueued Generation row.
+	// doGenerate does the real fetch once this turn is actually dequeued
+	// (see its own reference-URL block). Only runs when no HTML file was
+	// explicitly uploaded this turn — an upload is a more deliberate
+	// signal than a URL that merely appears somewhere in the prompt text,
+	// so it always wins over a link mentioned in passing.
+	//
+	// ExtractReferenceURL, not the looser ExtractFirstURL: any URL
+	// anywhere in the prompt used to count, which meant "our shop is at
+	// https://example.com — make the header blue" fetched a whole
+	// unrelated page and injected external-link framing into a request
+	// that had nothing to do with it. See ExtractReferenceURL's own doc
+	// comment for the intent check it applies instead.
+	var referenceURL string
+	if in.HTMLAttachmentContent == nil {
+		if link, ok := urlfetch.ExtractReferenceURL(in.Prompt); ok {
+			if _, verr := urlfetch.ValidateURL(link); verr != nil {
+				return GenerateOutcome{}, fmt.Errorf("%w: %s", ErrLinkFetchFailed, verr.Error())
 			}
-			in.HTMLAttachmentFilename = &link
-			in.HTMLAttachmentContent = &content
-			in.HTMLAttachmentIsExternalLink = true
+			referenceURL = link
 		}
 	}
 
@@ -604,6 +662,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		ChatID:        c.ID,
 		TenantID:      in.TenantID,
 		Prompt:        in.Prompt,
+		ReferenceURL:  referenceURL,
 		UserMessageID: &userMsg.ID,
 		ThemeSlug:     in.ThemeSlug,
 		Mode:          in.Mode,
@@ -727,6 +786,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		Token:         token,
 		ThemeSlug:     g.ThemeSlug,
 		Prompt:        g.Prompt,
+		ReferenceURL:  g.ReferenceURL,
 		Mode:          g.Mode,
 		UserMessageID: g.UserMessageID,
 	}
@@ -949,6 +1009,29 @@ func (s *Service) recordGenerationFailure(ctx context.Context, c chat.Chat, genI
 	}
 }
 
+// fetchReferenceURL is s.links.Fetch with a short-TTL cache in front (see
+// referenceURLCache's own doc comment) — a merchant iterating on the same
+// reference across several turns in one session shouldn't pay for the
+// fetch again on every single one. Falls back to an uncached call when
+// s.linkCache is nil (struct-literal tests, same nil-guard convention as
+// s.links itself). Only a successful fetch is ever cached — see
+// referenceURLCache.set's own doc comment for why a failure must not be.
+func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url string, maxBytes int64) (urlfetch.Result, error) {
+	if s.linkCache != nil {
+		if cached, ok := s.linkCache.get(tenantID, url); ok {
+			return cached, nil
+		}
+	}
+	result, err := s.links.Fetch(ctx, url, maxBytes)
+	if err != nil {
+		return urlfetch.Result{}, err
+	}
+	if s.linkCache != nil {
+		s.linkCache.set(tenantID, url, result)
+	}
+	return result, nil
+}
+
 // doGenerate is the part of generation that used to be Generate's entire
 // body before it became async: ask Claude for the resulting file changes
 // and stage them into the chat's draft overlay — see this package's own
@@ -1130,6 +1213,75 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				}
 			}
 			break
+		}
+	}
+
+	// Reference-URL fetch: Generate only detected the URL and validated its
+	// shape (see its own doc comment on why the actual fetch is deferred to
+	// here) — this is where the network call happens, now that a
+	// generation is genuinely running in the background and slow work is
+	// safe. Runs before the carry-forward fallback below so a reference
+	// on THIS turn always wins over an earlier turn's, the same precedence
+	// Generate already applies for an uploaded file vs. a URL in the
+	// prompt.
+	if in.HTMLAttachmentContent == nil && in.ReferenceURL != "" && s.links != nil {
+		emitter.emit(ctx, EventTypeFetchingLink, map[string]string{"url": in.ReferenceURL})
+		htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
+		result, ferr := s.fetchReferenceURL(ctx, in.TenantID, in.ReferenceURL, htmlLimit.MaxBytes)
+		sanitized := ""
+		truncated := false
+		if ferr == nil {
+			truncated = result.Truncated
+			sanitized = SanitizeHTMLAttachment(result.HTML)
+			// Unlike an uploaded file (still hard-rejected over this same
+			// limit — the merchant chose what to upload, not how heavy
+			// someone else's homepage is), a link that's still too big
+			// after sanitizing is truncated, not rejected — see
+			// HTMLAttachmentTruncated's own doc comment.
+			if int64(len(sanitized)) > htmlLimit.PostStripMaxBytes {
+				sanitized = urlfetch.TruncateAtTagBoundary(sanitized, htmlLimit.PostStripMaxBytes)
+				truncated = true
+			}
+		}
+		// Must NOT fail the turn either way — the merchant asked a real
+		// question and deserves an answer about everything except the
+		// page (see ReferenceURLFetchFailed's own doc comment).
+		// promptWithHTMLAttachment tells the model the fetch failed
+		// instead of silently proceeding as if no link had ever been
+		// mentioned.
+		if ferr != nil {
+			slog.Warn("reference URL fetch failed", "chat_id", c.ID, "url", in.ReferenceURL, "error", ferr)
+			in.ReferenceURLFetchFailed = true
+			in.ReferenceURLBlocked = errors.Is(ferr, urlfetch.ErrBlocked)
+		} else {
+			filename := in.ReferenceURL
+			in.HTMLAttachmentFilename = &filename
+			in.HTMLAttachmentContent = &sanitized
+			in.HTMLAttachmentIsExternalLink = true
+			in.HTMLAttachmentTruncated = truncated
+
+			// Persisted so findCarryForwardSourceMessageID still works on a
+			// later turn — that lookup reads chat_message_attachments, and
+			// nothing else writes there for a link now that RecordUserMessage
+			// no longer sees the fetched content (only Generate's raw
+			// detection, before any network call). filename is capped to 255
+			// (the column's width — urlfetch.maxURLLen is 2048, so a long URL
+			// would otherwise blow up the insert under strict SQL mode) while
+			// keeping the "https://" prefix intact so looksLikeFetchedLink
+			// still matches on read-back; the full URL still goes to the
+			// model via HTMLAttachmentFilename above, only the persisted copy
+			// is shortened. Best-effort: logged and swallowed on failure — a
+			// lost persist only costs carry-forward on a later turn, it must
+			// not fail a generation that already has the content in hand.
+			if in.UserMessageID != nil {
+				storedFilename := filename
+				if len(storedFilename) > 255 {
+					storedFilename = storedFilename[:255]
+				}
+				if attErr := s.chats.AttachHTMLToMessage(ctx, *in.UserMessageID, in.TenantID, storedFilename, sanitized); attErr != nil {
+					slog.Error("failed to persist fetched reference URL as an attachment", "chat_id", c.ID, "error", attErr)
+				}
+			}
 		}
 	}
 

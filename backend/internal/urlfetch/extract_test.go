@@ -29,3 +29,42 @@ func TestExtractFirstURL(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractReferenceURL(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+		ok   bool
+	}{
+		{"bare url dominates the prompt", "https://example.com", "https://example.com", true},
+		{"bare url with only trailing whitespace", "https://example.com   ", "https://example.com", true},
+		{"url plus a short question still dominates", "https://example.com ?", "https://example.com", true},
+		{"cue phrase: this link", "https://example.com can you access this link", "https://example.com", true},
+		{"cue phrase: this site", "https://example.com is this site accessible to you", "https://example.com", true},
+		{"cue phrase: this page", "https://example.com can you read this page for me", "https://example.com", true},
+		{"cue phrase: like this", "make our homepage look like this: https://example.com", "https://example.com", true},
+		{"cue phrase: reference", "https://example.com use this as a design reference", "https://example.com", true},
+		{"cue phrase: similar to", "we want something similar to https://example.com", "https://example.com", true},
+		{"cue phrase: check", "can you check https://example.com", "https://example.com", true},
+		{"cue phrase: look at", "look at https://example.com and tell me what you think", "https://example.com", true},
+		{"cue phrase: clone", "clone the layout from https://example.com", "https://example.com", true},
+		{"cue phrase: inspired by", "our new design should be inspired by https://example.com", "https://example.com", true},
+		{"cue phrase is case-insensitive", "https://example.com CHECK this out", "https://example.com", true},
+		{
+			"url mentioned in passing, no cue, does not dominate",
+			"our shop's own domain is https://example.com by the way, now please make the header background blue",
+			"", false,
+		},
+		{"no url at all", "just plain text, no links here", "", false},
+		{"empty string", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ExtractReferenceURL(tt.text)
+			if ok != tt.ok || got != tt.want {
+				t.Errorf("ExtractReferenceURL(%q) = %q, %v; want %q, %v", tt.text, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}

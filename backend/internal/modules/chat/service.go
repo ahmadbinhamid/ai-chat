@@ -262,6 +262,33 @@ func (s *Service) GetAttachmentsContent(ctx context.Context, messageID string) (
 	return s.repo.GetAttachmentsContent(ctx, messageID)
 }
 
+// AttachHTMLToMessage attaches an HTML reference to messageID after the
+// fact — the write-side counterpart to a reference-URL fetch that happens
+// in themebuild.Service.doGenerate, once a generation is actually running,
+// rather than at RecordUserMessage time (see Service.Generate's own doc
+// comment on why the fetch moved off the request path). Always position 0,
+// matching buildAttachments' own HTML-attachment convention: at most one
+// HTML file per message. Idempotent (see Repository.UpsertHTMLAttachment) —
+// safe to call again with the same messageID if a generation gets restarted
+// after a crash mid-fetch.
+func (s *Service) AttachHTMLToMessage(ctx context.Context, messageID string, tenantID uint64, filename, content string) error {
+	raw := []byte(content)
+	sum := sha256.Sum256(raw)
+	return s.repo.UpsertHTMLAttachment(ctx, MessageAttachment{
+		ID:        uuid.NewString(),
+		MessageID: messageID,
+		TenantID:  tenantID,
+		Kind:      AttachmentKindHTML,
+		Filename:  filename,
+		MediaType: "text/html",
+		SizeBytes: int64(len(raw)),
+		Checksum:  hex.EncodeToString(sum[:]),
+		Position:  0,
+		Content:   raw,
+		CreatedAt: time.Now().UTC(),
+	})
+}
+
 // RecordManualEditMessage appends a bookkeeping turn for a file the merchant
 // edited directly in the preview (see themebuild.Service.SaveManualEdit) —
 // every chat_generated_files row needs a message_id to hang off (foreign

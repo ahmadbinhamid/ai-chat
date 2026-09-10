@@ -10,6 +10,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/urlfetch"
 )
 
 // capturingGenerator records the prompt/images its FIRST Generate call
@@ -91,12 +92,16 @@ func (g *allCallsCapturingGenerator) snapshot() []string {
 	return out
 }
 
-// waitForNAssistantReplies polls until chatID has at least n assistant-role
-// messages — the multi-turn counterpart to waitForAssistantReply (see its
-// own doc comment for why waiting for real completion, not just the
-// generator having been called, matters).
-func waitForNAssistantReplies(t *testing.T, chatSvc *chat.Service, tenantID uint64, chatID string, n int) {
+// waitForSecondAssistantReply polls until chatID has at least two
+// assistant-role messages — the two-turn counterpart to
+// waitForAssistantReply (see its own doc comment for why waiting for real
+// completion, not just the generator having been called, matters), for
+// tests that send a second prompt to the same chat (e.g. the carry-forward
+// tests below) and need to wait for THAT turn specifically, not just any
+// assistant reply.
+func waitForSecondAssistantReply(t *testing.T, chatSvc *chat.Service, tenantID uint64, chatID string) {
 	t.Helper()
+	const wantReplies = 2
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		messages, err := chatSvc.ListMessages(context.Background(), tenantID, chatID)
@@ -107,13 +112,13 @@ func waitForNAssistantReplies(t *testing.T, chatSvc *chat.Service, tenantID uint
 					count++
 				}
 			}
-			if count >= n {
+			if count >= wantReplies {
 				return
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %d assistant replies", n)
+	t.Fatalf("timed out waiting for %d assistant replies", wantReplies)
 }
 
 // waitForAssistantReply polls until chatID has at least one assistant-role
@@ -275,7 +280,7 @@ func TestDoGenerate_CarriesForwardHTMLAttachmentFromEarlierTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Generate failed: %v", err)
 	}
-	waitForNAssistantReplies(t, chatSvc, tenantID, outcome.Chat.ID, 2)
+	waitForSecondAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
 
 	prompts := gen.snapshot()
 	if len(prompts) != 2 {
@@ -329,7 +334,7 @@ func TestDoGenerate_CarriesForwardLinkAttachment_PreservesLinkFraming(t *testing
 	if err != nil {
 		t.Fatalf("second Generate failed: %v", err)
 	}
-	waitForNAssistantReplies(t, chatSvc, tenantID, outcome.Chat.ID, 2)
+	waitForSecondAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
 
 	prompts := gen.snapshot()
 	if len(prompts) != 2 {
@@ -384,7 +389,7 @@ func TestDoGenerate_CurrentTurnAttachmentWinsOverCarryForward(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Generate failed: %v", err)
 	}
-	waitForNAssistantReplies(t, chatSvc, tenantID, outcome.Chat.ID, 2)
+	waitForSecondAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
 
 	prompts := gen.snapshot()
 	if len(prompts) != 2 {
@@ -400,5 +405,221 @@ func TestDoGenerate_CurrentTurnAttachmentWinsOverCarryForward(t *testing.T) {
 	}
 	if strings.Contains(second, "EARLIER message in this conversation") {
 		t.Errorf("expected no carry-forward framing when the current turn has its own attachment, got: %s", second)
+	}
+}
+
+// TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn confirms Phase 1's
+// graceful-degradation contract: a reference-URL fetch failing inside
+// doGenerate must still produce a completed turn (the merchant asked a
+// real question and deserves an answer about everything except the page —
+// see GenerateInput.ReferenceURLFetchFailed's own doc comment), and the
+// prompt handed to the model must say so plainly rather than silently
+// proceeding as if no link had ever been mentioned.
+func TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &capturingGenerator{}
+	svc.gen = gen
+	svc.links = &fakeLinkFetcher{err: urlfetch.ErrBlockedHost}
+
+	tenantID := uint64(time.Now().UnixNano())
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "https://example.com can you access this link",
+	})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	messages, err := chatSvc.ListMessages(context.Background(), tenantID, outcome.Chat.ID)
+	if err != nil {
+		t.Fatalf("failed to load messages: %v", err)
+	}
+	var assistant *chat.Message
+	for i := range messages {
+		if messages[i].Role == chat.RoleAssistant {
+			assistant = &messages[i]
+		}
+	}
+	if assistant == nil {
+		t.Fatal("expected an assistant reply despite the fetch failure")
+	}
+	if assistant.Status != chat.MessageStatusCompleted {
+		t.Errorf("expected a completed turn despite the fetch failure, got status %q", assistant.Status)
+	}
+
+	captured, gotPrompt, _ := gen.snapshot()
+	if !captured {
+		t.Fatal("expected the background generation to have called gen.Generate")
+	}
+	if !strings.Contains(gotPrompt, "could not reach or read it") {
+		t.Errorf("expected the prompt to include the could-not-fetch note, got: %s", gotPrompt)
+	}
+	if strings.Contains(gotPrompt, "you DID access this link") {
+		t.Errorf("expected NO you-DID-access framing on a failed fetch, got: %s", gotPrompt)
+	}
+}
+
+// TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward covers
+// Phase 1's persistence requirement end to end: a reference-URL fetch that
+// succeeds inside doGenerate must write the fetched content as a real
+// chat_message_attachments row (see chat.Service.AttachHTMLToMessage), not
+// just hold it in local GenerateInput scope for this one turn — otherwise
+// findCarryForwardSourceMessageID would find nothing on a later turn, since
+// RecordUserMessage itself no longer sees fetched content (only Generate's
+// pre-fetch URL detection).
+func TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &allCallsCapturingGenerator{}
+	svc.gen = gen
+	svc.links = &fakeLinkFetcher{content: "<h1>Reference Site</h1>"}
+
+	tenantID := uint64(time.Now().UnixNano())
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "https://example.com can you access this link",
+	})
+	if err != nil {
+		t.Fatalf("first Generate failed: %v", err)
+	}
+	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	_, err = svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "build it like that",
+	})
+	if err != nil {
+		t.Fatalf("second Generate failed: %v", err)
+	}
+	waitForSecondAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	prompts := gen.snapshot()
+	if len(prompts) != 2 {
+		t.Fatalf("expected exactly 2 Generate calls (one per turn), got %d: %+v", len(prompts), prompts)
+	}
+	second := prompts[1]
+	if !strings.Contains(second, "<h1>Reference Site</h1>") {
+		t.Errorf("expected turn 2 to carry forward the fetched content, got: %s", second)
+	}
+	if !strings.Contains(second, "EARLIER message in this conversation") {
+		t.Errorf("expected turn 2's prompt to carry the earlier-turn framing, got: %s", second)
+	}
+}
+
+// TestDoGenerate_LongReferenceURL_TruncatesStoredFilenameButKeepsFullURLInPrompt
+// covers the VARCHAR(255) filename column vs. urlfetch's 2048-char maxURLLen
+// mismatch: a URL over 255 chars must still round-trip in full to the
+// model (via GenerateInput.HTMLAttachmentFilename, never touched by the
+// truncation), while the persisted chat_message_attachments row's filename
+// is capped to fit the column — and must still look like a fetched link to
+// looksLikeFetchedLink after that truncation (i.e. the "https://" prefix
+// survives), or a later turn's carry-forward would misclassify it as an
+// upload.
+func TestDoGenerate_LongReferenceURL_TruncatesStoredFilenameButKeepsFullURLInPrompt(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &capturingGenerator{}
+	svc.gen = gen
+	svc.links = &fakeLinkFetcher{content: "<h1>Long URL page</h1>"}
+
+	longURL := "https://example.com/" + strings.Repeat("a", 300)
+	if len(longURL) <= 255 {
+		t.Fatalf("test setup: longURL must be over 255 chars, got %d", len(longURL))
+	}
+
+	tenantID := uint64(time.Now().UnixNano())
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: longURL + " can you access this link",
+	})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	captured, gotPrompt, _ := gen.snapshot()
+	if !captured {
+		t.Fatal("expected the background generation to have called gen.Generate")
+	}
+	if !strings.Contains(gotPrompt, longURL) {
+		t.Errorf("expected the FULL long URL in the model prompt, got: %s", gotPrompt)
+	}
+
+	messages, err := chatSvc.ListMessages(context.Background(), tenantID, outcome.Chat.ID)
+	if err != nil {
+		t.Fatalf("failed to load messages: %v", err)
+	}
+	var userMsg *chat.Message
+	for i := range messages {
+		if messages[i].Role == chat.RoleUser {
+			userMsg = &messages[i]
+		}
+	}
+	if userMsg == nil || len(userMsg.Attachments) == 0 {
+		t.Fatal("expected the user message to have a persisted HTML attachment")
+	}
+	storedFilename := userMsg.Attachments[0].Filename
+	if len(storedFilename) > 255 {
+		t.Errorf("expected the stored filename to be capped at 255 chars, got %d", len(storedFilename))
+	}
+	if !looksLikeFetchedLink(storedFilename) {
+		t.Errorf("expected looksLikeFetchedLink to still match the truncated filename %q", storedFilename)
+	}
+}
+
+// TestDoGenerate_LinkOverPostStripLimit_TruncatesInsteadOfFailing covers
+// Phase 2's core behavior change from Phase 1: a link whose content is
+// still over MaxHTMLAttachmentBytes (PostStripMaxBytes) after sanitizing
+// must be truncated and the turn must still complete — see
+// GenerateInput.HTMLAttachmentTruncated's own doc comment for why this
+// differs from the upload path, which still hard-rejects over the same
+// limit (see TestGenerate_HTMLAttachmentStillTooLargeAfterStripping, still
+// passing unchanged — that assertion is Phase 2's explicit "the uploaded
+// file path keeps its hard rejection" requirement).
+func TestDoGenerate_LinkOverPostStripLimit_TruncatesInsteadOfFailing(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &capturingGenerator{}
+	svc.gen = gen
+	// Plain paragraph text — SanitizeHTMLAttachment strips nothing from
+	// this, so its length survives sanitizing unchanged, same fixture
+	// shape as TestGenerate_HTMLAttachmentStillTooLargeAfterStripping.
+	bigContent := strings.Repeat("<p>real paragraph text, nothing to strip</p>", (MaxHTMLAttachmentBytes/44)+100)
+	if len(bigContent) <= MaxHTMLAttachmentBytes {
+		t.Fatalf("test setup bug: fixture content (%d bytes) doesn't exceed MaxHTMLAttachmentBytes (%d)", len(bigContent), MaxHTMLAttachmentBytes)
+	}
+	svc.links = &fakeLinkFetcher{content: bigContent}
+
+	tenantID := uint64(time.Now().UnixNano())
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "https://example.com can you access this link",
+	})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	messages, err := chatSvc.ListMessages(context.Background(), tenantID, outcome.Chat.ID)
+	if err != nil {
+		t.Fatalf("failed to load messages: %v", err)
+	}
+	var assistant *chat.Message
+	for i := range messages {
+		if messages[i].Role == chat.RoleAssistant {
+			assistant = &messages[i]
+		}
+	}
+	if assistant == nil {
+		t.Fatal("expected an assistant reply for an oversized link (truncated, not rejected)")
+	}
+	if assistant.Status != chat.MessageStatusCompleted {
+		t.Errorf("expected a completed turn, got status %q", assistant.Status)
+	}
+
+	captured, gotPrompt, _ := gen.snapshot()
+	if !captured {
+		t.Fatal("expected the background generation to have called gen.Generate")
+	}
+	if !strings.Contains(gotPrompt, "cut short") {
+		t.Errorf("expected the truncation note in the prompt, got: %s", gotPrompt)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -187,72 +188,127 @@ func TestGenerate_ValidImageAttachmentIsAccepted(t *testing.T) {
 // network call, matching fakeGenerator's own pattern in
 // check_and_repair_test.go.
 type fakeLinkFetcher struct {
-	calls   int
-	lastURL string
-	content string
-	err     error
+	calls     int
+	lastURL   string
+	content   string
+	truncated bool
+	err       error
 }
 
-func (f *fakeLinkFetcher) Fetch(_ context.Context, rawURL string, _ int64) (string, error) {
+func (f *fakeLinkFetcher) Fetch(_ context.Context, rawURL string, _ int64) (urlfetch.Result, error) {
 	f.calls++
 	f.lastURL = rawURL
 	if f.err != nil {
-		return "", f.err
+		return urlfetch.Result{}, f.err
 	}
-	return f.content, nil
+	return urlfetch.Result{HTML: f.content, Truncated: f.truncated}, nil
 }
 
-// TestGenerate_LinkInPromptIsFetchedAndUsedAsAttachment needs a real
-// database — success proceeds past validation into
-// GetOrCreateChat/RecordUserMessage, same as TestGenerate_ValidImageAttachmentIsAccepted.
-func TestGenerate_LinkInPromptIsFetchedAndUsedAsAttachment(t *testing.T) {
+// blockingLinkFetcher stands in for *urlfetch.Fetcher in tests that need to
+// prove Generate itself never calls Fetch — a plain call counter checked
+// right after Generate returns would be racing the background goroutine
+// Generate spawns to actually run the turn (see runGeneration), which may
+// or may not have been scheduled yet. Blocking Fetch on an unbuffered
+// channel closes that race outright: if Generate ever called Fetch
+// synchronously, the test would hang waiting on release (a much clearer
+// failure than a flaky counter check) instead of ever reaching the
+// assertions below Generate's own call. The test closes release once it's
+// done asserting, letting the real background fetch (if any) proceed so
+// runGeneration's goroutine finishes cleanly before the test's DB
+// connection is closed by newQueueTestService's own t.Cleanup.
+type blockingLinkFetcher struct {
+	mu      sync.Mutex
+	calls   int
+	lastURL string
+	content string
+	release chan struct{}
+}
+
+func (f *blockingLinkFetcher) Fetch(_ context.Context, rawURL string, _ int64) (urlfetch.Result, error) {
+	<-f.release
+	f.mu.Lock()
+	f.calls++
+	f.lastURL = rawURL
+	f.mu.Unlock()
+	return urlfetch.Result{HTML: f.content}, nil
+}
+
+func (f *blockingLinkFetcher) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// TestGenerate_DoesNotFetchSynchronously is Phase 1's core invariant: a
+// prompt containing a URL must not make Generate itself do any network
+// work — see Generate's own doc comment on why (POST /chats/messages must
+// stay a fast, synchronous 202). The actual fetch happens later, in
+// doGenerate, once this turn is dequeued and running in the background
+// (see TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward).
+// This only asserts what Generate carries forward for that later fetch to
+// use: the enqueued Generation row's ReferenceURL.
+func TestGenerate_DoesNotFetchSynchronously(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
-	fl := &fakeLinkFetcher{content: "<h1>Reference Site</h1>"}
+	fl := &blockingLinkFetcher{content: "<h1>Reference Site</h1>", release: make(chan struct{})}
 	svc.links = fl
+	t.Cleanup(func() { close(fl.release) })
 
 	tenantID := uint64(time.Now().UnixNano())
-	_, err := svc.Generate(context.Background(), GenerateInput{
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
 		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
 		Prompt: "https://example.com can you access this link",
 	})
+	// Reaching this line at all — Fetch would block forever on the unclosed
+	// channel if Generate had called it synchronously — is itself part of
+	// the proof.
 	if err != nil {
 		t.Fatalf("expected a link-only prompt to be accepted, got error: %v", err)
 	}
-	if fl.calls != 1 {
-		t.Errorf("expected exactly 1 fetch call, got %d", fl.calls)
+	if got := fl.callCount(); got != 0 {
+		t.Errorf("expected zero fetch calls from Generate itself, got %d", got)
 	}
-	if fl.lastURL != "https://example.com" {
-		t.Errorf("expected the extracted url %q, got %q", "https://example.com", fl.lastURL)
+
+	gen, err := svc.repo.GetGenerationByID(context.Background(), outcome.Chat.ID, outcome.GenerationID)
+	if err != nil {
+		t.Fatalf("failed to load the enqueued generation: %v", err)
+	}
+	if gen.ReferenceURL != "https://example.com" {
+		t.Errorf("expected the enqueued row to carry ReferenceURL %q, got %q", "https://example.com", gen.ReferenceURL)
 	}
 }
 
-func TestGenerate_LinkFetchFailureSurfacesError(t *testing.T) {
-	svc := &Service{gen: &fakeGenerator{}, links: &fakeLinkFetcher{err: urlfetch.ErrBlockedHost}}
+// TestGenerate_MalformedURLStillRejectedSynchronously confirms the one
+// case that IS still a synchronous 4xx: a URL malformed enough that
+// ValidateURL rejects it needs no network call to know that, so there's no
+// async-design reason to defer it — see Generate's own doc comment.
+// user:pass@ userinfo is one of ValidateURL's own rejection cases (see
+// guard_test.go).
+func TestGenerate_MalformedURLStillRejectedSynchronously(t *testing.T) {
+	svc := &Service{gen: &fakeGenerator{}, links: &fakeLinkFetcher{err: errors.New("must never be called — no network needed for a shape rejection")}}
 
 	_, err := svc.Generate(context.Background(), GenerateInput{
-		ThemeSlug: "demo", Prompt: "https://169.254.169.254/ can you access this link",
+		ThemeSlug: "demo", Prompt: "https://user:pass@example.com can you access this link",
 	})
 	if !errors.Is(err, ErrLinkFetchFailed) {
-		t.Fatalf("expected ErrLinkFetchFailed, got %v", err)
+		t.Fatalf("expected ErrLinkFetchFailed for a malformed url, got %v", err)
 	}
 }
 
 // TestGenerate_ExplicitHTMLAttachmentWinsOverLinkInPrompt confirms an
 // uploaded HTML file is a more deliberate signal than a URL the merchant
 // merely mentioned in the same message — see the link-reference feature's
-// own doc comment in Generate. fakeLinkFetcher.err is set to a value that
-// would fail the whole call if Fetch were ever invoked, proving it wasn't.
+// own doc comment in Generate. Checked at the point precedence is actually
+// decided now: the enqueued row's ReferenceURL must stay empty, not (as
+// before Phase 1) a synchronous fetch call that never happens either way.
 func TestGenerate_ExplicitHTMLAttachmentWinsOverLinkInPrompt(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
-	fl := &fakeLinkFetcher{err: errors.New("must never be called")}
-	svc.links = fl
 	filename := "page.html"
 	content := "<h1>Uploaded</h1>"
 
 	tenantID := uint64(time.Now().UnixNano())
-	_, err := svc.Generate(context.Background(), GenerateInput{
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
 		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
 		Prompt:                 "https://example.com make it look like the uploaded file",
 		HTMLAttachmentFilename: &filename,
@@ -261,8 +317,12 @@ func TestGenerate_ExplicitHTMLAttachmentWinsOverLinkInPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if fl.calls != 0 {
-		t.Errorf("expected the link fetcher never to be called when an HTML file was explicitly uploaded, got %d calls", fl.calls)
+	gen, err := svc.repo.GetGenerationByID(context.Background(), outcome.Chat.ID, outcome.GenerationID)
+	if err != nil {
+		t.Fatalf("failed to load the enqueued generation: %v", err)
+	}
+	if gen.ReferenceURL != "" {
+		t.Errorf("expected no ReferenceURL when an HTML file was explicitly uploaded, got %q", gen.ReferenceURL)
 	}
 }
 
