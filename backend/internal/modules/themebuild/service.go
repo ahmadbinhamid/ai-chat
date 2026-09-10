@@ -880,6 +880,21 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	// outcome still needs recording either way.
 	endCtx, endCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer endCancel()
+	// One unambiguous line per ended generation, logged before deciding
+	// which of the two outcomes below to record — settles, from the logs
+	// alone, whether a cut-short generation was an explicit stop request
+	// (cancelled=true; cross-reference cancelOneRunning's own "cancel
+	// requested" log for the same generation_id to see exactly when/how it
+	// was asked to stop) or a genuine failure/timeout (cancelled=false;
+	// error is the raw, unsanitized cause — never shown to the merchant,
+	// see ai.SanitizeError, but exactly what's needed here to tell a real
+	// timeout apart from, say, a context canceled for some other reason).
+	// This is what earlier incidents lacked: without it, "it just stopped"
+	// could only be diagnosed by inference from request timing.
+	if err != nil {
+		slog.Info("generation ended", "chat_id", c.ID, "generation_id", g.ID,
+			"cancelled_by_user", cancelledByUser.Load(), "error", err.Error())
+	}
 	// err != nil is required here, not cancelledByUser.Load() alone: the
 	// flag can still flip true after doGenerate has already committed a
 	// real, successful result (see doGenerate's own defer, which applies

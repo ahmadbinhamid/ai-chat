@@ -232,6 +232,14 @@ func (s *Service) cancelOneRunning(ctx context.Context, chatID, generationID str
 	if err := s.repo.RequestGenerationCancellation(ctx, chatID, generationID); err != nil {
 		return err
 	}
+	// The one definitive record that a running generation's stop was an
+	// explicit request through this API, not inferred later from timing —
+	// see runGeneration's own "generation ended" log, which states whether
+	// cancelledByUser ended up true or false for this same generation_id.
+	// Reading the two together settles, instead of guessing from elapsed
+	// time alone, whether a given cut-short generation was actually asked
+	// to stop or failed/timed out on its own.
+	slog.Info("cancel requested for a running generation", "chat_id", chatID, "generation_id", generationID)
 
 	payload, err := json.Marshal(map[string]string{"generation_id": generationID})
 	if err != nil {
