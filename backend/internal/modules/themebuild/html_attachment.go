@@ -79,6 +79,19 @@ func isExecutableScriptTag(openTag string) bool {
 // attribute's quotes, a CSS url(...) call — stays syntactically valid.
 var dataURIRe = regexp.MustCompile(`data:[a-zA-Z0-9.+/-]+;base64,[A-Za-z0-9+/=]+`)
 
+// svgBlockRe matches one whole inline <svg>...</svg> element — icon/logo
+// vector markup, the dominant source of bulk in real-world fetched pages
+// (see the link-fetch feature): a modern site's icon sprite sheet or a
+// handful of inline logo/icon SVGs routinely runs to hundreds of KB of path
+// coordinate data, dwarfing the actual page markup/copy. That data is
+// exactly as useless to the model as an embedded base64 image (see
+// dataURIRe above) — it can't see rendered vector graphics in path-command
+// text any more than it can see pixels in a data: URI — so it's stripped
+// the same way: dropped rather than kept toward the byte budget. Matches a
+// self-closing <svg .../> too, since an empty/icon-font-only svg element
+// can take that form.
+var svgBlockRe = regexp.MustCompile(`(?is)<svg\b[^>]*?(?:/>|>.*?</svg\s*>)`)
+
 // longBase64RunRe matches a long run of base64-alphabet characters with no
 // data: URI prefix to key off — the shape a binary asset (a font, an
 // image, a whole minified JS bundle) takes when embedded as a plain JSON
@@ -98,10 +111,10 @@ var dataURIRe = regexp.MustCompile(`data:[a-zA-Z0-9.+/-]+;base64,[A-Za-z0-9+/=]+
 // original was a plain quoted string, and an empty string is still one).
 var longBase64RunRe = regexp.MustCompile(`[A-Za-z0-9+/]{400,}=*`)
 
-// SanitizeHTMLAttachment removes executable scripts and embedded base64
-// assets from an uploaded HTML file before it's stored or sent to the
-// model — see Generate's own use of this, right before the post-strip
-// MaxHTMLAttachmentBytes check. Only strips a <script> block whose type
+// SanitizeHTMLAttachment removes executable scripts, inline SVG markup, and
+// embedded base64 assets from an uploaded HTML file before it's stored or
+// sent to the model — see Generate's own use of this, right before the
+// post-strip MaxHTMLAttachmentBytes check. Only strips a <script> block whose type
 // isExecutableScriptTag says a browser would actually run (see that
 // function's own doc comment) — a non-executable one (a JSON/template
 // data island) is left in place, since removing it destroys real content
@@ -117,6 +130,7 @@ func SanitizeHTMLAttachment(html string) string {
 		}
 		return block
 	})
+	html = svgBlockRe.ReplaceAllString(html, "")
 	html = dataURIRe.ReplaceAllString(html, "data:,")
 	return longBase64RunRe.ReplaceAllString(html, "")
 }

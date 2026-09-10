@@ -9,6 +9,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/urlfetch"
 )
 
 // Every failure case here returns before Generate ever touches s.chats/
@@ -179,5 +180,126 @@ func TestGenerate_ValidImageAttachmentIsAccepted(t *testing.T) {
 	}
 	if outcome.UserMessage.ID == "" {
 		t.Fatal("expected a recorded user message")
+	}
+}
+
+// fakeLinkFetcher stands in for *urlfetch.Fetcher — never makes a real
+// network call, matching fakeGenerator's own pattern in
+// check_and_repair_test.go.
+type fakeLinkFetcher struct {
+	calls   int
+	lastURL string
+	content string
+	err     error
+}
+
+func (f *fakeLinkFetcher) Fetch(_ context.Context, rawURL string, _ int64) (string, error) {
+	f.calls++
+	f.lastURL = rawURL
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.content, nil
+}
+
+// TestGenerate_LinkInPromptIsFetchedAndUsedAsAttachment needs a real
+// database — success proceeds past validation into
+// GetOrCreateChat/RecordUserMessage, same as TestGenerate_ValidImageAttachmentIsAccepted.
+func TestGenerate_LinkInPromptIsFetchedAndUsedAsAttachment(t *testing.T) {
+	svc, _ := newQueueTestService(t)
+	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
+	fl := &fakeLinkFetcher{content: "<h1>Reference Site</h1>"}
+	svc.links = fl
+
+	tenantID := uint64(time.Now().UnixNano())
+	_, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "https://example.com can you access this link",
+	})
+	if err != nil {
+		t.Fatalf("expected a link-only prompt to be accepted, got error: %v", err)
+	}
+	if fl.calls != 1 {
+		t.Errorf("expected exactly 1 fetch call, got %d", fl.calls)
+	}
+	if fl.lastURL != "https://example.com" {
+		t.Errorf("expected the extracted url %q, got %q", "https://example.com", fl.lastURL)
+	}
+}
+
+func TestGenerate_LinkFetchFailureSurfacesError(t *testing.T) {
+	svc := &Service{gen: &fakeGenerator{}, links: &fakeLinkFetcher{err: urlfetch.ErrBlockedHost}}
+
+	_, err := svc.Generate(context.Background(), GenerateInput{
+		ThemeSlug: "demo", Prompt: "https://169.254.169.254/ can you access this link",
+	})
+	if !errors.Is(err, ErrLinkFetchFailed) {
+		t.Fatalf("expected ErrLinkFetchFailed, got %v", err)
+	}
+}
+
+// TestGenerate_ExplicitHTMLAttachmentWinsOverLinkInPrompt confirms an
+// uploaded HTML file is a more deliberate signal than a URL the merchant
+// merely mentioned in the same message — see the link-reference feature's
+// own doc comment in Generate. fakeLinkFetcher.err is set to a value that
+// would fail the whole call if Fetch were ever invoked, proving it wasn't.
+func TestGenerate_ExplicitHTMLAttachmentWinsOverLinkInPrompt(t *testing.T) {
+	svc, _ := newQueueTestService(t)
+	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
+	fl := &fakeLinkFetcher{err: errors.New("must never be called")}
+	svc.links = fl
+	filename := "page.html"
+	content := "<h1>Uploaded</h1>"
+
+	tenantID := uint64(time.Now().UnixNano())
+	_, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt:                 "https://example.com make it look like the uploaded file",
+		HTMLAttachmentFilename: &filename,
+		HTMLAttachmentContent:  &content,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fl.calls != 0 {
+		t.Errorf("expected the link fetcher never to be called when an HTML file was explicitly uploaded, got %d calls", fl.calls)
+	}
+}
+
+// TestGenerate_NoLinkInPromptSkipsFetch confirms a prompt with no URL at
+// all never touches the link fetcher.
+func TestGenerate_NoLinkInPromptSkipsFetch(t *testing.T) {
+	svc, _ := newQueueTestService(t)
+	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
+	fl := &fakeLinkFetcher{err: errors.New("must never be called")}
+	svc.links = fl
+
+	tenantID := uint64(time.Now().UnixNano())
+	_, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme", Prompt: "just redesign the homepage",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fl.calls != 0 {
+		t.Errorf("expected the link fetcher never to be called for a prompt with no url, got %d calls", fl.calls)
+	}
+}
+
+// TestGenerate_NilLinksSkipsFetchGracefully is the regression this guards:
+// a Service built by struct literal without setting links (svc.links stays
+// nil, its zero value) — matching how every other test in this file
+// constructs one — must not panic on a prompt that happens to contain a
+// url; it should behave exactly as if no reference link feature existed at
+// all, same as before this feature was added.
+func TestGenerate_NilLinksSkipsFetchGracefully(t *testing.T) {
+	svc := &Service{gen: &fakeGenerator{visionSupported: true}}
+
+	_, err := svc.Generate(context.Background(), GenerateInput{
+		ThemeSlug: "demo", Prompt: "https://example.com and also too many images",
+		Images: make([]chat.MessageImage, maxImagesPerMessage+1), // fails validation right after, for a cheap assertion
+	})
+	if !errors.Is(err, ErrTooManyImages) {
+		t.Fatalf("expected Generate to proceed past the (skipped) link fetch and fail on the image count check as normal, got %v", err)
 	}
 }

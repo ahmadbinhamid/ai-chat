@@ -17,6 +17,7 @@ import (
 	"ai-chat/internal/safego"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
+	"ai-chat/internal/urlfetch"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -181,6 +182,14 @@ type generator interface {
 	Summarize(ctx context.Context, turns []ai.Turn) (string, error)
 }
 
+// linkFetcher matches *urlfetch.Fetcher's own method — a private interface
+// (same pattern as generator above) so Generate can be tested against a
+// fake that never makes a real network call, and so this package doesn't
+// need to import urlfetch's concrete type anywhere but NewService.
+type linkFetcher interface {
+	Fetch(ctx context.Context, rawURL string, maxBytes int64) (string, error)
+}
+
 // Service is the AI theme builder's orchestration: turn a prompt into
 // proposed changes and stage them into the chat's draft overlay (see
 // Generate) — writing to the real theme is a separate, explicit ApplyDraft
@@ -189,6 +198,13 @@ type Service struct {
 	repo  *Repository
 	chats *chat.Service
 	gen   generator
+	// links fetches a merchant-pasted reference URL's HTML — see the
+	// link-reference feature in Generate. nil in tests that construct a
+	// Service by struct literal without setting it (see e.g.
+	// generate_valid_proposal_test.go); Generate treats that the same way
+	// it already treats a turn with no reference link at all, so those
+	// tests need no changes.
+	links linkFetcher
 	// store is always the REAL (non-overlay) store — see doGenerate, which
 	// wraps it in a fresh themefs.OverlayStore per generation call rather
 	// than mutating this field. A mutable "current store" field here would
@@ -247,6 +263,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		repo:                        repo,
 		chats:                       chats,
 		gen:                         gen,
+		links:                       urlfetch.NewFetcher(),
 		store:                       store,
 		themeLocks:                  locks,
 		bus:                         bus,
@@ -333,6 +350,14 @@ var ErrImageTooLarge = errors.New("an attached image is too large")
 // exceeded MaxHTMLUploadBytes (raw) or MaxHTMLAttachmentBytes (post-strip).
 var ErrHTMLAttachmentTooLarge = errors.New("attached HTML file is too large")
 
+// ErrLinkFetchFailed means a reference URL the merchant pasted directly in
+// their prompt (see the link-reference feature in Generate) couldn't be
+// used — wraps the underlying urlfetch error (invalid URL, blocked/private
+// host, unreachable, wrong content type, or too large) for detail; every
+// one of those is already merchant-readable on its own (see urlfetch's own
+// sentinel errors), so nothing here needs to redact or re-explain it.
+var ErrLinkFetchFailed = errors.New("could not use the link in your message as a reference")
+
 // ErrGenerationInProgress means the tenant's chat already has a background
 // generation running — see the generations table (phase 3a) and
 // Repository.StartGeneration/DequeueNext. Generate itself never returns
@@ -374,6 +399,18 @@ type GenerateInput struct {
 	// text — no vision-model plumbing needed for it.
 	HTMLAttachmentFilename *string
 	HTMLAttachmentContent  *string
+	// HTMLAttachmentIsExternalLink is true when HTMLAttachmentContent came
+	// from Generate fetching a URL the merchant mentioned (see the
+	// link-reference feature), as opposed to a file the merchant uploaded.
+	// promptWithHTMLAttachment uses it to call out explicitly that the
+	// content is a completely different, external website — not the
+	// merchant's own theme — since a fetched competitor/inspiration site's
+	// markup routinely contains the same kind of e-commerce shapes
+	// (add-to-cart buttons, product data attributes) the merchant's own
+	// theme does, and without this the model has been observed going to
+	// grep the merchant's own theme files for matching patterns even for a
+	// plain read-only question about the fetched site.
+	HTMLAttachmentIsExternalLink bool
 	// UserMessageID is set by Generate right after RecordUserMessage and
 	// carried through the queue (Generation.UserMessageID) so doGenerate
 	// can re-resolve Images from chat_messages once this turn actually
@@ -492,6 +529,35 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 			return GenerateOutcome{}, fmt.Errorf("%w: image %d", ErrImageTooLarge, i)
 		}
 	}
+	// A merchant pasting a bare reference link directly in their prompt
+	// ("https://example.com can you access this link") is treated almost
+	// exactly like uploading that URL's page as an HTML attachment —
+	// fetched here, then handed to the same sanitize/size-check/prompt-
+	// framing logic just below. The one thing that does differ is the
+	// framing text itself: HTMLAttachmentIsExternalLink tells
+	// promptWithHTMLAttachment to call out that this is a different,
+	// external site, not the merchant's own theme (see that field's own
+	// doc comment for why that call-out matters). Only runs when no HTML
+	// file was explicitly uploaded this turn — an upload is a more
+	// deliberate signal than a URL that merely appears somewhere in the
+	// prompt text, so it always wins rather than being silently
+	// overwritten by a fetch of an unrelated link mentioned in passing.
+	// s.links is nil in tests that construct a Service by struct literal
+	// without setting it (see linkFetcher's own doc comment) — those
+	// simply skip this, same as they already skip store/bus/etc.
+	if in.HTMLAttachmentContent == nil && s.links != nil {
+		if link, ok := urlfetch.ExtractFirstURL(in.Prompt); ok {
+			htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
+			content, ferr := s.links.Fetch(ctx, link, htmlLimit.MaxBytes)
+			if ferr != nil {
+				return GenerateOutcome{}, fmt.Errorf("%w: %s", ErrLinkFetchFailed, ferr.Error())
+			}
+			in.HTMLAttachmentFilename = &link
+			in.HTMLAttachmentContent = &content
+			in.HTMLAttachmentIsExternalLink = true
+		}
+	}
+
 	if in.HTMLAttachmentContent != nil {
 		htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
 		if int64(len(*in.HTMLAttachmentContent)) > htmlLimit.MaxBytes {
