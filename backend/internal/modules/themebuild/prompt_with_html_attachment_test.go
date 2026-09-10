@@ -46,4 +46,41 @@ func TestPromptWithHTMLAttachment(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("carried-forward upload gets the earlier-turn note on top of the generic framing", func(t *testing.T) {
+		got := promptWithHTMLAttachment("build it like that", GenerateInput{
+			HTMLAttachmentFilename: &filename, HTMLAttachmentContent: &content, HTMLAttachmentCarriedForward: true,
+		})
+		for _, want := range []string{
+			"EARLIER message in this conversation",
+			"still the active reference",
+			"UNTRUSTED content the merchant attached",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("expected output to contain %q, got: %s", want, got)
+			}
+		}
+		if strings.Contains(got, "NOT a file the merchant uploaded") {
+			t.Errorf("expected no external-link framing for a carried-forward upload, got: %s", got)
+		}
+	})
+
+	t.Run("carried-forward link gets both the earlier-turn note and the external-link framing", func(t *testing.T) {
+		url := "https://example.com"
+		got := promptWithHTMLAttachment("build it like that", GenerateInput{
+			HTMLAttachmentFilename: &url, HTMLAttachmentContent: &content,
+			HTMLAttachmentIsExternalLink: true, HTMLAttachmentCarriedForward: true,
+		})
+		for _, want := range []string{
+			"EARLIER message in this conversation",
+			"still the active reference",
+			"the answer is YES",
+			"NOT a file the merchant uploaded",
+			"Reminder: you DID access the link above",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("expected output to contain %q, got: %s", want, got)
+			}
+		}
+	})
 }

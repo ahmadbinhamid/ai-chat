@@ -41,10 +41,30 @@ func TestCheckAllowedSyntax_UnknownTag(t *testing.T) {
 }
 
 func TestCheckAllowedSyntax_UnknownFilter(t *testing.T) {
-	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Content: "{{ product.name | truncate: 20 }}"}}}
+	// "replace" is a real php-liquid filter (so ScanOutputExpressions parses
+	// it fine) but not one §1 documents — genuinely disallowed, unlike
+	// truncate below.
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Content: "{{ product.name | replace: 'a', 'b' }}"}}}
 	got := checkAllowedSyntax(p, Snapshot{})
 	if len(got) != 1 {
-		t.Fatalf("expected 1 finding for the disallowed 'truncate' filter, got %+v", got)
+		t.Fatalf("expected 1 finding for the disallowed 'replace' filter, got %+v", got)
+	}
+}
+
+// TestCheckAllowedSyntax_SpecDocumentedFiltersAreAllowed covers the five
+// filters §1 has always documented (money, get_products, escape,
+// strip_html, truncate) but allowedFilters didn't actually accept until
+// this fix — see allowedFilters' own doc comment. A regression here means
+// the whitelist has drifted from §1 again.
+func TestCheckAllowedSyntax_SpecDocumentedFiltersAreAllowed(t *testing.T) {
+	content := `{{ price | money }}
+{{ "slug-a,slug-b" | split: ',' | get_products }}
+{{ product.name | escape }}
+{{ product.description | strip_html }}
+{{ product.description | truncate: 140 }}`
+	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Content: content}}}
+	if got := checkAllowedSyntax(p, Snapshot{}); len(got) != 0 {
+		t.Errorf("expected no findings for spec-documented filters, got %+v", got)
 	}
 }
 

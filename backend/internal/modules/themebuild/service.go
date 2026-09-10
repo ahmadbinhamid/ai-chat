@@ -392,25 +392,40 @@ type GenerateInput struct {
 	Images []chat.MessageImage
 	// HTMLAttachmentFilename/HTMLAttachmentContent, when both set, attach
 	// one reference HTML file to this turn's prompt — see the
-	// HTML-attachment feature. Same "only this call, never resurfaced
-	// later" rule as Images, folded into the effective prompt text at
+	// HTML-attachment feature. Folded into the effective prompt text at
 	// each Generate call within this turn (see promptWithHTMLAttachment)
 	// rather than sent as a separate structured param, since it's plain
-	// text — no vision-model plumbing needed for it.
+	// text — no vision-model plumbing needed for it. Unlike Images (which
+	// really is only ever this one call), doGenerate can also populate
+	// these two from an EARLIER turn's attachment when the current turn
+	// has none of its own — see findCarryForwardSourceMessageID and
+	// HTMLAttachmentCarriedForward below.
 	HTMLAttachmentFilename *string
 	HTMLAttachmentContent  *string
 	// HTMLAttachmentIsExternalLink is true when HTMLAttachmentContent came
-	// from Generate fetching a URL the merchant mentioned (see the
-	// link-reference feature), as opposed to a file the merchant uploaded.
-	// promptWithHTMLAttachment uses it to call out explicitly that the
-	// content is a completely different, external website — not the
-	// merchant's own theme — since a fetched competitor/inspiration site's
-	// markup routinely contains the same kind of e-commerce shapes
-	// (add-to-cart buttons, product data attributes) the merchant's own
-	// theme does, and without this the model has been observed going to
-	// grep the merchant's own theme files for matching patterns even for a
-	// plain read-only question about the fetched site.
+	// from a URL fetch (see the link-reference feature) rather than a file
+	// the merchant uploaded — true whether that fetch happened on THIS turn
+	// or an earlier one it was carried forward from (see
+	// HTMLAttachmentCarriedForward). promptWithHTMLAttachment uses it to
+	// call out explicitly that the content is a completely different,
+	// external website — not the merchant's own theme — since a fetched
+	// competitor/inspiration site's markup routinely contains the same kind
+	// of e-commerce shapes (add-to-cart buttons, product data attributes)
+	// the merchant's own theme does, and without this the model has been
+	// observed going to grep the merchant's own theme files for matching
+	// patterns even for a plain read-only question about the fetched site.
+	// Restored from storage via looksLikeFetchedLink — chat_message_attachments
+	// has no column of its own for this (see that function's own doc
+	// comment for why the filename alone is a reliable enough signal).
 	HTMLAttachmentIsExternalLink bool
+	// HTMLAttachmentCarriedForward is true when HTMLAttachmentFilename/
+	// Content came from an earlier turn in this chat (see
+	// findCarryForwardSourceMessageID), not from the current turn's own
+	// message. promptWithHTMLAttachment uses it to tell the model the
+	// reference won't be mentioned again in the merchant's latest message
+	// but is still the active one — without this, the model has no way to
+	// know the attachment below wasn't just silently dropped.
+	HTMLAttachmentCarriedForward bool
 	// UserMessageID is set by Generate right after RecordUserMessage and
 	// carried through the queue (Generation.UserMessageID) so doGenerate
 	// can re-resolve Images from chat_messages once this turn actually
@@ -1106,6 +1121,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 					content := string(a.Content)
 					in.HTMLAttachmentFilename = &filename
 					in.HTMLAttachmentContent = &content
+					in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
 				default:
 					// Repository already filters unknown kinds before they
 					// get here — this is defense in depth, not the primary
@@ -1114,6 +1130,43 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				}
 			}
 			break
+		}
+	}
+
+	// Carry-forward fallback: this turn attached no HTML reference of its
+	// own — look back for the most recent earlier turn in this chat that
+	// did, still inside the window actually replayed to the model (see
+	// findCarryForwardSourceMessageID). Without this, "here's a link"
+	// followed later by "build it like that" runs the actual build with no
+	// page content at all — the model designs from its own earlier summary
+	// of the page, not the page itself. currentID is empty (never matches a
+	// real message.ID) when in.UserMessageID is nil, which only happens in
+	// tests that drive doGenerate directly — harmless: nothing to exclude
+	// from the scan in that case either.
+	if in.HTMLAttachmentContent == nil {
+		currentID := ""
+		if in.UserMessageID != nil {
+			currentID = *in.UserMessageID
+		}
+		if sourceID, ok := findCarryForwardSourceMessageID(priorMessages, currentID); ok {
+			full, attErr := s.chats.GetAttachmentsContent(ctx, sourceID)
+			if attErr != nil {
+				return fmt.Errorf("load carried-forward attachment content: %w", attErr)
+			}
+			for _, a := range full {
+				if a.Kind != chat.AttachmentKindHTML {
+					continue
+				}
+				filename := a.Filename
+				content := string(a.Content)
+				in.HTMLAttachmentFilename = &filename
+				in.HTMLAttachmentContent = &content
+				in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
+				in.HTMLAttachmentCarriedForward = true
+				slog.Info("carried forward an earlier turn's HTML reference", "chat_id", c.ID,
+					"source_message_id", sourceID, "is_link", in.HTMLAttachmentIsExternalLink)
+				break
+			}
 		}
 	}
 
@@ -1474,20 +1527,22 @@ func flattenFileTree(entries []themefs.FileTreeEntry, paths map[string]bool) {
 // before the fix that stops persisting one (see Generate): the bad row
 // stays in the database, but it's excluded here every time history gets
 // rebuilt, so it can't keep breaking every future message in that chat.
+// Delegates its inclusion rule to isReplayedMessage (attachment_carry_forward.go)
+// rather than inlining it a second time — findCarryForwardSourceMessageID
+// needs the exact same rule to determine whether an earlier turn is still
+// inside the window actually replayed here, and a second, drifted copy of
+// it would silently desync the two.
 func toTurns(messages []chat.Message) []ai.Turn {
 	turns := make([]ai.Turn, 0, len(messages))
 	for _, m := range messages {
-		if strings.TrimSpace(m.Content) == "" {
+		if !isReplayedMessage(m) {
 			continue
 		}
-		switch m.Role {
-		case chat.RoleUser:
-			turns = append(turns, ai.Turn{Role: "user", Content: m.Content})
-		case chat.RoleAssistant:
-			if m.Status == chat.MessageStatusCompleted {
-				turns = append(turns, ai.Turn{Role: "assistant", Content: m.Content})
-			}
+		role := "user"
+		if m.Role == chat.RoleAssistant {
+			role = "assistant"
 		}
+		turns = append(turns, ai.Turn{Role: role, Content: m.Content})
 	}
 	return turns
 }

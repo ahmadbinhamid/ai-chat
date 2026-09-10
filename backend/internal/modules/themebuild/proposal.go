@@ -42,7 +42,11 @@ func imagesFromInput(in GenerateInput) []ai.Image {
 // imagesFromInput's doc comment for why: a repair retry has to re-see the
 // reference to correct itself against it), unlike Images, this is plain
 // text folded straight into the prompt rather than a separate structured
-// param — no vision-model plumbing needed for it.
+// param — no vision-model plumbing needed for it. in's attachment fields
+// may have been resolved from THIS turn's own message or carried forward
+// from an earlier one (see findCarryForwardSourceMessageID) — the two get
+// different framing (in.HTMLAttachmentCarriedForward) but are otherwise
+// handled identically here.
 func promptWithHTMLAttachment(prompt string, in GenerateInput) string {
 	if in.HTMLAttachmentFilename == nil || in.HTMLAttachmentContent == nil {
 		return prompt
@@ -73,6 +77,20 @@ func promptWithHTMLAttachment(prompt string, in GenerateInput) string {
 		trailer = "\n\nReminder: you DID access the link above — its content is everything between the " +
 			"--- markers above. Do not tell the merchant you can't open external links or can only work " +
 			"with attached/theme files."
+	}
+	if in.HTMLAttachmentCarriedForward {
+		// Prepended on top of whichever base note was selected above — a
+		// carried-forward link still needs the "you DID access it" framing
+		// (the disclaimer reflex it guards against doesn't care which turn
+		// fetched it), it just ALSO needs this conversation-continuity note,
+		// since the merchant's latest message won't mention this reference
+		// at all (that's exactly why doGenerate went looking for it — see
+		// findCarryForwardSourceMessageID) and the model must not read its
+		// absence there as "no longer relevant."
+		sourceNote = "The merchant attached or linked this in an EARLIER message in this conversation, not " +
+			"their latest one. It is still the active reference for the current request — they haven't said " +
+			"to stop using it, so treat it as fully in force even though it isn't repeated in their message " +
+			"above. " + sourceNote
 	}
 	return fmt.Sprintf(
 		"%s\n\n--- Attached reference file: %s ---\n"+
@@ -528,10 +546,24 @@ func recapAssistantTurn(result *ai.Result) string {
 // repairPrompt is the new user turn sent back to the model after a rejected
 // proposal — every error finding, since those are what actually blocked the
 // write (warnings are surfaced to the merchant, never fed back for a retry).
+//
+// Deliberately scopes the retry down to just the findings, not a general
+// invitation to keep working on the turn: a repair that re-explores the
+// theme and re-emits whole files costs as much as, or more than, the
+// original generation it's supposedly a small fix to (observed in
+// production: a single allowed-syntax violation triggering a 4-iteration,
+// 21,485-output-token repair against a 20,359-output-token original
+// generation — the repair should be the cheap step, not the expensive one).
+// recapAssistantTurn (the assistant turn appended right before this one)
+// already carries the exact, current, full content of every file the prior
+// proposal touched, so unlike a normal turn — where the model has to go
+// read a file before editing it — there is nothing to look up here for any
+// file already in that recap; explicitly saying so is what stops the model
+// from calling read_theme_file on it "just in case" anyway.
 func repairPrompt(errorFindings []themecheck.Finding) string {
 	var b strings.Builder
-	b.WriteString("Your last proposal failed validation against the theme engine spec. Fix these specific problems " +
-		"and resubmit the complete corrected set of files (not a diff):\n\n")
+	b.WriteString("Your last proposal failed validation against the theme engine spec. Fix ONLY these specific " +
+		"problems, in ONLY the file(s) named below, and resubmit the complete corrected set of files (not a diff):\n\n")
 	for _, f := range errorFindings {
 		if f.Path != "" {
 			fmt.Fprintf(&b, "- [%s] %s: %s\n", f.Rule, f.Path, f.Message)
@@ -539,21 +571,19 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 			fmt.Fprintf(&b, "- [%s] %s\n", f.Rule, f.Message)
 		}
 	}
-	// A rejection on an existing file is often a sign the resubmitted
-	// content was reconstructed from memory rather than the real file —
-	// e.g. dropping the mandatory layout-start/layout-end boilerplate when
-	// regenerating a page you were only asked to make a small change to.
-	// The tool loop is still available on this retry; use it.
-	b.WriteString("\nIf you're unsure of a file's exact current content, call read_theme_file on it again " +
-		"before resubmitting — don't reconstruct it from memory, that's how boilerplate like the layout " +
-		"renders above gets silently dropped.")
+	b.WriteString("\nThe exact current content of every file in your last proposal is already in your message " +
+		"above — that IS the real, current content (not a reconstruction from memory), so do not call " +
+		"read_theme_file again on any file named there. Only read a file if a finding above names one your last " +
+		"proposal did NOT already include. Do not explore, read, or touch anything else — no other files, no " +
+		"re-checking components you already used correctly, no improvements beyond what's listed above.")
 	// A themecheck rejection is exactly the case action "edit" is for: the
 	// findings above already say precisely which line(s) are wrong, so a
-	// targeted old_string/new_string fix is normally both correct and far
-	// smaller than resubmitting the whole file — see the intro sentence
-	// above, which still applies (edit's server-side materialization always
-	// produces that same complete, corrected file; it's just a cheaper way
-	// to submit it, not a partial one).
+	// targeted old_string/new_string fix against the content you already
+	// have (see the paragraph above) is normally both correct and far
+	// smaller than resubmitting the whole file — action "edit"'s
+	// server-side materialization always produces that same complete,
+	// corrected file; it's just a cheaper way to submit it, not a partial
+	// one.
 	b.WriteString("\n\nFor most of these, action \"edit\" on the file you already have (a precise old_string/" +
 		"new_string pair per finding) is the right fix — resubmit the whole file as action \"update\" only if the " +
 		"correction is broad enough that a full rewrite is genuinely simpler.")

@@ -98,9 +98,13 @@ type Message struct {
 	// populates this with METADATA ONLY — no bytes; see
 	// MessageAttachment's own doc comment for why, and for the one caller
 	// (themebuild.Service.doGenerate) that fetches actual bytes, and how.
-	// Never resurfaced to a DIFFERENT, later turn via toTurns (see
-	// themebuild's history-building) — only ever relevant to the turn that
-	// attached it.
+	// Never resurfaced to a DIFFERENT, later turn via toTurns itself (see
+	// themebuild's history-building) — a turn's own Content there is always
+	// just the merchant's original words, never this. An HTML reference
+	// specifically CAN still reach a later turn, just not through toTurns:
+	// see themebuild's findCarryForwardSourceMessageID, which doGenerate
+	// consults directly against this same metadata when a later turn has no
+	// attachment of its own. Images never carry forward this way.
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
 }
 
