@@ -148,7 +148,17 @@ func TestFetcher_Fetch_RejectsNonHTMLContentType(t *testing.T) {
 
 func TestFetcher_Fetch_AllowsMissingContentType(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Del("Content-Type")
+		// Set(..., "") rather than Del: net/http's own auto-sniffing only
+		// triggers when the Content-Type key is ABSENT from the header map
+		// (net/http/server.go checks `_, haveType := header["Content-Type"]`)
+		// — Del achieves that, but then Go itself sniffs this body (which
+		// opens with "<html") and sends a real "text/html" header anyway, so
+		// the client never actually sees a missing Content-Type and this
+		// test would silently exercise the header branch of looksLikeHTML,
+		// not the no-header/sniff branch it's named for. Set(..., "") keeps
+		// the key present with an empty value, which suppresses net/http's
+		// sniffing and lets an actually-empty header reach the client.
+		w.Header().Set("Content-Type", "")
 		w.Write([]byte("<html></html>"))
 	}))
 	defer srv.Close()
@@ -435,7 +445,11 @@ func TestFetcher_Fetch_ErrBlockedFor429AfterRetry(t *testing.T) {
 // accepted — via body sniffing, not the header (which says nothing here).
 func TestFetcher_Fetch_SniffsEmptyContentTypeAsHTML(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Del("Content-Type")
+		// Set(..., "") rather than Del — see TestFetcher_Fetch_AllowsMissingContentType's
+		// own comment: Del lets net/http sniff this doctype-opening body
+		// itself and send a real "text/html" header, which would bypass the
+		// empty-header/body-sniff branch this test means to exercise.
+		w.Header().Set("Content-Type", "")
 		w.Write([]byte("<!doctype html><html><body>hi</body></html>"))
 	}))
 	defer srv.Close()
@@ -453,7 +467,15 @@ func TestFetcher_Fetch_SniffsEmptyContentTypeAsHTML(t *testing.T) {
 // header was empty, regardless of the body.
 func TestFetcher_Fetch_RejectsEmptyContentTypeNonHTMLBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Del("Content-Type")
+		// Set(..., "") rather than Del: this body doesn't open with a markup
+		// tag, so net/http's own sniffing (which would run if Del left the
+		// header key absent) lands on some non-html/xml type here too and
+		// this particular test's outcome doesn't actually depend on the
+		// distinction — kept consistent with the other two Content-Type
+		// tests in this file anyway, so a reader doesn't wonder why only
+		// this one uses Del, and nobody "simplifies" the other two back to
+		// it by copying this one.
+		w.Header().Set("Content-Type", "")
 		w.Write([]byte("%PDF-1.4 this is not markup at all, just plain bytes"))
 	}))
 	defer srv.Close()
@@ -474,56 +496,53 @@ func TestFetcher_Fetch_RejectsEmptyContentTypeNonHTMLBody(t *testing.T) {
 // rejected it — slow, and a real memory cost for something that should
 // fail almost immediately.
 //
-// Proven by wall-clock time, not by counting bytes the server managed to
-// write: an earlier version of this test tried to assert on bytes written
-// before the server noticed the client was gone, but TCP send buffers can
-// silently absorb megabytes into the kernel before a close/RST actually
-// propagates back to an io.Writer.Write call on loopback — that made the
-// byte count meaningless as a signal on a fast connection, not just noisy.
-// Pacing the server's own writes with a real per-chunk delay (server-side
-// TEST code, not anything in the fetch path itself — the "no new sleeps"
-// constraint is about Fetch, not about how a test simulates a slow
-// upstream) sidesteps that: draining the whole body would take several
-// seconds at this pace, so a fast return is unambiguous proof Fetch never
-// asked for the rest of it.
+// Proven with a blocked handler, not a byte count or a wall-clock bound: an
+// earlier version of this test tried to assert on bytes written before the
+// server noticed the client was gone, but TCP send buffers can silently
+// absorb megabytes into the kernel before a close/RST actually propagates
+// back to an io.Writer.Write call on loopback — that made the byte count
+// meaningless as a signal on a fast connection, not just noisy. A later
+// version paced the server's writes and asserted on elapsed wall-clock
+// time against a generous margin — not flaky, but still a threshold
+// judgement, and it cost real seconds in the suite. This version instead
+// writes exactly one sniff-sized chunk, flushes it, and then blocks the
+// handler on a channel the test only closes AFTER Fetch has returned. If
+// Fetch correctly bails right after sniffing, it never asks the connection
+// for more, returns immediately, and the test's close(release) lets the
+// handler exit cleanly. If a regression ever made Fetch read past the
+// sniffed chunk, that read has nothing more to consume — the handler is
+// parked on the channel, not writing — so it blocks until Fetch's own
+// fetchTimeout gives up on the request; the test then fails on the
+// resulting error being something other than ErrNotHTML, not on a duration
+// check. Either way there's no timing assertion in this test itself.
 func TestFetcher_Fetch_RejectsNonHTMLWithoutReadingWholeBody(t *testing.T) {
-	const chunkDelay = 10 * time.Millisecond
-	const chunkCount = 1000 // fully draining this takes ~10s at chunkDelay
-
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
-		flusher, _ := w.(http.Flusher)
-		chunk := bytes.Repeat([]byte{0xFF}, 4096) // binary, never sniffs as HTML
-		for i := 0; i < chunkCount; i++ {
-			select {
-			case <-r.Context().Done():
-				return
-			case <-time.After(chunkDelay):
-			}
-			if _, err := w.Write(chunk); err != nil {
-				return
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
+		w.Write(bytes.Repeat([]byte{0xFF}, sniffBytes)) // binary, never sniffs as HTML
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		// select on r.Context().Done() too, not just release, as a backstop:
+		// release is always closed right after Fetch returns below, but if
+		// Fetch itself never returns (the very regression this test exists
+		// to catch, should its own fetchTimeout somehow not apply), the
+		// deferred srv.Close() tearing down the connection at least gives
+		// this handler goroutine a second way to unblock and exit.
+		select {
+		case <-release:
+		case <-r.Context().Done():
 		}
 	}))
 	defer srv.Close()
 
 	f := newFetcherWithDialContext(unguardedDialContext)
-	start := time.Now()
 	_, err := f.Fetch(context.Background(), srv.URL, 1024)
-	elapsed := time.Since(start)
+	close(release)
 
 	if !errors.Is(err, ErrNotHTML) {
-		t.Fatalf("expected ErrNotHTML, got: %v", err)
-	}
-	// Fully draining the paced body would take ~10s (chunkCount *
-	// chunkDelay); rejecting after the sniff-sized first chunk should
-	// return in about one chunkDelay. 2s is a generous bound that's still
-	// unmistakably "did not wait for the rest."
-	if elapsed > 2*time.Second {
-		t.Errorf("expected Fetch to reject quickly after sniffing, took %v — the full (deliberately slow) body may have been read", elapsed)
+		t.Fatalf("expected ErrNotHTML, got: %v — a non-ErrNotHTML error here (e.g. a fetchTimeout expiry) means "+
+			"Fetch asked the connection for more than the sniffed chunk", err)
 	}
 }
 

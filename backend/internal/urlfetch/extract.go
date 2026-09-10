@@ -112,7 +112,16 @@ func ExtractReferenceURL(prompt string) (string, bool) {
 		return url, true
 	}
 
-	if referenceCuePattern.MatchString(prompt) {
+	// The cue check runs against the prompt with the URL itself cut out —
+	// url's own host/path text can otherwise satisfy referenceCuePattern on
+	// its own word boundaries (https://example.com/check,
+	// https://reference.io), which would treat a bare mention as a referring
+	// cue on the strength of the link's own spelling rather than anything
+	// the merchant actually wrote around it. Only one Replace, since
+	// ExtractFirstURL/url is itself the first (and, per its own doc comment,
+	// only) URL this function ever considers.
+	promptWithoutURL := strings.Replace(prompt, url, "", 1)
+	if referenceCuePattern.MatchString(promptWithoutURL) {
 		return url, true
 	}
 	return "", false

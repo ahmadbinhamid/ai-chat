@@ -1046,10 +1046,47 @@ func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url st
 		sanitized = urlfetch.TruncateAtTagBoundary(sanitized, postStripMax)
 		truncated = true
 	}
-	if s.linkCache != nil {
+	// A page that sanitizes to nothing (its real content lived entirely in
+	// stripped <script> blocks — see doGenerate's own
+	// ReferenceURLEmptyAfterSanitize handling) is not a successful
+	// fetch+sanitize in the sense referenceURLCache.set requires, even
+	// though no error occurred: caching it would hold an empty shell for
+	// the full TTL, contradicting the cache's own "successes only"
+	// contract. Unlike a network failure, this result is deterministic for
+	// a given page — skipping the cache here just costs a repeat fetch
+	// next turn, not a repeat of whatever actually went wrong.
+	if s.linkCache != nil && strings.TrimSpace(sanitized) != "" {
 		s.linkCache.set(tenantID, url, sanitized, truncated)
 	}
 	return sanitized, truncated, nil
+}
+
+// truncatedLengthTolerance bounds how far under PostStripMaxBytes a
+// persisted attachment's stored length can be and still be inferred as
+// truncated (see looksTruncatedByStoredLength) — chat_message_attachments
+// has no truncated column of its own, so a later turn's carry-forward has
+// only the stored length to go on. An exact-cap comparison misses the case
+// where the cut landed mid-tag: TruncateAtTagBoundary backs up to the last
+// "<" (and, on top of that, may trim a few more bytes to avoid splitting a
+// rune — see trimIncompleteTrailingRune in urlfetch), so the stored length
+// can land noticeably short of PostStripMaxBytes even though the fetch was
+// genuinely truncated. 4096 is comfortably larger than any single HTML tag
+// plus a trailing rune, while still far below any plausible real page that
+// just happens to end within a few KB of the cap by coincidence. This is a
+// heuristic over a stored length, not a persisted fact, so it's allowed to
+// be wrong in either direction — a false positive only costs an
+// unnecessary "this was cut short" note in the prompt, while a false
+// negative costs that note on a turn that actually needed it. The
+// tolerance is sized to favor the former, cheaper mistake.
+const truncatedLengthTolerance = 4096
+
+// looksTruncatedByStoredLength reports whether contentLength is close
+// enough to PostStripMaxBytes to infer the stored HTML attachment was
+// truncated on write — see truncatedLengthTolerance's own doc comment for
+// why this is a range check, not an exact comparison.
+func looksTruncatedByStoredLength(contentLength int64) bool {
+	postStripMax := attachmentLimits[chat.AttachmentKindHTML].PostStripMaxBytes
+	return contentLength >= postStripMax-truncatedLengthTolerance
 }
 
 // doGenerate is the part of generation that used to be Generate's entire
@@ -1225,13 +1262,9 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 					in.HTMLAttachmentFilename = &filename
 					in.HTMLAttachmentContent = &content
 					in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
-					// chat_message_attachments has no truncated column of its
-					// own (a schema change isn't worth it just for this
-					// prompt note) — a stored length exactly at the cap is a
-					// reliable-in-practice heuristic for "this was cut short
-					// on write", since fetchReferenceURL only ever produces
-					// content at or under PostStripMaxBytes.
-					in.HTMLAttachmentTruncated = int64(len(content)) >= attachmentLimits[chat.AttachmentKindHTML].PostStripMaxBytes
+					// See looksTruncatedByStoredLength's own doc comment for
+					// why this is a tolerance range, not an exact-cap check.
+					in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(int64(len(content)))
 				default:
 					// Repository already filters unknown kinds before they
 					// get here — this is defense in depth, not the primary
@@ -1343,10 +1376,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				in.HTMLAttachmentContent = &content
 				in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
 				// See the identical check in the current-turn attachment
-				// block above — same heuristic, same reason: no persisted
-				// truncated flag to read back, so a stored length at the cap
-				// stands in for one.
-				in.HTMLAttachmentTruncated = int64(len(content)) >= attachmentLimits[chat.AttachmentKindHTML].PostStripMaxBytes
+				// block above — same heuristic, same reason.
+				in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(int64(len(content)))
 				in.HTMLAttachmentCarriedForward = true
 				slog.Info("carried forward an earlier turn's HTML reference", "chat_id", c.ID,
 					"source_message_id", sourceID, "is_link", in.HTMLAttachmentIsExternalLink)

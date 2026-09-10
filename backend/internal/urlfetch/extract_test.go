@@ -68,6 +68,20 @@ func TestExtractReferenceURL(t *testing.T) {
 			"our shop's own domain is https://example.com by the way, now please make the header background blue",
 			"", false,
 		},
+		{
+			"the URL's own path containing a cue word does not itself count as a cue",
+			"our support page is at https://example.com/check by the way, now update the homepage colors",
+			"", false,
+		},
+		{
+			"the URL's own host containing a cue word does not itself count as a cue",
+			"our docs live at https://reference.io if you ever need them, but for now just fix the footer",
+			"", false,
+		},
+		{
+			"a real cue in the prompt still matches even when the URL's own text also contains a cue word",
+			"can you check this out for me: https://reference.io", "https://reference.io", true,
+		},
 		{"no url at all", "just plain text, no links here", "", false},
 		{"empty string", "", "", false},
 	}

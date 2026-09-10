@@ -67,11 +67,21 @@ func promptWithHTMLAttachment(prompt string, in GenerateInput) string {
 			// block, which sets both flags together for this case) — "could
 			// not reach" would be actively wrong for it.
 			reason := "could not reach or read it"
+			// tellMerchant is also varied per case, not just reason/suggestion:
+			// the fixed "you couldn't access that link" wording is actively
+			// wrong for ReferenceURLEmptyAfterSanitize, where the page WAS
+			// reached — only its content wasn't readable. Telling the model to
+			// say it "couldn't access" a page it just described accessing is
+			// exactly the contradiction this whole note exists to avoid.
+			tellMerchant := "Tell the merchant plainly that you couldn't access that link, and answer the rest " +
+				"of their request without it."
 			suggestion := ""
 			switch {
 			case in.ReferenceURLEmptyAfterSanitize:
 				reason = "loaded, but its content is rendered by JavaScript in the browser rather than present in " +
 					"the page's own HTML, so there was nothing readable to extract"
+				tellMerchant = "Tell the merchant plainly that the page loaded but had no readable content in its " +
+					"HTML, and answer the rest of their request without it."
 				suggestion = " Suggest the merchant open the page, copy the rendered HTML (e.g. via \"Inspect\" > " +
 					"the <body> element), and paste it as an HTML file attachment instead of a link."
 			case in.ReferenceURLBlocked:
@@ -79,10 +89,8 @@ func promptWithHTMLAttachment(prompt string, in GenerateInput) string {
 				suggestion = " Suggest the merchant paste the page's HTML as a file attachment instead of a link."
 			}
 			return fmt.Sprintf(
-				"%s\n\n(The platform tried to fetch %s — the link in the message above — and %s. Tell the "+
-					"merchant plainly that you couldn't access that link, and answer the rest of their request "+
-					"without it.%s)",
-				prompt, in.ReferenceURL, reason, suggestion,
+				"%s\n\n(The platform tried to fetch %s — the link in the message above — and %s. %s%s)",
+				prompt, in.ReferenceURL, reason, tellMerchant, suggestion,
 			)
 		}
 		return prompt
