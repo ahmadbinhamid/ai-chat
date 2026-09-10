@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/urlfetch"
 )
 
 func TestLooksLikeFetchedLink(t *testing.T) {
@@ -23,6 +24,50 @@ func TestLooksLikeFetchedLink(t *testing.T) {
 		if got := looksLikeFetchedLink(tt.filename); got != tt.want {
 			t.Errorf("looksLikeFetchedLink(%q) = %v, want %v", tt.filename, got, tt.want)
 		}
+	}
+}
+
+// TestLooksTruncatedByStoredLength covers the regression Phase 3.1 fixes:
+// a link's stored content is a digest capped at urlfetch.DigestHardCapBytes
+// (16KB), not PostStripMaxBytes (~300KB) — comparing it against the wrong
+// cap meant this always returned false for a link, silently. filename is
+// what picks the cap (see looksLikeFetchedLink, the same signal used one
+// line earlier at both call sites to set HTMLAttachmentIsExternalLink).
+func TestLooksTruncatedByStoredLength(t *testing.T) {
+	htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
+	tests := []struct {
+		name          string
+		filename      string
+		contentLength int64
+		want          bool
+	}{
+		{
+			"link at the digest hard cap is truncated",
+			"https://example.com/page", urlfetch.DigestHardCapBytes, true,
+		},
+		{
+			"link just under the digest tolerance window is not truncated",
+			"https://example.com/page", urlfetch.DigestHardCapBytes - digestTruncatedLengthTolerance - 1, false,
+		},
+		{
+			"upload at PostStripMaxBytes is truncated",
+			"reference.html", htmlLimit.PostStripMaxBytes, true,
+		},
+		{
+			"upload just under the upload tolerance window is not truncated",
+			"reference.html", htmlLimit.PostStripMaxBytes - truncatedLengthTolerance - 1, false,
+		},
+		{
+			"upload at the digest hard cap is NOT truncated (wrong cap for an upload)",
+			"reference.html", urlfetch.DigestHardCapBytes, false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := looksTruncatedByStoredLength(tt.filename, tt.contentLength); got != tt.want {
+				t.Errorf("looksTruncatedByStoredLength(%q, %d) = %v, want %v", tt.filename, tt.contentLength, got, tt.want)
+			}
+		})
 	}
 }
 

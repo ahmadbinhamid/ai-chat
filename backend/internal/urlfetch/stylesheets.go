@@ -21,13 +21,26 @@ import (
 const maxStylesheets = 3
 
 // maxStylesheetBytes bounds the TOTAL combined size of collected CSS —
-// inline <style> content plus every fetched external stylesheet together,
-// not each individually. Once this is spent, FetchStylesheets stops
-// accumulating; it never fails the reference over it. 150KB of real CSS is
-// far more design signal (colors, type, spacing, radii — see digest.go)
-// than the page's own HTML ever was per byte, so this is deliberately a
-// meaningful budget, not an afterthought.
+// inline <style> content plus every fetched external stylesheet together.
+// Once this is spent, FetchStylesheets stops accumulating; it never fails
+// the reference over it. 150KB of real CSS is far more design signal
+// (colors, type, spacing, radii — see digest.go) than the page's own HTML
+// ever was per byte, so this is deliberately a meaningful budget, not an
+// afterthought. Each individual external fetch is actually READ up to only
+// its own even share of this (see maxStylesheetBytesPerFile) — this const
+// itself is enforced by combineCSS once every fetch is back, not by any
+// single read.
 const maxStylesheetBytes = 150 * 1024
+
+// maxStylesheetBytesPerFile bounds how much of any ONE external stylesheet
+// FetchStylesheets actually reads off the wire — an even share of
+// maxStylesheetBytes across the concurrent fetches, so maxStylesheets
+// stylesheets racing at once can pull at most maxStylesheetBytes total into
+// memory before combineCSS ever runs, not up to maxStylesheets times that.
+// A stylesheet smaller than its share simply leaves budget unused; the
+// combined cap in combineCSS is a ceiling on the total, not a target each
+// file is expected to hit.
+const maxStylesheetBytesPerFile = maxStylesheetBytes / maxStylesheets
 
 // stylesheetPhaseTimeout bounds the WHOLE stylesheet phase — not per file,
 // total — derived from the parent context via context.WithTimeout, same
@@ -70,11 +83,15 @@ const stylesheetPhaseTimeout = 3 * time.Second
 // successfully.
 //
 // Returns the combined CSS text and count, the number of EXTERNAL
-// stylesheets actually fetched successfully (not counting inline <style>
-// content, and not counting one that failed/timed out/was blocked) — a
-// caller (doGenerate) uses count for its own merchant-facing narration
-// ("read N stylesheets"), so it needs to reflect genuine successes, not
-// just how many hrefs were attempted.
+// stylesheets that actually contributed bytes to that combined text (not
+// counting inline <style> content, which was never "fetched") — a caller
+// (doGenerate) uses count for its own merchant-facing narration ("read N
+// stylesheets"), so it needs to reflect what's actually IN the result, not
+// just how many requests came back 2xx: a stylesheet can succeed and still
+// contribute nothing if combineCSS had already spent the combined budget
+// on earlier chunks by the time its turn came (see combineCSS's own doc
+// comment) — counting it anyway would tell the merchant a stylesheet was
+// read when none of its CSS made it into the digest.
 func (f *Fetcher) FetchStylesheets(ctx context.Context, htmlSrc string, finalURL *url.URL) (css string, count int) {
 	hrefs, inlineCSS := extractStylesheetSources(htmlSrc, finalURL)
 
@@ -82,40 +99,33 @@ func (f *Fetcher) FetchStylesheets(ctx context.Context, htmlSrc string, finalURL
 	defer cancel()
 
 	fetched := make([]string, len(hrefs))
-	ok := make([]bool, len(hrefs))
 	var g errgroup.Group
 	for i, href := range hrefs {
 		g.Go(func() error {
-			// Each individual fetch is allowed up to the full
-			// maxStylesheetBytes budget on its own — the actual combined
-			// cap is enforced once below, after every goroutine has
-			// returned, by combineCSS. Synchronizing a single shared
-			// byte counter live across concurrent in-flight downloads
-			// would need real coordination for a saving that only
-			// matters in the rare case of more than one large stylesheet
-			// racing at once; capping and combining after the fact is
-			// simpler and already bounded by stylesheetPhaseTimeout
-			// either way. Any error here (network failure, SSRF block,
-			// non-2xx status) is swallowed, not returned to the group —
-			// see this function's own doc comment for why one
-			// stylesheet's failure must never affect, let alone cancel,
-			// the others.
-			body, err := f.fetchRaw(ctx, href, maxStylesheetBytes)
+			// Each individual fetch reads at most its own even share of
+			// the combined budget (maxStylesheetBytesPerFile) — not the
+			// full maxStylesheetBytes — so maxStylesheets of these racing
+			// concurrently can't pull more than maxStylesheetBytes total
+			// off the wire before combineCSS ever runs below. A
+			// synchronized shared byte counter live across the in-flight
+			// downloads would let one stylesheet borrow unused budget from
+			// another that turned out smaller, but that needs real
+			// coordination for a benefit that only matters when sizes are
+			// uneven; an even split is simpler and already bounded by
+			// stylesheetPhaseTimeout either way. Any error here (network
+			// failure, SSRF block, non-2xx status) is swallowed, not
+			// returned to the group — see this function's own doc comment
+			// for why one stylesheet's failure must never affect, let
+			// alone cancel, the others.
+			body, err := f.fetchRaw(ctx, href, maxStylesheetBytesPerFile)
 			if err != nil {
 				return nil
 			}
 			fetched[i] = string(body)
-			ok[i] = true // tracked separately from fetched[i] != "" — an empty-but-successful CSS response is a real success, not a failure
 			return nil
 		})
 	}
 	_ = g.Wait() // never returns a non-nil error — every goroutine above always returns nil
-
-	for _, succeeded := range ok {
-		if succeeded {
-			count++
-		}
-	}
 
 	chunks := make([]string, 0, len(fetched)+1)
 	// Inline CSS first: often the page's own critical/above-the-fold
@@ -124,7 +134,19 @@ func (f *Fetcher) FetchStylesheets(ctx context.Context, htmlSrc string, finalURL
 	// spent all of it.
 	chunks = append(chunks, inlineCSS)
 	chunks = append(chunks, fetched...)
-	return combineCSS(maxStylesheetBytes, chunks), count
+	combined, contributed := combineCSS(maxStylesheetBytes, chunks)
+	// contributed counts every chunk that contributed bytes, including
+	// inline CSS (chunks[0]) — subtract it back out here so count reflects
+	// only EXTERNAL stylesheets, matching this function's own doc comment.
+	// inlineCSS contributes iff it's non-empty: chunks[0] is combineCSS's
+	// very first chunk, considered while b.Len() is still 0, which is
+	// always < a positive budget, so a non-empty inlineCSS always gets at
+	// least one byte in.
+	count = contributed
+	if inlineCSS != "" {
+		count--
+	}
+	return combined, count
 }
 
 // combineCSS concatenates chunks in order up to budget bytes total,
@@ -132,7 +154,13 @@ func (f *Fetcher) FetchStylesheets(ctx context.Context, htmlSrc string, finalURL
 // boundary) once it's spent — this is where "stop accumulating once the
 // budget is spent, don't fail" (FetchStylesheets' own doc comment) is
 // actually enforced, after every source's content is already in hand.
-func combineCSS(budget int, chunks []string) string {
+// Also reports contributed, how many of chunks ended up donating at least
+// one byte to the result — a chunk arriving after the budget was already
+// spent by earlier ones contributes zero and isn't counted, which is
+// exactly the distinction FetchStylesheets' own count return needs (see
+// its doc comment): a stylesheet that fetched fine but never actually
+// made it into the combined CSS shouldn't be narrated as read.
+func combineCSS(budget int, chunks []string) (text string, contributed int) {
 	var b strings.Builder
 	for _, chunk := range chunks {
 		if b.Len() >= budget {
@@ -142,9 +170,12 @@ func combineCSS(budget int, chunks []string) string {
 		if len(chunk) > remaining {
 			chunk = trimIncompleteTrailingRune(chunk[:remaining])
 		}
+		if len(chunk) > 0 {
+			contributed++
+		}
 		b.WriteString(chunk)
 	}
-	return b.String()
+	return b.String(), contributed
 }
 
 // fetchRaw is Fetch's shared plumbing — SSRF-guarded dial (via this same
@@ -178,17 +209,42 @@ func (f *Fetcher) fetchRaw(ctx context.Context, rawURL string, maxBytes int64) (
 	return io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 }
 
+// mediaAllowsScreen reports whether a <style>/<link rel="stylesheet">
+// element's media attribute value still applies to how the page looks on
+// an ordinary screen. An absent OR EMPTY media value always does — the
+// HTML spec treats an empty media attribute identically to it not being
+// specified at all (both mean "all"), and attrVal can't tell "absent" from
+// "present but empty" apart anyway, so treating both as "applies" is both
+// simpler and the actually-correct behavior, not just a simplification.
+// Anything else must mention "screen" or "all" to count. This is a
+// substring check, not real CSS media-query parsing — good enough to
+// filter out the common, often-large, screen-irrelevant case
+// (media="print") without a media-query parser; "screen and
+// (min-width: 800px)" still correctly matches via "screen".
+func mediaAllowsScreen(media string) bool {
+	if media == "" {
+		return true
+	}
+	media = strings.ToLower(media)
+	return strings.Contains(media, "screen") || strings.Contains(media, "all")
+}
+
 // extractStylesheetSources walks htmlSrc's tokens to find every stylesheet
 // <link>'s href (resolved to an absolute URL, deduplicated, capped at
 // maxStylesheets, in document order) and the concatenated text content of
-// every inline <style> block. Two passes over the tokenizer, not one: a
-// <base href> can affect how EVERY relative href in the document resolves
-// regardless of where in the document it physically appears (matching how
-// a browser applies it), so the base has to be known before hrefs are
-// resolved — findBaseHref runs first and cheaply (it stops at the first
-// <base>, which real documents put early in <head>), then the real
-// extraction pass runs with a settled base. Pure function of its inputs —
-// no network, table-driven tests, per CLAUDE.md rule 2.
+// every inline <style> block — skipping, in both cases, one whose media
+// attribute rules out ordinary screen rendering (print stylesheets are
+// often large and never relevant to how the page looks visually), and, for
+// <style> specifically, one nested inside an inline <svg> subtree (icon-
+// scoped rules, not page design — tracked via svgDepth in this same walk,
+// not a second pass just for that). Two passes over the tokenizer overall,
+// not one: a <base href> can affect how EVERY relative href in the
+// document resolves regardless of where in the document it physically
+// appears (matching how a browser applies it), so the base has to be known
+// before hrefs are resolved — findBaseHref runs first and cheaply (it
+// stops at the first <base>, which real documents put early in <head>),
+// then the real extraction pass runs with a settled base. Pure function of
+// its inputs — no network, table-driven tests, per CLAUDE.md rule 2.
 func extractStylesheetSources(htmlSrc string, finalURL *url.URL) (hrefs []string, inlineCSS string) {
 	base := finalURL
 	if href, ok := findBaseHref(htmlSrc); ok {
@@ -200,16 +256,19 @@ func extractStylesheetSources(htmlSrc string, finalURL *url.URL) (hrefs []string
 	seen := make(map[string]bool)
 	var inline strings.Builder
 	inStyle := false
+	skipStyle := false // true for the current <style>...</style> when it's print-only or inside an <svg>
+	svgDepth := 0
 	z := html.NewTokenizer(strings.NewReader(htmlSrc))
 	for {
-		switch z.Next() {
+		tt := z.Next()
+		switch tt {
 		case html.ErrorToken:
 			return hrefs, inline.String()
 		case html.StartTagToken, html.SelfClosingTagToken:
 			t := z.Token()
 			switch t.Data {
 			case "link":
-				if !hasRelToken(attrVal(t, "rel"), "stylesheet") {
+				if !hasRelToken(attrVal(t, "rel"), "stylesheet") || !mediaAllowsScreen(attrVal(t, "media")) {
 					continue
 				}
 				href := attrVal(t, "href")
@@ -226,16 +285,29 @@ func extractStylesheetSources(htmlSrc string, finalURL *url.URL) (hrefs []string
 				}
 				seen[key] = true
 				hrefs = append(hrefs, key)
+			case "svg":
+				// A self-closing <svg/> has no content following it at the
+				// tokenizer level, so only a real StartTagToken opens a
+				// subtree worth tracking.
+				if tt == html.StartTagToken {
+					svgDepth++
+				}
 			case "style":
 				inStyle = true
+				skipStyle = svgDepth > 0 || !mediaAllowsScreen(attrVal(t, "media"))
 			}
 		case html.EndTagToken:
 			t := z.Token()
-			if t.Data == "style" {
+			switch t.Data {
+			case "style":
 				inStyle = false
+			case "svg":
+				if svgDepth > 0 {
+					svgDepth--
+				}
 			}
 		case html.TextToken:
-			if inStyle {
+			if inStyle && !skipStyle {
 				inline.WriteString(z.Token().Data)
 			}
 		}

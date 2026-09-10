@@ -80,6 +80,41 @@ func TestExtractStylesheetSources(t *testing.T) {
 			html:      `<html><body><h1>hi</h1></body></html>`,
 			wantHrefs: nil,
 		},
+		{
+			name:      "link with media=print is skipped",
+			html:      `<link rel="stylesheet" href="print.css" media="print">`,
+			wantHrefs: nil,
+		},
+		{
+			name:      "link with a screen media query is kept",
+			html:      `<link rel="stylesheet" href="a.css" media="screen and (min-width: 800px)">`,
+			wantHrefs: []string{"https://example.com/shop/a.css"},
+		},
+		{
+			name:      "link with no media attribute is kept",
+			html:      `<link rel="stylesheet" href="a.css">`,
+			wantHrefs: []string{"https://example.com/shop/a.css"},
+		},
+		{
+			name:          "style with media=print is skipped",
+			html:          `<style media="print">.a{color:red}</style>`,
+			wantInlineCSS: "",
+		},
+		{
+			name:          "style with no media attribute is kept",
+			html:          `<style>.a{color:red}</style>`,
+			wantInlineCSS: ".a{color:red}",
+		},
+		{
+			name:          "style nested inside an inline svg is skipped",
+			html:          `<svg><style>.icon{fill:red}</style></svg><style>.page{color:blue}</style>`,
+			wantInlineCSS: ".page{color:blue}",
+		},
+		{
+			name:          "style after a self-closing svg is kept, not treated as nested",
+			html:          `<svg/><style>.page{color:blue}</style>`,
+			wantInlineCSS: ".page{color:blue}",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -95,16 +130,26 @@ func TestExtractStylesheetSources(t *testing.T) {
 }
 
 func TestCombineCSS_StopsAccumulatingAtBudget(t *testing.T) {
-	got := combineCSS(10, []string{"12345", "67890ABCDE"})
+	got, contributed := combineCSS(10, []string{"12345", "67890ABCDE"})
 	if got != "1234567890" {
 		t.Errorf("got %q, want %q", got, "1234567890")
+	}
+	if contributed != 2 {
+		t.Errorf("expected both chunks to have contributed bytes, got contributed = %d", contributed)
 	}
 }
 
 func TestCombineCSS_SkipsChunksAfterBudgetExactlySpent(t *testing.T) {
-	got := combineCSS(5, []string{"12345", "should not appear"})
+	got, contributed := combineCSS(5, []string{"12345", "should not appear"})
 	if got != "12345" {
 		t.Errorf("got %q, want %q", got, "12345")
+	}
+	// The whole point of item 3: the second chunk never even got a byte in
+	// once the first one exactly spent the budget, so it must not count as
+	// having contributed — this is what tells FetchStylesheets' own count
+	// apart from "how many fetches succeeded".
+	if contributed != 1 {
+		t.Errorf("expected only the first chunk to have contributed bytes, got contributed = %d", contributed)
 	}
 }
 
@@ -114,12 +159,47 @@ func TestCombineCSS_SkipsChunksAfterBudgetExactlySpent(t *testing.T) {
 // comment promises.
 func TestCombineCSS_EnforcesTheRealByteCap(t *testing.T) {
 	big := strings.Repeat("a", maxStylesheetBytes+1000)
-	got := combineCSS(maxStylesheetBytes, []string{big})
+	got, contributed := combineCSS(maxStylesheetBytes, []string{big})
 	if len(got) > maxStylesheetBytes {
 		t.Errorf("expected at most %d bytes, got %d", maxStylesheetBytes, len(got))
 	}
 	if len(got) != maxStylesheetBytes {
 		t.Errorf("expected exactly %d bytes for an all-ASCII chunk over budget, got %d", maxStylesheetBytes, len(got))
+	}
+	if contributed != 1 {
+		t.Errorf("expected the one (truncated) chunk to still count as contributed, got %d", contributed)
+	}
+}
+
+// TestFetchStylesheets_CapsEachFileAtItsOwnShare confirms a SINGLE
+// stylesheet larger than maxStylesheetBytesPerFile but under the combined
+// maxStylesheetBytes is still cut down to its own share, not read in full —
+// three of these racing concurrently must never pull more than
+// maxStylesheetBytes total off the wire, which requires each individual
+// read to stop at its share regardless of what combineCSS does afterward
+// with whatever came back.
+func TestFetchStylesheets_CapsEachFileAtItsOwnShare(t *testing.T) {
+	over := strings.Repeat("a", maxStylesheetBytesPerFile+1000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css")
+		_, _ = w.Write([]byte(over))
+	}))
+	defer srv.Close()
+
+	htmlSrc := fmt.Sprintf(`<link rel="stylesheet" href="%s/big.css">`, srv.URL)
+	finalURL, err := url.Parse(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("test setup: %v", err)
+	}
+
+	f := newFetcherWithDialContext(unguardedDialContext)
+	css, count := f.FetchStylesheets(context.Background(), htmlSrc, finalURL)
+
+	if len(css) > maxStylesheetBytesPerFile {
+		t.Errorf("expected at most %d bytes from one oversized stylesheet, got %d", maxStylesheetBytesPerFile, len(css))
+	}
+	if count != 1 {
+		t.Errorf("expected count = 1 (the fetch still succeeded, just truncated), got %d", count)
 	}
 }
 
@@ -175,6 +255,62 @@ func TestFetchStylesheets_RunsConcurrently(t *testing.T) {
 	}
 	if count != n {
 		t.Errorf("expected count = %d, got %d", n, count)
+	}
+}
+
+// TestFetchStylesheets_DoesNotCountAStylesheetThatDidNotSurviveTheBudget
+// covers item 3's fix directly: a stylesheet whose fetch succeeds cleanly
+// can still contribute zero bytes to the combined CSS if the budget was
+// already spent by earlier chunks (inline CSS goes first — see
+// FetchStylesheets' own doc comment) by the time combineCSS reaches it.
+// count must reflect that, not the fact that the HTTP request itself
+// succeeded.
+func TestFetchStylesheets_DoesNotCountAStylesheetThatDidNotSurviveTheBudget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css")
+		_, _ = w.Write([]byte(".good{color:blue}"))
+	}))
+	defer srv.Close()
+
+	// Inline CSS alone spends the ENTIRE combined budget, so the external
+	// stylesheet below — a later chunk — gets nothing, even though its own
+	// fetch succeeds without error.
+	inline := strings.Repeat("a", maxStylesheetBytes)
+	htmlSrc := fmt.Sprintf(`<style>%s</style><link rel="stylesheet" href="%s/small.css">`, inline, srv.URL)
+	finalURL, err := url.Parse(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("test setup: %v", err)
+	}
+
+	f := newFetcherWithDialContext(unguardedDialContext)
+	css, count := f.FetchStylesheets(context.Background(), htmlSrc, finalURL)
+
+	if strings.Contains(css, "color:blue") {
+		t.Errorf("expected the external stylesheet's content to be fully crowded out by inline CSS, but found it in: (css omitted, %d bytes)", len(css))
+	}
+	if count != 0 {
+		t.Errorf("expected count = 0 — the stylesheet fetched fine but contributed no bytes, got %d", count)
+	}
+}
+
+// TestFetchStylesheets_InlineCSSDoesNotCountTowardStylesheetCount confirms
+// inline <style> content is collected but never counted as a "stylesheet
+// fetched" — it wasn't fetched, it was already in the document.
+func TestFetchStylesheets_InlineCSSDoesNotCountTowardStylesheetCount(t *testing.T) {
+	htmlSrc := `<style>.a{color:red}</style>`
+	finalURL, err := url.Parse("https://example.com/")
+	if err != nil {
+		t.Fatalf("test setup: %v", err)
+	}
+
+	f := newFetcherWithDialContext(unguardedDialContext)
+	css, count := f.FetchStylesheets(context.Background(), htmlSrc, finalURL)
+
+	if !strings.Contains(css, "color:red") {
+		t.Errorf("expected inline CSS to still be collected, got: %q", css)
+	}
+	if count != 0 {
+		t.Errorf("expected count = 0 for inline-only CSS (nothing was fetched), got %d", count)
 	}
 }
 

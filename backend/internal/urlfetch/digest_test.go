@@ -72,7 +72,7 @@ func TestBuildDigest_OrdinaryMarketingPage(t *testing.T) {
 			t.Errorf("expected nav label %q to appear in the digest:\n%s", navLabel, d.Text)
 		}
 	}
-	if len(d.Text) > digestHardCapBytes {
+	if len(d.Text) > DigestHardCapBytes {
 		t.Errorf("digest exceeds hard cap: %d bytes", len(d.Text))
 	}
 	if d.Truncated {
@@ -126,15 +126,15 @@ func TestBuildDigest_OverHardCapIsTruncated(t *testing.T) {
 	finalURL, _ := url.Parse("https://example.com/")
 	d := BuildDigest(finalURL, htmlSrc, css)
 
-	if len(d.Text) > digestHardCapBytes {
-		t.Fatalf("expected the digest to be truncated to at most %d bytes, got %d", digestHardCapBytes, len(d.Text))
+	if len(d.Text) > DigestHardCapBytes {
+		t.Fatalf("expected the digest to be truncated to at most %d bytes, got %d", DigestHardCapBytes, len(d.Text))
 	}
 	// Close to (not just under) the cap — proves truncation actually fired
 	// rather than the content happening to land under the cap on its own,
 	// which per-section caps alone would not achieve for this fixture (see
 	// its own generation comment / size).
-	if len(d.Text) < digestHardCapBytes-10 {
-		t.Errorf("expected the digest to be truncated close to the %d-byte cap, got %d bytes — did the fixture stop being large enough to actually exceed it?", digestHardCapBytes, len(d.Text))
+	if len(d.Text) < DigestHardCapBytes-10 {
+		t.Errorf("expected the digest to be truncated close to the %d-byte cap, got %d bytes — did the fixture stop being large enough to actually exceed it?", DigestHardCapBytes, len(d.Text))
 	}
 	if !utf8.ValidString(d.Text) {
 		t.Error("expected the hard-cap-truncated digest to still be valid UTF-8")

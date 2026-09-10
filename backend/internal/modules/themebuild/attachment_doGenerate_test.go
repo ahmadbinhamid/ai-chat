@@ -356,6 +356,119 @@ func TestDoGenerate_CarriesForwardLinkAttachment_PreservesLinkFraming(t *testing
 	}
 }
 
+// exactLengthFiller returns a string of EXACTLY n bytes, built from an
+// alternating "a "/space pattern rather than a single repeated character —
+// SanitizeHTMLAttachment's longBase64RunRe strips any run of 400+
+// consecutive characters from the base64 alphabet (which includes plain
+// lowercase letters), so a naive strings.Repeat("a", n) would silently be
+// stripped to "" by the upload-path validation these carry-forward tests
+// route through (see Generate's own HTMLAttachmentContent handling) before
+// ever reaching the length this test needs to control precisely. The
+// space breaks every run at length 1, so nothing here matches that regex.
+func exactLengthFiller(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	const unit = "a "
+	return strings.Repeat(unit, n/len(unit)+1)[:n]
+}
+
+// TestDoGenerate_CarryForwardDigestAtHardCap_ReportsTruncated and
+// TestDoGenerate_CarryForwardDigestJustUnderTolerance_ReportsNotTruncated
+// cover the regression Phase 3 introduced and Phase 3.1 fixes:
+// looksTruncatedByStoredLength used to compare EVERY stored HTML
+// attachment's length against PostStripMaxBytes (~300KB) regardless of
+// kind, but Phase 3 changed a link's stored content from sanitized raw
+// markup to a digest capped at urlfetch.DigestHardCapBytes (16KB) — a
+// comparison against ~300KB could never be true for a digest, so a
+// carried-forward truncated link silently lost its "this copy was cut
+// short" note. Driven through a REAL carry-forward turn, not just the
+// helper in isolation, matching how the loss actually showed up: a
+// merchant building from a reference on turn 2 with no idea turn 1's
+// fetch was cut short.
+func TestDoGenerate_CarryForwardDigestAtHardCap_ReportsTruncated(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &allCallsCapturingGenerator{}
+	svc.gen = gen
+
+	tenantID := uint64(time.Now().UnixNano())
+	url := "https://example.com/big-reference"
+	// Exactly at urlfetch.DigestHardCapBytes — squarely inside
+	// digestTruncatedLengthTolerance's window, so this must read as
+	// truncated.
+	htmlContent := exactLengthFiller(urlfetch.DigestHardCapBytes)
+
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt:                       url + " can you access this link?",
+		HTMLAttachmentFilename:       &url,
+		HTMLAttachmentContent:        &htmlContent,
+		HTMLAttachmentIsExternalLink: true,
+	})
+	if err != nil {
+		t.Fatalf("first Generate failed: %v", err)
+	}
+	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	_, err = svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "build it like that",
+	})
+	if err != nil {
+		t.Fatalf("second Generate failed: %v", err)
+	}
+	waitForSecondAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	prompts := gen.snapshot()
+	if len(prompts) != 2 {
+		t.Fatalf("expected exactly 2 Generate calls (one per turn), got %d: %+v", len(prompts), prompts)
+	}
+	if !strings.Contains(prompts[1], "cut short") {
+		t.Errorf("expected turn 2's carried-forward prompt to report the digest as truncated, got: %s", prompts[1])
+	}
+}
+
+func TestDoGenerate_CarryForwardDigestJustUnderTolerance_ReportsNotTruncated(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &allCallsCapturingGenerator{}
+	svc.gen = gen
+
+	tenantID := uint64(time.Now().UnixNano())
+	url := "https://example.com/normal-reference"
+	// One byte below digestTruncatedLengthTolerance's window — must NOT
+	// read as truncated.
+	htmlContent := exactLengthFiller(urlfetch.DigestHardCapBytes - digestTruncatedLengthTolerance - 1)
+
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt:                       url + " can you access this link?",
+		HTMLAttachmentFilename:       &url,
+		HTMLAttachmentContent:        &htmlContent,
+		HTMLAttachmentIsExternalLink: true,
+	})
+	if err != nil {
+		t.Fatalf("first Generate failed: %v", err)
+	}
+	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	_, err = svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "build it like that",
+	})
+	if err != nil {
+		t.Fatalf("second Generate failed: %v", err)
+	}
+	waitForSecondAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	prompts := gen.snapshot()
+	if len(prompts) != 2 {
+		t.Fatalf("expected exactly 2 Generate calls (one per turn), got %d: %+v", len(prompts), prompts)
+	}
+	if strings.Contains(prompts[1], "cut short") {
+		t.Errorf("expected turn 2's carried-forward prompt to NOT report the digest as truncated, got: %s", prompts[1])
+	}
+}
+
 // TestDoGenerate_CurrentTurnAttachmentWinsOverCarryForward confirms a turn
 // that attaches its OWN HTML reference never gets the carried-forward one
 // instead — the current turn's explicit attachment must always win, with no

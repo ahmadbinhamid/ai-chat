@@ -15,16 +15,20 @@ import (
 // enforced here as a hard cutoff, since negotiating it precisely between
 // sections would need real coordination for no real benefit: the per-
 // section caps are sized so a typical real page lands close to this on its
-// own, and digestHardCapBytes is the actual backstop for anything that
+// own, and DigestHardCapBytes is the actual backstop for anything that
 // doesn't.
 const digestSoftBudgetBytes = 10 * 1024
 
-// digestHardCapBytes is the absolute ceiling BuildDigest enforces on its
+// DigestHardCapBytes is the absolute ceiling BuildDigest enforces on its
 // output, unconditionally, as a final truncation pass — see BuildDigest's
 // own tail. A model working from a reference is still working primarily
 // from the merchant's own theme files and prompt; this keeps one reference
 // from ever growing into a second dominant input the way raw markup could.
-const digestHardCapBytes = 16 * 1024
+// Exported so a caller that persists a digest (themebuild.Service, for
+// carry-forward) can recognize a stored one that hit this cap without a
+// second, drifting copy of the number — see
+// themebuild.looksTruncatedByStoredLength.
+const DigestHardCapBytes = 16 * 1024
 
 // maxCustomProperties bounds how many CSS custom properties (--brand-green:
 // #6E9A3A) BuildDigest lists verbatim, in first-declared order — a real
@@ -75,7 +79,7 @@ const (
 // without these two, one pathological heading or declared value (a
 // merchant's own copy dumped into an <h1>, a box-shadow with many
 // comma-separated layers) could dominate the whole budget on its own
-// before digestHardCapBytes' final truncation ever gets a say in which
+// before DigestHardCapBytes' final truncation ever gets a say in which
 // section loses ground.
 const (
 	maxHeadingChars  = 200
@@ -164,7 +168,7 @@ var interactiveLabelTags = map[string]bool{"a": true, "button": true, "label": t
 // Digest is BuildDigest's result.
 type Digest struct {
 	// Text is the finished, labelled plain-text digest, capped at
-	// digestHardCapBytes — what themebuild sends to the model for a
+	// DigestHardCapBytes — what themebuild sends to the model for a
 	// fetched reference URL in place of raw HTML (see
 	// Service.fetchReferenceURL).
 	Text string
@@ -182,11 +186,11 @@ type Digest struct {
 	// sanitized-HTML result always has (see themebuild's
 	// ReferenceURLEmptyAfterSanitize).
 	Empty bool
-	// Truncated reports whether BuildDigest's own digestHardCapBytes
+	// Truncated reports whether BuildDigest's own DigestHardCapBytes
 	// truncation actually cut the assembled text — independent of, and in
 	// addition to, whatever truncation happened upstream fetching the raw
 	// HTML (Result.Truncated): a page can fetch in full and still produce
-	// more extracted headings/copy/design-tokens than digestHardCapBytes
+	// more extracted headings/copy/design-tokens than DigestHardCapBytes
 	// allows once combined. A caller (themebuild.Service.fetchReferenceURL)
 	// ORs this together with Result.Truncated so the merchant-facing "this
 	// copy was cut short" note fires for either cause, not just the first.
@@ -243,9 +247,9 @@ func BuildDigest(finalURL *url.URL, htmlSrc, css string) Digest {
 	}
 
 	text := strings.TrimSpace(b.String())
-	truncated := len(text) > digestHardCapBytes
+	truncated := len(text) > DigestHardCapBytes
 	if truncated {
-		text = trimIncompleteTrailingRune(text[:digestHardCapBytes])
+		text = trimIncompleteTrailingRune(text[:DigestHardCapBytes])
 	}
 
 	empty := len(structure.headings) == 0 && len(structure.landmarks) == 0 && strings.TrimSpace(body.bodyText) == ""

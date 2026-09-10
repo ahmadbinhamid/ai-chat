@@ -1048,18 +1048,21 @@ func (s *Service) recordGenerationFailure(ctx context.Context, c chat.Chat, genI
 // usefully remove.
 func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url string, maxBytes int64) (content string, truncated, empty bool, title string, styleCount int, err error) {
 	if s.linkCache != nil {
-		if cached, wasTruncated, ok := s.linkCache.get(tenantID, url); ok {
+		if cached, cachedTitle, wasTruncated, ok := s.linkCache.get(tenantID, url); ok {
 			// Latency: a hit returns the already-built digest directly and
 			// skips fetching stylesheets and building a fresh digest
 			// entirely — a cache hit is strictly faster than a miss, not
-			// just smaller to store. Title and styleCount aren't part of
-			// what the cache stores (a cache hit is never Empty by
-			// construction — see the set call below — so there's nothing
-			// for a caller to route to the empty-after-fetch path either):
-			// the merchant-facing "fetched N stylesheets" narration this
-			// turn just reflects nothing new having actually been fetched,
-			// which is accurate.
-			return cached, wasTruncated, false, "", 0, nil
+			// just smaller to store. A cache hit is never Empty by
+			// construction (see the set call below), so there's nothing for
+			// a caller to route to the empty-after-fetch path either.
+			// styleCount stays 0 on a hit — the merchant-facing "fetched N
+			// stylesheets" narration genuinely means nothing was fetched
+			// THIS turn, which is accurate and not worth a cache schema
+			// change to preserve. title DOES ride along (cachedReference
+			// carries it — see its own doc comment): showing the merchant
+			// which page they referenced, even from cache, beats a blank
+			// step in the narration.
+			return cached, wasTruncated, false, cachedTitle, 0, nil
 		}
 	}
 	result, err := s.links.Fetch(ctx, url, maxBytes)
@@ -1096,13 +1099,13 @@ func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url st
 	// here just costs a repeat fetch next turn, not a repeat of whatever
 	// actually went wrong.
 	if s.linkCache != nil && !digest.Empty {
-		s.linkCache.set(tenantID, url, content, truncated)
+		s.linkCache.set(tenantID, url, content, digest.Title, truncated)
 	}
 	return content, truncated, digest.Empty, digest.Title, styleCount, nil
 }
 
-// truncatedLengthTolerance bounds how far under PostStripMaxBytes a
-// persisted attachment's stored length can be and still be inferred as
+// truncatedLengthTolerance bounds how far under PostStripMaxBytes an
+// UPLOADED attachment's stored length can be and still be inferred as
 // truncated (see looksTruncatedByStoredLength) — chat_message_attachments
 // has no truncated column of its own, so a later turn's carry-forward has
 // only the stored length to go on. An exact-cap comparison misses the case
@@ -1118,13 +1121,44 @@ func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url st
 // unnecessary "this was cut short" note in the prompt, while a false
 // negative costs that note on a turn that actually needed it. The
 // tolerance is sized to favor the former, cheaper mistake.
+//
+// This path is dead in practice today: an uploaded HTML file over its
+// limit is hard-rejected (see ErrHTMLAttachmentTooLarge), never truncated,
+// so no upload attachment is ever actually stored at this length. It's
+// kept as the upload-side half of looksTruncatedByStoredLength's dispatch
+// in case that changes, and because the const it anchors
+// (PostStripMaxBytes) is also the link path's own now-unreachable backstop
+// (see Service.fetchReferenceURL) — removing it would leave that backstop
+// with no matching truncation-detection story either.
 const truncatedLengthTolerance = 4096
 
+// digestTruncatedLengthTolerance is truncatedLengthTolerance's counterpart
+// for a LINK attachment's stored digest — a much smaller number, because
+// the two paths truncate differently. TruncateAtTagBoundary (the upload/
+// PostStripMaxBytes path) can back up over a whole HTML tag to avoid
+// leaving one half-written; BuildDigest's own hard-cap truncation (see
+// urlfetch.DigestHardCapBytes) is a plain byte slice plus
+// trimIncompleteTrailingRune, which trims at most 3 bytes to stay on a
+// valid UTF-8 boundary. Reusing truncatedLengthTolerance's 4096 here would
+// flag any digest over roughly 12KB (16KB cap minus 4096) as truncated
+// even when it isn't. 64 is comfortably larger than the 3-byte maximum a
+// rune trim can remove, with headroom to spare.
+const digestTruncatedLengthTolerance = 64
+
 // looksTruncatedByStoredLength reports whether contentLength is close
-// enough to PostStripMaxBytes to infer the stored HTML attachment was
-// truncated on write — see truncatedLengthTolerance's own doc comment for
-// why this is a range check, not an exact comparison.
-func looksTruncatedByStoredLength(contentLength int64) bool {
+// enough to its cap to infer the stored HTML attachment was truncated on
+// write — see truncatedLengthTolerance's and digestTruncatedLengthTolerance's
+// own doc comments for why this is a range check, not an exact comparison,
+// and why the two paths need different tolerances. filename picks which
+// cap/tolerance applies: looksLikeFetchedLink(filename) is the same signal
+// both call sites already use one line earlier to set
+// HTMLAttachmentIsExternalLink, so a link compares against
+// urlfetch.DigestHardCapBytes and an upload keeps comparing against
+// PostStripMaxBytes.
+func looksTruncatedByStoredLength(filename string, contentLength int64) bool {
+	if looksLikeFetchedLink(filename) {
+		return contentLength >= urlfetch.DigestHardCapBytes-digestTruncatedLengthTolerance
+	}
 	postStripMax := attachmentLimits[chat.AttachmentKindHTML].PostStripMaxBytes
 	return contentLength >= postStripMax-truncatedLengthTolerance
 }
@@ -1303,8 +1337,9 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 					in.HTMLAttachmentContent = &content
 					in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
 					// See looksTruncatedByStoredLength's own doc comment for
-					// why this is a tolerance range, not an exact-cap check.
-					in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(int64(len(content)))
+					// why this is a tolerance range, not an exact-cap check,
+					// and why filename decides which cap applies.
+					in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(filename, int64(len(content)))
 				default:
 					// Repository already filters unknown kinds before they
 					// get here — this is defense in depth, not the primary
@@ -1433,7 +1468,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
 				// See the identical check in the current-turn attachment
 				// block above — same heuristic, same reason.
-				in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(int64(len(content)))
+				in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(filename, int64(len(content)))
 				in.HTMLAttachmentCarriedForward = true
 				slog.Info("carried forward an earlier turn's HTML reference", "chat_id", c.ID,
 					"source_message_id", sourceID, "is_link", in.HTMLAttachmentIsExternalLink)
