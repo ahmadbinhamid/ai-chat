@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -182,12 +183,16 @@ type generator interface {
 	Summarize(ctx context.Context, turns []ai.Turn) (string, error)
 }
 
-// linkFetcher matches *urlfetch.Fetcher's own method — a private interface
-// (same pattern as generator above) so Generate can be tested against a
-// fake that never makes a real network call, and so this package doesn't
-// need to import urlfetch's concrete type anywhere but NewService.
+// linkFetcher matches *urlfetch.Fetcher's own methods — a private
+// interface (same pattern as generator above) so Generate/doGenerate can
+// be tested against a fake that never makes a real network call, and so
+// this package doesn't need to import urlfetch's concrete type anywhere
+// but NewService. FetchStylesheets was added alongside Fetch once
+// Service.fetchReferenceURL started building a digest instead of just
+// sanitizing raw HTML — see its own doc comment.
 type linkFetcher interface {
 	Fetch(ctx context.Context, rawURL string, maxBytes int64) (urlfetch.Result, error)
+	FetchStylesheets(ctx context.Context, htmlSrc string, finalURL *url.URL) (css string, count int)
 }
 
 // Service is the AI theme builder's orchestration: turn a prompt into
@@ -435,14 +440,16 @@ type GenerateInput struct {
 	// know the attachment below wasn't just silently dropped.
 	HTMLAttachmentCarriedForward bool
 	// HTMLAttachmentTruncated is true when a link-fetched attachment had to
-	// be cut short — either the raw fetch itself (see urlfetch.Result.
-	// Truncated) or the post-sanitize content still being over
-	// PostStripMaxBytes (see doGenerate's own reference-URL block; unlike
-	// an uploaded file, which is still hard-rejected over that limit — the
-	// merchant controls what they upload, not how heavy someone else's
-	// homepage is). promptWithHTMLAttachment states this in the framing so
-	// the model doesn't read a missing footer/section as absent from the
-	// real page — it's just past where this turn's copy was cut.
+	// be cut short — either the raw HTML fetch itself (see urlfetch.Result.
+	// Truncated) or the built digest exceeding its own hard cap (see
+	// urlfetch.Digest.Truncated); PostStripMaxBytes truncation is a third,
+	// now-effectively-unreachable backstop (see Service.fetchReferenceURL's
+	// own doc comment) kept only for a future change to either constant.
+	// Unlike an uploaded file, which is still hard-rejected over its own
+	// limit — the merchant controls what they upload, not how heavy someone
+	// else's homepage is. promptWithHTMLAttachment states this in the
+	// framing so the model doesn't read a missing footer/section as absent
+	// from the real page — it's just past where this turn's copy was cut.
 	HTMLAttachmentTruncated bool
 	// ReferenceURL is a URL Generate found in Prompt (see
 	// urlfetch.ExtractReferenceURL) and validated the shape of, but has not
@@ -471,16 +478,18 @@ type GenerateInput struct {
 	// HTML instead") rather than a generic "couldn't reach it."
 	ReferenceURLBlocked bool
 	// ReferenceURLEmptyAfterSanitize is set alongside ReferenceURLFetchFailed
-	// when the fetch itself succeeded but SanitizeHTMLAttachment stripped
-	// it down to nothing (or whitespace only) — a client-rendered page
-	// (React/Vue/etc.) whose server-sent HTML is just an empty shell with
-	// its real content injected by scripts sanitizes to exactly this.
-	// Treated as a failure, not a success with an empty attachment: without
-	// this, doGenerate would hand the model an empty HTMLAttachmentContent
-	// alongside the "you DID access this link" framing, which had the
-	// model assert it read a page it has nothing from.
-	// promptWithHTMLAttachment gives this its own distinct note rather than
-	// the generic "couldn't reach it" one.
+	// when the fetch itself succeeded but the built digest came back Empty
+	// (see urlfetch.Digest.Empty — no headings, no landmarks, no real
+	// copy) — a client-rendered page (React/Vue/etc.) whose server-sent
+	// HTML is just an empty mount point with its real content injected by
+	// scripts digests to exactly this. Treated as a failure, not a success
+	// with an empty attachment: without this, doGenerate would hand the
+	// model an empty HTMLAttachmentContent alongside the external-link
+	// success framing, which had the model assert it read a page it has
+	// nothing from. promptWithHTMLAttachment gives this its own distinct
+	// note rather than the generic "couldn't reach it" one. (Field name
+	// kept from when this was measured on SanitizeHTMLAttachment's output —
+	// renaming it now would touch every caller for no behavioral change.)
 	ReferenceURLEmptyAfterSanitize bool
 	// UserMessageID is set by Generate right after RecordUserMessage and
 	// carried through the queue (Generation.UserMessageID) so doGenerate
@@ -1013,52 +1022,83 @@ func (s *Service) recordGenerationFailure(ctx context.Context, c chat.Chat, genI
 	}
 }
 
-// fetchReferenceURL is s.links.Fetch, sanitized and truncated to
-// PostStripMaxBytes, with a short-TTL cache in front holding that FINISHED
-// content (see referenceURLCache's own doc comment for why post-sanitize,
-// not the raw fetch, is what's cached) — a merchant iterating on the same
-// reference across several turns in one session shouldn't pay for the
-// fetch, or re-run SanitizeHTMLAttachment, again on every single one. This
-// is the only place sanitizing happens for a link-fetched reference —
-// doGenerate's own reference-URL block just uses whatever this returns.
-// Falls back to an uncached call when s.linkCache is nil (struct-literal
-// tests, same nil-guard convention as s.links itself). Only a successful
-// fetch+sanitize is ever cached — see referenceURLCache.set's own doc
-// comment for why a failure must not be.
-func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url string, maxBytes int64) (content string, truncated bool, err error) {
+// fetchReferenceURL is s.links.Fetch, plus fetching the page's stylesheets
+// (s.links.FetchStylesheets) and building a compact structured digest from
+// the two (urlfetch.BuildDigest) — see BuildDigest's own doc comment for
+// why a digest, not raw markup, is what a link-fetched reference sends to
+// the model. A short-TTL cache sits in front of the whole thing, holding
+// that FINISHED digest text (see referenceURLCache's own doc comment for
+// why post-digest, not the raw fetch, is what's cached) — a merchant
+// iterating on the same reference across several turns in one session
+// shouldn't pay for the HTML fetch, the stylesheet fetches, AND building
+// the digest again, on every single one. Falls back to an uncached call
+// when s.linkCache is nil (struct-literal tests, same nil-guard convention
+// as s.links itself).
+//
+// Unlike the upload path (Generate's HTML-attachment handling, which
+// still runs an uploaded file's raw content through
+// SanitizeHTMLAttachment unchanged — that file IS what the model reads
+// verbatim, so stripping script/SVG/base64 out of it still matters),
+// SanitizeHTMLAttachment plays no role here any more: BuildDigest performs
+// STRUCTURAL EXTRACTION, walking the document's own tokens to pull out
+// headings/copy/design tokens rather than stripping a few dangerous
+// patterns out of markup that's otherwise sent through as-is. A link's raw
+// HTML never reaches the model at all any more, only what BuildDigest
+// extracted from it, so there is nothing left for the sanitizer to
+// usefully remove.
+func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url string, maxBytes int64) (content string, truncated, empty bool, title string, styleCount int, err error) {
 	if s.linkCache != nil {
 		if cached, wasTruncated, ok := s.linkCache.get(tenantID, url); ok {
-			// Latency: a hit returns the already-sanitized content
-			// directly and skips SanitizeHTMLAttachment entirely — a cache
-			// hit is strictly faster than a miss, not just smaller to
-			// store.
-			return cached, wasTruncated, nil
+			// Latency: a hit returns the already-built digest directly and
+			// skips fetching stylesheets and building a fresh digest
+			// entirely — a cache hit is strictly faster than a miss, not
+			// just smaller to store. Title and styleCount aren't part of
+			// what the cache stores (a cache hit is never Empty by
+			// construction — see the set call below — so there's nothing
+			// for a caller to route to the empty-after-fetch path either):
+			// the merchant-facing "fetched N stylesheets" narration this
+			// turn just reflects nothing new having actually been fetched,
+			// which is accurate.
+			return cached, wasTruncated, false, "", 0, nil
 		}
 	}
 	result, err := s.links.Fetch(ctx, url, maxBytes)
 	if err != nil {
-		return "", false, err
+		return "", false, false, "", 0, err
 	}
-	sanitized := SanitizeHTMLAttachment(result.HTML)
-	truncated = result.Truncated
+	css, styleCount := s.links.FetchStylesheets(ctx, result.HTML, result.FinalURL)
+	digest := urlfetch.BuildDigest(result.FinalURL, result.HTML, css)
+	content = digest.Text
+	// Either cause counts: the raw HTML fetch itself may have been cut off
+	// (result.Truncated), OR the page fetched in full but extraction alone
+	// still produced more than digestHardCapBytes once combined
+	// (digest.Truncated) — see Digest.Truncated's own doc comment. Either
+	// way the merchant-facing "this copy was cut short" note needs to fire.
+	truncated = result.Truncated || digest.Truncated
+	// PostStripMaxBytes is now a BACKSTOP, not the normal path:
+	// digestHardCapBytes (16KB) is already comfortably under
+	// PostStripMaxBytes (300KB), so a real digest should never actually
+	// reach this branch — kept only so a future change to either constant
+	// can't silently reintroduce an oversized reference-link attachment.
 	postStripMax := attachmentLimits[chat.AttachmentKindHTML].PostStripMaxBytes
-	if int64(len(sanitized)) > postStripMax {
-		sanitized = urlfetch.TruncateAtTagBoundary(sanitized, postStripMax)
+	if int64(len(content)) > postStripMax {
+		content = urlfetch.TruncateAtTagBoundary(content, postStripMax)
 		truncated = true
 	}
-	// A page that sanitizes to nothing (its real content lived entirely in
-	// stripped <script> blocks — see doGenerate's own
-	// ReferenceURLEmptyAfterSanitize handling) is not a successful
-	// fetch+sanitize in the sense referenceURLCache.set requires, even
-	// though no error occurred: caching it would hold an empty shell for
-	// the full TTL, contradicting the cache's own "successes only"
-	// contract. Unlike a network failure, this result is deterministic for
-	// a given page — skipping the cache here just costs a repeat fetch
-	// next turn, not a repeat of whatever actually went wrong.
-	if s.linkCache != nil && strings.TrimSpace(sanitized) != "" {
-		s.linkCache.set(tenantID, url, sanitized, truncated)
+	// digest.Empty (no headings, no landmarks, effectively no copy —
+	// measured on the digest's own EXTRACTED text, not on raw HTML byte
+	// length; see Digest.Empty's own doc comment) is the client-rendered-
+	// shell case — not a successful fetch+digest in the sense
+	// referenceURLCache.set requires, even though no error occurred:
+	// caching it would hold an empty shell for the full TTL, contradicting
+	// the cache's own "successes only" contract. Unlike a network failure,
+	// this result is deterministic for a given page — skipping the cache
+	// here just costs a repeat fetch next turn, not a repeat of whatever
+	// actually went wrong.
+	if s.linkCache != nil && !digest.Empty {
+		s.linkCache.set(tenantID, url, content, truncated)
 	}
-	return sanitized, truncated, nil
+	return content, truncated, digest.Empty, digest.Title, styleCount, nil
 }
 
 // truncatedLengthTolerance bounds how far under PostStripMaxBytes a
@@ -1287,18 +1327,18 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	if in.HTMLAttachmentContent == nil && in.ReferenceURL != "" && s.links != nil {
 		emitter.emit(ctx, EventTypeFetchingLink, map[string]string{"url": in.ReferenceURL})
 		htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
-		// Sanitizing (and, if needed, post-sanitize truncation) happens
-		// entirely inside fetchReferenceURL now — see its own doc comment
-		// for why: keeping it in exactly one place also lets a cache hit
-		// skip re-sanitizing, not just re-fetching.
-		sanitized, truncated, ferr := s.fetchReferenceURL(ctx, in.TenantID, in.ReferenceURL, htmlLimit.MaxBytes)
+		// Fetching the HTML, fetching its stylesheets, and building the
+		// digest all happen entirely inside fetchReferenceURL now — see
+		// its own doc comment for why: keeping it in exactly one place
+		// also lets a cache hit skip all three, not just re-fetching.
+		digestContent, truncated, digestEmpty, title, styleCount, ferr := s.fetchReferenceURL(ctx, in.TenantID, in.ReferenceURL, htmlLimit.MaxBytes)
 		// A page whose real content lives entirely in client-rendered
 		// <script> blocks (a React/Vue SPA whose server-sent HTML is just
-		// an empty shell) sanitizes to nothing — SanitizeHTMLAttachment
-		// strips exactly the script tags that would have held it. Treated
-		// as a failure, not a success with an empty attachment — see
-		// ReferenceURLEmptyAfterSanitize's own doc comment.
-		emptyAfterSanitize := ferr == nil && strings.TrimSpace(sanitized) == ""
+		// an empty mount point) digests to nothing usable — no headings,
+		// no landmarks, no real copy (see Digest.Empty's own doc comment).
+		// Treated as a failure, not a success with an empty attachment —
+		// see ReferenceURLEmptyAfterSanitize's own doc comment.
+		emptyAfterSanitize := ferr == nil && digestEmpty
 		// Must NOT fail the turn either way — the merchant asked a real
 		// question and deserves an answer about everything except the
 		// page (see ReferenceURLFetchFailed's own doc comment).
@@ -1311,13 +1351,20 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			in.ReferenceURLFetchFailed = true
 			in.ReferenceURLBlocked = errors.Is(ferr, urlfetch.ErrBlocked)
 		case emptyAfterSanitize:
-			slog.Warn("reference URL sanitized to empty content (likely client-rendered)", "chat_id", c.ID, "url", in.ReferenceURL)
+			slog.Warn("reference URL digest was empty (likely client-rendered)", "chat_id", c.ID, "url", in.ReferenceURL)
 			in.ReferenceURLFetchFailed = true
 			in.ReferenceURLEmptyAfterSanitize = true
 		default:
+			// Narration that something real happened — see
+			// EventTypeFetchedLink's own doc comment for why this only
+			// fires on this success path, not on a failure or an empty
+			// digest (both already have their own explanation via the
+			// turn's eventual reply).
+			emitter.emit(ctx, EventTypeFetchedLink, map[string]any{"title": title, "stylesheet_count": styleCount})
+
 			filename := in.ReferenceURL
 			in.HTMLAttachmentFilename = &filename
-			in.HTMLAttachmentContent = &sanitized
+			in.HTMLAttachmentContent = &digestContent
 			in.HTMLAttachmentIsExternalLink = true
 			in.HTMLAttachmentTruncated = truncated
 
@@ -1334,12 +1381,21 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			// is shortened. Best-effort: logged and swallowed on failure — a
 			// lost persist only costs carry-forward on a later turn, it must
 			// not fail a generation that already has the content in hand.
+			//
+			// What's stored here is the DIGEST now, not raw HTML — a real
+			// change to chat_message_attachments.content's meaning for a
+			// link-kind attachment going forward. An OLD row from before
+			// this phase still holds raw sanitized markup; that reads back
+			// fine on a later carry-forward turn (see doGenerate's
+			// carry-forward block below) — it's still real page content the
+			// model can use, just not in digest form — so no backfill or
+			// migration is needed for it.
 			if in.UserMessageID != nil {
 				storedFilename := filename
 				if len(storedFilename) > 255 {
 					storedFilename = storedFilename[:255]
 				}
-				if attErr := s.chats.AttachHTMLToMessage(ctx, *in.UserMessageID, in.TenantID, storedFilename, sanitized); attErr != nil {
+				if attErr := s.chats.AttachHTMLToMessage(ctx, *in.UserMessageID, in.TenantID, storedFilename, digestContent); attErr != nil {
 					slog.Error("failed to persist fetched reference URL as an attachment", "chat_id", c.ID, "error", attErr)
 				}
 			}

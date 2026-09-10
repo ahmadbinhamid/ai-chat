@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"syscall"
 	"time"
@@ -184,6 +185,14 @@ func guardedDialer() *net.Dialer {
 type Result struct {
 	HTML      string
 	Truncated bool
+	// FinalURL is resp.Request.URL — the URL the response actually came
+	// from, AFTER any redirects Fetch followed, not rawURL as passed in. A
+	// stylesheet or asset href found in the fetched HTML is usually
+	// relative, so resolving it correctly requires the document's actual
+	// location, not the one originally requested (a redirect from
+	// "example.com" to "www.example.com/en/" changes what a bare "style.css"
+	// href resolves to). Never nil on a successful Fetch.
+	FinalURL *url.URL
 }
 
 // Fetch validates rawURL, then performs an SSRF-guarded GET (see the
@@ -256,9 +265,9 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string, maxBytes int64) (Res
 		return Result{}, fmt.Errorf("%w: %w", ErrFetchFailed, err)
 	}
 	if int64(len(body)) > maxBytes {
-		return Result{HTML: TruncateAtTagBoundary(string(body), maxBytes), Truncated: true}, nil
+		return Result{HTML: TruncateAtTagBoundary(string(body), maxBytes), Truncated: true, FinalURL: resp.Request.URL}, nil
 	}
-	return Result{HTML: string(body)}, nil
+	return Result{HTML: string(body), FinalURL: resp.Request.URL}, nil
 }
 
 // doWithRetry performs the GET, retrying exactly once (see retryDelay) when

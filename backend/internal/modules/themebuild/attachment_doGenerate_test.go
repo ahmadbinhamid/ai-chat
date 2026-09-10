@@ -3,6 +3,7 @@ package themebuild
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -297,7 +298,7 @@ func TestDoGenerate_CarriesForwardHTMLAttachmentFromEarlierTurn(t *testing.T) {
 	if !strings.Contains(second, "EARLIER message in this conversation") {
 		t.Errorf("expected turn 2's prompt to carry the earlier-turn framing, got: %s", second)
 	}
-	if strings.Contains(second, "the answer is YES") {
+	if strings.Contains(second, "fetched this page's live content on your behalf") {
 		t.Errorf("expected NO external-link framing for a carried-forward UPLOAD, got: %s", second)
 	}
 }
@@ -346,9 +347,8 @@ func TestDoGenerate_CarriesForwardLinkAttachment_PreservesLinkFraming(t *testing
 		htmlContent,
 		"EARLIER message in this conversation",
 		"still the active reference",
-		"the answer is YES",
-		"NOT a file the merchant uploaded",
-		"Reminder: you DID access the link above",
+		"fetched this page's live content on your behalf",
+		"you DID access it",
 	} {
 		if !strings.Contains(second, want) {
 			t.Errorf("expected turn 2's prompt to contain %q, got: %s", want, second)
@@ -455,7 +455,7 @@ func TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn(t *testing.T) {
 	if !strings.Contains(gotPrompt, "could not reach or read it") {
 		t.Errorf("expected the prompt to include the could-not-fetch note, got: %s", gotPrompt)
 	}
-	if strings.Contains(gotPrompt, "you DID access this link") {
+	if strings.Contains(gotPrompt, "you DID access it") {
 		t.Errorf("expected NO you-DID-access framing on a failed fetch, got: %s", gotPrompt)
 	}
 }
@@ -497,9 +497,24 @@ func TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward(t *testi
 	if len(prompts) != 2 {
 		t.Fatalf("expected exactly 2 Generate calls (one per turn), got %d: %+v", len(prompts), prompts)
 	}
-	second := prompts[1]
-	if !strings.Contains(second, "<h1>Reference Site</h1>") {
-		t.Errorf("expected turn 2 to carry forward the fetched content, got: %s", second)
+	first, second := prompts[0], prompts[1]
+	// Turn 1's OWN fetch — not carry-forward — produces a prompt with the
+	// digest, not raw markup: the heading's TEXT ("Reference Site")
+	// survives extraction, but the literal "<h1>" tag does not.
+	if !strings.Contains(first, "Reference Site") {
+		t.Errorf("expected turn 1 to contain the fetched page's extracted content, got: %s", first)
+	}
+	if strings.Contains(first, "<h1>") {
+		t.Errorf("expected turn 1's content to be a digest, not raw markup, got: %s", first)
+	}
+	// The fetched page is carried forward as its DIGEST, not raw markup
+	// (see Service.fetchReferenceURL) — the heading's TEXT ("Reference
+	// Site") survives extraction, but the literal "<h1>" tag does not.
+	if !strings.Contains(second, "Reference Site") {
+		t.Errorf("expected turn 2 to carry forward the fetched page's extracted content, got: %s", second)
+	}
+	if strings.Contains(second, "<h1>") {
+		t.Errorf("expected turn 2's carried-forward content to be a digest, not raw markup, got: %s", second)
 	}
 	if !strings.Contains(second, "EARLIER message in this conversation") {
 		t.Errorf("expected turn 2's prompt to carry the earlier-turn framing, got: %s", second)
@@ -566,27 +581,64 @@ func TestDoGenerate_LongReferenceURL_TruncatesStoredFilenameButKeepsFullURLInPro
 	}
 }
 
-// TestDoGenerate_LinkOverPostStripLimit_TruncatesInsteadOfFailing covers
-// Phase 2's core behavior change from Phase 1: a link whose content is
-// still over MaxHTMLAttachmentBytes (PostStripMaxBytes) after sanitizing
-// must be truncated and the turn must still complete — see
-// GenerateInput.HTMLAttachmentTruncated's own doc comment for why this
-// differs from the upload path, which still hard-rejects over the same
-// limit (see TestGenerate_HTMLAttachmentStillTooLargeAfterStripping, still
-// passing unchanged — that assertion is Phase 2's explicit "the uploaded
-// file path keeps its hard rejection" requirement).
-func TestDoGenerate_LinkOverPostStripLimit_TruncatesInsteadOfFailing(t *testing.T) {
+// TestDoGenerate_LinkOverDigestHardCap_TruncatesInsteadOfFailing covers
+// truncate-not-fail for a link's DIGEST now, not its raw fetched HTML —
+// Phase 3 (see urlfetch.BuildDigest) replaced a link's raw sanitized
+// markup with a compact structured digest, capped at digestHardCapBytes
+// (16KB), well under MaxHTMLAttachmentBytes (PostStripMaxBytes, 300KB).
+// That makes the OLD version of this test's premise (a post-sanitize
+// result still over PostStripMaxBytes) effectively unreachable for a real
+// page — see Service.fetchReferenceURL's own doc comment on
+// PostStripMaxBytes now being a backstop, not the normal path — so this
+// exercises the truncation BuildDigest itself actually performs instead: a
+// page with far more extractable headings/landmarks/copy than fits in
+// 16KB still completes the turn, with the digest cut down (see
+// Digest.Truncated) rather than the reference being rejected. Still
+// exactly the same behavioral guarantee Phase 2 first established (an
+// oversized link truncates, it never fails the turn) — see
+// TestGenerate_HTMLAttachmentStillTooLargeAfterStripping, unchanged, for
+// the upload path's own, still-different, still-hard-rejecting behavior.
+func TestDoGenerate_LinkOverDigestHardCap_TruncatesInsteadOfFailing(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &capturingGenerator{}
 	svc.gen = gen
-	// Plain paragraph text — SanitizeHTMLAttachment strips nothing from
-	// this, so its length survives sanitizing unchanged, same fixture
-	// shape as TestGenerate_HTMLAttachmentStillTooLargeAfterStripping.
-	bigContent := strings.Repeat("<p>real paragraph text, nothing to strip</p>", (MaxHTMLAttachmentBytes/44)+100)
-	if len(bigContent) <= MaxHTMLAttachmentBytes {
-		t.Fatalf("test setup bug: fixture content (%d bytes) doesn't exceed MaxHTMLAttachmentBytes (%d)", len(bigContent), MaxHTMLAttachmentBytes)
+
+	var html strings.Builder
+	html.WriteString("<html><head><title>Big Page</title></head><body>")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&html, "<h2>Section heading number %d with enough padding text to push each heading close to the "+
+			"two hundred character per-heading cap so that forty of these alone already approach eight kilobytes "+
+			"on their own before any other section is even considered at all</h2>", i)
 	}
-	svc.links = &fakeLinkFetcher{content: bigContent}
+	for i := 0; i < 20; i++ {
+		fmt.Fprintf(&html, "<section><p>Landmark section number %d contains a long paragraph of filler copy repeated "+
+			"specifically to fill out its one-line preview all the way to the landmark preview character cap of "+
+			"one hundred and twenty characters so the structure section alone contributes a meaningful chunk of "+
+			"the sixteen kilobyte hard cap on its own merits.</p></section>", i)
+	}
+	html.WriteString("<p>" + strings.Repeat(
+		"Body copy filler text meant to fill the general copy section all the way up to its own two thousand character cap. ",
+		40,
+	) + "</p>")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&html, `<a href="/link%d">Interactive label number %d padded out toward the sixty character per label cap so</a>`, i, i)
+	}
+	html.WriteString("</body></html>")
+	bigContent := html.String()
+
+	// Every per-section cap above (40 headings, 20 landmarks, 2000-char
+	// copy, 40 labels) is already saturated by the HTML alone, but that
+	// combination alone lands just under digestHardCapBytes — a
+	// DESIGN TOKENS section (from CSS, which a real fetch would also
+	// collect via FetchStylesheets) is what pushes the total over, the
+	// same way it did for urlfetch's own over_hard_cap fixture.
+	var css strings.Builder
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&css, "--token-%d: value-%d-padded-out-toward-the-two-hundred-character-cap-just-a-little-bit-more-text-here-to-make-it-longer;\n", i, i)
+	}
+	bigCSS := ":root {\n" + css.String() + "}\n"
+
+	svc.links = &fakeLinkFetcher{content: bigContent, stylesheetCSS: bigCSS, stylesheetCount: 1}
 
 	tenantID := uint64(time.Now().UnixNano())
 	outcome, err := svc.Generate(context.Background(), GenerateInput{
@@ -626,19 +678,21 @@ func TestDoGenerate_LinkOverPostStripLimit_TruncatesInsteadOfFailing(t *testing.
 
 // TestDoGenerate_LinkSanitizesToEmpty_TreatedAsFetchFailureNotSuccess covers
 // the client-rendered-SPA case: a page whose entire server-sent HTML is a
-// single executable <script> block (SanitizeHTMLAttachment strips exactly
-// that) sanitizes to nothing. This must take the ReferenceURLFetchFailed
-// path with the distinct JS-rendered note (see promptWithHTMLAttachment),
-// NOT the "you DID access this link" success framing with an empty
-// attachment — the model has nothing to actually read from the page, and
-// the success framing would make it falsely claim otherwise.
+// single <script> block digests to nothing (no headings, no landmarks, no
+// copy — see Digest.Empty's own doc comment; extraction excludes script
+// content the same way SanitizeHTMLAttachment used to strip it outright).
+// This must take the ReferenceURLFetchFailed path with the distinct
+// JS-rendered note (see promptWithHTMLAttachment), NOT the external-link
+// success framing with an empty attachment — the model has nothing to
+// actually read from the page, and the success framing would make it
+// falsely claim otherwise.
 func TestDoGenerate_LinkSanitizesToEmpty_TreatedAsFetchFailureNotSuccess(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &capturingGenerator{}
 	svc.gen = gen
-	// Sanitizes to "" in full: the whole body is one executable <script>
-	// block, which SanitizeHTMLAttachment strips outright, and nothing else
-	// in the page survives to take its place.
+	// Digests to "" in full: the whole body is one <script> block, which
+	// extraction excludes entirely, and nothing else in the page survives
+	// to take its place.
 	svc.links = &fakeLinkFetcher{content: `<script>document.body.innerHTML = renderApp();</script>`}
 
 	tenantID := uint64(time.Now().UnixNano())
@@ -675,7 +729,7 @@ func TestDoGenerate_LinkSanitizesToEmpty_TreatedAsFetchFailureNotSuccess(t *test
 	if !strings.Contains(gotPrompt, "JavaScript") {
 		t.Errorf("expected the JS-rendered-content note in the prompt, got: %s", gotPrompt)
 	}
-	if strings.Contains(gotPrompt, "you already have") {
-		t.Errorf("expected the fetch-failure framing, NOT the \"you DID access this link\" success framing, got: %s", gotPrompt)
+	if strings.Contains(gotPrompt, "fetched this page's live content on your behalf") {
+		t.Errorf("expected the fetch-failure framing, NOT the external-link success framing, got: %s", gotPrompt)
 	}
 }

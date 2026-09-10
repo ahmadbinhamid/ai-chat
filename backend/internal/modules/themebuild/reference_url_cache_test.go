@@ -14,17 +14,24 @@ import (
 // call actually consulting it) is covered separately in
 // attachment_doGenerate_test.go.
 
+// fetchReferenceURLTestHTML is real enough markup (a heading plus a
+// paragraph) to build a NON-empty digest — the cache only ever stores a
+// non-empty digest (see fetchReferenceURL's own doc comment), so any test
+// below that needs an entry to actually get cached uses this rather than a
+// bare fragment that might digest to nothing.
+const fetchReferenceURLTestHTML = `<html><body><h1>cached</h1><p>Some real body copy so the digest isn't empty.</p></body></html>`
+
 func TestFetchReferenceURL_CachesWithinTTLForSameTenant(t *testing.T) {
-	fl := &fakeLinkFetcher{content: "<h1>cached</h1>"}
+	fl := &fakeLinkFetcher{content: fetchReferenceURLTestHTML}
 	svc := &Service{links: fl, linkCache: newReferenceURLCache()}
 	ctx := context.Background()
 	const tenantID = uint64(1)
 
-	firstContent, _, err := svc.fetchReferenceURL(ctx, tenantID, "https://example.com", 1024)
+	firstContent, _, _, _, _, err := svc.fetchReferenceURL(ctx, tenantID, "https://example.com", 1024)
 	if err != nil {
 		t.Fatalf("first fetch failed: %v", err)
 	}
-	secondContent, _, err := svc.fetchReferenceURL(ctx, tenantID, "https://example.com", 1024)
+	secondContent, _, _, _, _, err := svc.fetchReferenceURL(ctx, tenantID, "https://example.com", 1024)
 	if err != nil {
 		t.Fatalf("second fetch failed: %v", err)
 	}
@@ -37,49 +44,53 @@ func TestFetchReferenceURL_CachesWithinTTLForSameTenant(t *testing.T) {
 	}
 }
 
-// TestFetchReferenceURL_CacheHitSkipsSanitize proves a cache hit returns
-// the ALREADY-sanitized content straight from the cache rather than
-// re-running SanitizeHTMLAttachment on it — the latency point of caching
-// post-sanitize content in the first place (see fetchReferenceURL's own
-// doc comment). Sanitizing is idempotent, so this can't be proven by
-// re-sanitizing the result and comparing; instead it seeds the cache
-// directly with content SanitizeHTMLAttachment would never itself produce
-// (a live <script> tag, which SanitizeHTMLAttachment strips) and confirms
-// a hit returns that content completely unchanged.
-func TestFetchReferenceURL_CacheHitSkipsSanitize(t *testing.T) {
+// TestFetchReferenceURL_CacheHitSkipsRebuildingDigest proves a cache hit
+// returns the ALREADY-built digest straight from the cache rather than
+// re-fetching stylesheets and re-running BuildDigest on it — the latency
+// point of caching the finished digest in the first place (see
+// fetchReferenceURL's own doc comment). Seeds the cache directly with text
+// BuildDigest would never itself produce from fl's configured HTML, and
+// confirms a hit returns that text completely unchanged while making zero
+// calls to Fetch (and, transitively, FetchStylesheets/BuildDigest).
+func TestFetchReferenceURL_CacheHitSkipsRebuildingDigest(t *testing.T) {
 	const tenantID = uint64(1)
 	const url = "https://example.com"
-	const rawWithScript = `<h1>hi</h1><script>alert(1)</script>`
+	const cachedDigest = "PAGE\nurl: https://example.com/\ntitle: A Manually Seeded Cache Entry\n"
 
 	cache := newReferenceURLCache()
-	cache.set(tenantID, url, rawWithScript, false)
-	fl := &fakeLinkFetcher{content: "<h1>should not be used</h1>"}
+	cache.set(tenantID, url, cachedDigest, false)
+	fl := &fakeLinkFetcher{content: "<h1>should never be fetched or digested</h1>"}
 	svc := &Service{links: fl, linkCache: cache}
 
-	got, _, err := svc.fetchReferenceURL(context.Background(), tenantID, url, 1024)
+	content, _, empty, title, styleCount, err := svc.fetchReferenceURL(context.Background(), tenantID, url, 1024)
 	if err != nil {
 		t.Fatalf("fetch failed: %v", err)
 	}
 	if fl.calls != 0 {
 		t.Errorf("expected a cache hit to make 0 real fetch calls, got %d", fl.calls)
 	}
-	if got != rawWithScript {
-		t.Errorf("expected a cache hit to skip sanitizing and return the stored content verbatim: got %q, want %q", got, rawWithScript)
+	if content != cachedDigest {
+		t.Errorf("expected a cache hit to return the stored digest verbatim: got %q, want %q", content, cachedDigest)
 	}
-	if !strings.Contains(got, "<script>") {
-		t.Error("expected the unsanitized <script> tag to survive a cache hit untouched — proves sanitize did not re-run")
+	if empty {
+		t.Error("expected a cache hit to never report empty — only a non-empty digest is ever cached")
+	}
+	// See fetchReferenceURL's own doc comment on the cache-hit path: title
+	// and styleCount aren't part of what's cached, so a hit reports neither.
+	if title != "" || styleCount != 0 {
+		t.Errorf("expected a cache hit to report no title/styleCount, got title=%q styleCount=%d", title, styleCount)
 	}
 }
 
 func TestFetchReferenceURL_DoesNotShareCacheAcrossTenants(t *testing.T) {
-	fl := &fakeLinkFetcher{content: "<h1>content</h1>"}
+	fl := &fakeLinkFetcher{content: fetchReferenceURLTestHTML}
 	svc := &Service{links: fl, linkCache: newReferenceURLCache()}
 	ctx := context.Background()
 
-	if _, _, err := svc.fetchReferenceURL(ctx, 1, "https://example.com", 1024); err != nil {
+	if _, _, _, _, _, err := svc.fetchReferenceURL(ctx, 1, "https://example.com", 1024); err != nil {
 		t.Fatalf("tenant 1 fetch failed: %v", err)
 	}
-	if _, _, err := svc.fetchReferenceURL(ctx, 2, "https://example.com", 1024); err != nil {
+	if _, _, _, _, _, err := svc.fetchReferenceURL(ctx, 2, "https://example.com", 1024); err != nil {
 		t.Fatalf("tenant 2 fetch failed: %v", err)
 	}
 
@@ -94,10 +105,10 @@ func TestFetchReferenceURL_DoesNotCacheFailure(t *testing.T) {
 	ctx := context.Background()
 	const tenantID = uint64(1)
 
-	if _, _, err := svc.fetchReferenceURL(ctx, tenantID, "https://example.com", 1024); err == nil {
+	if _, _, _, _, _, err := svc.fetchReferenceURL(ctx, tenantID, "https://example.com", 1024); err == nil {
 		t.Fatal("expected the first fetch to fail")
 	}
-	if _, _, err := svc.fetchReferenceURL(ctx, tenantID, "https://example.com", 1024); err == nil {
+	if _, _, _, _, _, err := svc.fetchReferenceURL(ctx, tenantID, "https://example.com", 1024); err == nil {
 		t.Fatal("expected the second fetch to also fail — a failure must never be served from cache")
 	}
 
@@ -107,14 +118,14 @@ func TestFetchReferenceURL_DoesNotCacheFailure(t *testing.T) {
 }
 
 func TestFetchReferenceURL_NilCacheFallsBackToUncached(t *testing.T) {
-	fl := &fakeLinkFetcher{content: "<h1>ok</h1>"}
+	fl := &fakeLinkFetcher{content: fetchReferenceURLTestHTML}
 	svc := &Service{links: fl} // linkCache left nil, same nil-guard convention as links itself
 	ctx := context.Background()
 
-	if _, _, err := svc.fetchReferenceURL(ctx, 1, "https://example.com", 1024); err != nil {
+	if _, _, _, _, _, err := svc.fetchReferenceURL(ctx, 1, "https://example.com", 1024); err != nil {
 		t.Fatalf("expected a nil linkCache to fall back to an uncached call, got error: %v", err)
 	}
-	if _, _, err := svc.fetchReferenceURL(ctx, 1, "https://example.com", 1024); err != nil {
+	if _, _, _, _, _, err := svc.fetchReferenceURL(ctx, 1, "https://example.com", 1024); err != nil {
 		t.Fatalf("expected a nil linkCache to fall back to an uncached call, got error: %v", err)
 	}
 	if fl.calls != 2 {

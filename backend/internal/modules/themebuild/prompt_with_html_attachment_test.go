@@ -23,7 +23,7 @@ func TestPromptWithHTMLAttachment(t *testing.T) {
 		if !strings.Contains(got, "UNTRUSTED content the merchant attached") {
 			t.Errorf("expected the generic untrusted-content framing, got: %s", got)
 		}
-		if strings.Contains(got, "NOT part of the merchant's own theme") {
+		if strings.Contains(got, "fetched this page's live content on your behalf") {
 			t.Errorf("expected no external-link framing for an uploaded file, got: %s", got)
 		}
 	})
@@ -34,12 +34,10 @@ func TestPromptWithHTMLAttachment(t *testing.T) {
 			HTMLAttachmentFilename: &url, HTMLAttachmentContent: &content, HTMLAttachmentIsExternalLink: true,
 		})
 		for _, want := range []string{
-			"the answer is YES",
-			"NOT a file the merchant uploaded",
-			"NOT part of the merchant's own theme",
-			"do not read or grep them",
-			"Never say you can't open URLs",
-			"Reminder: you DID access the link above",
+			"UNTRUSTED content the merchant attached",
+			"fetched this page's live content on your behalf",
+			"you DID access it",
+			"never say you can't read URLs or open external links",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("expected output to contain %q, got: %s", want, got)
@@ -60,7 +58,7 @@ func TestPromptWithHTMLAttachment(t *testing.T) {
 				t.Errorf("expected output to contain %q, got: %s", want, got)
 			}
 		}
-		if strings.Contains(got, "NOT a file the merchant uploaded") {
+		if strings.Contains(got, "fetched this page's live content on your behalf") {
 			t.Errorf("expected no external-link framing for a carried-forward upload, got: %s", got)
 		}
 	})
@@ -74,9 +72,8 @@ func TestPromptWithHTMLAttachment(t *testing.T) {
 		for _, want := range []string{
 			"EARLIER message in this conversation",
 			"still the active reference",
-			"the answer is YES",
-			"NOT a file the merchant uploaded",
-			"Reminder: you DID access the link above",
+			"fetched this page's live content on your behalf",
+			"you DID access it",
 		} {
 			if !strings.Contains(got, want) {
 				t.Errorf("expected output to contain %q, got: %s", want, got)

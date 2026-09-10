@@ -82,6 +82,20 @@ const (
 	// equivalent of EventTypeToolCall for this one step, which isn't itself
 	// a model tool call (it happens before the model is even invoked).
 	EventTypeFetchingLink = "fetching_link"
+	// EventTypeFetchedLink is EventTypeFetchingLink's counterpart, emitted
+	// once the reference URL's HTML fetched successfully AND its digest
+	// (see urlfetch.BuildDigest) was built — payload: {"title": "...",
+	// "stylesheet_count": N}. Not emitted on a fetch failure or an
+	// empty-after-digest result (see ReferenceURLFetchFailed/
+	// ReferenceURLEmptyAfterSanitize) — those already get their own
+	// merchant-facing explanation via the eventual chat reply, and this
+	// event exists purely as narration that something real was actually
+	// read, not as another failure signal. title may be "" (a cache hit
+	// doesn't re-surface it — see fetchReferenceURL's own doc comment) and
+	// stylesheet_count is 0 on both a cache hit and a page with no
+	// stylesheets found/reachable — a merchant reading the step list
+	// shouldn't read either as an error.
+	EventTypeFetchedLink = "fetched_link"
 	// EventTypeThinking is EPHEMERAL — see emitLive. Never pass this to
 	// emit(): it would durably persist every streamed text chunk of every
 	// generation, and worse, burn a seq number per chunk, breaking

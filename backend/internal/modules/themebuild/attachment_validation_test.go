@@ -3,6 +3,7 @@ package themebuild
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -186,13 +187,21 @@ func TestGenerate_ValidImageAttachmentIsAccepted(t *testing.T) {
 
 // fakeLinkFetcher stands in for *urlfetch.Fetcher — never makes a real
 // network call, matching fakeGenerator's own pattern in
-// check_and_repair_test.go.
+// check_and_repair_test.go. FetchStylesheets always returns
+// stylesheetCSS/stylesheetCount unconditionally (no per-call error/
+// failure simulation the way Fetch has) — CSS fetching is best-effort by
+// design (see FetchStylesheets' own doc comment: a failure there is
+// swallowed, never surfaced to the caller), so there is no failure mode
+// for this fake to simulate in the first place.
 type fakeLinkFetcher struct {
 	calls     int
 	lastURL   string
 	content   string
 	truncated bool
 	err       error
+
+	stylesheetCSS   string
+	stylesheetCount int
 }
 
 func (f *fakeLinkFetcher) Fetch(_ context.Context, rawURL string, _ int64) (urlfetch.Result, error) {
@@ -201,7 +210,12 @@ func (f *fakeLinkFetcher) Fetch(_ context.Context, rawURL string, _ int64) (urlf
 	if f.err != nil {
 		return urlfetch.Result{}, f.err
 	}
-	return urlfetch.Result{HTML: f.content, Truncated: f.truncated}, nil
+	finalURL, _ := url.Parse(rawURL)
+	return urlfetch.Result{HTML: f.content, Truncated: f.truncated, FinalURL: finalURL}, nil
+}
+
+func (f *fakeLinkFetcher) FetchStylesheets(_ context.Context, _ string, _ *url.URL) (string, int) {
+	return f.stylesheetCSS, f.stylesheetCount
 }
 
 // blockingLinkFetcher stands in for *urlfetch.Fetcher in tests that need to
@@ -237,6 +251,14 @@ func (f *blockingLinkFetcher) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// FetchStylesheets is never expected to be reached by
+// TestGenerate_DoesNotFetchSynchronously (Fetch itself already blocks
+// forever on f.release, so doGenerate never gets past it) — implemented
+// only to satisfy the linkFetcher interface.
+func (f *blockingLinkFetcher) FetchStylesheets(_ context.Context, _ string, _ *url.URL) (string, int) {
+	return "", 0
 }
 
 // TestGenerate_DoesNotFetchSynchronously is Phase 1's core invariant: a
