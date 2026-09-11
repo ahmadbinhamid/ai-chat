@@ -19,6 +19,14 @@ func TestExtractFirstURL(t *testing.T) {
 		{"plain http also matches", "http://example.com", "http://example.com", true},
 		{"first of two urls wins", "https://a.example.com and https://b.example.com", "https://a.example.com", true},
 		{"empty string", "", "", false},
+		{
+			"fullwidth IDN URL with trailing fullwidth punctuation is trimmed by rune, not byte",
+			"here's our reference: https://例え.jp。", "https://例え.jp", true,
+		},
+		{
+			"multiple trailing ASCII punctuation marks still trim exactly as before (byte-identical for pure ASCII)",
+			"see (https://example.com).", "https://example.com", true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

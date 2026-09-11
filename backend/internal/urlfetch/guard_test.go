@@ -53,20 +53,25 @@ func TestValidateURL_AllowsNonStandardPorts(t *testing.T) {
 
 func TestIsBlockedIP(t *testing.T) {
 	blocked := []string{
-		"127.0.0.1",        // loopback
-		"::1",              // loopback v6
-		"10.0.0.1",         // private
-		"172.16.0.1",       // private
-		"192.168.1.1",      // private
-		"169.254.169.254",  // link-local — cloud metadata endpoint
-		"169.254.1.1",      // link-local
-		"fe80::1",          // link-local v6
-		"fc00::1",          // unique-local v6
-		"0.0.0.0",          // unspecified
-		"::",               // unspecified
-		"224.0.0.1",        // multicast
-		"::ffff:127.0.0.1", // IPv4-mapped loopback
-		"::ffff:10.0.0.1",  // IPv4-mapped private
+		"127.0.0.1",         // loopback
+		"::1",               // loopback v6
+		"10.0.0.1",          // private
+		"172.16.0.1",        // private
+		"192.168.1.1",       // private
+		"169.254.169.254",   // link-local — cloud metadata endpoint
+		"169.254.1.1",       // link-local
+		"fe80::1",           // link-local v6
+		"fc00::1",           // unique-local v6
+		"0.0.0.0",           // unspecified
+		"::",                // unspecified
+		"224.0.0.1",         // multicast
+		"::ffff:127.0.0.1",  // IPv4-mapped loopback
+		"::ffff:10.0.0.1",   // IPv4-mapped private
+		"100.64.0.1",        // CGNAT (RFC 6598) — start of range
+		"100.127.255.254",   // CGNAT — end of range
+		"::ffff:100.64.0.1", // IPv4-mapped CGNAT — proves normalization runs before the CIDR checks, not just the net.IP Is* helpers
+		"198.18.0.1",        // benchmarking (RFC 2544)
+		"240.0.0.1",         // reserved / "Class E" (RFC 1112)
 	}
 	for _, s := range blocked {
 		ip := net.ParseIP(s)
@@ -83,6 +88,9 @@ func TestIsBlockedIP(t *testing.T) {
 		"1.1.1.1",              // public
 		"93.184.216.34",        // public (example.com, historically)
 		"2606:4700:4700::1111", // public v6 (Cloudflare)
+		"100.63.255.255",       // just below CGNAT (RFC 6598) — /10 mask boundary
+		"100.128.0.0",          // just above CGNAT — /10 mask boundary
+		"198.17.255.255",       // just below benchmarking (RFC 2544) — /15 mask boundary
 	}
 	for _, s := range allowed {
 		ip := net.ParseIP(s)

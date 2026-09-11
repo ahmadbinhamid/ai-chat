@@ -170,6 +170,21 @@ func guardedDialer() *net.Dialer {
 			}
 			ip := net.ParseIP(host)
 			if ip == nil || IsBlockedIP(ip) {
+				// Traced (see this fmt.Errorf, not the sentinel): host — the
+				// resolved internal address — never reaches a merchant.
+				// This error is wrapped by net.Dialer/net/http into a
+				// *net.OpError ("dial tcp <host>:<port>: ..."), which Fetch
+				// (below) wraps again under ErrFetchFailed and returns. Its
+				// only call site (themebuild.Service.fetchReferenceURL,
+				// consumed as `ferr` in doGenerate) never stringifies it into
+				// anything merchant-facing — ferr only feeds an
+				// errors.Is(ferr, ErrBlocked) check and a slog.Warn (server
+				// log only). The actual merchant-facing text comes from
+				// promptWithHTMLAttachment's own fixed strings, which never
+				// read ferr.Error() at all. If a new call site to Fetch is
+				// ever added, re-verify this before assuming it still holds —
+				// Go's own "dial tcp <host>:<port>:" prefix would leak host
+				// right alongside this sentinel's own wrap either way.
 				return fmt.Errorf("%w: %s", ErrBlockedHost, host)
 			}
 			return nil

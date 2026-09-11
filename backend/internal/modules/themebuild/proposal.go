@@ -635,9 +635,26 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 	// server-side materialization always produces that same complete,
 	// corrected file; it's just a cheaper way to submit it, not a partial
 	// one.
+	//
+	// The second escape hatch (an edit already failed once this turn) is
+	// what closes a real gap: materializeEdits' own retry escalation
+	// (maxEditMaterializationFailures) is scoped to ONE Generate call, so
+	// it never fires across repair ROUNDS — each fresh checkAndRepair
+	// attempt starts that counter back at zero, even though the model's own
+	// conversation history (its prior tool_result) already shows the exact
+	// same file rejecting an edit. Observed in production: the identical
+	// file failing edit materialization on the first attempt of two
+	// separate repair rounds in the same turn, each self-correcting only
+	// after burning a whole extra model call retrying with the same
+	// (already-in-context) content. Naming the earlier failure explicitly
+	// gives the model a reason to reach for "update" instead of repeating
+	// the same old_string guess a second time.
 	b.WriteString("\n\nFor most of these, action \"edit\" on the file you already have (a precise old_string/" +
-		"new_string pair per finding) is the right fix — resubmit the whole file as action \"update\" only if the " +
-		"correction is broad enough that a full rewrite is genuinely simpler.")
+		"new_string pair per finding) is the right fix — resubmit the whole file as action \"update\" instead if " +
+		"the correction is broad enough that a full rewrite is genuinely simpler, OR if an earlier attempt in " +
+		"THIS conversation already failed to apply an \"edit\" to this same file (check your own prior tool " +
+		"results above) — trying another old_string/new_string pair risks the identical mismatch, and the file's " +
+		"exact current content is already right here, so a full \"update\" costs nothing extra to get right.")
 	return b.String()
 }
 

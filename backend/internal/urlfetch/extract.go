@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // urlPattern matches an http(s) URL starting at a word boundary — greedy up
@@ -16,7 +17,10 @@ var urlPattern = regexp.MustCompile(`https?://\S+`)
 // trailingPunctuation is stripped, one rune at a time, from the end of a
 // matched URL — repeatedly, in case more than one trails (e.g. a URL at
 // the end of a parenthetical sentence: "...like this (https://example.com).").
-const trailingPunctuation = ".,;:!?)]}\"'"
+// Includes the fullwidth equivalents (。，）！？；：) a merchant writing in
+// Chinese/Japanese punctuation would naturally leave trailing after an IDN
+// URL, alongside the ASCII set.
+const trailingPunctuation = ".,;:!?)]}\"'。，）！？；："
 
 // ExtractFirstURL returns the first http(s) URL found anywhere in text —
 // used to detect a merchant pasting a reference link directly in their
@@ -32,8 +36,19 @@ const trailingPunctuation = ".,;:!?)]}\"'"
 // match is a safe, fetchable URL.
 func ExtractFirstURL(text string) (string, bool) {
 	match := urlPattern.FindString(text)
-	for len(match) > 0 && strings.ContainsRune(trailingPunctuation, rune(match[len(match)-1])) {
-		match = match[:len(match)-1]
+	// Trim by RUNE, not byte: match[len(match)-1] is the last byte, and
+	// converting a byte directly to a rune is only safe for the ASCII
+	// portion of trailingPunctuation — a fullwidth punctuation mark
+	// (trailingPunctuation now includes several) is multi-byte in UTF-8,
+	// and trimming its trailing byte one at a time would leave the
+	// preceding bytes as an invalid, un-trimmable partial encoding rather
+	// than actually removing the character.
+	for len(match) > 0 {
+		r, size := utf8.DecodeLastRuneInString(match)
+		if r == utf8.RuneError || !strings.ContainsRune(trailingPunctuation, r) {
+			break
+		}
+		match = match[:len(match)-size]
 	}
 	if match == "" {
 		return "", false
