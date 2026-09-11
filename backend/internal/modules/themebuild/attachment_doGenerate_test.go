@@ -3,6 +3,7 @@ package themebuild
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -570,6 +571,72 @@ func TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn(t *testing.T) {
 	}
 	if strings.Contains(gotPrompt, "you DID access it") {
 		t.Errorf("expected NO you-DID-access framing on a failed fetch, got: %s", gotPrompt)
+	}
+}
+
+// TestDoGenerate_CurrentTurnFailedReferenceURL_DoesNotFallBackToEarlierTurn
+// covers a real observed production bug: a merchant references one site on
+// turn 1 (which fetches fine), then on turn 2 names a DIFFERENT site of
+// their own — whose fetch fails. Before this fix, the carry-forward
+// fallback (see doGenerate's own comment on it) ran whenever
+// HTMLAttachmentContent was nil, with no check for WHY it was nil — so a
+// turn with its own (just-failed) reference URL fell straight through to
+// carrying forward turn 1's completely unrelated page, with no indication
+// to the model (and so the merchant) that the new URL was ever tried at
+// all. The fix requires in.ReferenceURL == "" too: carry-forward is for "no
+// reference this turn," not "this turn's own reference didn't work out" —
+// the latter must surface as an honest failure note (see
+// TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn above), never a
+// silent substitution.
+func TestDoGenerate_CurrentTurnFailedReferenceURL_DoesNotFallBackToEarlierTurn(t *testing.T) {
+	svc, chatSvc := newQueueTestService(t)
+	gen := &allCallsCapturingGenerator{}
+	svc.gen = gen
+	fl := &fakeLinkFetcher{content: fetchReferenceURLTestHTML}
+	svc.links = fl
+
+	tenantID := uint64(time.Now().UnixNano())
+	outcome, err := svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "https://coconut-water-site.example.com can you access this link",
+	})
+	if err != nil {
+		t.Fatalf("first Generate failed: %v", err)
+	}
+	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	// Turn 2 names its OWN, different URL — and that one's fetch fails.
+	// Flipping the shared fake's behavior here is safe: turn 1 has already
+	// completed (waitForAssistantReply above), so turn 1's own fetch call
+	// already happened against the old (successful) configuration.
+	fl.err = errors.New("simulated fetch failure for turn 2's own URL")
+
+	_, err = svc.Generate(context.Background(), GenerateInput{
+		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
+		Prompt: "redesign the homepage exactly similar to the attached link https://ebay-lookalike.example.com",
+	})
+	if err != nil {
+		t.Fatalf("second Generate failed: %v", err)
+	}
+	waitForSecondAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
+
+	prompts := gen.snapshot()
+	if len(prompts) != 2 {
+		t.Fatalf("expected exactly 2 Generate calls (one per turn), got %d: %+v", len(prompts), prompts)
+	}
+	second := prompts[1]
+
+	if strings.Contains(second, "EARLIER message in this conversation") {
+		t.Errorf("expected NO carry-forward framing when turn 2 had its own (failed) reference URL, got: %s", second)
+	}
+	if strings.Contains(second, "cached") {
+		// fetchReferenceURLTestHTML's own distinguishing heading text
+		// ("cached") — proves turn 1's unrelated page content did not leak
+		// into turn 2's prompt.
+		t.Errorf("expected turn 1's carried-forward content to NOT appear in turn 2's prompt, got: %s", second)
+	}
+	if !strings.Contains(second, "could not reach or read it") {
+		t.Errorf("expected turn 2's prompt to honestly report ITS OWN fetch failure, got: %s", second)
 	}
 }
 

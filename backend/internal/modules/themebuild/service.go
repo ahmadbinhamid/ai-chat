@@ -1447,7 +1447,23 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// real message.ID) when in.UserMessageID is nil, which only happens in
 	// tests that drive doGenerate directly — harmless: nothing to exclude
 	// from the scan in that case either.
-	if in.HTMLAttachmentContent == nil {
+	//
+	// in.ReferenceURL == "" is required alongside the nil check: without it,
+	// a turn that named its OWN new reference URL but whose fetch just
+	// failed/came back empty (the switch above, case ferr != nil / case
+	// emptyAfterSanitize — both leave HTMLAttachmentContent nil on purpose)
+	// would silently fall through to an EARLIER, unrelated turn's reference
+	// instead — reported to the merchant as if their new link had never
+	// been mentioned at all. A real observed failure: merchant pastes
+	// ebay.com wanting the homepage redesigned to match it, the fetch
+	// fails, and the turn quietly redesigns against a completely different
+	// site referenced several turns earlier instead — no acknowledgment
+	// that ebay.com itself was ever tried. Carry-forward is for "this turn
+	// has no reference of its own," not "this turn's own reference didn't
+	// work out" — the latter already has its own honest narration via
+	// ReferenceURLFetchFailed/ReferenceURLBlocked/ReferenceURLEmptyAfterSanitize
+	// (see promptWithHTMLAttachment), which must not be silently overridden.
+	if in.HTMLAttachmentContent == nil && in.ReferenceURL == "" {
 		currentID := ""
 		if in.UserMessageID != nil {
 			currentID = *in.UserMessageID
