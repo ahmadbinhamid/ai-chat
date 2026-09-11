@@ -80,6 +80,17 @@ func TestSanitizeHTMLAttachment(t *testing.T) {
 			wantNotIn: []string{"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5"},
 		},
 		{
+			name:      "strips an inline svg icon",
+			in:        `<button><svg viewBox="0 0 24 24"><path d="M12 2L2 22h20z" fill="#f00"/></svg>Menu</button>`,
+			wantIn:    []string{"Menu"},
+			wantNotIn: []string{"<svg", "viewBox", "M12 2L2 22h20z"},
+		},
+		{
+			name:      "strips a self-closing svg",
+			in:        `<p>before</p><svg viewBox="0 0 1 1" /><p>after</p>`,
+			wantNotIn: []string{"<svg", "viewBox"},
+		},
+		{
 			name:   "empty input stays empty",
 			in:     "",
 			wantIn: nil,

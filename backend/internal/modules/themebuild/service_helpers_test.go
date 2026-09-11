@@ -147,6 +147,16 @@ func TestRepairPrompt(t *testing.T) {
 	if !strings.Contains(got, "known-fields") || !strings.Contains(got, "pages/offers.liquid") || !strings.Contains(got, "invented field") {
 		t.Errorf("repair prompt missing expected content: %q", got)
 	}
+	for _, want := range []string{
+		"Fix ONLY these specific",
+		"do not call read_theme_file again on any file named there",
+		"Do not explore, read, or touch anything else",
+		"an earlier attempt in THIS conversation already failed to apply an \"edit\" to this same file",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected repair prompt to constrain scope with %q, got: %s", want, got)
+		}
+	}
 }
 
 func TestAppendWarningsNote(t *testing.T) {

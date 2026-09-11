@@ -39,6 +39,12 @@ type Generation struct {
 	UserMessageID *string
 	ThemeSlug     string
 	Mode          string
+	// ReferenceURL is a URL found in Prompt at enqueue time (see
+	// Service.Generate) — carried on the row, same as Prompt itself, so the
+	// actual fetch happens in doGenerate once this generation is dequeued,
+	// not synchronously inside the HTTP request that enqueued it. "" when
+	// no URL was found, or when an explicit HTML upload took precedence.
+	ReferenceURL string
 	// QueuedAt is nil for a row seeded directly as "running" (existing
 	// tests) and set for every row that ever went through EnqueueGeneration.
 	QueuedAt *time.Time
@@ -68,16 +74,19 @@ type rowScanner interface {
 // written exactly once.
 func scanGeneration(s rowScanner) (Generation, error) {
 	var g Generation
-	var errMsg, userMessageID sql.NullString
+	var errMsg, userMessageID, referenceURL sql.NullString
 	var queuedAt, startedAt, finishedAt sql.NullTime
 
 	err := s.Scan(&g.ID, &g.ChatID, &g.TenantID, &g.Status, &errMsg, &g.Attempts,
-		&g.Prompt, &userMessageID, &g.ThemeSlug, &g.Mode, &queuedAt, &startedAt, &finishedAt)
+		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &queuedAt, &startedAt, &finishedAt)
 	if err != nil {
 		return Generation{}, err
 	}
 	if errMsg.Valid {
 		g.Error = &errMsg.String
+	}
+	if referenceURL.Valid {
+		g.ReferenceURL = referenceURL.String
 	}
 	if userMessageID.Valid {
 		g.UserMessageID = &userMessageID.String

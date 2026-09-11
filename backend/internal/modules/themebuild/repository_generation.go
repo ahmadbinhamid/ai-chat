@@ -22,7 +22,7 @@ const mysqlDuplicateKeyErrNumber = 1062
 // query and silently missed by scanGeneration's positional Scan in another.
 const generationColumns = `
 	id, chat_id, tenant_id, status, error, attempts,
-	prompt, user_message_id, theme_slug, mode, queued_at, started_at, finished_at
+	prompt, reference_url, user_message_id, theme_slug, mode, queued_at, started_at, finished_at
 `
 
 // StartGeneration inserts a new running generation row for chatID directly
@@ -94,11 +94,12 @@ func (r *Repository) EnqueueGeneration(ctx context.Context, g Generation) (posit
 	}
 
 	enqueuedAt := time.Now().UTC()
+	referenceURL := sql.NullString{String: g.ReferenceURL, Valid: g.ReferenceURL != ""}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO generations
-			(id, chat_id, tenant_id, status, attempts, prompt, user_message_id, theme_slug, mode, queued_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
-	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, g.UserMessageID, g.ThemeSlug, g.Mode, enqueuedAt, enqueuedAt, enqueuedAt)
+			(id, chat_id, tenant_id, status, attempts, prompt, reference_url, user_message_id, theme_slug, mode, queued_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, referenceURL, g.UserMessageID, g.ThemeSlug, g.Mode, enqueuedAt, enqueuedAt, enqueuedAt)
 	if err != nil {
 		return 0, err
 	}

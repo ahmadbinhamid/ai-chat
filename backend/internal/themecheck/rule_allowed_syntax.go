@@ -26,10 +26,26 @@ var explicitlyForbiddenTags = map[string]bool{
 	"javascript": true, "stylesheet": true,
 }
 
-// allowedFilters is spec §1's complete filter list.
+// allowedFilters is spec §1's complete filter list — kept in sync with the
+// spec text by hand, not generated from it, so a spec edit that adds a
+// filter needs a matching edit here (see the spec's own §1 filter bullet).
+// This list drifted out of sync with §1 from the day this rule was added
+// (§1 has always documented money/get_products/escape/strip_html/truncate;
+// this map never had them) — meaning every one of those five, including
+// escape, which §1's own very next paragraph tells the model to use
+// "Always" on an HTML attribute, was an automatic allowed-syntax rejection
+// for as long as this rule has existed. Fixed here, not worked around with
+// an autofix: there is nothing to "fix" about a filter the spec already
+// says is allowed — the rule's own whitelist was simply wrong.
 var allowedFilters = map[string]bool{
 	"default": true, "asset_url": true, "plus": true,
 	"size": true, "slice": true, "strip": true, "upcase": true,
+	"money": true, "get_products": true, "escape": true, "strip_html": true, "truncate": true,
+	// split isn't its own bullet in §1, but the spec's own get_products
+	// example requires it ("slug-a,slug-b" | split: ',' | get_products) —
+	// without it, the one documented correct way to call get_products would
+	// itself be an allowed-syntax violation.
+	"split": true,
 }
 
 // checkAllowedSyntax enforces rule 2: only §1's tags and filters may appear

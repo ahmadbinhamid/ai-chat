@@ -1,0 +1,10 @@
+:root {
+  --brand-green: #6E9A3A;
+  --brand-navy: #1B2A4A;
+  --radius-md: 8px;
+  --font-heading: "Poppins", sans-serif;
+}
+.btn-primary {
+  background-color: var(--brand-green);
+  border-radius: var(--radius-md);
+}
