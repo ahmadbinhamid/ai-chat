@@ -1499,7 +1499,12 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	}
 	tc.GenerationMode = in.Mode
 
-	toolExec := s.buildToolExecutor(store, storeAuth)
+	snapBase, err := s.buildSnapshotBase(ctx, store, storeAuth)
+	if err != nil {
+		return fmt.Errorf("build snapshot base: %w", err)
+	}
+
+	toolExec := s.buildToolExecutor(store, storeAuth, tc, snapBase)
 	readFile := s.buildFileReader(store, storeAuth)
 
 	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
@@ -1519,10 +1524,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// "Writing M files…" for the same turn).
 		emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(result.Files)})
 
-		snap, err := s.buildSnapshot(ctx, store, storeAuth, result)
-		if err != nil {
-			return fmt.Errorf("build theme snapshot: %w", err)
-		}
+		snap := s.buildSnapshot(ctx, store, storeAuth, snapBase, result)
 		result, warnings, err = s.checkAndRepair(ctx, in, c.ID, tc, turns, result, snap, toolExec, readFile, emitter)
 		if err != nil {
 			return err
@@ -1735,26 +1737,42 @@ func (s *Service) ReadThemeAssetBytes(ctx context.Context, storeAuth themefs.Req
 	return reader.ReadFileBytes(ctx, storeAuth, relPath)
 }
 
+// buildThemeContext's four store round trips (two file reads, a listing,
+// and a manifest lookup) are independent of one another — GetOrGenerateManifest
+// internally calls ListFiles too, but against s.store (the real, non-overlay
+// store, to fingerprint its cache against committed theme state) rather than
+// the overlay store parameter this function lists against, so neither
+// result feeds the other. Run concurrently via errgroup, the same pattern
+// LoadThemeFiles/buildWritePlan already use in this file (capped there at
+// loadThemeFilesConcurrency; uncapped here since there are only ever
+// exactly four goroutines). Each goroutine assigns its own dedicated
+// variable rather than a shared map, so — unlike those two — no mutex is
+// needed: g.Wait() establishes happens-before for every read below it.
 func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
-	pagesJSON, err := store.ReadFile(ctx, storeAuth, pathPagesJSON)
-	if err != nil {
-		return ai.ThemeContext{}, err
-	}
-	defaultsJSON, err := store.ReadFile(ctx, storeAuth, pathDefaultsJSON)
-	if err != nil {
-		return ai.ThemeContext{}, err
-	}
-	tree, err := store.ListFiles(ctx, storeAuth)
-	if err != nil {
-		return ai.ThemeContext{}, err
-	}
+	var pagesJSON, defaultsJSON string
+	var tree []themefs.FileTreeEntry
 	var manifest themefs.Manifest
-	if mg, ok := s.store.(manifestGenerator); ok {
-		manifest, err = mg.GetOrGenerateManifest(ctx, storeAuth)
-		if err != nil {
-			return ai.ThemeContext{}, fmt.Errorf("build manifest: %w", err)
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() (err error) { pagesJSON, err = store.ReadFile(gctx, storeAuth, pathPagesJSON); return })
+	g.Go(func() (err error) { defaultsJSON, err = store.ReadFile(gctx, storeAuth, pathDefaultsJSON); return })
+	g.Go(func() (err error) { tree, err = store.ListFiles(gctx, storeAuth); return })
+	g.Go(func() error {
+		mg, ok := s.store.(manifestGenerator)
+		if !ok {
+			return nil
 		}
+		m, err := mg.GetOrGenerateManifest(gctx, storeAuth)
+		if err != nil {
+			return fmt.Errorf("build manifest: %w", err)
+		}
+		manifest = m
+		return nil
+	})
+	if err := g.Wait(); err != nil {
+		return ai.ThemeContext{}, err
 	}
+
 	return ai.ThemeContext{
 		ThemeSlug:    themeSlug,
 		PagesJSON:    pagesJSON,
@@ -1764,29 +1782,17 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 	}, nil
 }
 
-// buildSnapshot fetches the current theme's full file-path listing (every
-// path that exists, for rule 4's render-target-exists check — see
+// buildSnapshotBase fetches the part of a themecheck.Snapshot that's
+// invariant for the life of one merchant turn: the full file-path listing
+// (every path that exists, for rule 4's render-target-exists check — see
 // themecheck.Snapshot.Paths) plus real content for the handful of files
 // themecheck actually reads (pages.json, defaults.json, the two layout
-// files) — plus, for every file result proposes to "update", that file's
-// real current content too (see themecheck.checkPlaceholderBody's
-// content-shrink check, which needs a real "before" to compare the
-// proposal's "after" against — a page's prior content was never loaded
-// into the snapshot before this, so that check had nothing to compare
-// with). That same per-file "before" content is also what
-// themecheck.DowngradePreExistingFindings uses as its baseline (see
-// checkAndRepair) to tell a violation the merchant's theme already had from
-// one this proposal just introduced — sourced from store, the same overlay
-// store the model's own read_theme_file tool reads through, so it reflects
-// what the model actually saw, staged draft changes from earlier turns
-// included. Called once per doGenerate call, before the check-and-repair
-// loop: nothing is written to the theme until after that loop accepts a
-// proposal, so the same snapshot — and the same pre-generation baseline —
-// is valid across every retry within one call, never a prior failed
-// attempt's own output (checkAndRepair keeps re-using this same snapshot;
-// only fresh update paths that first appear on a retry would miss a
-// "before" here, same as before this change for any path).
-func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, result *ai.Result) (themecheck.Snapshot, error) {
+// files). Nothing is written to the theme until the check-and-repair loop
+// accepts a proposal, so this is safe to build once per doGenerate call and
+// reuse for every validate_changes call (see buildToolExecutor) and the
+// final buildSnapshot call below, instead of repeating this same
+// ListFiles + 4 ReadFile round trip on every check.
+func (s *Service) buildSnapshotBase(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth) (themecheck.Snapshot, error) {
 	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
 		return themecheck.Snapshot{}, fmt.Errorf("list theme files: %w", err)
@@ -1801,6 +1807,34 @@ func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, s
 			return themecheck.Snapshot{}, fmt.Errorf("read %s: %w", path, err)
 		}
 		files[path] = content
+	}
+	return themecheck.Snapshot{Files: files, Paths: paths}, nil
+}
+
+// buildSnapshot layers, on top of base (see buildSnapshotBase), the real
+// current content of every file result proposes to "update" (see
+// themecheck.checkPlaceholderBody's content-shrink check, which needs a
+// real "before" to compare the proposal's "after" against — a page's prior
+// content was never loaded into the snapshot before this, so that check had
+// nothing to compare with). That same per-file "before" content is also
+// what themecheck.DowngradePreExistingFindings uses as its baseline (see
+// checkAndRepair) to tell a violation the merchant's theme already had from
+// one this proposal just introduced — sourced from store, the same overlay
+// store the model's own read_theme_file tool reads through, so it reflects
+// what the model actually saw, staged draft changes from earlier turns
+// included. base is built once per doGenerate call, before the
+// check-and-repair loop: nothing is written to the theme until after that
+// loop accepts a proposal, so the same base snapshot is valid across every
+// retry within one call, never a prior failed attempt's own output
+// (checkAndRepair keeps re-using this same snapshot; only fresh update
+// paths that first appear on a retry would miss a "before" here, same as
+// before this change for any path). Never itself fails — the one call that
+// can error (each proposed file's baseline fetch) fails open instead, so
+// unlike buildSnapshotBase this has no error return.
+func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, base themecheck.Snapshot, result *ai.Result) themecheck.Snapshot {
+	files := make(map[string]string, len(base.Files)+len(result.Files))
+	for k, v := range base.Files {
+		files[k] = v
 	}
 	for _, f := range result.Files {
 		if f.Action != "update" {
@@ -1825,7 +1859,7 @@ func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, s
 		files[f.Path] = content
 	}
 
-	return themecheck.Snapshot{Files: files, Paths: paths}, nil
+	return themecheck.Snapshot{Files: files, Paths: base.Paths}
 }
 
 // flattenFileTree walks a theme's file tree (see themefs.Store.ListFiles),

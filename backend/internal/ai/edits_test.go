@@ -422,7 +422,7 @@ func TestMaterializeEdits_SuccessConvertsEditToUpdate(t *testing.T) {
 	}}
 	readFile := fixedFileReader(map[string]string{"components/footer.liquid": "before old after"})
 
-	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
+	ok, msg := MaterializeEdits(context.Background(), result, readFile, map[string]int{})
 	if !ok {
 		t.Fatalf("expected materialization to succeed, got message: %s", msg)
 	}
@@ -442,7 +442,7 @@ func TestMaterializeEdits_UnmaterializedFilesUnaffected(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "pages/new.liquid", Action: "create", Content: "hello"},
 	}}
-	ok, _ := materializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
+	ok, _ := MaterializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
 	if !ok {
 		t.Fatal("expected materialization to succeed with no edit-action files")
 	}
@@ -455,7 +455,7 @@ func TestMaterializeEdits_NonexistentFileFails(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "components/ghost.liquid", Action: "edit", Edits: []Edit{{OldString: "x", NewString: "y"}}},
 	}}
-	ok, msg := materializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
+	ok, msg := MaterializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
 	if ok {
 		t.Fatal("expected materialization to fail for a nonexistent file")
 	}
@@ -469,7 +469,7 @@ func TestMaterializeEdits_DuplicatePathRejected(t *testing.T) {
 		{Path: "components/footer.liquid", Action: "edit", Edits: []Edit{{OldString: "x", NewString: "y"}}},
 		{Path: "components/footer.liquid", Action: "update", Content: "z"},
 	}}
-	ok, msg := materializeEdits(context.Background(), result, fixedFileReader(map[string]string{"components/footer.liquid": "x"}), map[string]int{})
+	ok, msg := MaterializeEdits(context.Background(), result, fixedFileReader(map[string]string{"components/footer.liquid": "x"}), map[string]int{})
 	if ok {
 		t.Fatal("expected edit+update on the same path in one proposal to be rejected")
 	}
@@ -482,7 +482,7 @@ func TestMaterializeEdits_EmptyEditsListFails(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "components/footer.liquid", Action: "edit", Edits: nil},
 	}}
-	ok, _ := materializeEdits(context.Background(), result, fixedFileReader(map[string]string{"components/footer.liquid": "x"}), map[string]int{})
+	ok, _ := MaterializeEdits(context.Background(), result, fixedFileReader(map[string]string{"components/footer.liquid": "x"}), map[string]int{})
 	if ok {
 		t.Fatal("expected action \"edit\" with an empty edits[] to fail")
 	}
@@ -493,7 +493,7 @@ func TestMaterializeEdits_ReadErrorFailsWithoutPanicking(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "components/footer.liquid", Action: "edit", Edits: []Edit{{OldString: "x", NewString: "y"}}},
 	}}
-	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
+	ok, msg := MaterializeEdits(context.Background(), result, readFile, map[string]int{})
 	if ok {
 		t.Fatal("expected a read error to fail materialization")
 	}
@@ -511,12 +511,12 @@ func TestMaterializeEdits_TwoFailuresFallsBackToUpdateAdvice(t *testing.T) {
 	readFile := fixedFileReader(map[string]string{"components/footer.liquid": "content with no match"})
 	counts := map[string]int{}
 
-	_, firstMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	_, firstMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
 	if got := "resubmit this file with action \"update\""; strings.Contains(firstMsg, got) {
 		t.Errorf("expected the FIRST failure to just describe the problem, not already suggest falling back: %q", firstMsg)
 	}
 
-	_, secondMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	_, secondMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
 	if got := `resubmit this file with action "update"`; !strings.Contains(secondMsg, got) {
 		t.Errorf("expected the SECOND failure for the same file to fall back to requesting full content, got: %q", secondMsg)
 	}
@@ -536,12 +536,12 @@ func TestMaterializeEdits_DuplicatePathsTwiceFailsGeneration(t *testing.T) {
 	readFile := fixedFileReader(map[string]string{"components/footer.liquid": "x"})
 	counts := map[string]int{}
 
-	_, firstMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	_, firstMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
 	if strings.Contains(firstMsg, "fail the generation") {
 		t.Errorf("expected the FIRST duplicate-paths failure to just describe the problem, got: %q", firstMsg)
 	}
 
-	_, secondMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	_, secondMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
 	if !strings.Contains(secondMsg, "fail the generation") {
 		t.Errorf("expected the SECOND duplicate-paths failure in a row to warn the generation will fail, got: %q", secondMsg)
 	}
@@ -566,7 +566,7 @@ func TestMaterializeEdits_NonexistentFileTwiceFailsGeneration(t *testing.T) {
 	readFile := fixedFileReader(nil) // "" for every path — nothing exists
 	counts := map[string]int{}
 
-	_, firstMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	_, firstMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
 	if strings.Contains(firstMsg, "fail the generation") {
 		t.Errorf("expected the FIRST file-not-found failure to just describe the problem, got: %q", firstMsg)
 	}
@@ -574,7 +574,7 @@ func TestMaterializeEdits_NonexistentFileTwiceFailsGeneration(t *testing.T) {
 		t.Errorf("expected the original create-instead-of-edit guidance, got: %q", firstMsg)
 	}
 
-	_, secondMsg := materializeEdits(context.Background(), result(), readFile, counts)
+	_, secondMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
 	if !strings.Contains(secondMsg, "fail the generation") {
 		t.Errorf("expected the SECOND file-not-found failure in a row to warn the generation will fail, got: %q", secondMsg)
 	}

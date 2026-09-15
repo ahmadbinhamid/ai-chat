@@ -11,7 +11,7 @@ import (
 
 // FileReader reads one theme file's current raw content by path — used only
 // to materialize a GeneratedFile's "edit" action into full content (see
-// materializeEdits). Distinct from ToolExecutor: that's scoped to
+// MaterializeEdits). Distinct from ToolExecutor: that's scoped to
 // model-invoked tool calls and returns a human-formatted string for the
 // model to read; this needs one file's exact raw bytes and a clean error,
 // never model-facing text. An empty, non-error return means the path
@@ -22,12 +22,12 @@ type FileReader func(ctx context.Context, path string) (content string, err erro
 
 // maxEditMaterializationFailures bounds how many times a materialization
 // failure is allowed to repeat — a bad old_string, a read error, a
-// nonexistent edit target — before materializeEdits stops just repeating
+// nonexistent edit target — before MaterializeEdits stops just repeating
 // its usual guidance and tells the model plainly that doing it again will
 // fail the generation. Keyed per file path for those; the duplicate-paths
 // failure below isn't about any single file, so it gets its own reserved
 // key (duplicatePathsFailureKey) in the same map instead. See
-// materializeEdits' own doc comment on why this is the safe fallback rather
+// MaterializeEdits' own doc comment on why this is the safe fallback rather
 // than looping indefinitely on something the model can't get right.
 const maxEditMaterializationFailures = 2
 
@@ -38,7 +38,7 @@ const maxEditMaterializationFailures = 2
 // collide with a real per-file count sharing the same map.
 const duplicatePathsFailureKey = "<duplicate-paths>"
 
-// materializeEdits turns every "edit"-action file in result into "update"
+// MaterializeEdits turns every "edit"-action file in result into "update"
 // with real content, in place — see GeneratedFile's own doc comment for why
 // this makes "edit" a wire-format optimization only, invisible to every
 // caller downstream of Generate. ok is false when at least one file failed
@@ -51,8 +51,11 @@ const duplicatePathsFailureKey = "<duplicate-paths>"
 // propose_changes call can take minutes to stream, so a rejected
 // materialization throws away that whole cost, not just a cheap round trip.
 // failureCounts is keyed by path and must persist across the whole Generate
-// call (not be reset per attempt) — see the constant above.
-func materializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
+// call (not be reset per attempt) — see the constant above. Exported so
+// themebuild's validate_changes tool executor can materialize a candidate
+// proposal's edits the exact same way, before checking it — see
+// tool_exec.go's execValidateChanges.
+func MaterializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
 	if dupes := duplicateFilePaths(result.Files); len(dupes) > 0 {
 		failureCounts[duplicatePathsFailureKey]++
 		msg := fmt.Sprintf(
@@ -171,7 +174,7 @@ func (t matchTier) String() string {
 // against genuinely current content rather than offsets pre-computed
 // against the original. worstTier is the loosest tier any single edit in
 // the list needed (tierExact if every one matched byte-for-byte) — the
-// summary materializeEdits logs for the whole file.
+// summary MaterializeEdits logs for the whole file.
 func applyEdits(content string, edits []Edit) (result string, worstTier matchTier, matchCount int, err error) {
 	worstTier = tierExact
 	for i, e := range edits {
