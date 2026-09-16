@@ -103,10 +103,11 @@ func TestBuildSnapshot_SeesDraftCreatedFileInMergedTree(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 	overlay := themefs.NewOverlayStore(svc.store, map[string]string{"pages/new.liquid": "content"})
 
-	snap, err := svc.buildSnapshot(context.Background(), overlay, testStoreAuth(), &ai.Result{})
+	base, err := svc.buildSnapshotBase(context.Background(), overlay, testStoreAuth())
 	if err != nil {
-		t.Fatalf("buildSnapshot failed: %v", err)
+		t.Fatalf("buildSnapshotBase failed: %v", err)
 	}
+	snap := svc.buildSnapshot(context.Background(), overlay, testStoreAuth(), base, &ai.Result{})
 	if !snap.Paths["pages/new.liquid"] {
 		t.Fatalf("expected the draft-created file to appear in the snapshot's Paths, got %+v", snap.Paths)
 	}
@@ -144,10 +145,11 @@ func TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration(t *testing.T) {
 		{Path: "components/footer.liquid", Action: "update", Content: "new content"},
 	}}
 
-	snap, err := svc.buildSnapshot(context.Background(), svc.store, testStoreAuth(), result)
+	base, err := svc.buildSnapshotBase(context.Background(), svc.store, testStoreAuth())
 	if err != nil {
-		t.Fatalf("expected buildSnapshot to fail open on a baseline fetch error, got: %v", err)
+		t.Fatalf("buildSnapshotBase failed: %v", err)
 	}
+	snap := svc.buildSnapshot(context.Background(), svc.store, testStoreAuth(), base, result)
 	if _, ok := snap.Files["components/footer.liquid"]; ok {
 		t.Errorf("expected no baseline entry for the file whose fetch failed, got %+v", snap.Files)
 	}
@@ -200,5 +202,50 @@ func TestBuildThemeContext_SecondCallSeesFirstTurnsDraftOutput(t *testing.T) {
 	walk(tc.FileTree)
 	if !sawPath {
 		t.Fatalf("expected the second turn's theme context to include the first turn's staged file, got tree %+v", tc.FileTree)
+	}
+}
+
+// TestBuildThemeContext_ConcurrentCallsMatchSequentialShape confirms
+// parallelizing buildThemeContext's four store round trips (see its own
+// doc comment) doesn't change what it returns.
+func TestBuildThemeContext_ConcurrentCallsMatchSequentialShape(t *testing.T) {
+	ts := newFakeThemeServer(t, map[string]string{"pages.json": `[{"slug":"home"}]`, "defaults.json": `{"colors":{}}`})
+	defer ts.Close()
+	svc := &Service{store: themefs.NewStore(ts.URL)}
+
+	tc, err := svc.buildThemeContext(context.Background(), svc.store, testStoreAuth(), "demo-theme")
+	if err != nil {
+		t.Fatalf("buildThemeContext failed: %v", err)
+	}
+	if tc.ThemeSlug != "demo-theme" {
+		t.Errorf("expected ThemeSlug to be passed through, got %q", tc.ThemeSlug)
+	}
+	if tc.PagesJSON != `[{"slug":"home"}]` {
+		t.Errorf("expected pages.json content, got %q", tc.PagesJSON)
+	}
+	if tc.DefaultsJSON != `{"colors":{}}` {
+		t.Errorf("expected defaults.json content, got %q", tc.DefaultsJSON)
+	}
+	if tc.Manifest == nil {
+		t.Error("expected a non-nil Manifest even when the store has no components")
+	}
+}
+
+// TestBuildThemeContext_FailsOnASingleReadError confirms the parallelized
+// version still fails the whole call the same way a sequential one would —
+// on the first error any of the four concurrent calls hits.
+func TestBuildThemeContext_FailsOnASingleReadError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/store/themes/active/files" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+	svc := &Service{store: themefs.NewStore(ts.URL)}
+
+	if _, err := svc.buildThemeContext(context.Background(), svc.store, testStoreAuth(), "demo-theme"); err == nil {
+		t.Error("expected an error when the file-listing call fails")
 	}
 }

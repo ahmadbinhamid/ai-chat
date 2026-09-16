@@ -53,7 +53,7 @@ type Image struct {
 
 // GeneratedFile is one file the model proposes creating, updating, or
 // editing. Action "edit" is a wire-format optimization only — see
-// materializeEdits, which Generate calls immediately after parsing
+// MaterializeEdits, which Generate calls immediately after parsing
 // propose_changes' input: by the time a *Result leaves Generate, every file
 // is "create" or "update" with real Content, and Edits is always empty.
 // Nothing downstream of Generate (themebuild, themecheck, the write plan)
@@ -312,7 +312,7 @@ var resultSchema = map[string]any{
 		// endpoint (the actual target for this schema) has unverified
 		// support for conditional subschemas, so the contract is documented
 		// in each field's description instead and enforced server-side by
-		// materializeEdits, not by the schema itself.
+		// MaterializeEdits, not by the schema itself.
 		"files": map[string]any{
 			"type": "array",
 			"items": map[string]any{
@@ -500,7 +500,7 @@ var errMaxTokensTruncated = errors.New("model response was truncated at the max_
 // itself, see ToolExecutor), with the results fed back as a new turn, until
 // the model calls propose_changes, whose input becomes Result — with one
 // extra step first: any "edit"-action file is materialized into "update"
-// via materializeEdits(readFile) before the result is returned, so callers
+// via MaterializeEdits(readFile) before the result is returned, so callers
 // never see "edit" (see GeneratedFile's doc comment). A materialization
 // failure does NOT return an error or end the turn: it's fed back as this
 // propose_changes call's own tool_result, and the loop continues exactly
@@ -530,7 +530,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		callModel = g.visionModel
 	}
 	// Keyed by path, persists across every iteration of this one Generate
-	// call — see materializeEdits' own doc comment on why a path that keeps
+	// call — see MaterializeEdits' own doc comment on why a path that keeps
 	// failing needs to fall back to requesting full content rather than
 	// retrying forever.
 	editFailureCounts := make(map[string]int)
@@ -832,7 +832,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		// materializeFailureMsg, when non-empty, is fed back below as the
 		// propose_changes tool_use's own tool_result (isError: true) instead
-		// of returning — see materializeEdits' doc comment. Declared here
+		// of returning — see MaterializeEdits' doc comment. Declared here
 		// (not inside the if) so the general toolUses loop further down can
 		// see it regardless of which branch set it.
 		var materializeFailureMsg string
@@ -841,7 +841,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			if err := json.Unmarshal(proposeInput, &result); err != nil {
 				return nil, fmt.Errorf("could not parse propose_changes input: %w", err)
 			}
-			ok, retryMsg := materializeEdits(ctx, &result, readFile, editFailureCounts)
+			ok, retryMsg := MaterializeEdits(ctx, &result, readFile, editFailureCounts)
 			if ok {
 				result.InputTokens = totalInputTokens
 				result.OutputTokens = totalOutputTokens

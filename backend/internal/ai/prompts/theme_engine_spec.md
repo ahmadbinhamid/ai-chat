@@ -42,6 +42,8 @@ Direct edits to these two files ARE allowed (via a normal `files[]` entry, same 
 
 **Emit only what changed.** Never re-emit a file whose content is unchanged. Never emit a file you have not read. For an existing file, prefer `action: "edit"` (`old_string`/`new_string` pairs) over resubmitting the whole file as `action: "update"` — `old_string` must match the file's real current content exactly once, whitespace included; use `update` only when the change is broad enough that a full rewrite is genuinely smaller.
 
+**Verify structural changes before finalizing (optional).** `validate_changes` takes the exact payload you're about to submit and runs the same checks `propose_changes` will, without committing anything — useful when you're unsure a page/component change is spec-valid. It never replaces `propose_changes`: always finish the turn by calling that, even after a clean validation.
+
 ## 1. Template language
 
 Liquid (Shopify-style). The engine is the full [keepsuit/liquid](https://github.com/keepsuit/php-liquid) standard library (every standard Shopify-style tag and filter — `unless`, `case`/`when`, `cycle`, `date`, `where`, `map`, `sort`, `truncate`, etc. all technically work), but keep generated code to the vocabulary below — it's what every existing file already uses, and a component staying inside it is easier for the next turn to read and edit.

@@ -564,13 +564,31 @@ func findingRules(findings []themecheck.Finding) []string {
 func summarizeFindings(findings []themecheck.Finding) string {
 	parts := make([]string, len(findings))
 	for i, f := range findings {
-		if f.Path != "" {
-			parts[i] = fmt.Sprintf("[%s] %s: %s", f.Rule, f.Path, f.Message)
-		} else {
-			parts[i] = fmt.Sprintf("[%s] %s", f.Rule, f.Message)
-		}
+		parts[i] = formatFindingLine(f)
 	}
 	return strings.Join(parts, "; ")
+}
+
+// formatFindingLine renders one finding the same way everywhere a
+// merchant-model-facing findings list is built (repairPrompt,
+// summarizeFindings, and execValidateChanges' tool result) — one shared
+// format, not three copies that could drift apart.
+func formatFindingLine(f themecheck.Finding) string {
+	if f.Path != "" {
+		return fmt.Sprintf("[%s] %s: %s", f.Rule, f.Path, f.Message)
+	}
+	return fmt.Sprintf("[%s] %s", f.Rule, f.Message)
+}
+
+// formatFindingsList renders findings as a bullet list, one formatFindingLine
+// per line — the same "- [rule] path: message" shape repairPrompt already
+// builds inline, factored out so execValidateChanges can reuse it exactly.
+func formatFindingsList(findings []themecheck.Finding) string {
+	var b strings.Builder
+	for _, f := range findings {
+		b.WriteString("- " + formatFindingLine(f) + "\n")
+	}
+	return b.String()
 }
 
 // recapAssistantTurn replays a rejected proposal's file content back to the
@@ -616,11 +634,7 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 	b.WriteString("Your last proposal failed validation against the theme engine spec. Fix ONLY these specific " +
 		"problems, in ONLY the file(s) named below, and resubmit the complete corrected set of files (not a diff):\n\n")
 	for _, f := range errorFindings {
-		if f.Path != "" {
-			fmt.Fprintf(&b, "- [%s] %s: %s\n", f.Rule, f.Path, f.Message)
-		} else {
-			fmt.Fprintf(&b, "- [%s] %s\n", f.Rule, f.Message)
-		}
+		fmt.Fprintf(&b, "- %s\n", formatFindingLine(f))
 	}
 	b.WriteString("\nThe exact current content of every file in your last proposal is already in your message " +
 		"above — that IS the real, current content (not a reconstruction from memory), so do not call " +
@@ -637,7 +651,7 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 	// one.
 	//
 	// The second escape hatch (an edit already failed once this turn) is
-	// what closes a real gap: materializeEdits' own retry escalation
+	// what closes a real gap: MaterializeEdits' own retry escalation
 	// (maxEditMaterializationFailures) is scoped to ONE Generate call, so
 	// it never fires across repair ROUNDS — each fresh checkAndRepair
 	// attempt starts that counter back at zero, even though the model's own

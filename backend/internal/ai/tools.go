@@ -49,10 +49,11 @@ type ToolProgress interface {
 // knows about — shared between the schema table below and Generate's
 // switch on which one terminates the loop.
 const (
-	toolNameListThemeFiles = "list_theme_files"
-	toolNameReadThemeFile  = "read_theme_file"
-	toolNameGrepTheme      = "grep_theme"
-	toolNameProposeChanges = "propose_changes"
+	toolNameListThemeFiles  = "list_theme_files"
+	toolNameReadThemeFile   = "read_theme_file"
+	toolNameGrepTheme       = "grep_theme"
+	toolNameValidateChanges = "validate_changes"
+	toolNameProposeChanges  = "propose_changes"
 )
 
 func listThemeFilesTool() anthropic.ToolUnionParam {
@@ -135,14 +136,51 @@ func proposeChangesTool() anthropic.ToolUnionParam {
 	}}
 }
 
+// validateChangesTool lets the model check a candidate set of file changes
+// against the same themecheck rules propose_changes' own post-hoc check
+// runs, before committing to anything — purely advisory: checkAndRepair
+// remains the sole authority and still runs after propose_changes
+// regardless of whether this was called, and a model that never calls it is
+// still caught by that post-hoc check exactly as today. Reuses resultSchema,
+// same as proposeChangesTool — the model submits the exact payload it's
+// about to propose, no reshaping required. See themebuild's
+// execValidateChanges for what actually runs.
+func validateChangesTool() anthropic.ToolUnionParam {
+	return anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
+		Name: toolNameValidateChanges,
+		Description: param.NewOpt(
+			"Checks a candidate set of file changes against the theme engine spec's rules — the SAME check " +
+				"propose_changes' result goes through after you submit, just advisory and non-committing here. Pass " +
+				"the exact payload you're about to submit to propose_changes (same shape). Returns any blocking " +
+				"findings to fix, or confirms there are none. This never replaces propose_changes — always finish " +
+				"the turn by calling that, even after a clean validation.",
+		),
+		InputSchema: anthropic.ToolInputSchemaParam{
+			Properties:  resultSchema["properties"],
+			Required:    resultSchema["required"].([]string),
+			ExtraFields: map[string]any{"additionalProperties": false},
+		},
+		Strict: param.NewOpt(true),
+	}}
+}
+
 // toolsForMode returns the tool set offered for a given GenerationMode.
 // Brand mode is the one restriction: only propose_changes is offered, so
 // the model can't wander off exploring/editing arbitrary theme files when
 // this turn is only ever supposed to touch defaults.json (see
-// checkGenerationMode in themebuild for the matching write-side restriction).
+// checkGenerationMode in themebuild for the matching write-side
+// restriction) — validate_changes is deliberately excluded from brand mode
+// too, for the same reason: themecheck.Check itself has no GenerationMode
+// awareness (only themebuild's validateProposal does, post-hoc), so a
+// brand-mode candidate validated in-loop could come back "no findings" and
+// still get rejected later for violating the mode restriction. Not
+// offering the tool at all in brand mode is what keeps that gap closed,
+// rather than teaching themecheck about modes it was never meant to know.
 func toolsForMode(mode string) []anthropic.ToolUnionParam {
 	if mode == GenerationModeBrand {
 		return []anthropic.ToolUnionParam{proposeChangesTool()}
 	}
-	return []anthropic.ToolUnionParam{listThemeFilesTool(), readThemeFileTool(), grepThemeTool(), proposeChangesTool()}
+	return []anthropic.ToolUnionParam{
+		listThemeFilesTool(), readThemeFileTool(), grepThemeTool(), validateChangesTool(), proposeChangesTool(),
+	}
 }
