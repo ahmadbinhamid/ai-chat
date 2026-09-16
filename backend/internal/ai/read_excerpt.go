@@ -125,6 +125,13 @@ func excerptSingleBody(path, body string) string {
 	return b.String()
 }
 
+// ExcerptThemeBody is the exported form of excerptSingleBody for local
+// simple-edit context planners that prepare model-facing packages outside
+// the tool loop.
+func ExcerptThemeBody(path, body string) string {
+	return excerptSingleBody(path, body)
+}
+
 // structuralOutline picks up to max lines that look like top-level Liquid /
 // HTML structure so the model can navigate without the full body.
 func structuralOutline(lines []string, max int) string {

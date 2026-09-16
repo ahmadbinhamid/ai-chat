@@ -340,6 +340,57 @@ func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 	}
 }
 
+// TestGenerate_DeepSeekDoesNotForceToolChoiceWithThinking ensures we never
+// send tool_choice:{type:tool,name:propose_changes} on the DeepSeek path —
+// that combination 400s with "Thinking mode does not support this tool_choice".
+// Near the budget ceiling we still nudge via system text and keep tool_choice:any.
+func TestGenerate_DeepSeekDoesNotForceToolChoiceWithThinking(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		forced := strings.Contains(string(body), `"tool_choice":{"name":"propose_changes","type":"tool"}`) ||
+			strings.Contains(string(body), `"type":"tool","name":"propose_changes"`)
+		if forced {
+			t.Errorf("deepseek must not send forced tool_choice on call %d; body: %s", calls, body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls == 1 {
+			fmt.Fprint(w, toolUseSSEResponse("msg_1", "toolu_1", "list_theme_files", map[string]any{}, 10, 5))
+			return
+		}
+		// Ceiling iteration: must still be tool_choice any (nudge-only).
+		fmt.Fprint(w, toolUseSSEResponse(fmt.Sprintf("msg_%d", calls), fmt.Sprintf("toolu_%d", calls),
+			"propose_changes", map[string]any{
+				"summary":               "ok",
+				"needs_clarification":   false,
+				"answered_question":     false,
+				"files":                 []map[string]any{{"path": "defaults.json", "action": "update", "content": "{}"}},
+				"page_registry_entry":   nil,
+				"layout_links_to_add":   []string{},
+				"layout_scripts_to_add": []string{},
+			}, 10, 5))
+	}))
+	defer ts.Close()
+
+	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
+	g := newTestGenerator(client)
+	g.provider = "deepseek"
+	g.model = "deepseek-v4-pro"
+	g.modelName = "deepseek-v4-pro"
+
+	// Budget 2 → second iteration is the ceiling nudge path (iteration >= 1).
+	_, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo", MaxToolIterations: 2, DisableExplorationBrake: true}, nil,
+		"change the header", nil, nil, nil,
+		func(context.Context, string, json.RawMessage) (string, error) { return "[]", nil }, nil)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 model calls (explore then propose), got %d", calls)
+	}
+}
+
 // TestGenerate_BrandModeOnlyOffersProposeChanges confirms brand mode's tool
 // restriction: even though the fake server would happily answer a
 // read_theme_file call, the model is never offered anything but

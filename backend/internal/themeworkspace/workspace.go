@@ -28,10 +28,48 @@ import (
 )
 
 const (
-	metaFileName   = ".workspace-meta.json"
-	filesDirName   = "files"
+	metaFileName    = ".workspace-meta.json"
+	filesDirName    = "files"
 	syncConcurrency = 8
+	// syncFreshnessTTL: FlowPOS has no theme revision field we can trust.
+	// Within this window, a populated local mirror is reused without ListFiles
+	// or ReadFile. After the TTL, EnsureSynced re-lists and only fetches
+	// missing/changed text paths (hashes still skip unchanged files).
+	syncFreshnessTTL = 15 * time.Minute
 )
+
+// textThemeExt are source files useful for AI edit/search. Binary assets are
+// listed in the tree but never ReadFile'd as text — FlowPOS returns 422 for
+// many image paths (e.g. .avif), and a single failure used to abort the
+// whole workspace sync.
+var textThemeExt = map[string]bool{
+	".liquid": true,
+	".css":    true,
+	".scss":   true,
+	".sass":   true,
+	".js":     true,
+	".ts":     true,
+	".jsx":    true,
+	".tsx":    true,
+	".json":   true,
+	".yaml":   true,
+	".yml":    true,
+	".md":     true,
+	".txt":    true,
+	".svg":    true, // markup, not a raster binary
+	".map":    true,
+}
+
+// IsAITextPath reports whether relPath should be synced/read as theme text.
+func IsAITextPath(relPath string) bool {
+	ext := strings.ToLower(path.Ext(relPath))
+	if textThemeExt[ext] {
+		return true
+	}
+	// Extensionless theme-root files used by the engine.
+	base := path.Base(relPath)
+	return base == "robots.txt" || base == "defaults.json" || base == "pages.json"
+}
 
 // Manager owns the workspace root directory (one process-wide root, many
 // tenant/theme subdirs).
@@ -134,11 +172,51 @@ func hashContent(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// EnsureSynced pulls any missing/changed theme files from FlowPOS into the
-// local mirror. Safe to call at the start of doGenerate; subsequent reads
-// hit disk.
+// SyncStats is returned by EnsureSynced for structured timing logs.
+type SyncStats struct {
+	Listed     int
+	Fetched    int
+	Skipped    int
+	SkippedBin int
+	FetchErrs  int
+	ElapsedMs  int64
+}
+
+// EnsureSynced pulls missing/changed text theme files from FlowPOS into the
+// local mirror. Binary/unsupported assets are skipped (not fatal). Individual
+// ReadFile failures are logged and skipped so one bad path cannot disable
+// the whole local-first path.
+//
+// When the mirror was synced within syncFreshnessTTL and local files still
+// match recorded hashes, this is a no-op (no FlowPOS List/Read) so subsequent
+// generations reuse the disk workspace.
 func (w *Workspace) EnsureSynced(ctx context.Context, auth themefs.RequestAuth) (stats SyncStats, err error) {
 	start := time.Now()
+
+	w.mu.Lock()
+	syncedAt := w.meta.SyncedAt
+	fresh := !syncedAt.IsZero() &&
+		time.Since(syncedAt) < syncFreshnessTTL &&
+		len(w.meta.Hashes) > 0
+	hashSnapshot := make(map[string]string, len(w.meta.Hashes))
+	for k, v := range w.meta.Hashes {
+		hashSnapshot[k] = v
+	}
+	w.mu.Unlock()
+
+	if fresh && w.localMirrorIntact(hashSnapshot) {
+		stats = SyncStats{
+			Listed:    len(hashSnapshot),
+			Skipped:   len(hashSnapshot),
+			ElapsedMs: time.Since(start).Milliseconds(),
+		}
+		slog.Info("themeworkspace: reuse local mirror (fresh)",
+			"tenant_id", w.tenantID, "theme_slug", w.slug,
+			"files", len(hashSnapshot), "synced_at", syncedAt,
+			"elapsed_ms", stats.ElapsedMs)
+		return stats, nil
+	}
+
 	tree, err := w.remote.ListFiles(ctx, auth)
 	if err != nil {
 		return stats, fmt.Errorf("list remote theme: %w", err)
@@ -159,15 +237,23 @@ func (w *Workspace) EnsureSynced(ctx context.Context, auth themefs.RequestAuth) 
 	w.mu.Unlock()
 
 	var (
-		mu       sync.Mutex
-		fetchedN int
-		skipped  int
+		mu         sync.Mutex
+		fetchedN   int
+		skipped    int
+		skippedBin int
+		fetchErrs  int
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(syncConcurrency)
 	for _, p := range sorted {
 		p := p
 		g.Go(func() error {
+			if !IsAITextPath(p) {
+				mu.Lock()
+				skippedBin++
+				mu.Unlock()
+				return nil
+			}
 			localPath := w.absPath(p)
 			// Fast path: file on disk with recorded hash — skip remote read.
 			if _, err := os.Stat(localPath); err == nil {
@@ -180,11 +266,21 @@ func (w *Workspace) EnsureSynced(ctx context.Context, auth themefs.RequestAuth) 
 			}
 			content, err := w.remote.ReadFile(gctx, auth, p)
 			if err != nil {
-				return fmt.Errorf("read remote %s: %w", p, err)
+				mu.Lock()
+				fetchErrs++
+				mu.Unlock()
+				slog.Warn("themeworkspace: skip remote read",
+					"path", p, "error", err.Error())
+				return nil // non-fatal — continue syncing other files
 			}
 			h := hashContent(content)
 			if err := w.writeLocalFile(p, content); err != nil {
-				return err
+				mu.Lock()
+				fetchErrs++
+				mu.Unlock()
+				slog.Warn("themeworkspace: skip local write",
+					"path", p, "error", err.Error())
+				return nil
 			}
 			mu.Lock()
 			fetchedN++
@@ -209,24 +305,32 @@ func (w *Workspace) EnsureSynced(ctx context.Context, auth themefs.RequestAuth) 
 	err = w.saveMeta()
 	w.mu.Unlock()
 	stats = SyncStats{
-		Listed:    len(sorted),
-		Fetched:   fetchedN,
-		Skipped:   skipped,
-		ElapsedMs: time.Since(start).Milliseconds(),
+		Listed:     len(sorted),
+		Fetched:    fetchedN,
+		Skipped:    skipped,
+		SkippedBin: skippedBin,
+		FetchErrs:  fetchErrs,
+		ElapsedMs:  time.Since(start).Milliseconds(),
 	}
 	slog.Info("themeworkspace: sync finished",
 		"tenant_id", w.tenantID, "theme_slug", w.slug,
 		"listed", stats.Listed, "fetched", stats.Fetched, "skipped", stats.Skipped,
+		"skipped_binary", stats.SkippedBin, "fetch_errors", stats.FetchErrs,
 		"elapsed_ms", stats.ElapsedMs)
 	return stats, err
 }
 
-// SyncStats is returned by EnsureSynced for structured timing logs.
-type SyncStats struct {
-	Listed    int
-	Fetched   int
-	Skipped   int
-	ElapsedMs int64
+// localMirrorIntact reports whether every hashed text file still exists on disk.
+func (w *Workspace) localMirrorIntact(hashes map[string]string) bool {
+	if len(hashes) == 0 {
+		return false
+	}
+	for p := range hashes {
+		if _, err := os.Stat(w.absPath(p)); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func (w *Workspace) absPath(rel string) string {

@@ -89,6 +89,9 @@ func resolveMaxTokens(tc ThemeContext, configured int64, budgets TokenBudgets) i
 	if tc.MaxTokensOverride > 0 {
 		return capAt(tc.MaxTokensOverride)
 	}
+	if tc.SimpleEditOneShot {
+		return capAt(8_000)
+	}
 	if tc.Repair {
 		return capAt(budgets.Repair)
 	}

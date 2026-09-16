@@ -2,6 +2,7 @@ package themeworkspace
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -88,4 +89,115 @@ func contains(s, sub string) bool {
 			}
 			return false
 		})())
+}
+
+func TestWorkspace_SkipsBinaryAssets(t *testing.T) {
+	root := t.TempDir()
+	mgr := NewManager(root)
+	remote := &memStore{files: map[string]string{
+		"components/header.liquid": "<header></header>\n",
+		"images/hero.avif":         "not-real-avif-bytes",
+		"images/logo.png":          "png",
+	}}
+	ws, err := mgr.Open(1, "demo-theme", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := themefs.RequestAuth{Token: "t", TenantID: 1}
+	stats, err := ws.EnsureSynced(context.Background(), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Fetched != 1 {
+		t.Fatalf("fetched=%d want 1 (liquid only)", stats.Fetched)
+	}
+	if stats.SkippedBin < 2 {
+		t.Fatalf("skipped_binary=%d want >=2", stats.SkippedBin)
+	}
+	if !IsAITextPath("components/header.liquid") || IsAITextPath("images/hero.avif") {
+		t.Fatal("IsAITextPath misclassified")
+	}
+}
+
+func TestWorkspace_SyncContinuesWhenOneReadFails(t *testing.T) {
+	root := t.TempDir()
+	mgr := NewManager(root)
+	remote := &failOneStore{
+		memStore: memStore{files: map[string]string{
+			"pages/home.liquid":        "home",
+			"components/header.liquid": "header",
+		}},
+		failPath: "components/header.liquid",
+	}
+	ws, err := mgr.Open(2, "demo-theme", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := ws.EnsureSynced(context.Background(), themefs.RequestAuth{})
+	if err != nil {
+		t.Fatalf("sync must not fail hard: %v", err)
+	}
+	if stats.Fetched != 1 || stats.FetchErrs != 1 {
+		t.Fatalf("fetched=%d fetch_errors=%d", stats.Fetched, stats.FetchErrs)
+	}
+}
+
+type failOneStore struct {
+	memStore
+	failPath string
+}
+
+func (f *failOneStore) ReadFile(ctx context.Context, auth themefs.RequestAuth, relPath string) (string, error) {
+	if relPath == f.failPath {
+		return "", fmt.Errorf("unexpected status 422: path invalid")
+	}
+	return f.memStore.ReadFile(ctx, auth, relPath)
+}
+
+func TestWorkspace_ReusesFreshMirrorWithoutRemote(t *testing.T) {
+	root := t.TempDir()
+	mgr := NewManager(root)
+	remote := &countingListStore{memStore: memStore{files: map[string]string{
+		"components/header.liquid": "<header></header>\n",
+		"pages/home.liquid":        "home\n",
+	}}}
+	ws, err := mgr.Open(3, "demo-theme", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := themefs.RequestAuth{Token: "t", TenantID: 3}
+	if _, err := ws.EnsureSynced(context.Background(), auth); err != nil {
+		t.Fatal(err)
+	}
+	listsBefore := remote.listCalls
+	readsBefore := remote.readCalls
+	stats, err := ws.EnsureSynced(context.Background(), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.listCalls != listsBefore {
+		t.Fatalf("fresh reuse must not ListFiles again; lists=%d→%d", listsBefore, remote.listCalls)
+	}
+	if remote.readCalls != readsBefore {
+		t.Fatalf("fresh reuse must not ReadFile; reads=%d→%d", readsBefore, remote.readCalls)
+	}
+	if stats.Fetched != 0 || stats.Skipped < 2 {
+		t.Fatalf("stats=%+v", stats)
+	}
+}
+
+type countingListStore struct {
+	memStore
+	listCalls int
+	readCalls int
+}
+
+func (c *countingListStore) ListFiles(ctx context.Context, auth themefs.RequestAuth) ([]themefs.FileTreeEntry, error) {
+	c.listCalls++
+	return c.memStore.ListFiles(ctx, auth)
+}
+
+func (c *countingListStore) ReadFile(ctx context.Context, auth themefs.RequestAuth, relPath string) (string, error) {
+	c.readCalls++
+	return c.memStore.ReadFile(ctx, auth, relPath)
 }

@@ -168,6 +168,13 @@ type ThemeContext struct {
 	// (used by tests that assert pure iteration-ceiling behavior). Production
 	// callers leave this false.
 	DisableExplorationBrake bool
+	// SimpleEditOneShot is set for IntentSimpleEdit after local context
+	// planning: expose propose_changes (and optionally one read) only, so
+	// the model cannot run multi-call grep/read exploration loops.
+	SimpleEditOneShot bool
+	// SimpleEditAllowRead permits a single read_theme_file fallback when
+	// SimpleEditOneShot is set but the local planner's excerpts may be thin.
+	SimpleEditAllowRead bool
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -460,11 +467,11 @@ const maxToolIterationsCeiling = 20
 
 // forceProposeWithinLastN is how close to the effective iteration budget the
 // loop gets before it stops offering the model a free choice of tool and
-// instead forces propose_changes specifically (see the ToolChoice branch in
-// Generate) — pushing it to commit to a proposal using whatever context
-// it's already gathered, rather than reading indefinitely and running out
-// the budget with nothing to show for it.
-const forceProposeWithinLastN = 3
+// instead pushes propose_changes (see the ToolChoice branch in Generate).
+// Kept at 1 so interactive simple-edit budgets (often 6) are not forced for
+// half the loop — earlier forcing burned DeepSeek turns and, with thinking
+// mode, previously collided with forced tool_choice (400).
+const forceProposeWithinLastN = 1
 
 // thrashOutputTokenThreshold flags a tool-loop iteration that called only
 // read-only exploration tools (list_theme_files/read_theme_file/grep_theme
@@ -722,10 +729,22 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		forcingPropose := forceProposeNext || iteration >= iterationBudget-forceProposeWithinLastN
 		forceProposeNext = false
 		if forcingPropose {
-			toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
-			slog.Info("ai: forcing propose_changes near tool-loop budget ceiling",
-				"iteration", iteration, "max_tool_iterations", iterationBudget,
-				"provider", g.provider, "model", g.modelName)
+			// DeepSeek's Anthropic-compat endpoint rejects specific
+			// tool_choice ({"type":"tool","name":...}) while adaptive
+			// thinking is enabled: HTTP 400 "Thinking mode does not
+			// support this tool_choice". Keep thinking + tool_choice:any
+			// and push propose_changes via the system nudge below.
+			// Real Anthropic still accepts ToolChoiceParamOfTool with thinking.
+			if g.provider == "deepseek" {
+				slog.Info("ai: propose_changes nudge (deepseek: no forced tool_choice with thinking)",
+					"iteration", iteration, "max_tool_iterations", iterationBudget,
+					"provider", g.provider, "model", g.modelName)
+			} else {
+				toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
+				slog.Info("ai: forcing propose_changes near tool-loop budget ceiling",
+					"iteration", iteration, "max_tool_iterations", iterationBudget,
+					"provider", g.provider, "model", g.modelName)
+			}
 		}
 		params := anthropic.MessageNewParams{
 			Model:      callModel,
@@ -931,6 +950,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			var result Result
 			if err := json.Unmarshal(proposeInput, &result); err != nil {
 				return nil, fmt.Errorf("could not parse propose_changes input: %w", err)
+			}
+			if tc.SimpleEditOneShot {
+				if err := rejectBloatedSimpleEditProposal(&result); err != nil {
+					// Controlled failure — do not materialize or stage partial/huge updates.
+					return nil, err
+				}
 			}
 			ok, retryMsg := MaterializeEdits(ctx, &result, readFile, editFailureCounts)
 			if ok {
@@ -1144,14 +1169,14 @@ func dynamicSystemPrompt(tc ThemeContext) string {
 
 	return fmt.Sprintf(`## Theme being edited
 - Theme slug: %s
-- MODE: %s%s
+- MODE: %s%s%s
 - Current pages.json (existing routes — never register a slug that's already here):
 %s
 - Current defaults.json (brand colors, fonts, menu, footer — match this, don't invent a different palette):
 %s
 - Current file tree (call list_theme_files again if this feels stale):
 %s
-%s`, tc.ThemeSlug, mode, modeRestrictionNote(mode), pagesJSON, defaultsJSON, formatFileTree(tc.FileTree), formatManifest(tc.Manifest))
+%s`, tc.ThemeSlug, mode, modeRestrictionNote(mode), simpleEditOneShotNote(tc), pagesJSON, defaultsJSON, formatFileTree(tc.FileTree), formatManifest(tc.Manifest))
 }
 
 // formatManifest renders the manifest's component param index, if one was
@@ -1183,6 +1208,20 @@ func modeRestrictionNote(mode string) string {
 	default:
 		return ""
 	}
+}
+
+func simpleEditOneShotNote(tc ThemeContext) string {
+	if !tc.SimpleEditOneShot {
+		return ""
+	}
+	if tc.SimpleEditAllowRead {
+		return "\n- SIMPLE_EDIT (prepared): relevant files were pre-selected locally. Call propose_changes with a bounded edit. " +
+			"You may call read_theme_file at most once if a critical section is missing from the package — do not grep or list files."
+	}
+	return "\n- SIMPLE_EDIT (prepared): relevant files and excerpts were pre-selected locally. " +
+		"Do not explore. Call propose_changes once with a minimal action \"edit\" changeset. " +
+		"Never regenerate an entire file. summary must be one short sentence. " +
+		"needs_clarification only if you truly cannot act safely."
 }
 
 // formatFileTree renders a theme's file tree as an indented plain-text

@@ -188,12 +188,20 @@ func toolsForMode(mode string) []anthropic.ToolUnionParam {
 	}
 }
 
-// toolsForContext is toolsForMode plus repair narrowing when tc.Repair.
+// toolsForContext is toolsForMode plus repair / simple-edit narrowing.
 func toolsForContext(tc ThemeContext) []anthropic.ToolUnionParam {
 	if tc.Repair {
 		return []anthropic.ToolUnionParam{
 			readThemeFileTool(), validateChangesTool(), proposeChangesTool(),
 		}
+	}
+	if tc.SimpleEditOneShot {
+		if tc.SimpleEditAllowRead {
+			return []anthropic.ToolUnionParam{
+				readThemeFileTool(), proposeChangesTool(),
+			}
+		}
+		return []anthropic.ToolUnionParam{proposeChangesTool()}
 	}
 	return toolsForMode(tc.GenerationMode)
 }

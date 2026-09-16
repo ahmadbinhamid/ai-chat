@@ -101,6 +101,8 @@ func categorizeError(err error) string {
 		// it at all, so the original credit-only check silently missed it
 		// and fell through to the generic message). Observed in production.
 		return "the account is out of credits — please contact support"
+	case strings.Contains(lower, "simple_edit:"):
+		return "the change was too large for a simple edit — please try a smaller, more specific request"
 	case strings.Contains(lower, "did not call propose_changes within"):
 		return "the task was too complex to finish in one attempt — please try breaking it into smaller requests"
 	case strings.Contains(lower, "didn't pass validation after"):

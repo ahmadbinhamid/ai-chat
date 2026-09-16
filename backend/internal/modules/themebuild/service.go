@@ -1205,9 +1205,22 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// does; it's assigned, never redeclared, below.
 	doGenerateStart := time.Now()
 	var hasChanges bool
+	var skipDraftRefresh bool
+	var routedIntent Intent
+	var workspaceLoaded bool
+	var deepseekCalled bool
 	defer func() {
+		route := RouteLocalFirst
+		if routedIntent == IntentConversation {
+			route = RouteFastConversation
+		}
 		slog.Info("ai: generation wall-clock", "chat_id", c.ID, "mode", in.Mode,
-			"elapsed_ms", time.Since(doGenerateStart).Milliseconds(), "has_changes", hasChanges)
+			"generation_id", genID,
+			"elapsed_ms", time.Since(doGenerateStart).Milliseconds(), "has_changes", hasChanges,
+			"intent", string(routedIntent), "route", route,
+			"workspace_loaded", workspaceLoaded, "deepseek_called", deepseekCalled,
+			"draft_refresh", !skipDraftRefresh && routedIntent != IntentConversation,
+			"skip_draft_refresh", skipDraftRefresh)
 	}()
 	defer func() {
 		// A deliberately fresh, short-lived context for this defer's own
@@ -1286,11 +1299,59 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
 			}
 		} else {
-			emitter.emit(emitCtx, EventTypeDone, map[string]string{"summary": summary})
+			payload := map[string]any{"summary": summary}
+			if skipDraftRefresh {
+				payload["skip_draft_refresh"] = true
+				payload["intent"] = string(IntentConversation)
+				payload["route"] = RouteFastConversation
+			}
+			emitter.emit(emitCtx, EventTypeDone, payload)
 		}
 	}()
 
 	storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
+
+	// Intent routing happens BEFORE theme/workspace/DeepSeek work. Attachment
+	// presence is known from the user message metadata (bytes loaded later
+	// only on the theme path).
+	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
+	if err != nil {
+		return fmt.Errorf("load chat history: %w", err)
+	}
+	hasAttachments := len(in.Images) > 0 || in.HTMLAttachmentContent != nil || in.ReferenceURL != ""
+	if in.UserMessageID != nil {
+		for _, m := range priorMessages {
+			if m.ID == *in.UserMessageID && len(m.Attachments) > 0 {
+				hasAttachments = true
+				break
+			}
+		}
+	}
+	intent := ClassifyIntent(in.Prompt, in.Mode, hasAttachments)
+	routedIntent = intent
+	if intent == IntentConversation {
+		summary = conversationReply(in.Prompt)
+		if _, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
+			return fmt.Errorf("record conversation reply: %w", err)
+		}
+		skipDraftRefresh = true
+		slog.Info("ai: intent route",
+			"generation_id", genID,
+			"intent", string(intent),
+			"route", RouteFastConversation,
+			"workspace_loaded", false,
+			"deepseek_called", false,
+			"draft_refresh", false,
+			"duration_ms", time.Since(doGenerateStart).Milliseconds())
+		return nil
+	}
+	slog.Info("ai: intent route",
+		"generation_id", genID,
+		"intent", string(intent),
+		"route", RouteLocalFirst,
+		"workspace_loaded", false,
+		"deepseek_called", false,
+		"draft_refresh", true)
 
 	// The draft overlay this whole feature exists for: every prior turn's
 	// still-'pending' file content, read first before falling through to
@@ -1319,9 +1380,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				slog.Warn("themeworkspace: sync failed, using remote store",
 					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "error", syncErr)
 			} else {
+				workspaceLoaded = true
 				slog.Info("ai: local workspace ready",
 					"chat_id", c.ID, "listed", syncStats.Listed,
 					"fetched", syncStats.Fetched, "skipped", syncStats.Skipped,
+					"skipped_binary", syncStats.SkippedBin, "fetch_errors", syncStats.FetchErrs,
 					"sync_ms", syncStats.ElapsedMs)
 				baseStore = themeworkspace.Store{Workspace: ws}
 			}
@@ -1338,12 +1401,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			"chat_id", c.ID, "cache_hits", hits, "cache_misses", misses, "cache_invalidated", invalidated)
 	}()
 
-	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
-	if err != nil {
-		return fmt.Errorf("load chat history: %w", err)
-	}
-
-	// in arrives here rebuilt fresh from the generations row (see
+	// priorMessages was loaded above for intent routing. in arrives here
+	// rebuilt fresh from the generations row (see
 	// runOneQueuedGeneration) — it never carries an image straight from
 	// Generate's own local scope, since a dequeue can happen well after
 	// that scope returns. Re-resolve it from the just-loaded history
@@ -1549,12 +1608,55 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	}
 	tc.GenerationMode = in.Mode
 	prompt := in.Prompt
-	if isSimpleInteractiveEdit(in.Prompt, in.Mode) {
+	var simpleEditCtx SimpleEditContext
+	switch intent {
+	case IntentSimpleEdit:
+		contextStart := time.Now()
+		sec, secErr := BuildSimpleEditContext(ctx, store, storeAuth, in.Prompt)
+		contextMS := time.Since(contextStart).Milliseconds()
+		if secErr != nil {
+			slog.Warn("ai: simple-edit context planner failed", "chat_id", c.ID, "error", secErr)
+		} else {
+			simpleEditCtx = sec
+		}
+		tc.SimpleEditOneShot = true
+		// Targeted read fallback stays OFF when local context is sufficient;
+		// only enabled when the planner found no usable excerpts.
+		tc.SimpleEditAllowRead = !simpleEditCtx.Sufficient
+		tc.MaxToolIterations = maxSimpleEditModelCalls
+		tc.MaxTokensOverride = simpleEditMaxTokens
+		tc.DisableExplorationBrake = true
+		tc.FileTree = filterFileTreeToPaths(tc.FileTree, simpleEditCtx.Paths)
+		tc.Manifest = nil
+		tc.PagesJSON = truncateForSimpleEditPrompt(tc.PagesJSON, 800)
+		tc.DefaultsJSON = truncateForSimpleEditPrompt(tc.DefaultsJSON, 1200)
+		prompt = simpleEditOneShotPrompt(in.Prompt, simpleEditCtx)
+		pkgRunes := len([]rune(simpleEditCtx.Package))
+		slog.Info("ai: simple-edit one-shot",
+			"chat_id", c.ID,
+			"generation_id", genID,
+			"targets", simpleEditCtx.Targets,
+			"paths", simpleEditCtx.Paths,
+			"sufficient", simpleEditCtx.Sufficient,
+			"allow_read", tc.SimpleEditAllowRead,
+			"max_tool_iterations", tc.MaxToolIterations,
+			"max_tokens", tc.MaxTokensOverride,
+			"simple_edit_context_builder_ms", contextMS,
+			"simple_edit_context_chars", pkgRunes,
+			"package_runes", pkgRunes)
+	case IntentThemeQuery:
 		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 6 {
 			tc.MaxToolIterations = 6
 		}
-		prompt = in.Prompt + "\n\n[system hint: simple interactive edit — make one reasonable, bounded visual improvement to the named target that matches defaults.json; prefer propose_changes with action \"edit\"; do not explore broadly; only set needs_clarification if you truly cannot act safely, and if so ask immediately.]"
-		slog.Info("ai: simple-edit fast path", "chat_id", c.ID, "max_tool_iterations", tc.MaxToolIterations)
+		slog.Info("ai: theme-query path", "chat_id", c.ID, "max_tool_iterations", tc.MaxToolIterations)
+	case IntentRepair:
+		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 8 {
+			tc.MaxToolIterations = 8
+		}
+	case IntentComplexPage, IntentMultiFileEdit:
+		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 14 {
+			tc.MaxToolIterations = 14
+		}
 	}
 
 	emitter.emit(ctx, EventTypePreparingContext, struct{}{})
@@ -1566,13 +1668,43 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	toolExec := s.buildToolExecutor(store, storeAuth, tc, snapBase)
 	readFile := s.buildFileReader(store, storeAuth)
 
-	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
+	var turns []ai.Turn
+	if intent == IntentSimpleEdit {
+		turns = nil
+	} else {
+		turns = s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
+	}
 	slog.Info("ai: pre-model phase finished",
 		"chat_id", c.ID, "pre_model_ms", time.Since(preModelStart).Milliseconds())
 	emitter.emit(ctx, EventTypePreparingAI, struct{}{})
+	deepseekCalled = true
+	modelStart := time.Now()
 	result, turns, err := s.generateValidProposal(ctx, tc, turns, prompt, toolExec, readFile, emitter, in)
+	modelMS := time.Since(modelStart).Milliseconds()
 	if err != nil {
 		return err
+	}
+	if intent == IntentSimpleEdit {
+		if vErr := validateSimpleEditCompactness(result); vErr != nil {
+			slog.Warn("ai: simple-edit changeset rejected",
+				"chat_id", c.ID, "generation_id", genID, "error", vErr.Error(),
+				"simple_edit_patch_size", simpleEditPatchSize(result),
+				"simple_edit_model_call_count", 1,
+				"simple_edit_model_input_tokens", result.InputTokens,
+				"simple_edit_model_output_tokens", result.OutputTokens)
+			return vErr
+		}
+		slog.Info("ai: simple-edit metrics",
+			"chat_id", c.ID,
+			"generation_id", genID,
+			"simple_edit_model_call_count", 1,
+			"simple_edit_tool_call_count", result.ExplorationToolCalls,
+			"simple_edit_model_input_tokens", result.InputTokens,
+			"simple_edit_model_output_tokens", result.OutputTokens,
+			"simple_edit_patch_size", simpleEditPatchSize(result),
+			"simple_edit_context_chars", len([]rune(simpleEditCtx.Package)),
+			"simple_edit_model_ms", modelMS,
+			"paths", simpleEditCtx.Paths)
 	}
 
 	var warnings []themecheck.Finding

@@ -44,6 +44,8 @@ func TestResolveMaxTokens(t *testing.T) {
 		{"brand", ThemeContext{GenerationMode: GenerationModeBrand}, 64000, budgets.Brand},
 		{"respects low ceiling", ThemeContext{}, 4000, 4000},
 		{"override", ThemeContext{MaxTokensOverride: 12000}, 64000, 12000},
+		{"simple_edit one-shot", ThemeContext{SimpleEditOneShot: true}, 64000, 8000},
+		{"simple_edit override wins", ThemeContext{SimpleEditOneShot: true, MaxTokensOverride: 5000}, 64000, 5000},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
