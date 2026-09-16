@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/themecheck"
@@ -214,18 +215,100 @@ func TestExecGrepTheme_PathGlobRestriction(t *testing.T) {
 	}
 }
 
-func TestExecGrepTheme_NoMatches(t *testing.T) {
-	ts := newFakeThemeServer(t, map[string]string{"pages/home.liquid": "nothing interesting"})
+func TestExecGrepTheme_ReadsConcurrently(t *testing.T) {
+	files := map[string]string{}
+	for i := 0; i < 24; i++ {
+		files[fmt.Sprintf("pages/p%d.liquid", i)] = fmt.Sprintf("needle-%d", i)
+	}
+	var inFlight, maxInFlight int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/store/themes/active/files" {
+			entries := make([]themefs.FileTreeEntry, 0, len(files))
+			for p := range files {
+				entries = append(entries, themefs.FileTreeEntry{Name: p, Path: p, Type: "file"})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"files": entries}})
+			return
+		}
+		cur := atomic.AddInt32(&inFlight, 1)
+		for {
+			old := atomic.LoadInt32(&maxInFlight)
+			if cur <= old || atomic.CompareAndSwapInt32(&maxInFlight, old, cur) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		atomic.AddInt32(&inFlight, -1)
+		reqPath := strings.TrimPrefix(r.URL.Path, "/store/themes/active/files/")
+		content := files[reqPath]
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"path": reqPath, "content": content, "encoding": "utf-8"},
+		})
+	}))
 	defer ts.Close()
-	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	input, _ := json.Marshal(grepThemeInput{Pattern: "will-not-match-anything"})
+	svc := &Service{store: themefs.NewStore(ts.URL)}
+	input, _ := json.Marshal(grepThemeInput{Pattern: "needle-"})
 	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if out != "(no matches)" {
-		t.Errorf("expected the no-matches marker, got: %q", out)
+	if !strings.Contains(out, "pages/p0.liquid:") {
+		t.Fatalf("expected deterministic ordered matches, got: %s", out)
+	}
+	if maxInFlight < 2 {
+		t.Fatalf("expected concurrent ReadFile (maxInFlight>=2), got %d", maxInFlight)
+	}
+}
+
+func TestExecGrepTheme_ShortCircuitsAtMaxMatches(t *testing.T) {
+	files := map[string]string{}
+	for i := 0; i < 80; i++ {
+		var b strings.Builder
+		for j := 0; j < 50; j++ {
+			fmt.Fprintf(&b, "MATCH %d\n", j)
+		}
+		files[fmt.Sprintf("pages/p%02d.liquid", i)] = b.String()
+	}
+	var reads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/store/themes/active/files" {
+			entries := make([]themefs.FileTreeEntry, 0, len(files))
+			for p := range files {
+				entries = append(entries, themefs.FileTreeEntry{Name: p, Path: p, Type: "file"})
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"files": entries}})
+			return
+		}
+		reads.Add(1)
+		time.Sleep(5 * time.Millisecond)
+		reqPath := strings.TrimPrefix(r.URL.Path, "/store/themes/active/files/")
+		content := files[reqPath]
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"path": reqPath, "content": content, "encoding": "utf-8"},
+		})
+	}))
+	defer ts.Close()
+
+	svc := &Service{store: themefs.NewStore(ts.URL)}
+	input, _ := json.Marshal(grepThemeInput{Pattern: "MATCH"})
+	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "stopped at") {
+		t.Fatalf("expected max-match stop notice, got: %s", out)
+	}
+	if n := reads.Load(); n >= 80 {
+		t.Fatalf("expected short-circuit to skip most of 80 files, got %d reads", n)
+	}
+	// Deterministic ordering: first path in sort order is p00.
+	if !strings.HasPrefix(strings.TrimSpace(out), "pages/p00.liquid:") {
+		t.Fatalf("expected ordered matches starting at p00, got: %s", out[:min(120, len(out))])
 	}
 }
 

@@ -104,6 +104,16 @@ const (
 	// {"text": "..."}, one coalesced chunk at a time — see
 	// internal/ai.Generate's onDelta coalescing.
 	EventTypeThinking = "thinking"
+	// EventTypeLoadingTheme is emitted once doGenerate starts loading the
+	// theme context (pages/defaults/tree/manifest) — early progress so the
+	// UI is not silent during pre-model FlowPOS work.
+	EventTypeLoadingTheme = "loading_theme"
+	// EventTypePreparingContext is emitted after theme context is loaded and
+	// the snapshot base is about to be built / AI call prepared.
+	EventTypePreparingContext = "preparing_context"
+	// EventTypePreparingAI is emitted immediately before the first model
+	// Generate call for this turn.
+	EventTypePreparingAI = "preparing_ai"
 )
 
 // maxPromptPreviewChars bounds EventTypeQueued's prompt_preview field.

@@ -9,10 +9,13 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // maxToolReadPaths/maxToolReadBytes bound read_theme_file's own single-call
@@ -93,10 +96,21 @@ type readThemeFileInput struct {
 	Paths []string `json:"paths"`
 }
 
+// readThemeFileResult is one path's outcome from the parallel read phase of
+// execReadThemeFile — kept in request order so the model-facing string is
+// deterministic regardless of which goroutine finished first.
+type readThemeFileResult struct {
+	path    string
+	section string // preformatted "### path\n...\n\n" (or ERROR / missing)
+	bytes   int    // content bytes counted toward maxToolReadBytes; 0 for errors
+}
+
 // execReadThemeFile reads up to maxToolReadPaths files, capping the total
 // content returned at maxToolReadBytes — a model asking for several large
 // files in one call gets a clear truncation marker rather than a silently
-// cut-off response it might mistake for the whole file.
+// cut-off response it might mistake for the whole file. Independent path
+// reads run concurrently (errgroup, loadThemeFilesConcurrency) after
+// validation; assembly stays in the caller's path order.
 func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
 	var args readThemeFileInput
 	if err := json.Unmarshal(input, &args); err != nil {
@@ -109,9 +123,11 @@ func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStor
 		args.Paths = args.Paths[:maxToolReadPaths]
 	}
 
-	var b strings.Builder
-	total := 0
-	for _, p := range args.Paths {
+	results := make([]readThemeFileResult, len(args.Paths))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(loadThemeFilesConcurrency)
+	for i, p := range args.Paths {
+		i, p := i, p
 		// pages.json/defaults.json are rejected here for a reason that has
 		// nothing to do with whether they're writable (see
 		// themefs.ValidateGeneratedFilePath below, which now allows both as
@@ -124,34 +140,65 @@ func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStor
 		// allowlist, so a future change to what's writable never silently
 		// changes what's worth re-reading via this tool.
 		if p == pathPagesJSON || p == pathDefaultsJSON {
-			fmt.Fprintf(&b, "### %s\nERROR: %s is already in your context — do not read it via this tool.\n\n", p, p)
+			results[i] = readThemeFileResult{
+				path:    p,
+				section: fmt.Sprintf("### %s\nERROR: %s is already in your context — do not read it via this tool.\n\n", p, p),
+			}
 			continue
 		}
 		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
-			fmt.Fprintf(&b, "### %s\nERROR: %s\n\n", p, err.Error())
+			results[i] = readThemeFileResult{
+				path:    p,
+				section: fmt.Sprintf("### %s\nERROR: %s\n\n", p, err.Error()),
+			}
 			continue
 		}
-		// store here is the draft overlay (see doGenerate) — reading
-		// through it, not s.store directly, is THE fix this whole feature
-		// hinges on: without it, a model that just edited pages/home.liquid
-		// and then re-reads it (e.g. before a second, related edit) would
-		// see the stale pre-edit content and could silently undo its own
-		// prior work.
-		content, err := store.ReadFile(ctx, storeAuth, p)
-		if err != nil {
-			fmt.Fprintf(&b, "### %s\nERROR: %s\n\n", p, err.Error())
+		g.Go(func() error {
+			// store here is the draft overlay (see doGenerate) — reading
+			// through it, not s.store directly, is THE fix this whole feature
+			// hinges on: without it, a model that just edited pages/home.liquid
+			// and then re-reads it (e.g. before a second, related edit) would
+			// see the stale pre-edit content and could silently undo its own
+			// prior work.
+			content, err := store.ReadFile(gctx, storeAuth, p)
+			if err != nil {
+				results[i] = readThemeFileResult{
+					path:    p,
+					section: fmt.Sprintf("### %s\nERROR: %s\n\n", p, err.Error()),
+				}
+				return nil
+			}
+			if content == "" {
+				results[i] = readThemeFileResult{
+					path:    p,
+					section: fmt.Sprintf("### %s\n(does not exist yet)\n\n", p),
+				}
+				return nil
+			}
+			results[i] = readThemeFileResult{
+				path:    p,
+				section: fmt.Sprintf("### %s\n%s\n\n", p, content),
+				bytes:   len(content),
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	total := 0
+	for _, r := range results {
+		if r.section == "" {
 			continue
 		}
-		if content == "" {
-			fmt.Fprintf(&b, "### %s\n(does not exist yet)\n\n", p)
-			continue
-		}
-		if total+len(content) > maxToolReadBytes {
+		if r.bytes > 0 && total+r.bytes > maxToolReadBytes {
 			fmt.Fprintf(&b, "(remaining files omitted — total content capped at %d bytes per call; read fewer files per call)\n", maxToolReadBytes)
 			break
 		}
-		total += len(content)
-		fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
+		total += r.bytes
+		b.WriteString(r.section)
 	}
 	return b.String(), nil
 }
@@ -161,10 +208,21 @@ type grepThemeInput struct {
 	PathGlob string `json:"path_glob"`
 }
 
+// grepFileHit is one matching line from a scanned file — collected per-file
+// then merged in candidate order so output stays deterministic under
+// concurrent reads.
+type grepFileHit struct {
+	path string
+	line int
+	text string
+}
+
 // execGrepTheme searches every searchable theme file for a regular
 // expression (RE2 — Go's regexp package, not a plain substring; see
 // grepThemeTool's description) matched line-by-line, optionally restricted
 // to paths matching path_glob (path.Match — one wildcard segment, no "**").
+// Candidate file reads run concurrently (errgroup, loadThemeFilesConcurrency);
+// match assembly walks candidates in sorted order and stops at maxGrepMatches.
 func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
 	var args grepThemeInput
 	if err := json.Unmarshal(input, &args); err != nil {
@@ -206,31 +264,62 @@ func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, s
 		candidates = candidates[:maxGrepFilesScanned]
 	}
 
+	perFile := make([][]grepFileHit, len(candidates))
+	scanCtx, cancelScan := context.WithCancel(ctx)
+	defer cancelScan()
+	var matchTotal atomic.Int32
+	g, gctx := errgroup.WithContext(scanCtx)
+	g.SetLimit(loadThemeFilesConcurrency)
+	for i, p := range candidates {
+		i, p := i, p
+		g.Go(func() error {
+			if matchTotal.Load() >= int32(maxGrepMatches) {
+				return nil
+			}
+			select {
+			case <-gctx.Done():
+				return nil
+			default:
+			}
+			content, err := store.ReadFile(gctx, storeAuth, p)
+			if err != nil || content == "" {
+				return nil
+			}
+			var hits []grepFileHit
+			for lineIdx, line := range strings.Split(content, "\n") {
+				if re.MatchString(line) {
+					hits = append(hits, grepFileHit{
+						path: p,
+						line: lineIdx + 1,
+						text: strings.TrimSpace(line),
+					})
+				}
+			}
+			if n := len(hits); n > 0 {
+				if matchTotal.Add(int32(n)) >= int32(maxGrepMatches) {
+					cancelScan()
+				}
+			}
+			perFile[i] = hits
+			return nil
+		})
+	}
+	_ = g.Wait() // cancellation is expected when max matches hit early
+
 	var b strings.Builder
 	matches := 0
-	for _, p := range candidates {
-		if matches >= maxGrepMatches {
-			break
-		}
-		content, err := store.ReadFile(ctx, storeAuth, p)
-		if err != nil || content == "" {
-			continue
-		}
-		for i, line := range strings.Split(content, "\n") {
+	for _, hits := range perFile {
+		for _, h := range hits {
 			if matches >= maxGrepMatches {
-				break
+				fmt.Fprintf(&b, "(stopped at %d matches — narrow your pattern/path_glob)\n", maxGrepMatches)
+				return b.String(), nil
 			}
-			if re.MatchString(line) {
-				fmt.Fprintf(&b, "%s:%d: %s\n", p, i+1, strings.TrimSpace(line))
-				matches++
-			}
+			fmt.Fprintf(&b, "%s:%d: %s\n", h.path, h.line, h.text)
+			matches++
 		}
 	}
 	if matches == 0 {
 		return "(no matches)", nil
-	}
-	if matches >= maxGrepMatches {
-		fmt.Fprintf(&b, "(stopped at %d matches — narrow your pattern/path_glob)\n", maxGrepMatches)
 	}
 	return b.String(), nil
 }

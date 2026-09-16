@@ -150,6 +150,24 @@ type ThemeContext struct {
 	// GenerationMode restricts what this turn may touch — see the
 	// GenerationMode* constants. Empty behaves as GenerationModeEdit.
 	GenerationMode string
+	// MaxToolIterations overrides the mode-based tool-loop budget when > 0.
+	// Capped at maxToolIterationsCeiling. Zero means "pick from mode /
+	// Repair via toolIterationBudget".
+	MaxToolIterations int
+	// Repair marks a themecheck repair Generate: lower iteration budget and
+	// optional EffortOverride (see themebuild.checkAndRepair).
+	Repair bool
+	// EffortOverride, when non-empty, replaces the Generator's configured
+	// effort for this call only (e.g. "medium" on repair). Empty keeps
+	// mode policy via resolveEffort.
+	EffortOverride string
+	// MaxTokensOverride, when > 0, replaces resolveMaxTokens for this call
+	// (still capped by the Generator's configured maxTokens).
+	MaxTokensOverride int64
+	// DisableExplorationBrake skips thrash/streak/tool-call force-propose
+	// (used by tests that assert pure iteration-ceiling behavior). Production
+	// callers leave this false.
+	DisableExplorationBrake bool
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -170,10 +188,20 @@ type Generator struct {
 	// its doc comment for what this is for.
 	fake      bool
 	fakeDelay time.Duration
-	// maxTokens is the Claude call's max_tokens — see defaultMaxTokens and
-	// config.Config.MaxTokens (AI_MAX_TOKENS env var, falling back to the
-	// deprecated ANTHROPIC_MAX_TOKENS).
+	// maxTokens is the Claude call's max_tokens ceiling — see defaultMaxTokens
+	// and config.Config.MaxTokens. Per-call budgets may be lower via
+	// resolveMaxTokens / ThemeContext.MaxTokensOverride.
 	maxTokens int64
+	// tokenBudgets are mode/repair ceilings under maxTokens — see
+	// DefaultTokenBudgets and SetTokenBudgets.
+	tokenBudgets TokenBudgets
+	// provider is a coarse log tag ("anthropic" | "deepseek") — never a secret.
+	provider string
+	// modelName is the configured text-model string for logs.
+	modelName string
+	// idleTimeout bounds how long one NewStreaming attempt may block without
+	// an SSE event — see SetStreamIdleTimeout / defaultStreamIdleTimeout.
+	idleTimeout time.Duration
 }
 
 // New constructs the client. apiKey empty is a configuration error the
@@ -212,7 +240,13 @@ func New(apiKey, baseURL, model, effort, visionModel string, maxTokens int64) (*
 	// will use — see theory 1 (reasoning tax) in the diagnostics task this
 	// instruments. base_url_set only (not the URL itself) since it's not
 	// sensitive but also not needed to answer the question.
+	//
+	// HTTP transport: anthropic-sdk-go owns the shared default http.Client /
+	// connection pool for this Client value; we deliberately do not wrap a
+	// custom Transport here — the SDK does not expose a safe hook for idle
+	// conn / HTTP2 tuning without forking request options per call.
 	slog.Info("ai: generator configured",
+		"provider", providerLabel(baseURL != ""),
 		"model", model,
 		"effort", effort,
 		"max_tokens", maxTokens,
@@ -220,12 +254,24 @@ func New(apiKey, baseURL, model, effort, visionModel string, maxTokens int64) (*
 		"adaptive_thinking_supported", modelSupportsAdaptiveThinking(model),
 		"vision_model", visionModel)
 	return &Generator{
-		client:      anthropic.NewClient(opts...),
-		model:       model,
-		effort:      anthropic.OutputConfigEffort(effort),
-		maxTokens:   maxTokens,
-		visionModel: visionModel,
+		client:       anthropic.NewClient(opts...),
+		model:        model,
+		effort:       anthropic.OutputConfigEffort(effort),
+		maxTokens:    maxTokens,
+		tokenBudgets: DefaultTokenBudgets(),
+		visionModel:  visionModel,
+		provider:     providerLabel(baseURL != ""),
+		modelName:    model,
 	}, nil
+}
+
+// SetTokenBudgets replaces interactive/repair/complex max_tokens ceilings
+// (zeros keep DefaultTokenBudgets). Safe to call once at process startup.
+func (g *Generator) SetTokenBudgets(b TokenBudgets) {
+	if g == nil {
+		return
+	}
+	g.tokenBudgets = b.withDefaults()
 }
 
 // SupportsVision reports whether this Generator was configured with a
@@ -247,7 +293,7 @@ func (g *Generator) SupportsVision() bool {
 // that plumbing is still being debugged. Swap back to New(...) once done —
 // see config.Config.FakeAIMode / the AI_CHAT_FAKE_MODE env var.
 func NewFake(fakeDelay time.Duration) *Generator {
-	return &Generator{fake: true, fakeDelay: fakeDelay}
+	return &Generator{fake: true, fakeDelay: fakeDelay, tokenBudgets: DefaultTokenBudgets()}
 }
 
 // fakeGenerate is NewFake's whole implementation — see its doc comment.
@@ -276,7 +322,7 @@ func (g *Generator) fakeGenerate(ctx context.Context, prompt string) (*Result, e
 // this package's own tests, which need to drive the tool loop against a
 // fake server rather than the real Claude API.
 func newTestGenerator(client anthropic.Client) *Generator {
-	return &Generator{client: client, model: "claude-test", effort: anthropic.OutputConfigEffortMedium, maxTokens: defaultMaxTokens}
+	return &Generator{client: client, model: "claude-test", effort: anthropic.OutputConfigEffortMedium, maxTokens: defaultMaxTokens, tokenBudgets: DefaultTokenBudgets()}
 }
 
 // resultSchema is propose_changes' input_schema (see tools.go) — the same
@@ -405,19 +451,16 @@ func modelSupportsAdaptiveThinking(model anthropic.Model) bool {
 	return !strings.Contains(strings.ToLower(model), "haiku")
 }
 
-// maxToolIterations bounds the read/explore loop before Generate gives up —
-// raised from 8, then from 20: a real page-creation prompt ("design an
-// our-story page") was observed spending all 20 iterations on distinct,
-// purposeful reads/greps (not stuck looping) and never reaching
-// propose_changes, failing the whole generation despite real API cost
-// already spent gathering context. See forceProposeAtIteration below for
-// the complementary fix — pushing the model to commit near the ceiling
-// rather than relying on the ceiling alone to be big enough.
-const maxToolIterations = 28
+// maxToolIterationsCeiling is the absolute upper bound for any tool loop —
+// mode budgets and MaxToolIterations overrides cannot exceed this. Lower
+// than the historical 28 after production thrash (exploration-only
+// iterations burning minutes of wall clock) made the old ceiling a liability
+// for interactive builder turns.
+const maxToolIterationsCeiling = 20
 
-// forceProposeWithinLastN is how close to maxToolIterations the loop gets
-// before it stops offering the model a free choice of tool and instead
-// forces propose_changes specifically (see the ToolChoice branch in
+// forceProposeWithinLastN is how close to the effective iteration budget the
+// loop gets before it stops offering the model a free choice of tool and
+// instead forces propose_changes specifically (see the ToolChoice branch in
 // Generate) — pushing it to commit to a proposal using whatever context
 // it's already gathered, rather than reading indefinitely and running out
 // the budget with nothing to show for it.
@@ -431,13 +474,56 @@ const forceProposeWithinLastN = 3
 // Observed in production: one iteration of 6 grep_theme calls (whose
 // arguments are maybe 200 tokens combined) cost 24,315 output tokens and
 // 285 of a 477-second generation's total wall clock — 60% of the run, with
-// no file changed. This constant only backs a diagnostic slog.Warn
-// (see Generate) so the pattern's real-world frequency can be measured; it
-// does not abort, truncate, or otherwise change the loop's behavior.
+// no file changed. Crossing this threshold forces propose_changes on the
+// next iteration (see Generate) rather than only logging a warning.
 const thrashOutputTokenThreshold = 5000
+
+// maxExplorationOnlyIterations forces propose_changes after this many
+// consecutive exploration-only iterations (no propose_changes), even when
+// each stayed under thrashOutputTokenThreshold — stops slow drip thrash.
+const maxExplorationOnlyIterations = 6
+
+// maxExplorationToolCalls forces propose_changes once the cumulative
+// list/read/grep count in this Generate exceeds this — a second thrash
+// brake independent of iteration count (one iteration can fire many tools).
+const maxExplorationToolCalls = 24
+
+// maxZeroToolNudges bounds how many times Generate will nudge after a
+// toolless response (DeepSeek's Anthropic-compat path does not reliably
+// honor tool_choice: any). After this many nudges, the next iteration
+// forces propose_changes instead of another identical free-choice call.
+const maxZeroToolNudges = 2
+
+// toolIterationBudget picks the tool-loop ceiling for a call from mode /
+// repair flags. Interactive builder defaults stay well under
+// maxToolIterationsCeiling; MaxToolIterations on ThemeContext overrides
+// when set (still capped).
+func toolIterationBudget(tc ThemeContext) int {
+	if tc.MaxToolIterations > 0 {
+		if tc.MaxToolIterations > maxToolIterationsCeiling {
+			return maxToolIterationsCeiling
+		}
+		return tc.MaxToolIterations
+	}
+	if tc.Repair {
+		return 8
+	}
+	switch tc.GenerationMode {
+	case GenerationModeBrand:
+		return 4
+	case GenerationModeCopy:
+		return 8
+	case GenerationModePages:
+		return 14
+	default:
+		return 12
+	}
+}
 
 // explorationToolNames are the read-only tools a tool-loop iteration can
 // call besides propose_changes — see tools.go's toolName* constants.
+// validate_changes is deliberately excluded: it is advisory validation, not
+// theme exploration, and thrash forcing keys off exploration-only turns.
 var explorationToolNames = map[string]bool{
 	toolNameListThemeFiles: true,
 	toolNameReadThemeFile:  true,
@@ -459,24 +545,9 @@ func allExplorationTools(names []string) bool {
 	return true
 }
 
-// streamAccumulateMaxAttempts is how many times a single tool-loop
-// iteration's streaming call is attempted when the provider's stream itself
-// arrives truncated/garbled mid-chunk (see isRetryableAccumulateErr) —
-// observed in production as a transport-level hiccup unrelated to the
-// request, so a short retry resolves it in practice rather than failing the
-// whole generation. streamAccumulateRetryDelay between attempts gives the
-// provider a moment to recover; 3 attempts * 5s = up to 10s of retrying
-// before giving up.
-const streamAccumulateMaxAttempts = 3
-const streamAccumulateRetryDelay = 5 * time.Second
-
-// isRetryableAccumulateErr reports whether err is message.Accumulate failing
-// to parse a truncated/garbled streamed chunk — see sanitize.go's matching
-// categorization of the same error text for what the merchant sees if every
-// retry still fails.
-func isRetryableAccumulateErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "accumulate stream")
-}
+// maxToolIterations is retained as an alias for tests that still refer to
+// the historical ceiling name — prefer toolIterationBudget / ThemeContext.
+const maxToolIterations = maxToolIterationsCeiling
 
 // defaultMaxTokens is used when AI_MAX_TOKENS (or the deprecated
 // ANTHROPIC_MAX_TOKENS) is unset — comfortably
@@ -577,7 +648,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)))
 	}
 
-	tools := toolsForMode(tc.GenerationMode)
+	tools := toolsForContext(tc)
 	// The dynamic block (pages.json, defaults.json, file tree, manifest —
 	// often several thousand tokens on a theme with many pages) is
 	// byte-identical across every iteration of THIS call's tool loop and
@@ -616,37 +687,49 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	// means "not reported by this provider," not "confirmed zero."
 	var totalReasoningTokens int64
 	reasoningTokensReported := false
+	iterationBudget := toolIterationBudget(tc)
+	callEffort := resolveEffort(tc, g.effort)
+	callMaxTokens := resolveMaxTokens(tc, g.maxTokens, g.tokenBudgets)
+	forceProposeNext := false
+	explorationOnlyStreak := 0
+	zeroToolNudges := 0
+	readPathCounts := map[string]int{}
+	var firstTokenLogged bool
+	var ttftMs int64
 	defer func() {
 		slog.Info("ai: generate call finished",
+			"provider", g.provider,
+			"model", g.modelName,
 			"iterations_used", iterationsUsed,
+			"iteration_budget", iterationBudget,
+			"effort", string(callEffort),
+			"max_tokens", callMaxTokens,
+			"repair", tc.Repair,
 			"elapsed_ms", time.Since(generateStart).Milliseconds(),
+			"ttft_ms", ttftMs,
 			"model_elapsed_ms", totalModelElapsed.Milliseconds(),
 			"tool_elapsed_ms", totalToolElapsed.Milliseconds(),
 			"total_input_tokens", totalInputTokens,
 			"total_output_tokens", totalOutputTokens,
 			"total_reasoning_tokens", totalReasoningTokens,
-			"reasoning_tokens_reported", reasoningTokensReported)
+			"reasoning_tokens_reported", reasoningTokensReported,
+			"exploration_tool_calls", explorationToolCalls,
+			"zero_tool_nudges", zeroToolNudges)
 	}()
-	for iteration := 0; iteration < maxToolIterations; iteration++ {
+	for iteration := 0; iteration < iterationBudget; iteration++ {
 		iterationsUsed = iteration + 1
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
-		forcingPropose := iteration >= maxToolIterations-forceProposeWithinLastN
+		forcingPropose := forceProposeNext || iteration >= iterationBudget-forceProposeWithinLastN
+		forceProposeNext = false
 		if forcingPropose {
-			// Near the ceiling: stop offering read/explore tools as an equally
-			// valid choice and force propose_changes specifically, so the model
-			// commits to a proposal from whatever it's already gathered instead
-			// of spending its last few iterations reading more and running out
-			// the clock with nothing produced. If it still doesn't call
-			// propose_changes (calls something else anyway, or errors), the loop
-			// falls through to the usual "did not call propose_changes" failure
-			// below — no special handling needed beyond making this attempt happen.
 			toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
 			slog.Info("ai: forcing propose_changes near tool-loop budget ceiling",
-				"iteration", iteration, "max_tool_iterations", maxToolIterations)
+				"iteration", iteration, "max_tool_iterations", iterationBudget,
+				"provider", g.provider, "model", g.modelName)
 		}
 		params := anthropic.MessageNewParams{
 			Model:      callModel,
-			MaxTokens:  g.maxTokens,
+			MaxTokens:  callMaxTokens,
 			System:     system,
 			Messages:   messages,
 			Tools:      tools,
@@ -679,7 +762,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// sending a value that model can't accept.
 		if modelSupportsAdaptiveThinking(callModel) {
 			params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}}
-			params.OutputConfig = anthropic.OutputConfigParam{Effort: g.effort}
+			params.OutputConfig = anthropic.OutputConfigParam{Effort: callEffort}
 		}
 		var message anthropic.Message
 		// modelCallStart/attemptsUsed cover every streamAccumulateMaxAttempts
@@ -688,52 +771,44 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// attempts_used is logged alongside elapsed_ms below.
 		modelCallStart := time.Now()
 		attemptsUsed := 0
+		var streamRetryCount int
 		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
 			attemptsUsed = attempt
-			stream := g.client.Messages.NewStreaming(ctx, params)
-			message = anthropic.Message{}
-			emitted := 0
-			var accumulateErr error
-			// Fresh per attempt, same as message/emitted above: a retried
-			// attempt is its own streaming API call with its own text run,
-			// and coalescer.flush() below already empties it before the next
-			// attempt/iteration could otherwise reuse a stale buffer. Note
-			// this does mean a retry re-emits onDelta from the start of this
-			// iteration's text — acceptable since the failure this retries
-			// (see isRetryableAccumulateErr) happens while parsing a
-			// tool_use block's arguments, which iterations that narrate
-			// meaningful text rarely reach before it would have failed.
-			coalescer := newDeltaCoalescer(onDelta)
-			for stream.Next() {
-				if err := message.Accumulate(stream.Current()); err != nil {
-					accumulateErr = fmt.Errorf("accumulate stream: %w", err)
-					break
-				}
-				if full := currentText(message); len(full) > emitted {
-					coalescer.add(full[emitted:])
-					emitted = len(full)
-				}
-			}
-			// Whatever's still buffered when this attempt ends must go out
-			// now — otherwise the last <80-char, <200ms fragment of a turn's
-			// narration (very often the tail end, since a stream just ending
-			// is exactly when there's no more input to trigger the next
-			// add() call that would have flushed it) is silently lost.
-			coalescer.flush()
-			if accumulateErr == nil {
-				if err := stream.Err(); err != nil {
-					return nil, fmt.Errorf("claude stream: %w", err)
-				}
+			msg, meta, streamErr := g.consumeProviderStream(ctx, params, onDelta, attempt, iteration, generateStart, &firstTokenLogged, &ttftMs)
+			message = msg
+			if streamErr == nil {
+				logStreamAttempt(g, iteration, meta, message, nil, "success")
 				break
 			}
-			if !isRetryableAccumulateErr(accumulateErr) || attempt == streamAccumulateMaxAttempts {
-				return nil, accumulateErr
+			retryable := isRetryableStreamErr(streamErr)
+			canRetry := retryable && attempt < streamAccumulateMaxAttempts
+			retryDecision := "fail"
+			switch {
+			case canRetry:
+				retryDecision = "retry"
+				streamRetryCount++
+			case !retryable:
+				retryDecision = "no_retry_not_retryable"
+			default:
+				retryDecision = "no_retry_budget_exhausted"
 			}
-			// The provider's stream arrived truncated/garbled mid-chunk — a
-			// transport-level hiccup, not anything about this request — so a
-			// short pause and a fresh attempt resolves it in practice.
-			slog.Warn("ai: provider stream truncated/garbled, retrying", "attempt", attempt,
-				"max_attempts", streamAccumulateMaxAttempts, "error", accumulateErr.Error())
+			meta.RetryDecision = retryDecision
+			logStreamAttempt(g, iteration, meta, message, streamErr, retryDecision)
+			slog.Warn("ai: provider stream failed",
+				"provider", g.provider,
+				"model", g.modelName,
+				"iteration", iteration,
+				"attempt", attempt,
+				"stream_elapsed_ms", meta.StreamDurationMs,
+				"last_progress_ms", meta.IdleWaitMs,
+				"error_type", classifyStreamErr(streamErr),
+				"retry_decision", retryDecision,
+				"retry_count", streamRetryCount,
+				"max_attempts", streamAccumulateMaxAttempts,
+				"error", streamErr.Error())
+			if !canRetry {
+				return nil, streamErr
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -795,9 +870,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// iteration 2+ means caching is actually working (whether or not
 		// Anthropic's cache_control is what triggered it).
 		slog.Info("ai: model call timing",
+			"provider", g.provider,
+			"model", g.modelName,
 			"iteration", iteration,
 			"elapsed_ms", modelElapsed.Milliseconds(),
 			"attempts_used", attemptsUsed,
+			"stream_retry_count", streamRetryCount,
 			"forcing_propose", forcingPropose,
 			"input_tokens", message.Usage.InputTokens,
 			"output_tokens", message.Usage.OutputTokens,
@@ -809,15 +887,28 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			"text_chars", textChars,
 			"tool_use_count", len(toolUses))
 
-		// Flags, never controls: an iteration that called only read-only
-		// exploration tools (no propose_changes) yet still burned a large
-		// amount of output is the "thrash" pattern observed in production
-		// — see thrashOutputTokenThreshold's own doc comment for the
-		// 24,315-token/6-grep-call case that motivated this. Purely
-		// diagnostic — nothing about the loop's own behavior changes here.
-		if allExplorationTools(toolNames) && message.Usage.OutputTokens > thrashOutputTokenThreshold {
-			slog.Warn("ai: tool-loop iteration spent unusually many output tokens on exploration only",
-				"iteration", iteration, "output_tokens", message.Usage.OutputTokens, "tools_called", toolNames)
+		// Thrash brake: exploration-only iterations that burn huge output
+		// tokens (or too many consecutive exploration turns / tool calls)
+		// force propose_changes on the next iteration instead of only
+		// logging — see thrashOutputTokenThreshold's doc comment.
+		if !tc.DisableExplorationBrake && allExplorationTools(toolNames) {
+			explorationOnlyStreak++
+			if message.Usage.OutputTokens > thrashOutputTokenThreshold {
+				slog.Warn("ai: tool-loop thrash — forcing propose_changes next",
+					"iteration", iteration, "output_tokens", message.Usage.OutputTokens, "tools_called", toolNames)
+				forceProposeNext = true
+			} else if explorationOnlyStreak >= maxExplorationOnlyIterations {
+				slog.Warn("ai: exploration-only streak exceeded — forcing propose_changes next",
+					"iteration", iteration, "streak", explorationOnlyStreak)
+				forceProposeNext = true
+			}
+		} else if !allExplorationTools(toolNames) {
+			explorationOnlyStreak = 0
+		}
+		if !tc.DisableExplorationBrake && explorationToolCalls >= maxExplorationToolCalls {
+			slog.Warn("ai: exploration tool-call budget exceeded — forcing propose_changes next",
+				"iteration", iteration, "exploration_tool_calls", explorationToolCalls)
+			forceProposeNext = true
 		}
 
 		// StopReason == "max_tokens" means Claude was cut off mid-stream —
@@ -856,6 +947,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			// Counts how often this nudge fires — see theory 3 (wasted
 			// round-trips) in the diagnostics task this instruments.
 			slog.Warn("ai: tool-loop nudge fired (zero tool calls despite forced tool_choice)", "iteration", iteration)
+			zeroToolNudges++
 			// Real Anthropic's ToolChoice: OfAny guarantees at least one tool
 			// call. DeepSeek's Anthropic-compat endpoint does NOT honor that
 			// guarantee — confirmed empirically: a plain "hello"/"hi" gets a
@@ -865,10 +957,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			// whole generation over that would turn every greeting into an
 			// error. Nudge instead: replay the model's own toolless turn,
 			// tell it a tool call is required, and let the loop's own
-			// budget (maxToolIterations, forcingPropose near the ceiling)
+			// budget (iterationBudget, forcingPropose near the ceiling)
 			// bound how long this can go on — same safety net as the normal
 			// tool-call path below, just without a real tool_result to reply
-			// with.
+			// with. After maxZeroToolNudges, force propose_changes next
+			// instead of another free-choice nudge (DeepSeek was observed
+			// repeating the same toolless reply).
 			messages = append(messages, message.ToParam())
 			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(
 				"You must call one of the available tools on every turn — propose_changes if you already have enough "+
@@ -876,6 +970,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 					"answered_question: true, and the reply in `summary` is correct), or a read/explore tool otherwise. "+
 					"A plain text reply with no tool call is not valid here.",
 			)))
+			if zeroToolNudges >= maxZeroToolNudges {
+				forceProposeNext = true
+			}
 			continue
 		}
 
@@ -888,17 +985,13 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		resultBlocks := make([]anthropic.ContentBlockParamUnion, 0, len(toolUses))
 		for _, tu := range toolUses {
-			// propose_changes was already "executed" above (parsed, edits
-			// materialized) — reaching this loop for it at all means that
-			// failed, so its tool_result is the failure description rather
-			// than a real toolExec call (propose_changes isn't one of
-			// ToolExecutor's tools; calling toolExec with it would just
-			// error "unknown tool").
 			if tu.Name == toolNameProposeChanges {
 				resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, materializeFailureMsg, true))
 				continue
 			}
-			explorationToolCalls++
+			if explorationToolNames[tu.Name] {
+				explorationToolCalls++
+			}
 			if progress != nil {
 				progress.ToolStarted(tu.Name, tu.Input)
 			}
@@ -906,27 +999,29 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			output, err := toolExec(ctx, tu.Name, tu.Input)
 			toolElapsed := time.Since(toolCallStart)
 			totalToolElapsed += toolElapsed
-			// Distinguishes tool-execution latency (an HTTP round trip to
-			// FlowPOS) from model latency logged above — see "ai: model call
-			// timing".
-			slog.Info("ai: tool exec timing", "iteration", iteration, "tool", tu.Name, "elapsed_ms", toolElapsed.Milliseconds(), "error", err != nil)
+			slog.Info("ai: tool exec timing",
+				"provider", g.provider, "model", g.modelName,
+				"iteration", iteration, "tool", tu.Name,
+				"elapsed_ms", toolElapsed.Milliseconds(), "error", err != nil)
 			isError := err != nil
 			if progress != nil {
-				// Summarized from output/err before output is overwritten
-				// below with err.Error() — summarizeToolResult wants the
-				// real error, not the string it gets turned into for the
-				// model's own tool_result block.
 				progress.ToolFinished(tu.Name, summarizeToolResult(tu.Name, output, err), err)
 			}
 			if err != nil {
 				output = err.Error()
+			} else if tu.Name == toolNameReadThemeFile {
+				output = excerptReadThemeFileResult(output)
+				output, forceProposeNext = compactReadThemeFileResult(output, tu.Input, readPathCounts, forceProposeNext)
 			}
 			resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, output, isError))
 		}
 		messages = append(messages, anthropic.NewUserMessage(resultBlocks...))
+		if !tc.DisableExplorationBrake && explorationToolCalls >= maxExplorationToolCalls {
+			forceProposeNext = true
+		}
 	}
 
-	return nil, fmt.Errorf("model did not call propose_changes within %d tool-loop iterations", maxToolIterations)
+	return nil, fmt.Errorf("model did not call propose_changes within %d tool-loop iterations", iterationBudget)
 }
 
 // summarizeMaxTokens caps the summary completion — this is a cheap plain-
@@ -1014,10 +1109,17 @@ Rules for every request:
    never an attempted or completed change) and rule 15.
 8. Before you modify any existing file, read it with read_theme_file — never write a file you
    have not read, and never guess at its current content. Emit only files whose content actually
-   changes as a result of this request.
-9. Use list_theme_files/read_theme_file/grep_theme as needed to explore the theme before you
-   finalize anything. Call propose_changes exactly once, when you're done, with the complete,
-   final set of changes for this request — not a partial draft.`, themeEngineSpec),
+   changes as a result of this request. Prefer action "edit" (old_string/new_string) for large
+   existing files instead of re-emitting the whole file as action "update".
+9. Use list_theme_files/read_theme_file/grep_theme sparingly — targeted reads only, then call
+   propose_changes. Do not explore broadly when the merchant already named the target (header,
+   footer, a page). If a read_theme_file result says content was omitted, request another read of
+   only the section you need rather than the whole file again.
+10. Interactive edits must finish promptly: when the merchant asks to change/redesign something
+    they already named (e.g. "change the header"), make one reasonable, bounded visual improvement
+    that matches defaults.json — do not spend many tool rounds then return needs_clarification
+    with no files. Ask for clarification only when you truly cannot act safely; if you must ask,
+    call propose_changes with needs_clarification immediately (no long exploration first).`, themeEngineSpec),
 		CacheControl: cacheControl,
 	}
 }

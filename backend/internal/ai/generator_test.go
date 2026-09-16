@@ -270,12 +270,12 @@ func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {
 		return "[]", nil
 	}
 
-	_, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, nil, nil, toolExec, nil)
+	_, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo", MaxToolIterations: maxToolIterationsCeiling, DisableExplorationBrake: true}, nil, "do something", nil, nil, nil, toolExec, nil)
 	if err == nil {
 		t.Fatal("expected an error once the iteration cap is hit")
 	}
-	if calls != maxToolIterations {
-		t.Errorf("expected exactly %d calls (the iteration cap), got %d", maxToolIterations, calls)
+	if calls != maxToolIterationsCeiling {
+		t.Errorf("expected exactly %d calls (the iteration cap), got %d", maxToolIterationsCeiling, calls)
 	}
 }
 
@@ -288,7 +288,7 @@ func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {
 // and running out the clock with nothing produced.
 func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 	calls := 0
-	forceBoundary := maxToolIterations - forceProposeWithinLastN // 0-indexed iteration where forcing begins
+	forceBoundary := maxToolIterationsCeiling - forceProposeWithinLastN // 0-indexed iteration where forcing begins
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		iteration := calls - 1 // Generate's loop is 0-indexed
@@ -325,7 +325,7 @@ func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 		return "[]", nil
 	}
 
-	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, nil, nil, toolExec, nil)
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo", MaxToolIterations: maxToolIterationsCeiling, DisableExplorationBrake: true}, nil, "do something", nil, nil, nil, toolExec, nil)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}

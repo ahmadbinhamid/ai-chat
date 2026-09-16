@@ -110,27 +110,33 @@ func TestToolProgressEmitter_ToolStarted_TruncatesLongPattern(t *testing.T) {
 // TestToolProgressEmitter_ToolFinished_EmitsEvenOnError is item 4:
 // tool_result must always be emitted, including when the tool itself
 // failed — the step list should show the failure, not a step that
-// silently never resolves.
+// silently never resolves. tool_result is live-only (emitLive), so this
+// asserts via the in-process bus rather than generation_events.
 func TestToolProgressEmitter_ToolFinished_EmitsEvenOnError(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
 	ctx := context.Background()
 	chatID := uuid.NewString()
 	genID := seedGeneration(t, repo, chatID)
-	emitter := newEventEmitter(ctx, repo, nil, genID, chatID)
+	bus := newInProcessEventBus()
+	ch, unsub := bus.Subscribe(ctx, chatID)
+	defer unsub()
+	emitter := newEventEmitter(ctx, repo, bus, genID, chatID)
 	tp := toolProgressFor(ctx, emitter)
 
 	tp.ToolFinished("read_theme_file", "3 lines", nil)
 	tp.ToolFinished("grep_theme", "failed: boom", errors.New("boom"))
 
-	events, err := repo.GetEventsSince(ctx, chatID, 0)
-	if err != nil {
-		t.Fatalf("GetEventsSince failed: %v", err)
+	got := make([]GenerationEvent, 0, 2)
+	for len(got) < 2 {
+		select {
+		case ev := <-ch:
+			got = append(got, ev)
+		case <-ctx.Done():
+			t.Fatal("context canceled waiting for live tool_result")
+		}
 	}
-	if len(events) != 2 {
-		t.Fatalf("expected 2 tool_result events (success and failure both emit), got %d: %+v", len(events), events)
-	}
-	for _, ev := range events {
+	for _, ev := range got {
 		if ev.Type != EventTypeToolResult {
 			t.Errorf("expected %q, got %q", EventTypeToolResult, ev.Type)
 		}
@@ -139,16 +145,26 @@ func TestToolProgressEmitter_ToolFinished_EmitsEvenOnError(t *testing.T) {
 	var successPayload, failurePayload struct {
 		Summary string `json:"summary"`
 	}
-	if err := json.Unmarshal(events[0].Payload, &successPayload); err != nil {
+	if err := json.Unmarshal(got[0].Payload, &successPayload); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if successPayload.Summary != "3 lines" {
 		t.Errorf("expected summary %q, got %q", "3 lines", successPayload.Summary)
 	}
-	if err := json.Unmarshal(events[1].Payload, &failurePayload); err != nil {
+	if err := json.Unmarshal(got[1].Payload, &failurePayload); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if failurePayload.Summary != "failed: boom" {
 		t.Errorf("expected the error summary to be emitted, got %q", failurePayload.Summary)
+	}
+
+	events, err := repo.GetEventsSince(ctx, chatID, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince failed: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Type == EventTypeToolResult {
+			t.Fatalf("tool_result must not be durably persisted, found %+v", ev)
+		}
 	}
 }

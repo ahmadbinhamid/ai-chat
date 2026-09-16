@@ -491,8 +491,17 @@ func (s *Service) checkAndRepair(
 		turns = append(turns, ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)})
 		repair := repairPrompt(errorFindings)
 
+		repairTC := tc
+		repairTC.Repair = true
+		repairTC.EffortOverride = "medium"
+		// Targeted repair: drop full theme tree/manifest from the dynamic
+		// system prompt — recapAssistantTurn + repairPrompt already carry
+		// affected file bodies and findings. toolsForContext(Repair) also
+		// drops list/grep so the model cannot re-explore the whole theme.
+		repairTC.FileTree = nil
+		repairTC.Manifest = nil
 		repairStart := time.Now()
-		retried, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(repair, in), imagesFromInput(in), onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
+		retried, genErr := s.gen.Generate(ctx, repairTC, turns, promptWithHTMLAttachment(repair, in), imagesFromInput(in), onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
 		repairElapsed := time.Since(repairStart)
 		if genErr != nil {
 			// Surfaced distinctly from the generic reaper cleanup: without
@@ -500,12 +509,22 @@ func (s *Service) checkAndRepair(
 			// budget (ctx canceled mid-call) produces no log of its own —
 			// the chat just sits on "repairing" until the reaper's 1-minute
 			// sweep marks it failed, with nothing in the logs explaining why.
-			slog.Error("repair generation failed", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
-				"attempt", attempt, "elapsed", repairElapsed, "error", genErr)
+			slog.Error("repair generation failed",
+				"retry_reason", "themecheck_repair",
+				"retry_stage", "generate",
+				"attempt", attempt,
+				"elapsed_ms", repairElapsed.Milliseconds(),
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+				"error", genErr)
 			return nil, nil, fmt.Errorf("retry generation: %w", genErr)
 		}
-		slog.Info("repair generation completed", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
-			"attempt", attempt, "elapsed", repairElapsed, "input_tokens", retried.InputTokens, "output_tokens", retried.OutputTokens)
+		slog.Info("repair generation completed",
+			"retry_reason", "themecheck_repair",
+			"retry_stage", "generate",
+			"attempt", attempt,
+			"elapsed_ms", repairElapsed.Milliseconds(),
+			"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+			"input_tokens", retried.InputTokens, "output_tokens", retried.OutputTokens)
 		totalInput += retried.InputTokens
 		totalOutput += retried.OutputTokens
 		turns = append(turns, ai.Turn{Role: "user", Content: repair})

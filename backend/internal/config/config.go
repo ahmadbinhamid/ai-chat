@@ -77,6 +77,12 @@ type Config struct {
 	// failing with "truncated at the max_tokens limit" more than
 	// occasionally on complex prompts.
 	MaxTokens int64
+	// Token budget subclasses under MaxTokens — see ai.TokenBudgets /
+	// AI_MAX_TOKENS_INTERACTIVE / _REPAIR / _COMPLEX / _BRAND.
+	MaxTokensInteractive int64
+	MaxTokensBrand       int64
+	MaxTokensComplex     int64
+	MaxTokensRepair      int64
 
 	// DeepSeek — only read/required when AIProvider == "deepseek".
 	DeepSeekAPIKey  string
@@ -154,6 +160,17 @@ type Config struct {
 	// previous 10MB high-water mark.) Still far short of "an attacker can
 	// meaningfully exhaust memory with one call."
 	MaxRequestBodyBytes int64
+
+	// StreamIdleTimeout is how long one provider NewStreaming attempt may
+	// block without an SSE event before ai.Generator cancels that attempt
+	// (independent of the 65-minute generation timeout). See
+	// AI_STREAM_IDLE_TIMEOUT_MS.
+	StreamIdleTimeout time.Duration
+
+	// ThemeWorkspaceDir is the on-disk root for per-tenant local-first theme
+	// caches (CPU filesystem/search — not a local LLM). Empty disables the
+	// workspace and keeps FlowPOS HTTP as the sole theme store.
+	ThemeWorkspaceDir string
 }
 
 // Load reads configuration from the process environment. Callers are
@@ -190,8 +207,12 @@ func Load() Config {
 		AnthropicAPIKey:      os.Getenv("ANTHROPIC_API_KEY"),
 		AnthropicModel:       getenv("ANTHROPIC_MODEL", "claude-opus-5"),
 		AnthropicVisionModel: getenv("ANTHROPIC_VISION_MODEL", ""),
-		Effort:               getenvDeprecated("AI_EFFORT", "ANTHROPIC_EFFORT", "xhigh"),
+		Effort:               getenvDeprecated("AI_EFFORT", "ANTHROPIC_EFFORT", "medium"),
 		MaxTokens:            int64(getenvIntDeprecated("AI_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS", 64000)),
+		MaxTokensInteractive: int64(getenvInt("AI_MAX_TOKENS_INTERACTIVE", 16000)),
+		MaxTokensBrand:       int64(getenvInt("AI_MAX_TOKENS_BRAND", 8000)),
+		MaxTokensComplex:     int64(getenvInt("AI_MAX_TOKENS_COMPLEX", 24000)),
+		MaxTokensRepair:      int64(getenvInt("AI_MAX_TOKENS_REPAIR", 8000)),
 		FakeAIMode:           getenvBool("AI_CHAT_FAKE_MODE", false),
 		FakeAIDelay:          time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
@@ -209,6 +230,9 @@ func Load() Config {
 		RedisURL: os.Getenv("REDIS_URL"),
 
 		MaxRequestBodyBytes: int64(getenvInt("MAX_REQUEST_BODY_BYTES", 45*1024*1024)),
+
+		StreamIdleTimeout: time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_MS", 12000)) * time.Millisecond,
+		ThemeWorkspaceDir: getenv("THEME_WORKSPACE_DIR", "tmp/theme-workspaces"),
 	}
 }
 

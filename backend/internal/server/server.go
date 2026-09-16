@@ -59,6 +59,15 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 			return nil, err
 		}
 	}
+	if !cfg.FakeAIMode {
+		generator.SetTokenBudgets(ai.TokenBudgets{
+			Interactive: cfg.MaxTokensInteractive,
+			Brand:       cfg.MaxTokensBrand,
+			Complex:     cfg.MaxTokensComplex,
+			Repair:      cfg.MaxTokensRepair,
+		})
+		generator.SetStreamIdleTimeout(cfg.StreamIdleTimeout)
+	}
 	store := themefs.NewStore(cfg.FlowposAPIBase)
 
 	rdb, err := themebuild.NewRedisClient(cfg.RedisURL)
@@ -76,6 +85,10 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	buildRepo := themebuild.NewRepository(conn)
 	buildSvc := themebuild.NewService(buildRepo, chatSvc, generator, store, rdb)
 	buildSvc.SetHistorySummarizationEnabled(cfg.HistorySummarizationEnabled)
+	if cfg.ThemeWorkspaceDir != "" {
+		buildSvc.SetThemeWorkspaceRoot(cfg.ThemeWorkspaceDir)
+		logger.Info("theme workspace enabled", "dir", cfg.ThemeWorkspaceDir)
+	}
 
 	limiter := ratelimit.NewPerTenantLimiter(cfg.GenerationRateLimitPerMinute)
 

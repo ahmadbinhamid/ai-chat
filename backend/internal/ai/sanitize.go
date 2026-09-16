@@ -69,6 +69,12 @@ func categorizeError(err error) string {
 	if errors.Is(err, errMaxTokensTruncated) {
 		return "the response was too large to complete — please try a smaller request"
 	}
+	if errors.Is(err, errStreamIdleTimeout) {
+		return "the request timed out — please try again"
+	}
+	if errors.Is(err, errStreamTruncated) {
+		return "the connection to the AI provider was interrupted mid-response — please try again"
+	}
 
 	var netErr net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
@@ -77,7 +83,8 @@ func categorizeError(err error) string {
 
 	lower := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(lower, "accumulate stream") || strings.Contains(lower, "error converting content block to json"):
+	case strings.Contains(lower, "accumulate stream") || strings.Contains(lower, "error converting content block to json") ||
+		strings.Contains(lower, "provider stream truncated") || strings.Contains(lower, "provider stream idle"):
 		// The provider's streamed response was cut off or garbled mid-chunk
 		// before the SDK could reassemble it into valid JSON (seen in
 		// production as both "unexpected end of JSON input" and "invalid

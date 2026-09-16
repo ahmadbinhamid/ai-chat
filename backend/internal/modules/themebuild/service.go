@@ -18,6 +18,7 @@ import (
 	"ai-chat/internal/safego"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
+	"ai-chat/internal/themeworkspace"
 	"ai-chat/internal/urlfetch"
 
 	"github.com/google/uuid"
@@ -235,6 +236,10 @@ type Service struct {
 	historySummarizationEnabled bool
 	historySummaries            *historySummaryCache
 	historySummaryLocks         *stripedMutex
+	// workspaceRoot, when non-empty, enables local-first theme mirrors for
+	// generation reads/greps (see themeworkspace). Set once via
+	// SetThemeWorkspaceRoot from server wiring.
+	workspaceRoot string
 }
 
 // SetHistorySummarizationEnabled overrides the default (enabled) — see the
@@ -243,6 +248,13 @@ type Service struct {
 // concurrently with a generation already reading the field.
 func (s *Service) SetHistorySummarizationEnabled(enabled bool) {
 	s.historySummarizationEnabled = enabled
+}
+
+// SetThemeWorkspaceRoot enables local-first on-disk theme mirrors under
+// root (CPU filesystem/search only — never a local LLM). Empty disables.
+// Call once at process startup from server wiring.
+func (s *Service) SetThemeWorkspaceRoot(root string) {
+	s.workspaceRoot = strings.TrimSpace(root)
 }
 
 // NewService wires the service's dependencies. rdb may be nil (see
@@ -763,6 +775,11 @@ func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) 
 func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Generation) {
 	emitter := newEventEmitter(ctx, s.repo, s.bus, g.ID, c.ID)
 	emitter.emit(ctx, EventTypeDequeued, struct{}{})
+	if g.QueuedAt != nil {
+		slog.Info("ai: queue wait",
+			"chat_id", c.ID, "generation_id", g.ID,
+			"queue_wait_ms", time.Since(*g.QueuedAt).Milliseconds())
+	}
 
 	token, ok := s.tokens.take(g.ID)
 	if !ok {
@@ -1288,7 +1305,38 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	if err != nil {
 		return fmt.Errorf("load draft overlay: %w", err)
 	}
-	store := themefs.NewOverlayStore(s.store, draft)
+	// Local-first: sync theme to on-disk workspace (CPU mirror), then layer
+	// draft overlay + generation cache. DeepSeek remains the only model.
+	baseStore := s.store
+	if s.workspaceRoot != "" {
+		mgr := themeworkspace.NewManager(s.workspaceRoot)
+		if ws, wsErr := mgr.Open(in.TenantID, in.ThemeSlug, s.store); wsErr != nil {
+			slog.Warn("themeworkspace: open failed, using remote store",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "error", wsErr)
+		} else {
+			syncStats, syncErr := ws.EnsureSynced(ctx, storeAuth)
+			if syncErr != nil {
+				slog.Warn("themeworkspace: sync failed, using remote store",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "error", syncErr)
+			} else {
+				slog.Info("ai: local workspace ready",
+					"chat_id", c.ID, "listed", syncStats.Listed,
+					"fetched", syncStats.Fetched, "skipped", syncStats.Skipped,
+					"sync_ms", syncStats.ElapsedMs)
+				baseStore = themeworkspace.Store{Workspace: ws}
+			}
+		}
+	}
+	// CachingStore wraps the draft overlay for this generation only — so
+	// buildThemeContext, buildSnapshotBase, read_theme_file, and grep_theme
+	// share ListFiles/ReadFile results instead of re-hitting FlowPOS for the
+	// same paths. Scoped to this call; never shared across tenants/gens.
+	store := themefs.NewCachingStore(themefs.NewOverlayStore(baseStore, draft))
+	defer func() {
+		hits, misses, invalidated := store.Stats()
+		slog.Info("ai: theme cache stats",
+			"chat_id", c.ID, "cache_hits", hits, "cache_misses", misses, "cache_invalidated", invalidated)
+	}()
 
 	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
@@ -1493,12 +1541,23 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
+	emitter.emit(ctx, EventTypeLoadingTheme, struct{}{})
+	preModelStart := time.Now()
 	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)
 	if err != nil {
 		return fmt.Errorf("load theme context: %w", err)
 	}
 	tc.GenerationMode = in.Mode
+	prompt := in.Prompt
+	if isSimpleInteractiveEdit(in.Prompt, in.Mode) {
+		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 6 {
+			tc.MaxToolIterations = 6
+		}
+		prompt = in.Prompt + "\n\n[system hint: simple interactive edit — make one reasonable, bounded visual improvement to the named target that matches defaults.json; prefer propose_changes with action \"edit\"; do not explore broadly; only set needs_clarification if you truly cannot act safely, and if so ask immediately.]"
+		slog.Info("ai: simple-edit fast path", "chat_id", c.ID, "max_tool_iterations", tc.MaxToolIterations)
+	}
 
+	emitter.emit(ctx, EventTypePreparingContext, struct{}{})
 	snapBase, err := s.buildSnapshotBase(ctx, store, storeAuth)
 	if err != nil {
 		return fmt.Errorf("build snapshot base: %w", err)
@@ -1508,7 +1567,10 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	readFile := s.buildFileReader(store, storeAuth)
 
 	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
-	result, turns, err := s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
+	slog.Info("ai: pre-model phase finished",
+		"chat_id", c.ID, "pre_model_ms", time.Since(preModelStart).Milliseconds())
+	emitter.emit(ctx, EventTypePreparingAI, struct{}{})
+	result, turns, err := s.generateValidProposal(ctx, tc, turns, prompt, toolExec, readFile, emitter, in)
 	if err != nil {
 		return err
 	}
@@ -1758,11 +1820,9 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 	g.Go(func() (err error) { defaultsJSON, err = store.ReadFile(gctx, storeAuth, pathDefaultsJSON); return })
 	g.Go(func() (err error) { tree, err = store.ListFiles(gctx, storeAuth); return })
 	g.Go(func() error {
-		mg, ok := s.store.(manifestGenerator)
-		if !ok {
-			return nil
-		}
-		m, err := mg.GetOrGenerateManifest(gctx, storeAuth)
+		// Build through the generation-scoped store (overlay + cache) so
+		// component reads reuse FlowPOS work already paid for this turn.
+		m, err := themefs.GenerateManifestFrom(gctx, storeAuth, store)
 		if err != nil {
 			return fmt.Errorf("build manifest: %w", err)
 		}
@@ -1800,13 +1860,26 @@ func (s *Service) buildSnapshotBase(ctx context.Context, store themefs.ThemeStor
 	paths := make(map[string]bool)
 	flattenFileTree(tree, paths)
 
-	files := make(map[string]string, 4)
-	for _, path := range []string{pathPagesJSON, pathDefaultsJSON, pathLayoutStart, pathLayoutEnd} {
-		content, err := store.ReadFile(ctx, storeAuth, path)
-		if err != nil {
-			return themecheck.Snapshot{}, fmt.Errorf("read %s: %w", path, err)
-		}
-		files[path] = content
+	required := []string{pathPagesJSON, pathDefaultsJSON, pathLayoutStart, pathLayoutEnd}
+	files := make(map[string]string, len(required))
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(loadThemeFilesConcurrency)
+	for _, p := range required {
+		p := p
+		g.Go(func() error {
+			content, err := store.ReadFile(gctx, storeAuth, p)
+			if err != nil {
+				return fmt.Errorf("read %s: %w", p, err)
+			}
+			mu.Lock()
+			files[p] = content
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return themecheck.Snapshot{}, err
 	}
 	return themecheck.Snapshot{Files: files, Paths: paths}, nil
 }

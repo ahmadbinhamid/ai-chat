@@ -139,15 +139,15 @@ func TestLoad_EffortAndMaxTokensDeprecatedFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("neither set - existing defaults unchanged", func(t *testing.T) {
+	t.Run("neither set - interactive defaults", func(t *testing.T) {
 		t.Setenv("AI_EFFORT", "")
 		t.Setenv("ANTHROPIC_EFFORT", "")
 		t.Setenv("AI_MAX_TOKENS", "")
 		t.Setenv("ANTHROPIC_MAX_TOKENS", "")
 
 		cfg := Load()
-		if cfg.Effort != "xhigh" {
-			t.Errorf("Effort = %q, want default %q", cfg.Effort, "xhigh")
+		if cfg.Effort != "medium" {
+			t.Errorf("Effort = %q, want default %q", cfg.Effort, "medium")
 		}
 		if cfg.MaxTokens != 64000 {
 			t.Errorf("MaxTokens = %d, want default %d", cfg.MaxTokens, 64000)

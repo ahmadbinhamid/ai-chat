@@ -73,7 +73,9 @@ func (p toolProgressEmitter) ToolStarted(name string, input json.RawMessage) {
 // failure ("failed: ..." — see summarizeToolResult), so this would just be
 // the same information twice.
 func (p toolProgressEmitter) ToolFinished(_ string, summary string, _ error) {
-	p.emitter.emit(p.ctx, EventTypeToolResult, map[string]string{"summary": summary})
+	// tool_result is high-frequency narration — live bus only, not durable
+	// generation_events (reconnect still has tool_call + lifecycle events).
+	p.emitter.emitLive(p.ctx, EventTypeToolResult, map[string]string{"summary": summary})
 }
 
 // onThinkingDelta builds the onDelta callback passed to ai.Generate — routes

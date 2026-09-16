@@ -176,6 +176,9 @@ func validateChangesTool() anthropic.ToolUnionParam {
 // still get rejected later for violating the mode restriction. Not
 // offering the tool at all in brand mode is what keeps that gap closed,
 // rather than teaching themecheck about modes it was never meant to know.
+//
+// Repair mode (ThemeContext.Repair) narrows to read + validate + propose —
+// no list/grep exploration during themecheck fix rounds.
 func toolsForMode(mode string) []anthropic.ToolUnionParam {
 	if mode == GenerationModeBrand {
 		return []anthropic.ToolUnionParam{proposeChangesTool()}
@@ -183,4 +186,14 @@ func toolsForMode(mode string) []anthropic.ToolUnionParam {
 	return []anthropic.ToolUnionParam{
 		listThemeFilesTool(), readThemeFileTool(), grepThemeTool(), validateChangesTool(), proposeChangesTool(),
 	}
+}
+
+// toolsForContext is toolsForMode plus repair narrowing when tc.Repair.
+func toolsForContext(tc ThemeContext) []anthropic.ToolUnionParam {
+	if tc.Repair {
+		return []anthropic.ToolUnionParam{
+			readThemeFileTool(), validateChangesTool(), proposeChangesTool(),
+		}
+	}
+	return toolsForMode(tc.GenerationMode)
 }

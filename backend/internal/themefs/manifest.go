@@ -104,7 +104,14 @@ func isComponentOrPartial(path string) bool {
 // file + infer every component's params); see GetOrGenerateManifest for
 // the cached version most callers want instead.
 func (s *Store) GenerateManifest(ctx context.Context, auth RequestAuth) (Manifest, error) {
-	tree, err := s.ListFiles(ctx, auth)
+	return GenerateManifestFrom(ctx, auth, s)
+}
+
+// GenerateManifestFrom builds a Manifest by listing/reading through store —
+// used by themebuild's generation-scoped CachingStore so component reads
+// reuse the same FlowPOS cache as the rest of doGenerate.
+func GenerateManifestFrom(ctx context.Context, auth RequestAuth, store ThemeStore) (Manifest, error) {
+	tree, err := store.ListFiles(ctx, auth)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -124,7 +131,7 @@ func (s *Store) GenerateManifest(ctx context.Context, auth RequestAuth) (Manifes
 			hasher.Write([]byte(p + "\n"))
 			continue
 		}
-		content, err := s.ReadFile(ctx, auth, p)
+		content, err := store.ReadFile(ctx, auth, p)
 		if err != nil {
 			return Manifest{}, err
 		}
