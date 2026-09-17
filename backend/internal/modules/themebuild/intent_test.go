@@ -32,10 +32,17 @@ func TestClassifyIntent_ThemeEdit(t *testing.T) {
 		{"fix the broken header", IntentRepair},
 		{"rebuild the entire theme from scratch", IntentComplexPage},
 		{"change the header and footer", IntentMultiFileEdit},
+		{"redesign the footer", IntentComplexPage},
+		{"redesign the footer into a modern premium SaaS footer with newsletter", IntentComplexPage},
+		{"make the footer text white", IntentSimpleEdit},
 		{"can you change the home page desgin ? proper with a slider and and beautifull home page", IntentComplexPage},
 		{"redesign the homepage with a slider", IntentComplexPage},
 		{"make a beautiful homepage", IntentComplexPage},
 		{"change home page design", IntentComplexPage},
+		{"an we use multilpal imges on slider and auto scrol please", IntentComplexPage},
+		{"can we use multiple images on slider and auto scroll please", IntentComplexPage},
+		{"enable autoplay on the carousel", IntentComplexPage},
+		{"change the slider color", IntentSimpleEdit},
 	}
 	for _, tc := range cases {
 		got := ClassifyIntent(tc.prompt, "", false)

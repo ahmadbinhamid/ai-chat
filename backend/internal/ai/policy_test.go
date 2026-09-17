@@ -22,6 +22,7 @@ func TestResolveEffort(t *testing.T) {
 		{"copy honors low", ThemeContext{GenerationMode: GenerationModeCopy}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortLow},
 		{"pages default high", ThemeContext{GenerationMode: GenerationModePages}, "", anthropic.OutputConfigEffortHigh},
 		{"pages honors low", ThemeContext{GenerationMode: GenerationModePages}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortLow},
+		{"page-create prepared honors AI_EFFORT=low", ThemeContext{PageCreatePrepared: true}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortLow},
 		{"repair forces medium", ThemeContext{Repair: true}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortMedium},
 		{"override wins", ThemeContext{EffortOverride: "high"}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortHigh},
 	}

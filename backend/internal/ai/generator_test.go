@@ -341,14 +341,13 @@ func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 	}
 }
 
-// TestGenerate_MaxTokensStopReasonDoesNotMaterialize ensures StopReasonMaxTokens
-// fails closed: no MaterializeEdits, no partial Result, ErrMaxTokensTruncated.
-func TestGenerate_MaxTokensStopReasonDoesNotMaterialize(t *testing.T) {
+// TestGenerate_MaxTokensWithParseableProposeAcceptsPartial ensures that when
+// stop_reason=max_tokens but propose_changes JSON is complete, we materialize
+// instead of failing closed (merchant-facing "timeout"/truncation errors).
+func TestGenerate_MaxTokensWithParseableProposeAcceptsPartial(t *testing.T) {
 	materializeCalls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		// Complete tool_use JSON can still arrive with stop_reason=max_tokens
-		// (cut mid-stream after the block closed). Must NOT materialize.
 		var b strings.Builder
 		sseEvent(&b, "message_start", map[string]any{
 			"type": "message_start",
@@ -395,23 +394,113 @@ func TestGenerate_MaxTokensStopReasonDoesNotMaterialize(t *testing.T) {
 
 	readFile := FileReader(func(ctx context.Context, path string) (string, error) {
 		materializeCalls++
-		return "", fmt.Errorf("should not materialize on truncation")
+		return "", fmt.Errorf("create needs no read")
 	})
 
 	result, err := g.Generate(context.Background(),
-		ThemeContext{ThemeSlug: "demo", SimpleEditOneShot: true, MaxTokensOverride: 8000},
+		ThemeContext{ThemeSlug: "demo", MaxTokensOverride: 8000},
 		nil, "create a page", nil, nil, nil, nil, readFile)
+	if err != nil {
+		t.Fatalf("want accepted partial, got err=%v", err)
+	}
+	if result == nil || len(result.Files) != 1 || result.Files[0].Path != "pages/contact.liquid" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+// TestGenerate_MaxTokensWithoutProposeStillFails ensures incomplete max_tokens
+// (no parseable propose_changes) still returns ErrMaxTokensTruncated.
+func TestGenerate_MaxTokensWithoutProposeStillFails(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		var b strings.Builder
+		sseEvent(&b, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": "msg_trunc2", "type": "message", "role": "assistant", "model": "claude-test",
+				"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+				"usage": map[string]any{"input_tokens": 100, "output_tokens": 0},
+			},
+		})
+		sseEvent(&b, "content_block_start", map[string]any{
+			"type": "content_block_start", "index": 0,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		})
+		sseEvent(&b, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": "thinking about"},
+		})
+		sseEvent(&b, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+		sseEvent(&b, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "max_tokens", "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": 8000},
+		})
+		sseEvent(&b, "message_stop", map[string]any{"type": "message_stop"})
+		fmt.Fprint(w, b.String())
+	}))
+	defer ts.Close()
+
+	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
+	g := newTestGenerator(client)
+	result, err := g.Generate(context.Background(),
+		ThemeContext{ThemeSlug: "demo", MaxTokensOverride: 8000},
+		nil, "create a page", nil, nil, nil, nil, nil)
 	if !errors.Is(err, ErrMaxTokensTruncated) {
 		t.Fatalf("want ErrMaxTokensTruncated, got result=%v err=%v", result, err)
 	}
-	if result != nil {
-		t.Fatal("must not return a partial Result on max_tokens truncation")
+}
+
+// TestGenerate_DeepSeekPreparedDisablesThinkingAndForcesPropose ensures
+// prepared DeepSeek turns send thinking:{type:disabled} (omit ≠ off on V4)
+// and force named propose_changes tool_choice for fast TTFT.
+func TestGenerate_DeepSeekPreparedDisablesThinkingAndForcesPropose(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		s := string(body)
+		if !strings.Contains(s, `"type":"disabled"`) {
+			t.Errorf("prepared deepseek must send thinking type=disabled; body: %s", body)
+		}
+		if strings.Contains(s, `"type":"adaptive"`) {
+			t.Errorf("prepared deepseek must not enable adaptive thinking; body: %s", body)
+		}
+		forcedNamed := strings.Contains(s, `"tool_choice":{"name":"propose_changes","type":"tool"}`) ||
+			strings.Contains(s, `"type":"tool","name":"propose_changes"`)
+		if !forcedNamed {
+			t.Errorf("prepared deepseek with thinking disabled must force named tool_choice; body: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, toolUseSSEResponse("msg_1", "toolu_1", "propose_changes", map[string]any{
+			"summary":               "ok",
+			"needs_clarification":   false,
+			"answered_question":     false,
+			"files":                 []map[string]any{{"path": "pages/home.liquid", "action": "update", "content": "x"}},
+			"page_registry_entry":   nil,
+			"layout_links_to_add":   []string{},
+			"layout_scripts_to_add": []string{},
+		}, 10, 5))
+	}))
+	defer ts.Close()
+
+	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
+	g := newTestGenerator(client)
+	g.provider = "deepseek"
+	g.model = "deepseek-v4-pro"
+	g.modelName = "deepseek-v4-pro"
+
+	_, err := g.Generate(context.Background(), ThemeContext{
+		ThemeSlug:          "demo",
+		PageCreatePrepared: true,
+		MaxToolIterations:  2,
+	}, nil, "redesign homepage with slider", nil, nil, nil,
+		func(context.Context, string, json.RawMessage) (string, error) { return "[]", nil }, nil)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
 	}
-	if materializeCalls != 0 {
-		t.Fatalf("MaterializeEdits/readFile must not run on truncation, got %d reads", materializeCalls)
-	}
-	if msg := SanitizeError(err); msg == "" || strings.Contains(strings.ToLower(msg), "deepseek") {
-		t.Fatalf("merchant-facing sanitize unexpected: %q", msg)
+	if calls != 1 {
+		t.Fatalf("expected 1 model call, got %d", calls)
 	}
 }
 

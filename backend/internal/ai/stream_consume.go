@@ -163,9 +163,9 @@ func (g *Generator) SetStreamFirstTokenTimeout(d time.Duration) {
 }
 
 // defaultPreparedFirstTokenTimeout bounds TTFT for PageCreatePrepared calls —
-// shorter than the interactive default so a hung prepared turn fails (~15s +
-// one retry) instead of a ~50s dead window.
-const defaultPreparedFirstTokenTimeout = 15 * time.Second
+// DeepSeek can exceed 25s even with thinking disabled; 40s cuts false
+// timeouts without waiting the full interactive 45s budget twice.
+const defaultPreparedFirstTokenTimeout = 60 * time.Second
 
 // PreparedFirstTokenTimeout is the TTFT budget for PageCreatePrepared
 // generations (exported for themebuild wiring / tests).

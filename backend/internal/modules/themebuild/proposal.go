@@ -306,6 +306,29 @@ func (s *Service) generateValidProposal(
 			continue
 		}
 
+		if err := incompleteSliderFeatureProposal(prompt, result); err != nil {
+			if attempt >= maxThemeCheckRetries+1 {
+				return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
+			}
+			slog.Warn("slider autoplay proposal incomplete, retrying if budget remains",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+				"attempt": attempt, "message": err.Error(),
+			})
+			turns = append(turns,
+				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
+				ai.Turn{Role: "user", Content: fmt.Sprintf(
+					"That proposal is incomplete for a working autoplay slider: %s. "+
+						"Do NOT only edit CSS. Resubmit propose_changes including ALL of: "+
+						"(1) store-hero-banner.liquid with 2+ data-slide-item slides, "+
+						"(2) js/store-hero-banner.js with real setInterval/is-active autoplay, "+
+						"(3) liquid/layout-end.liquid script tag for store-hero-banner.js. "+
+						"CSS-only or static stacked images will be rejected again.", err)},
+			)
+			nextPrompt = "Resubmit a complete working multi-image autoplay slider proposal as instructed above."
+			continue
+		}
+
 		if isUnexploredEmptyProposal(result) {
 			if attempt >= maxThemeCheckRetries+1 {
 				// Fail open, per this whole mechanism's own rule: never turn
@@ -494,6 +517,17 @@ func (s *Service) checkAndRepair(
 		repairTC := tc
 		repairTC.Repair = true
 		repairTC.EffortOverride = "medium"
+		// Never inherit simple_edit one-shot (2 iters / 8k) into repair —
+		// that is what surfaced as "too complex… break into smaller requests"
+		// after a large footer redesign nearly succeeded on the first pass.
+		repairTC.SimpleEditOneShot = false
+		repairTC.SimpleEditAllowRead = false
+		if repairTC.MaxToolIterations < 6 {
+			repairTC.MaxToolIterations = 6
+		}
+		if repairTC.MaxTokensOverride > 0 && repairTC.MaxTokensOverride < 16_000 {
+			repairTC.MaxTokensOverride = 16_000
+		}
 		// Targeted repair: drop full theme tree/manifest from the dynamic
 		// system prompt — recapAssistantTurn + repairPrompt already carry
 		// affected file bodies and findings. toolsForContext(Repair) also

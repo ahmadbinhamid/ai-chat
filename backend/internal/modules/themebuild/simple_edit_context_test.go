@@ -22,6 +22,10 @@ func TestDetectSimpleEditTargets(t *testing.T) {
 	if len(got) < 2 {
 		t.Fatalf("expected homepage+hero, got %v", got)
 	}
+	got = detectSimpleEditTargets("change the slider color")
+	if len(got) == 0 || got[0] != "slider" {
+		t.Fatalf("expected slider target, got %v", got)
+	}
 }
 
 func TestBuildSimpleEditContext_Header(t *testing.T) {

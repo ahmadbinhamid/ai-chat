@@ -84,7 +84,7 @@ func TestSanitizeError(t *testing.T) {
 		{
 			name:        "tool-loop iterations exhausted",
 			err:         errors.New("model did not call propose_changes within 28 tool-loop iterations"),
-			wantContain: "too complex",
+			wantContain: "another pass",
 		},
 		{
 			name:        "themecheck validation exhausted after repairs",

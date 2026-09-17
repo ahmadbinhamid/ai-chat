@@ -47,8 +47,8 @@ var (
 	thanksOnly         = regexp.MustCompile(`(?i)^(thanks|thank you|thx|ty)[\s!?.]*$`)
 	noiseOnly          = regexp.MustCompile(`(?i)^[a-z]{1,8}$`) // short single token like asdf/qwerty handled via exact map too
 
-	themeTargetRe = regexp.MustCompile(`(?i)\b(header|footer|nav|navbar|menu|hero|button|banner|logo|cart|sidebar|homepage|home\s*page|product\s*card|section|page|theme|layout|css|liquid|component|partial)\b`)
-	themeActionRe = regexp.MustCompile(`(?i)\b(change|update|edit|redesign|restyle|improve|fix|make|tweak|adjust|modify|add|remove|create|build|rewrite|replace|move|resize|recolor|colour|color|style)\b`)
+	themeTargetRe = regexp.MustCompile(`(?i)\b(header|footer|nav|navbar|menu|hero|slider|carousel|button|banner|logo|cart|sidebar|homepage|home\s*page|product\s*card|section|page|theme|layout|css|liquid|component|partial)\b`)
+	themeActionRe = regexp.MustCompile(`(?i)\b(change|update|edit|redesign|restyle|improve|fix|make|tweak|adjust|modify|add|remove|create|build|rewrite|replace|move|resize|recolor|colour|color|style|use)\b`)
 	themeQueryRe  = regexp.MustCompile(`(?i)\b(what|where|which|show|find|list|read|explain|describe|how|does|is there|look at)\b`)
 	repairRe      = regexp.MustCompile(`(?i)\b(fix|broken|error|bug|crash|not working|doesn'?t work|render failed|blank|missing)\b`)
 	complexRe     = regexp.MustCompile(`(?i)\b(from scratch|entire theme|whole site|all pages|every page|new theme|brand kit|redesign (the )?site|multi[- ]page)\b`)
@@ -93,14 +93,53 @@ var (
 		`|` +
 		`\b(?:beautiful|beautifull|proper)\b[\s\S]{0,40}\b(?:home\s*page|homepage)\b` +
 		`)`)
+
+	// sliderFeatureRe: multi-image / autoplay / auto-scroll on a slider —
+	// liquid+js+css work that truncates under the 8k simple_edit ceiling.
+	// Typos (imges, scrol, multilpal) are intentional — merchants type them.
+	sliderOrCarouselRe = regexp.MustCompile(`(?i)\b(?:slider|carousel)\b`)
+	sliderMultiImageRe = regexp.MustCompile(`(?i)(?:` +
+		`\b(?:multiple|multi\w*|several|more)\b[\s\S]{0,48}\b(?:images?|imges|imgs?|photos?|pics?)\b` +
+		`|` +
+		`\b(?:\d+)\s+(?:\w+[\s/_-]*){0,8}(?:images?|imges|imgs?|photos?|pics?|slides?)\b` +
+		`|` +
+		`\b(?:images?|imges|imgs?|photos?|pics?)\b[\s\S]{0,40}\b(?:on|in|for)\b[\s\S]{0,24}\b(?:slider|carousel)\b` +
+		`)`)
+	sliderAutoplayRe = regexp.MustCompile(`(?i)\bauto[\s-]*(?:scroll|scrol|play)\b|\bautoplay\b`)
+	// Merchant complaining the slider is broken / only shows static images —
+	// must stay on complex_page repair, never simple_edit that deletes slides.
+	sliderBrokenRe = regexp.MustCompile(`(?i)(?:` +
+		`\b(?:not working|isn'?t working|broken|doesn'?t work|fix)\b` +
+		`|` +
+		`\b(?:nahi|ni)\b` +
+		`|` +
+		`\b(?:chal\s*r?a?h[ei]?\s*n|nhi\s*chal)\b` +
+		`|` +
+		`\b(?:only |just |to )?(?:images?|iamges|pics?)\b` +
+		`)`)
+	// Image-swap only: keep autoplay wiring, just replace slide <img> src URLs.
+	// Window is 96 chars so "hero slider … 5 different … Unsplash images" still matches.
+	sliderImagesOnlyRe = regexp.MustCompile(`(?i)(?:` +
+		`\b(?:natural|real|stock|photo|public\s*url|https?|unsplash)\b[\s\S]{0,96}\b(?:images?|imges|pics?|photos?)\b` +
+		`|` +
+		`\b(?:images?|imges|pics?|photos?)\b[\s\S]{0,96}\b(?:slider|carousel|hero)\b` +
+		`|` +
+		`\b(?:slider|carousel|hero)\b[\s\S]{0,96}\b(?:images?|imges|pics?|photos?)\b` +
+		`|` +
+		`\b(?:\d+)\s*(?:pics?|images?|imges|photos?|slides?)\b` +
+		`|` +
+		`\b(?:\d+)\s+(?:\w+[\s/_-]*){0,8}(?:pics?|images?|imges|photos?|slides?)\b` +
+		`)`)
 )
 
 // ClassifyIntent is a deterministic local router. Attachments / non-edit modes
 // never classify as conversation. Ambiguous text defaults toward a theme path.
+//
+// Attachments (uploaded files OR a prompt ReferenceURL) only suppress the
+// conversation short-circuit — they must NOT skip page-create / slider
+// structural routing. An Unsplash "reference image" URL used to force
+// simple_edit and then fail the 4k patch guard on a 5-slide hero rewrite.
 func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
-	if hasAttachments {
-		return IntentSimpleEdit
-	}
 	if mode != "" && mode != "edit" {
 		switch mode {
 		case "brand", "copy":
@@ -115,31 +154,38 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 	p := strings.ToLower(strings.TrimSpace(prompt))
 	p = strings.Join(strings.Fields(p), " ")
 	if p == "" {
+		if hasAttachments {
+			return IntentSimpleEdit
+		}
 		return IntentConversation
 	}
 
-	// Strip trailing punctuation for exact-map lookup.
-	normalized := strings.TrimRight(p, "!?.,;: ")
-	if conversationExact[p] || conversationExact[normalized] {
-		return IntentConversation
-	}
-	if conversationPrefix.MatchString(p) || thanksOnly.MatchString(p) {
-		return IntentConversation
-	}
-	// Pure punctuation / emoji-ish short noise with no theme words.
-	if !themeTargetRe.MatchString(p) && !themeActionRe.MatchString(p) && !themeQueryRe.MatchString(p) && !repairRe.MatchString(p) {
-		if len([]rune(p)) <= 12 && mostlyNonThemeNoise(p) {
+	// Conversation only when there is no attachment — a bare "hi" with a
+	// file still means theme work, not a greeting.
+	if !hasAttachments {
+		normalized := strings.TrimRight(p, "!?.,;: ")
+		if conversationExact[p] || conversationExact[normalized] {
 			return IntentConversation
 		}
-		if noiseOnly.MatchString(normalized) && len(normalized) <= 8 && !looksLikeThemeWord(normalized) {
+		if conversationPrefix.MatchString(p) || thanksOnly.MatchString(p) {
 			return IntentConversation
+		}
+		// Pure punctuation / emoji-ish short noise with no theme words.
+		if !themeTargetRe.MatchString(p) && !themeActionRe.MatchString(p) && !themeQueryRe.MatchString(p) && !repairRe.MatchString(p) {
+			if len([]rune(p)) <= 12 && mostlyNonThemeNoise(p) {
+				return IntentConversation
+			}
+			if noiseOnly.MatchString(normalized) && len(normalized) <= 8 && !looksLikeThemeWord(normalized) {
+				return IntentConversation
+			}
 		}
 	}
 
 	if complexRe.MatchString(p) {
 		return IntentComplexPage
 	}
-	// Page create / redesign / page+menu MUST run before simple_edit matching.
+	// Page create / redesign / page+menu / slider MUST run before simple_edit
+	// matching — including when a ReferenceURL made hasAttachments=true.
 	if isPageCreateOrStructural(p) {
 		return IntentComplexPage
 	}
@@ -167,6 +213,17 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 	return IntentSimpleEdit
 }
 
+// sectionRedesignRe: substantial header/footer rebuilds (newsletter, link
+// columns, SaaS chrome) — never the 8k simple_edit one-shot. Tiny tweaks
+// ("make the footer text white" / "make the header modern") stay simple_edit.
+var sectionRedesignRe = regexp.MustCompile(`(?i)(?:` +
+	`\b(?:redesign|restyle|rewrite|overhaul|rebuild)\b[\s\S]{0,64}\b(?:footer|header)\b` +
+	`|` +
+	`\b(?:footer|header)\b[\s\S]{0,64}\b(?:redesign|restyle|rewrite|overhaul|rebuild)\b` +
+	`|` +
+	`\b(?:footer|header)\b[\s\S]{0,220}\b(?:newsletter|saas|social\s*media|copyright|privacy\s*policy|terms\s*(?:&|and)?\s*conditions|cookie\s*policy|documentation|link\s*columns?|multi[- ]column)\b` +
+	`)`)
+
 // isPageCreateOrStructural reports new-page / page redesign / page+menu work
 // that must use the full multi-file generation path, never SIMPLE_EDIT one-shot.
 func isPageCreateOrStructural(p string) bool {
@@ -174,6 +231,12 @@ func isPageCreateOrStructural(p string) bool {
 		return true
 	}
 	if pageRedesignRe.MatchString(p) {
+		return true
+	}
+	if isSliderFeaturePrompt(p) {
+		return true
+	}
+	if isSectionRedesignPrompt(p) {
 		return true
 	}
 	// "… page … menu …" (or nav) with create/add/new — e.g. create page and add to menu.
@@ -189,6 +252,57 @@ func isPageCreateOrStructural(p string) bool {
 		}
 	}
 	return false
+}
+
+// isSectionRedesignPrompt is a full header/footer rebuild (multi-column SaaS
+// chrome, newsletter, legal bar) — liquid+css that truncates under simple_edit.
+func isSectionRedesignPrompt(p string) bool {
+	p = strings.ToLower(strings.TrimSpace(p))
+	if !(strings.Contains(p, "footer") || strings.Contains(p, "header")) {
+		return false
+	}
+	return sectionRedesignRe.MatchString(p)
+}
+
+// isSliderFeaturePrompt is multi-image / autoplay / broken-slider / image-swap
+// work on a slider/carousel — never the 8k simple_edit one-shot.
+func isSliderFeaturePrompt(p string) bool {
+	if isSliderImagesOnlyPrompt(p) {
+		return true
+	}
+	if !sliderOrCarouselRe.MatchString(p) {
+		return false
+	}
+	return sliderMultiImageRe.MatchString(p) || sliderAutoplayRe.MatchString(p) || sliderBrokenRe.MatchString(p)
+}
+
+// isSliderImagesOnlyPrompt is a narrow swap of slide <img> src URLs — keep
+// existing JS/CSS/layout wiring, only rewrite liquid image sources.
+func isSliderImagesOnlyPrompt(p string) bool {
+	p = strings.ToLower(strings.TrimSpace(p))
+	if !(strings.Contains(p, "slider") || strings.Contains(p, "carousel") || strings.Contains(p, "hero")) {
+		return false
+	}
+	if !sliderImagesOnlyRe.MatchString(p) {
+		return false
+	}
+	// Strong URL/photo-swap cues only — bare "images" alone is not enough
+	// (that also appears in "multiple images + autoplay" rebuilds).
+	urlSwapCue := strings.Contains(p, "natural") || strings.Contains(p, "stock") ||
+		strings.Contains(p, "public") || strings.Contains(p, "picsum") ||
+		strings.Contains(p, "unsplash") || strings.Contains(p, "http") ||
+		strings.Contains(p, "photo") || strings.Contains(p, "url")
+	if !urlSwapCue {
+		return false
+	}
+	// Autoplay / working-slider rebuilds need full JS+CSS wiring even when
+	// the merchant also mentions photos/URLs.
+	if sliderAutoplayRe.MatchString(p) || strings.Contains(p, "working") ||
+		strings.Contains(p, "autoplay") || strings.Contains(p, "broken") ||
+		strings.Contains(p, "not working") {
+		return false
+	}
+	return true
 }
 
 // intentUsesSimpleEditOneShot is the single gate for the narrow one-shot
@@ -209,7 +323,7 @@ func mostlyNonThemeNoise(p string) bool {
 
 func looksLikeThemeWord(s string) bool {
 	switch s {
-	case "header", "footer", "hero", "nav", "menu", "logo", "cart", "css", "js",
+	case "header", "footer", "hero", "slider", "carousel", "nav", "menu", "logo", "cart", "css", "js",
 		"page", "home", "theme", "fix", "edit", "make", "add":
 		return true
 	default:

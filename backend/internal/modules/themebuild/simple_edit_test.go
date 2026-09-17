@@ -10,7 +10,8 @@ func TestIsSimpleInteractiveEdit(t *testing.T) {
 	}{
 		{"can you change the header desgin please do it fast", "", true},
 		{"change the header", "edit", true},
-		{"redesign the footer", "", true},
+		{"redesign the footer", "", false},
+		{"make the footer text white", "", true},
 		{"hi", "", false},
 		{"what does the header say?", "", false},
 		{"rebuild the entire theme from scratch", "", false},

@@ -96,6 +96,7 @@ func detectSimpleEditTargets(prompt string) []string {
 		{[]string{"header", "navbar", "nav bar", "top bar"}, "header"},
 		{[]string{"footer"}, "footer"},
 		{[]string{"hero", "banner"}, "hero"},
+		{[]string{"slider", "carousel"}, "slider"},
 		{[]string{"product card", "product-card", "cards"}, "product_card"},
 		{[]string{"homepage", "home page", "landing"}, "homepage"},
 		{[]string{"button", "cta"}, "button"},
@@ -175,6 +176,13 @@ func rankPathsForTargets(paths, targets []string, prompt string) []string {
 				if strings.Contains(low, "hero") || strings.Contains(low, "banner") {
 					score += 100
 				}
+			case "slider":
+				if strings.Contains(low, "slider") || strings.Contains(low, "carousel") {
+					score += 100
+				}
+				if strings.Contains(low, "hero") || strings.Contains(low, "banner") {
+					score += 40
+				}
 			case "product_card":
 				if strings.Contains(low, "product") && (strings.Contains(low, "card") || strings.Contains(low, "item") || strings.Contains(low, "grid")) {
 					score += 100
@@ -245,7 +253,8 @@ func simpleEditFallbackPackage(prompt string, paths []string) string {
 	for _, p := range paths {
 		low := strings.ToLower(p)
 		if strings.Contains(low, "header") || strings.Contains(low, "home") ||
-			strings.Contains(low, "hero") || strings.Contains(low, "product") {
+			strings.Contains(low, "hero") || strings.Contains(low, "slider") ||
+			strings.Contains(low, "carousel") || strings.Contains(low, "product") {
 			candidates = append(candidates, p)
 		}
 		if len(candidates) >= 12 {
@@ -418,7 +427,8 @@ func focusKeywords(prompt string) []string {
 	}
 	for _, k := range []string{
 		"background", "color", "colour", "button", "btn", "nav", "menu",
-		"header", "hero", "banner", "card", "hover", "padding", "margin",
+		"header", "hero", "banner", "slider", "carousel", "autoplay",
+		"card", "hover", "padding", "margin",
 	} {
 		if strings.Contains(p, k) {
 			add(k)

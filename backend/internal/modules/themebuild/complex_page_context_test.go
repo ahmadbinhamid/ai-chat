@@ -77,6 +77,7 @@ func TestRankPathsForPageCreate_HomeRedesignPrefersHomeOverHeader(t *testing.T) 
 		"components/css/home.css",
 		"components/hero-slider.liquid",
 		"components/js/slider.js",
+		"sections/home-hero.liquid",
 	}
 	got := rankPathsForPageCreate(paths, "change home page design with a slider and beautiful home page")
 	if len(got) == 0 || got[0] != "pages/home.liquid" {
@@ -88,6 +89,57 @@ func TestRankPathsForPageCreate_HomeRedesignPrefersHomeOverHeader(t *testing.T) 
 	}
 	if !strings.Contains(joined, "home.css") && !strings.Contains(joined, "hero") && !strings.Contains(joined, "slider") {
 		t.Fatalf("expected homepage/hero/slider assets in %v", got)
+	}
+	// pages.json must not crowd out hero/slider when both exist
+	if len(got) >= 3 {
+		top := strings.Join(got[:3], "|")
+		if strings.Contains(top, "pages.json") && !strings.Contains(top, "home") && !strings.Contains(top, "hero") && !strings.Contains(top, "slider") {
+			t.Fatalf("top ranks should be homepage assets, got %v", got)
+		}
+	}
+}
+
+func TestRankPathsForPageCreate_SliderMultiImage(t *testing.T) {
+	paths := []string{
+		"pages.json",
+		"pages/home.liquid",
+		"components/header.liquid",
+		"components/card-essentials.liquid",
+		"components/store-hero-banner.liquid",
+		"components/css/store-hero-banner.css",
+		"js/store-hero-banner.js",
+		"js/testimonials.js",
+		"liquid/layout-end.liquid",
+		"components/css/home.css",
+	}
+	got := rankPathsForPageCreate(paths, "an we use multilpal imges on slider and auto scrol please")
+	if len(got) == 0 {
+		t.Fatal("expected ranked paths")
+	}
+	joined := strings.Join(got, "|")
+	if !strings.Contains(joined, "store-hero-banner") {
+		t.Fatalf("expected store-hero-banner paths, got %v", got)
+	}
+	if !strings.Contains(joined, "store-hero-banner.js") {
+		t.Fatalf("autoplay slider must include hero JS, got %v", got)
+	}
+	if !strings.Contains(joined, "layout-end") {
+		t.Fatalf("autoplay slider must include layout-end for script tag, got %v", got)
+	}
+	if strings.Contains(joined, "card-essentials") {
+		t.Fatalf("must not prefer unrelated cards over slider, got %v", got)
+	}
+	if !isHomePageRedesignPrompt("an we use multilpal imges on slider and auto scrol please") {
+		t.Fatal("slider multi-image must use homepage ranking")
+	}
+}
+
+func TestPromptWantsHeaderOrNav_NotInnovative(t *testing.T) {
+	if promptWantsHeaderOrNav("make an innovative beautiful homepage with a slider") {
+		t.Fatal("innovative must not trip nav detection")
+	}
+	if !promptWantsHeaderOrNav("create a page and add it to the menu") {
+		t.Fatal("menu request must want nav")
 	}
 }
 
@@ -120,7 +172,7 @@ func TestComplexPageBudgets_Bounded(t *testing.T) {
 	if simpleEditMaxTokens != 8000 {
 		t.Fatalf("simple_edit max_tokens must stay 8000, got %d", simpleEditMaxTokens)
 	}
-	if ai.PreparedFirstTokenTimeout() > 20*time.Second {
+	if ai.PreparedFirstTokenTimeout() > 45*time.Second {
 		t.Fatalf("prepared first-token timeout too high: %v", ai.PreparedFirstTokenTimeout())
 	}
 	if ai.PreparedFirstTokenTimeout() < 5*time.Second {

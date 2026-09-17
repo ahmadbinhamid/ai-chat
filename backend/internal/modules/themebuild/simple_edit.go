@@ -17,6 +17,10 @@ func isSimpleInteractiveEdit(prompt, mode string) bool {
 	if p == "" || len([]rune(p)) > 240 {
 		return false
 	}
+	// Full section rebuilds belong on complex_page, not the 8k one-shot.
+	if isSectionRedesignPrompt(p) || isSliderFeaturePrompt(p) || isPageCreateOrStructural(p) {
+		return false
+	}
 	// Skip when the merchant attached complexity signals.
 	for _, bad := range []string{
 		"http://", "https://", "every page", "all pages", "whole site",

@@ -649,10 +649,21 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	var referenceURL string
 	if in.HTMLAttachmentContent == nil {
 		if link, ok := urlfetch.ExtractReferenceURL(in.Prompt); ok {
-			if _, verr := urlfetch.ValidateURL(link); verr != nil {
-				return GenerateOutcome{}, fmt.Errorf("%w: %s", ErrLinkFetchFailed, verr.Error())
+			// Style-cue Unsplash/picsum URLs on a hero/slider image-swap are
+			// not HTML references to fetch — treating them as attachments
+			// used to force simple_edit and blow the patch-size guard.
+			pl := strings.ToLower(strings.Join(strings.Fields(in.Prompt), " "))
+			linkLow := strings.ToLower(link)
+			skipRefFetch := isSliderImagesOnlyPrompt(pl) &&
+				(strings.Contains(linkLow, "unsplash.com") ||
+					strings.Contains(linkLow, "picsum.photos") ||
+					strings.Contains(linkLow, "images.unsplash.com"))
+			if !skipRefFetch {
+				if _, verr := urlfetch.ValidateURL(link); verr != nil {
+					return GenerateOutcome{}, fmt.Errorf("%w: %s", ErrLinkFetchFailed, verr.Error())
+				}
+				referenceURL = link
 			}
-			referenceURL = link
 		}
 	}
 
@@ -1696,6 +1707,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			"max_exploration_tool_calls", tc.MaxExplorationToolCalls,
 			"max_exploration_streak", tc.MaxExplorationOnlyStreak,
 			"max_tokens", tc.MaxTokensOverride,
+			"generation_mode", tc.GenerationMode,
 			"simple_edit_one_shot", false,
 			"complex_page_context_builder_ms", contextMS,
 			"complex_page_context_chars", len([]rune(cpc.Package)))

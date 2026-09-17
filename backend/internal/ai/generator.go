@@ -476,6 +476,39 @@ func modelSupportsAdaptiveThinking(model anthropic.Model) bool {
 	return !strings.Contains(strings.ToLower(model), "haiku")
 }
 
+// deepSeekMustDisableThinking is true for DeepSeek prepared/simple-edit turns.
+// DeepSeek V4 enables thinking by DEFAULT when the field is omitted — that
+// alone caused 25s+ TTFT hangs and 400s on named tool_choice. Explicit
+// thinking:{type:disabled} turns it off so we can force propose_changes.
+func (g *Generator) deepSeekMustDisableThinking(tc ThemeContext) bool {
+	return g.provider == "deepseek" && (tc.PageCreatePrepared || tc.SimpleEditOneShot)
+}
+
+// useAdaptiveThinking reports whether this call sends thinking:adaptive.
+func (g *Generator) useAdaptiveThinking(tc ThemeContext, model anthropic.Model) bool {
+	if !modelSupportsAdaptiveThinking(model) {
+		return false
+	}
+	if g.deepSeekMustDisableThinking(tc) {
+		return false
+	}
+	return true
+}
+
+// applyThinkingConfig sets Thinking / OutputConfig on params for this call.
+// DeepSeek prepared turns MUST send type=disabled (omit ≠ off on V4).
+func (g *Generator) applyThinkingConfig(params *anthropic.MessageNewParams, tc ThemeContext, model anthropic.Model, effort anthropic.OutputConfigEffort) {
+	if g.deepSeekMustDisableThinking(tc) {
+		disabled := anthropic.NewThinkingConfigDisabledParam()
+		params.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &disabled}
+		return
+	}
+	if modelSupportsAdaptiveThinking(model) {
+		params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}}
+		params.OutputConfig = anthropic.OutputConfigParam{Effort: effort}
+	}
+}
+
 // maxToolIterationsCeiling is the absolute upper bound for any tool loop —
 // mode budgets and MaxToolIterations overrides cannot exceed this. Lower
 // than the historical 28 after production thrash (exploration-only
@@ -582,16 +615,24 @@ const maxToolIterations = maxToolIterationsCeiling
 // large page-generation proposals mid-JSON.
 const defaultMaxTokens = 64000
 
-// ErrMaxTokensTruncated is returned instead of attempting to json.Unmarshal
-// a propose_changes input that Claude's own StopReason says was cut off
-// mid-stream — unmarshaling truncated JSON either errors confusingly or,
-// worse, could succeed on a coincidentally-valid prefix and silently accept
-// a partial proposal. Callers must not materialize or stage a draft.
+// ErrMaxTokensTruncated is returned when StopReasonMaxTokens fires and
+// propose_changes input is missing or not valid JSON. When the tool_use
+// block closed with parseable JSON (files or clarification), Generate
+// accepts and materializes that proposal instead of failing closed.
 var ErrMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
 
 // errMaxTokensTruncated is kept as an alias for older call sites in this package.
 var errMaxTokensTruncated = ErrMaxTokensTruncated
 
+// proposeInputFromMessage returns the raw propose_changes tool input if present.
+func proposeInputFromMessage(message anthropic.Message) json.RawMessage {
+	for _, block := range message.Content {
+		if block.Type == "tool_use" && block.Name == toolNameProposeChanges && len(block.Input) > 0 {
+			return block.Input
+		}
+	}
+	return nil
+}
 // Generate asks Claude for the file changes implementing prompt, given the
 // theme context and prior conversation turns. The model drives a tool loop:
 // each call may return one or more tool_use blocks, which toolExec executes
@@ -761,13 +802,10 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		}
 		forceProposeNext = false
 		if forcingPropose {
-			// DeepSeek's Anthropic-compat endpoint rejects specific
-			// tool_choice ({"type":"tool","name":...}) while adaptive
-			// thinking is enabled: HTTP 400 "Thinking mode does not
-			// support this tool_choice". Keep thinking + tool_choice:any
-			// and push propose_changes via the system nudge below.
-			// Real Anthropic still accepts ToolChoiceParamOfTool with thinking.
-			if g.provider == "deepseek" {
+			// DeepSeek V4 defaults to thinking ON; named tool_choice 400s unless
+			// we explicitly send thinking:{type:disabled}. When disabled, force
+			// propose_changes like Anthropic. Otherwise nudge + any.
+			if g.provider == "deepseek" && !g.deepSeekMustDisableThinking(tc) {
 				slog.Info("ai: propose_changes nudge (deepseek: no forced tool_choice with thinking)",
 					"iteration", iteration, "max_tool_iterations", iterationBudget,
 					"page_create_prepared", tc.PageCreatePrepared,
@@ -776,7 +814,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
 				slog.Info("ai: forcing propose_changes near tool-loop budget ceiling",
 					"iteration", iteration, "max_tool_iterations", iterationBudget,
-					"provider", g.provider, "model", g.modelName)
+					"provider", g.provider, "model", g.modelName,
+					"thinking_disabled", g.deepSeekMustDisableThinking(tc))
 			}
 		}
 		params := anthropic.MessageNewParams{
@@ -816,14 +855,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				Text: nudge,
 			})
 		}
-		// Adaptive thinking and output_config.effort are both rejected outright
-		// (400) on Haiku-tier models — leave both fields zero-valued (omitted
-		// from the request, see their "omitzero" json tags) rather than
-		// sending a value that model can't accept.
-		if modelSupportsAdaptiveThinking(callModel) {
-			params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}}
-			params.OutputConfig = anthropic.OutputConfigParam{Effort: callEffort}
-		}
+		// Haiku rejects adaptive thinking/effort (400). DeepSeek prepared
+		// turns must send thinking:disabled — omit leaves V4 thinking ON.
+		g.applyThinkingConfig(&params, tc, callModel, callEffort)
 		var message anthropic.Message
 		// modelCallStart/attemptsUsed cover every streamAccumulateMaxAttempts
 		// retry within this one iteration — a slow iteration due to a
@@ -875,6 +909,20 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				"max_attempts", streamAccumulateMaxAttempts,
 				"error", streamErr.Error())
 			if !canRetry {
+				// Last attempt failed mid-stream — if propose_changes already
+				// accumulated as valid JSON, keep it instead of hard-failing.
+				if salvage := proposeInputFromMessage(message); len(salvage) > 0 {
+					var probe Result
+					if err := json.Unmarshal(salvage, &probe); err == nil &&
+						(len(probe.Files) > 0 || probe.NeedsClarification) {
+						slog.Warn("ai: accepting partial propose_changes after stream failure",
+							"iteration", iteration,
+							"attempt", attempt,
+							"files", len(probe.Files),
+							"error_type", classifyStreamErr(streamErr))
+						break
+					}
+				}
 				return nil, streamErr
 			}
 			select {
@@ -987,28 +1035,45 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			forceProposeNext = true
 		}
 
-		// StopReason == "max_tokens" means Claude was cut off mid-stream —
-		// propose_changes' input (if any tool_use block even parsed as valid
-		// JSON that far) is truncated, not a real proposal. Unmarshaling it
-		// anyway either fails confusingly or, worse, could succeed against a
-		// coincidentally well-formed prefix and silently accept a partial
-		// result — fail explicitly instead. Never MaterializeEdits / stage.
+		// StopReason == "max_tokens" means the model hit the output ceiling.
+		// If propose_changes JSON still fully unmarshals, fall through and
+		// materialize — failing closed forced merchant-facing errors when the
+		// proposal was already usable. Incomplete JSON still returns
+		// ErrMaxTokensTruncated.
 		if message.StopReason == anthropic.StopReasonMaxTokens {
 			callMax := resolveMaxTokens(tc, g.maxTokens, g.tokenBudgets)
-			slog.Warn("ai: max_tokens truncation before propose_changes",
-				"provider", g.provider,
-				"model", g.modelName,
-				"max_tokens", callMax,
-				"stop_reason", string(message.StopReason),
-				"output_tokens", message.Usage.OutputTokens,
-				"input_tokens", message.Usage.InputTokens,
-				"propose_changes_parsed", false,
-				"propose_changes_block_present", len(proposeInput) > 0,
-				"simple_edit_one_shot", tc.SimpleEditOneShot,
-				"generation_mode", tc.GenerationMode,
-				"iteration", iteration,
-				"elapsed_ms", time.Since(modelCallStart).Milliseconds())
-			return nil, ErrMaxTokensTruncated
+			acceptPartial := false
+			if len(proposeInput) > 0 {
+				var probe Result
+				if err := json.Unmarshal(proposeInput, &probe); err == nil &&
+					(len(probe.Files) > 0 || probe.NeedsClarification) {
+					acceptPartial = true
+					slog.Warn("ai: max_tokens with parseable propose_changes — accepting partial",
+						"provider", g.provider,
+						"model", g.modelName,
+						"max_tokens", callMax,
+						"output_tokens", message.Usage.OutputTokens,
+						"files", len(probe.Files),
+						"iteration", iteration,
+						"elapsed_ms", time.Since(modelCallStart).Milliseconds())
+				}
+			}
+			if !acceptPartial {
+				slog.Warn("ai: max_tokens truncation before propose_changes",
+					"provider", g.provider,
+					"model", g.modelName,
+					"max_tokens", callMax,
+					"stop_reason", string(message.StopReason),
+					"output_tokens", message.Usage.OutputTokens,
+					"input_tokens", message.Usage.InputTokens,
+					"propose_changes_parsed", false,
+					"propose_changes_block_present", len(proposeInput) > 0,
+					"simple_edit_one_shot", tc.SimpleEditOneShot,
+					"generation_mode", tc.GenerationMode,
+					"iteration", iteration,
+					"elapsed_ms", time.Since(modelCallStart).Milliseconds())
+				return nil, ErrMaxTokensTruncated
+			}
 		}
 
 		// materializeFailureMsg, when non-empty, is fed back below as the

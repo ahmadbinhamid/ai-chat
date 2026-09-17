@@ -104,9 +104,9 @@ func categorizeError(err error) string {
 	case strings.Contains(lower, "simple_edit:"):
 		return "the change was too large for a simple edit — please try a smaller, more specific request"
 	case strings.Contains(lower, "did not call propose_changes within"):
-		return "the task was too complex to finish in one attempt — please try breaking it into smaller requests"
+		return "the change needed another pass and couldn't finish — please try again"
 	case strings.Contains(lower, "didn't pass validation after"):
-		return "the generated changes couldn't be validated after multiple attempts — please try a smaller or more specific request"
+		return "the generated changes couldn't be validated after multiple attempts — please try again"
 	case strings.Contains(lower, "rate limit") || strings.Contains(lower, "429"):
 		return "too many requests right now — please try again shortly"
 	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
