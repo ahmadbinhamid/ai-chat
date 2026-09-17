@@ -67,6 +67,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 			Repair:      cfg.MaxTokensRepair,
 		})
 		generator.SetStreamIdleTimeout(cfg.StreamIdleTimeout)
+		generator.SetStreamFirstTokenTimeout(cfg.StreamFirstTokenTimeout)
 	}
 	store := themefs.NewStore(cfg.FlowposAPIBase)
 

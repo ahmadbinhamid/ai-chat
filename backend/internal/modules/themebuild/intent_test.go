@@ -26,11 +26,16 @@ func TestClassifyIntent_ThemeEdit(t *testing.T) {
 		{"change the header color", IntentSimpleEdit},
 		{"update logo in header", IntentSimpleEdit},
 		{"update homepage hero", IntentSimpleEdit},
+		{"change the homepage hero color", IntentSimpleEdit},
 		{"add a section", IntentSimpleEdit},
 		{"change product card design", IntentSimpleEdit},
 		{"fix the broken header", IntentRepair},
 		{"rebuild the entire theme from scratch", IntentComplexPage},
 		{"change the header and footer", IntentMultiFileEdit},
+		{"can you change the home page desgin ? proper with a slider and and beautifull home page", IntentComplexPage},
+		{"redesign the homepage with a slider", IntentComplexPage},
+		{"make a beautiful homepage", IntentComplexPage},
+		{"change home page design", IntentComplexPage},
 	}
 	for _, tc := range cases {
 		got := ClassifyIntent(tc.prompt, "", false)

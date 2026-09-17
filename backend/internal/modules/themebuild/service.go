@@ -1661,22 +1661,40 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	case IntentComplexPage:
 		// Full tool loop (list/grep/read/propose) — never simple-edit one-shot.
-		// Keep GenerationMode from the request (usually edit) so menu/nav
-		// component edits remain allowed; apply the complex token ceiling.
+		// Local page/menu context first so DeepSeek does not thrash exploring.
 		tc.SimpleEditOneShot = false
 		tc.SimpleEditAllowRead = false
-		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 14 {
-			tc.MaxToolIterations = 14
+		contextStart := time.Now()
+		cpc, cpcErr := BuildComplexPageContext(ctx, store, storeAuth, in.Prompt)
+		contextMS := time.Since(contextStart).Milliseconds()
+		if cpcErr != nil {
+			slog.Warn("ai: complex-page context planner failed", "chat_id", c.ID, "error", cpcErr)
+		} else {
+			tc.PageCreatePrepared = true
+			tc.FileTree = filterFileTreeToPaths(tc.FileTree, cpc.Paths)
+			tc.Manifest = nil
+			tc.PagesJSON = truncateForSimpleEditPrompt(tc.PagesJSON, 2500)
+			tc.DefaultsJSON = truncateForSimpleEditPrompt(tc.DefaultsJSON, 800)
+			prompt = complexPagePreparedPrompt(in.Prompt, cpc)
 		}
+		tc.MaxToolIterations = maxComplexPageModelCalls
+		tc.MaxExplorationToolCalls = maxComplexExploration
+		tc.MaxExplorationOnlyStreak = maxComplexExploreStreak
 		if tc.MaxTokensOverride <= 0 {
 			tc.MaxTokensOverride = ai.DefaultTokenBudgets().Complex
 		}
 		slog.Info("ai: complex-page path",
 			"chat_id", c.ID, "generation_id", genID,
 			"intent", string(intent),
+			"paths", cpc.Paths,
+			"page_create_prepared", tc.PageCreatePrepared,
 			"max_tool_iterations", tc.MaxToolIterations,
+			"max_exploration_tool_calls", tc.MaxExplorationToolCalls,
+			"max_exploration_streak", tc.MaxExplorationOnlyStreak,
 			"max_tokens", tc.MaxTokensOverride,
-			"simple_edit_one_shot", false)
+			"simple_edit_one_shot", false,
+			"complex_page_context_builder_ms", contextMS,
+			"complex_page_context_chars", len([]rune(cpc.Package)))
 	case IntentMultiFileEdit:
 		tc.SimpleEditOneShot = false
 		tc.SimpleEditAllowRead = false

@@ -69,7 +69,7 @@ func categorizeError(err error) string {
 	if errors.Is(err, ErrMaxTokensTruncated) {
 		return "the response was too large to complete — please try a smaller request"
 	}
-	if errors.Is(err, errStreamIdleTimeout) {
+	if errors.Is(err, errStreamIdleTimeout) || errors.Is(err, errStreamFirstTokenTimeout) {
 		return "the request timed out — please try again"
 	}
 	if errors.Is(err, errStreamTruncated) {

@@ -78,6 +78,21 @@ var (
 	menuNavRe     = regexp.MustCompile(`(?i)\b(?:menu|navigation|navbar)\b|\bnav\b`)
 	addToMenuRe   = regexp.MustCompile(`(?i)\b(?:add|put|include)\b[\s\S]{0,48}\b(?:to\s+)?(?:the\s+)?(?:menu|navigation|navbar)\b`)
 	pageLikeNameRe = regexp.MustCompile(`(?i)\b(?:contact|about|faq|landing)\b`)
+
+	// pageRedesignRe matches substantial homepage/page redesigns (slider,
+	// full design overhaul) that must NOT use the 8k simple_edit one-shot.
+	// Narrow: "change homepage hero color" / "update homepage hero" stay simple.
+	pageRedesignRe = regexp.MustCompile(`(?i)(?:` +
+		`\b(?:redesign|restyle|rewrite|overhaul)\b[\s\S]{0,48}\b(?:home\s*page|homepage|landing(?:\s*page)?)\b` +
+		`|` +
+		`\b(?:home\s*page|homepage|landing(?:\s*page)?)\b[\s\S]{0,48}\b(?:redesign|restyle|rewrite|overhaul)\b` +
+		`|` +
+		`\b(?:change|update|make|improve|edit)\b[\s\S]{0,72}\b(?:home\s*page|homepage)\b[\s\S]{0,72}\b(?:design|desgin|slider|carousel|beautiful|beautifull|layout)\b` +
+		`|` +
+		`\b(?:home\s*page|homepage)\b[\s\S]{0,48}\b(?:slider|carousel)\b` +
+		`|` +
+		`\b(?:beautiful|beautifull|proper)\b[\s\S]{0,40}\b(?:home\s*page|homepage)\b` +
+		`)`)
 )
 
 // ClassifyIntent is a deterministic local router. Attachments / non-edit modes
@@ -124,7 +139,7 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 	if complexRe.MatchString(p) {
 		return IntentComplexPage
 	}
-	// Page create / page+menu MUST run before simple_edit matching.
+	// Page create / redesign / page+menu MUST run before simple_edit matching.
 	if isPageCreateOrStructural(p) {
 		return IntentComplexPage
 	}
@@ -152,10 +167,13 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 	return IntentSimpleEdit
 }
 
-// isPageCreateOrStructural reports new-page / page+menu work that must use
-// the full multi-file generation path, never SIMPLE_EDIT one-shot.
+// isPageCreateOrStructural reports new-page / page redesign / page+menu work
+// that must use the full multi-file generation path, never SIMPLE_EDIT one-shot.
 func isPageCreateOrStructural(p string) bool {
 	if pageCreateRe.MatchString(p) {
+		return true
+	}
+	if pageRedesignRe.MatchString(p) {
 		return true
 	}
 	// "… page … menu …" (or nav) with create/add/new — e.g. create page and add to menu.

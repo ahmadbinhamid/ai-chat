@@ -175,6 +175,15 @@ type ThemeContext struct {
 	// SimpleEditAllowRead permits a single read_theme_file fallback when
 	// SimpleEditOneShot is set but the local planner's excerpts may be thin.
 	SimpleEditAllowRead bool
+	// PageCreatePrepared is set for IntentComplexPage after local page/menu
+	// context is injected — tightens exploration brakes so the model does
+	// not thrash on list/grep/read before propose_changes.
+	PageCreatePrepared bool
+	// MaxExplorationToolCalls overrides maxExplorationToolCalls when > 0
+	// (still subject to DisableExplorationBrake).
+	MaxExplorationToolCalls int
+	// MaxExplorationOnlyStreak overrides maxExplorationOnlyIterations when > 0.
+	MaxExplorationOnlyStreak int
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -209,6 +218,9 @@ type Generator struct {
 	// idleTimeout bounds how long one NewStreaming attempt may block without
 	// an SSE event — see SetStreamIdleTimeout / defaultStreamIdleTimeout.
 	idleTimeout time.Duration
+	// firstTokenTimeout bounds wait for the first content token — see
+	// SetStreamFirstTokenTimeout / defaultStreamFirstTokenTimeout.
+	firstTokenTimeout time.Duration
 }
 
 // New constructs the client. apiKey empty is a configuration error the
@@ -913,23 +925,31 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// tokens (or too many consecutive exploration turns / tool calls)
 		// force propose_changes on the next iteration instead of only
 		// logging — see thrashOutputTokenThreshold's doc comment.
+		streakLimit := maxExplorationOnlyIterations
+		if tc.MaxExplorationOnlyStreak > 0 {
+			streakLimit = tc.MaxExplorationOnlyStreak
+		}
+		exploreCallLimit := maxExplorationToolCalls
+		if tc.MaxExplorationToolCalls > 0 {
+			exploreCallLimit = tc.MaxExplorationToolCalls
+		}
 		if !tc.DisableExplorationBrake && allExplorationTools(toolNames) {
 			explorationOnlyStreak++
 			if message.Usage.OutputTokens > thrashOutputTokenThreshold {
 				slog.Warn("ai: tool-loop thrash — forcing propose_changes next",
 					"iteration", iteration, "output_tokens", message.Usage.OutputTokens, "tools_called", toolNames)
 				forceProposeNext = true
-			} else if explorationOnlyStreak >= maxExplorationOnlyIterations {
+			} else if explorationOnlyStreak >= streakLimit {
 				slog.Warn("ai: exploration-only streak exceeded — forcing propose_changes next",
-					"iteration", iteration, "streak", explorationOnlyStreak)
+					"iteration", iteration, "streak", explorationOnlyStreak, "streak_limit", streakLimit)
 				forceProposeNext = true
 			}
 		} else if !allExplorationTools(toolNames) {
 			explorationOnlyStreak = 0
 		}
-		if !tc.DisableExplorationBrake && explorationToolCalls >= maxExplorationToolCalls {
+		if !tc.DisableExplorationBrake && explorationToolCalls >= exploreCallLimit {
 			slog.Warn("ai: exploration tool-call budget exceeded — forcing propose_changes next",
-				"iteration", iteration, "exploration_tool_calls", explorationToolCalls)
+				"iteration", iteration, "exploration_tool_calls", explorationToolCalls, "limit", exploreCallLimit)
 			forceProposeNext = true
 		}
 
@@ -1058,7 +1078,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, output, isError))
 		}
 		messages = append(messages, anthropic.NewUserMessage(resultBlocks...))
-		if !tc.DisableExplorationBrake && explorationToolCalls >= maxExplorationToolCalls {
+		if !tc.DisableExplorationBrake && explorationToolCalls >= exploreCallLimit {
 			forceProposeNext = true
 		}
 	}
@@ -1228,17 +1248,22 @@ func modeRestrictionNote(mode string) string {
 }
 
 func simpleEditOneShotNote(tc ThemeContext) string {
-	if !tc.SimpleEditOneShot {
-		return ""
+	if tc.SimpleEditOneShot {
+		if tc.SimpleEditAllowRead {
+			return "\n- SIMPLE_EDIT (prepared): relevant files were pre-selected locally. Call propose_changes with a bounded edit. " +
+				"You may call read_theme_file at most once if a critical section is missing from the package — do not grep or list files."
+		}
+		return "\n- SIMPLE_EDIT (prepared): relevant files and excerpts were pre-selected locally. " +
+			"Do not explore. Call propose_changes once with a minimal action \"edit\" changeset. " +
+			"Never regenerate an entire file. summary must be one short sentence. " +
+			"needs_clarification only if you truly cannot act safely."
 	}
-	if tc.SimpleEditAllowRead {
-		return "\n- SIMPLE_EDIT (prepared): relevant files were pre-selected locally. Call propose_changes with a bounded edit. " +
-			"You may call read_theme_file at most once if a critical section is missing from the package — do not grep or list files."
+	if tc.PageCreatePrepared {
+		return "\n- PAGE_CREATE (prepared): pages.json, a sample page, and menu/nav/header excerpts were pre-selected locally. " +
+			"Prefer propose_changes promptly with only the required files (new page + registry/menu updates). " +
+			"Do not re-list the whole theme. Use at most a few targeted reads if a critical detail is missing."
 	}
-	return "\n- SIMPLE_EDIT (prepared): relevant files and excerpts were pre-selected locally. " +
-		"Do not explore. Call propose_changes once with a minimal action \"edit\" changeset. " +
-		"Never regenerate an entire file. summary must be one short sentence. " +
-		"needs_clarification only if you truly cannot act safely."
+	return ""
 }
 
 // formatFileTree renders a theme's file tree as an indented plain-text

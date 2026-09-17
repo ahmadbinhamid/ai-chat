@@ -20,6 +20,16 @@ import (
 // AI_STREAM_IDLE_TIMEOUT_MS.
 const defaultStreamIdleTimeout = 12 * time.Second
 
+// defaultStreamFirstTokenTimeout bounds how long one NewStreaming attempt may
+// wait for the first narration/thinking content token after the stream opens.
+// Idle timeout alone resets on every SSE control frame (message_start, etc.),
+// so a connection that dribbles non-content events would never trip idle —
+// this deadline covers the pre-first-token window explicitly.
+// Override via Generator.SetStreamFirstTokenTimeout /
+// AI_STREAM_FIRST_TOKEN_TIMEOUT_MS. Kept longer than idle to avoid aggressive
+// false cancellations on slow-but-healthy TTFT.
+const defaultStreamFirstTokenTimeout = 45 * time.Second
+
 // streamAccumulateMaxAttempts bounds retries for truncated/idle provider
 // streams within one tool-loop iteration. Interactive edits allow one
 // controlled retry (2 attempts total) — the pre-fix policy of 3× with a 5s
@@ -34,6 +44,10 @@ const streamAccumulateRetryDelay = 1 * time.Second
 // streamIdleTimeout. Retryable via isRetryableStreamErr.
 var errStreamIdleTimeout = errors.New("provider stream idle timeout: no progress")
 
+// errStreamFirstTokenTimeout is returned when no content token arrives within
+// streamFirstTokenTimeout. Retryable like idle — same controlled budget.
+var errStreamFirstTokenTimeout = errors.New("provider stream first-token timeout: no content")
+
 // errStreamTruncated wraps Accumulate / incomplete JSON failures so callers
 // and logs can classify them without string-matching alone.
 var errStreamTruncated = errors.New("provider stream truncated or incomplete JSON")
@@ -46,6 +60,7 @@ type streamAttemptMeta struct {
 	LastProgressAt   time.Time
 	StreamEnd        time.Time
 	IdleTimeout      bool
+	FirstTokenTimeout bool
 	Truncated        bool
 	Retried          bool
 	RetryDecision    string
@@ -61,7 +76,9 @@ func isRetryableStreamErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, errStreamIdleTimeout) || errors.Is(err, errStreamTruncated) {
+	if errors.Is(err, errStreamIdleTimeout) ||
+		errors.Is(err, errStreamFirstTokenTimeout) ||
+		errors.Is(err, errStreamTruncated) {
 		return true
 	}
 	msg := err.Error()
@@ -77,6 +94,8 @@ func classifyStreamErr(err error) string {
 		return ""
 	case errors.Is(err, errStreamIdleTimeout):
 		return "stream_timeout"
+	case errors.Is(err, errStreamFirstTokenTimeout):
+		return "first_token_timeout"
 	case errors.Is(err, errStreamTruncated),
 		strings.Contains(err.Error(), "accumulate stream"),
 		strings.Contains(err.Error(), "unexpected end of JSON input"):
@@ -121,6 +140,28 @@ func (g *Generator) SetStreamIdleTimeout(d time.Duration) {
 	g.idleTimeout = d
 }
 
+// streamFirstTokenTimeout resolves the Generator's configured first-token budget.
+func (g *Generator) streamFirstTokenTimeout() time.Duration {
+	if g != nil && g.firstTokenTimeout > 0 {
+		return g.firstTokenTimeout
+	}
+	return defaultStreamFirstTokenTimeout
+}
+
+// SetStreamFirstTokenTimeout configures how long NewStreaming may wait for
+// the first narration/thinking content token. Zero or negative keeps the
+// default. Independent of idle timeout (which resets on every SSE frame).
+func (g *Generator) SetStreamFirstTokenTimeout(d time.Duration) {
+	if g == nil {
+		return
+	}
+	if d <= 0 {
+		g.firstTokenTimeout = defaultStreamFirstTokenTimeout
+		return
+	}
+	g.firstTokenTimeout = d
+}
+
 // consumeProviderStream runs one NewStreaming attempt with an idle deadline
 // independent of the parent generation timeout. Every successful Next()
 // resets the idle timer (healthy long streams that keep emitting are fine).
@@ -143,6 +184,7 @@ func (g *Generator) consumeProviderStream(
 	meta.LastProgressAt = meta.StreamStart
 
 	idle := g.streamIdleTimeout()
+	firstTokenDeadline := g.streamFirstTokenTimeout()
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -161,8 +203,40 @@ func (g *Generator) consumeProviderStream(
 	}()
 
 	for {
-		ok, waitMs, err := nextWithIdle(streamCtx, cancel, stream, idle)
+		waitBudget := idle
+		if meta.FirstDeltaAt.IsZero() {
+			remaining := firstTokenDeadline - time.Since(meta.StreamStart)
+			if remaining <= 0 {
+				meta.FirstTokenTimeout = true
+				meta.IdleWaitMs = time.Since(meta.StreamStart).Milliseconds()
+				meta.ErrorType = classifyStreamErr(errStreamFirstTokenTimeout)
+				cancel()
+				slog.Warn("ai: provider stream first-token timeout",
+					"provider", g.provider,
+					"model", g.modelName,
+					"iteration", iteration,
+					"attempt", attempt,
+					"first_token_timeout_ms", firstTokenDeadline.Milliseconds(),
+					"stream_elapsed_ms", time.Since(meta.StreamStart).Milliseconds())
+				return message, meta, errStreamFirstTokenTimeout
+			}
+			// Cap Next() wait so first-token deadline can fire even while
+			// blocked on the next SSE frame (idle alone would wait the full
+			// idle window first).
+			if remaining < waitBudget {
+				waitBudget = remaining
+			}
+		}
+
+		ok, waitMs, err := nextWithIdle(streamCtx, cancel, stream, waitBudget)
 		if err != nil {
+			if errors.Is(err, errStreamIdleTimeout) && meta.FirstDeltaAt.IsZero() &&
+				time.Since(meta.StreamStart) >= firstTokenDeadline {
+				meta.FirstTokenTimeout = true
+				meta.IdleWaitMs = time.Since(meta.StreamStart).Milliseconds()
+				meta.ErrorType = classifyStreamErr(errStreamFirstTokenTimeout)
+				return message, meta, errStreamFirstTokenTimeout
+			}
 			meta.IdleTimeout = errors.Is(err, errStreamIdleTimeout)
 			meta.IdleWaitMs = waitMs
 			meta.ErrorType = classifyStreamErr(err)
@@ -286,6 +360,7 @@ func logStreamAttempt(
 		"last_progress_ms", lastProgressMs,
 		"idle_wait_ms", meta.IdleWaitMs,
 		"stream_timeout", meta.IdleTimeout,
+		"first_token_timeout", meta.FirstTokenTimeout,
 		"stream_truncated", meta.Truncated,
 		"retry_decision", retryDecision,
 		"error_type", meta.ErrorType,

@@ -167,6 +167,12 @@ type Config struct {
 	// AI_STREAM_IDLE_TIMEOUT_MS.
 	StreamIdleTimeout time.Duration
 
+	// StreamFirstTokenTimeout is how long one NewStreaming attempt may wait
+	// for the first narration/thinking content token. Distinct from idle
+	// timeout (which resets on every SSE frame including control events).
+	// See AI_STREAM_FIRST_TOKEN_TIMEOUT_MS.
+	StreamFirstTokenTimeout time.Duration
+
 	// ThemeWorkspaceDir is the on-disk root for per-tenant local-first theme
 	// caches (CPU filesystem/search — not a local LLM). Empty disables the
 	// workspace and keeps FlowPOS HTTP as the sole theme store.
@@ -231,8 +237,9 @@ func Load() Config {
 
 		MaxRequestBodyBytes: int64(getenvInt("MAX_REQUEST_BODY_BYTES", 45*1024*1024)),
 
-		StreamIdleTimeout: time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_MS", 12000)) * time.Millisecond,
-		ThemeWorkspaceDir: getenv("THEME_WORKSPACE_DIR", "tmp/theme-workspaces"),
+		StreamIdleTimeout:       time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_MS", 12000)) * time.Millisecond,
+		StreamFirstTokenTimeout: time.Duration(getenvInt("AI_STREAM_FIRST_TOKEN_TIMEOUT_MS", 45000)) * time.Millisecond,
+		ThemeWorkspaceDir:       getenv("THEME_WORKSPACE_DIR", "tmp/theme-workspaces"),
 	}
 }
 
