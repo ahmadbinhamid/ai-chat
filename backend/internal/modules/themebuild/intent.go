@@ -224,6 +224,20 @@ var sectionRedesignRe = regexp.MustCompile(`(?i)(?:` +
 	`\b(?:footer|header)\b[\s\S]{0,220}\b(?:newsletter|saas|social\s*media|copyright|privacy\s*policy|terms\s*(?:&|and)?\s*conditions|cookie\s*policy|documentation|link\s*columns?|multi[- ]column)\b` +
 	`)`)
 
+// sectionCSSBrokenRe: merchant says footer/header CSS/design did not apply —
+// Roman Urdu ("ni apply", "nahi hui") and English. Must not use simple_edit.
+var sectionCSSBrokenRe = regexp.MustCompile(`(?i)(?:` +
+	`\b(?:not\s+applied|didn'?t\s+apply|doesn'?t\s+apply|won'?t\s+apply|no\s+apply)\b` +
+	`|` +
+	`\b(?:ni|nahi|nhi)\s*apply\b` +
+	`|` +
+	`\bapply\b[\s\S]{0,32}\b(?:nahi|ni|nhi|hoi|hui|hua|hne)\b` +
+	`|` +
+	`\b(?:css|style|design|desgin)\b[\s\S]{0,48}\b(?:not\s+working|broken|missing|nahi|ni|nhi)\b` +
+	`|` +
+	`\b(?:css|style)\b[\s\S]{0,24}\b(?:e\s+)?(?:ni|nahi|nhi)\b` +
+	`)`)
+
 // isPageCreateOrStructural reports new-page / page redesign / page+menu work
 // that must use the full multi-file generation path, never SIMPLE_EDIT one-shot.
 func isPageCreateOrStructural(p string) bool {
@@ -254,14 +268,33 @@ func isPageCreateOrStructural(p string) bool {
 	return false
 }
 
-// isSectionRedesignPrompt is a full header/footer rebuild (multi-column SaaS
-// chrome, newsletter, legal bar) — liquid+css that truncates under simple_edit.
+// isSectionRedesignPrompt is a full header/footer rebuild OR a follow-up that
+// the section CSS/design did not apply — liquid+css that truncates under simple_edit.
 func isSectionRedesignPrompt(p string) bool {
 	p = strings.ToLower(strings.TrimSpace(p))
 	if !(strings.Contains(p, "footer") || strings.Contains(p, "header")) {
 		return false
 	}
-	return sectionRedesignRe.MatchString(p)
+	if sectionRedesignRe.MatchString(p) {
+		return true
+	}
+	return isSectionCSSBrokenPrompt(p)
+}
+
+// isSectionCSSBrokenPrompt is "footer/header css/design not applied" — often
+// after a redesign where liquid classes and CSS selectors diverged.
+func isSectionCSSBrokenPrompt(p string) bool {
+	p = strings.ToLower(strings.TrimSpace(p))
+	if !(strings.Contains(p, "footer") || strings.Contains(p, "header")) {
+		return false
+	}
+	if !sectionCSSBrokenRe.MatchString(p) {
+		return false
+	}
+	// Prefer an explicit css/style/design cue, but "footer ni apply" is enough.
+	return strings.Contains(p, "css") || strings.Contains(p, "style") ||
+		strings.Contains(p, "design") || strings.Contains(p, "desgin") ||
+		strings.Contains(p, "apply")
 }
 
 // isSliderFeaturePrompt is multi-image / autoplay / broken-slider / image-swap

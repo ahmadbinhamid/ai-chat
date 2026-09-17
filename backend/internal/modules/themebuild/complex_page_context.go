@@ -65,11 +65,13 @@ func BuildComplexPageContext(ctx context.Context, store themefs.ThemeStore, auth
 		if strings.Contains(strings.ToLower(prompt), "header") && !strings.Contains(strings.ToLower(prompt), "footer") {
 			target = "header"
 		}
-		fmt.Fprintf(&b, "## Pre-selected local %s redesign context\n", target)
-		b.WriteString("Merchant wants a full modern/premium redesign of this section (not a tiny color/text tweak).\n")
-		b.WriteString("Ship complete liquid + matching CSS in one propose_changes. Prefer action \"update\" with FULL file bodies.\n")
+		fmt.Fprintf(&b, "## Pre-selected local %s redesign/fix context\n", target)
+		b.WriteString("Merchant wants a full modern redesign OR says the section CSS/design did not apply.\n")
+		b.WriteString("Ship BOTH liquid + matching CSS in one propose_changes using action \"update\" with FULL file bodies.\n")
+		b.WriteString("CRITICAL: CSS selectors MUST match the liquid class names you emit.\n")
+		b.WriteString("If liquid uses new classes (e.g. t1-footer--saas), rewrite footer.css for those classes — do NOT leave old selectors (e.g. t1-footer--jpro) as the only rules.\n")
 		b.WriteString("Keep existing theme tokens/brand colors where sensible; stay responsive; do not invent extra pages.\n")
-		b.WriteString("Call propose_changes once with the section liquid and its CSS (and JS only if required).\n\n")
+		b.WriteString("Call propose_changes once with the section liquid and its CSS.\n\n")
 	} else if sliderImagesOnly {
 		b.WriteString("## Pre-selected local hero-slider IMAGE SWAP\n")
 		b.WriteString("ONLY change <img src> URLs in components/store-hero-banner.liquid.\n")
