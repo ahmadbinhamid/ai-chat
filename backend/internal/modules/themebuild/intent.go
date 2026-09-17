@@ -215,13 +215,16 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 
 // sectionRedesignRe: substantial header/footer rebuilds (newsletter, link
 // columns, SaaS chrome) — never the 8k simple_edit one-shot. Tiny tweaks
-// ("make the footer text white" / "make the header modern") stay simple_edit.
+// ("make the footer text white" / "make copyright lighter") stay simple_edit.
+// Do NOT treat bare "copyright" alone as a redesign cue.
 var sectionRedesignRe = regexp.MustCompile(`(?i)(?:` +
 	`\b(?:redesign|restyle|rewrite|overhaul|rebuild)\b[\s\S]{0,64}\b(?:footer|header)\b` +
 	`|` +
 	`\b(?:footer|header)\b[\s\S]{0,64}\b(?:redesign|restyle|rewrite|overhaul|rebuild)\b` +
 	`|` +
-	`\b(?:footer|header)\b[\s\S]{0,220}\b(?:newsletter|saas|social\s*media|copyright|privacy\s*policy|terms\s*(?:&|and)?\s*conditions|cookie\s*policy|documentation|link\s*columns?|multi[- ]column)\b` +
+	`\b(?:footer|header)\b[\s\S]{0,220}\b(?:newsletter|saas|social\s*media|privacy\s*policy|terms\s*(?:&|and)?\s*conditions|cookie\s*policy|documentation|link\s*columns?|multi[- ]column|bottom\s*bar)\b` +
+	`|` +
+	`\b(?:footer|header)\b[\s\S]{0,220}\bcopyright\b[\s\S]{0,48}\b(?:privacy|terms|cookie|newsletter|social)\b` +
 	`)`)
 
 // sectionCSSBrokenRe: merchant says footer/header CSS/design did not apply —

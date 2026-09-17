@@ -2,6 +2,7 @@ package themebuild
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -550,6 +551,19 @@ func (s *Service) checkAndRepair(
 				"elapsed_ms", repairElapsed.Milliseconds(),
 				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
 				"error", genErr)
+			// Timeout / propose exhaustion during "Applying a fix…" used to
+			// wipe a usable first proposal and show merchants "another pass
+			// couldn't finish". Keep the last well-formed changeset instead.
+			if result != nil && len(result.Files) > 0 && isTransientRepairErr(genErr) {
+				slog.Warn("ai: repair timed out — keeping prior proposal",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+					"attempt", attempt,
+					"pending_error_findings", len(errorFindings),
+					"rules", findingRules(errorFindings),
+					"error", genErr)
+				result.InputTokens, result.OutputTokens = totalInput, totalOutput
+				return result, append(warningFindings, errorFindings...), nil
+			}
 			return nil, nil, fmt.Errorf("retry generation: %w", genErr)
 		}
 		slog.Info("repair generation completed",
@@ -604,6 +618,24 @@ func splitFindings(findings []themecheck.Finding) (errorFindings, warningFinding
 		}
 	}
 	return errorFindings, warningFindings
+}
+
+// isTransientRepairErr reports provider/timeout failures during themecheck
+// repair where keeping the prior proposal is better than failing the turn.
+func isTransientRepairErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ai.ErrMaxTokensTruncated) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "did not call propose_changes") ||
+		strings.Contains(msg, "first-token timeout") ||
+		strings.Contains(msg, "first_token_timeout") ||
+		strings.Contains(msg, "idle timeout") ||
+		strings.Contains(msg, "timed out") ||
+		strings.Contains(msg, "timeout")
 }
 
 func findingRules(findings []themecheck.Finding) []string {

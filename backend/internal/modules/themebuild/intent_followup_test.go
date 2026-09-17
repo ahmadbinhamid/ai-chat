@@ -21,4 +21,7 @@ func TestClassifyIntent_FooterCSSNotApplied(t *testing.T) {
 	if got := ClassifyIntent("make the footer text white", "", false); got != IntentSimpleEdit {
 		t.Fatalf("tiny tweak want simple_edit got %s", got)
 	}
+	if got := ClassifyIntent("make the footer copyright text a bit lighter gray", "", false); got != IntentSimpleEdit {
+		t.Fatalf("copyright color tweak want simple_edit got %s", got)
+	}
 }
