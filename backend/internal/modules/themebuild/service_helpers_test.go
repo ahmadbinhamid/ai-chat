@@ -139,6 +139,63 @@ func TestRecapAssistantTurn_NeverEmpty(t *testing.T) {
 	}
 }
 
+// TestRecapAssistantTurn_ShowsOriginalActionForMaterializedEdit is the case
+// this field exists for: a file the model submitted as "edit" (materialized
+// to "update" by the time it reaches here — see ai.MaterializeEdits) must
+// recap as "(edit)", not "(update)", or the model's own replayed history
+// contradicts the guidance repairPrompt gives it.
+func TestRecapAssistantTurn_ShowsOriginalActionForMaterializedEdit(t *testing.T) {
+	result := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "components/footer.liquid", Action: "update", OriginalAction: "edit", Content: "<footer>new</footer>"},
+		},
+	}
+	got := recapAssistantTurn(result)
+	if !strings.Contains(got, "(edit)") {
+		t.Errorf("expected the recap to show the model's own original action (edit), got: %s", got)
+	}
+	if strings.Contains(got, "(update)") {
+		t.Errorf("expected the recap NOT to also show (update) for a materialized edit, got: %s", got)
+	}
+}
+
+// TestRecapAssistantTurn_CreateAndUpdateByteIdenticalToBeforeOriginalAction
+// confirms a file that was never an "edit" (OriginalAction unset) recaps
+// exactly as it did before this field existed — the required back-compat
+// case for every existing caller, including a fake generator/eval fixture
+// built directly in Go that never sets OriginalAction.
+func TestRecapAssistantTurn_CreateAndUpdateByteIdenticalToBeforeOriginalAction(t *testing.T) {
+	result := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "pages/new.liquid", Action: "create", Content: "hello"},
+			{Path: "pages/offers.liquid", Action: "update", Content: "world"},
+		},
+	}
+	got := recapAssistantTurn(result)
+	want := "### pages/new.liquid (create)\nhello\n\n### pages/offers.liquid (update)\nworld"
+	if got != want {
+		t.Errorf("recap = %q, want %q", got, want)
+	}
+}
+
+// TestRecapAssistantTurn_FailedMaterializationRecapsAsUpdate documents the
+// decision for the edge case where an edit failed materialization and the
+// model's retry, within the same Generate call, resubmitted the file
+// directly as a full "update" — that file never enters the OriginalAction
+// branch (see materializeEdits), so its recap shows exactly what the model
+// ultimately supplied: "update", not a stale "edit" it abandoned.
+func TestRecapAssistantTurn_FailedMaterializationRecapsAsUpdate(t *testing.T) {
+	result := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "components/footer.liquid", Action: "update", Content: "<footer>fixed</footer>"},
+		},
+	}
+	got := recapAssistantTurn(result)
+	if !strings.Contains(got, "(update)") {
+		t.Errorf("expected a resubmitted-as-update file to recap as (update), got: %s", got)
+	}
+}
+
 func TestRepairPrompt(t *testing.T) {
 	findings := []themecheck.Finding{
 		{Rule: "known-fields", Path: "pages/offers.liquid", Message: "invented field"},

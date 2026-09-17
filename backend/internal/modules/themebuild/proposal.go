@@ -491,8 +491,14 @@ func (s *Service) checkAndRepair(
 		turns = append(turns, ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)})
 		repair := repairPrompt(errorFindings)
 
+		// result here is the proposal that just got rejected — repairFileReader
+		// lets an "edit" during THIS repair round resolve against its own
+		// already-materialized files (a file the model just created, which
+		// nothing has written to the store yet) before falling back to
+		// readFile. See repairFileReader's own doc comment for why this is
+		// scoped to only this call, never the initial generation.
 		repairStart := time.Now()
-		retried, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(repair, in), imagesFromInput(in), onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
+		retried, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(repair, in), imagesFromInput(in), onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, repairFileReader(readFile, result))
 		repairElapsed := time.Since(repairStart)
 		if genErr != nil {
 			// Surfaced distinctly from the generic reaper cleanup: without
@@ -570,25 +576,14 @@ func summarizeFindings(findings []themecheck.Finding) string {
 }
 
 // formatFindingLine renders one finding the same way everywhere a
-// merchant-model-facing findings list is built (repairPrompt,
-// summarizeFindings, and execValidateChanges' tool result) — one shared
-// format, not three copies that could drift apart.
+// merchant-model-facing findings list is built (repairPrompt and
+// summarizeFindings) — one shared format, not two copies that could drift
+// apart.
 func formatFindingLine(f themecheck.Finding) string {
 	if f.Path != "" {
 		return fmt.Sprintf("[%s] %s: %s", f.Rule, f.Path, f.Message)
 	}
 	return fmt.Sprintf("[%s] %s", f.Rule, f.Message)
-}
-
-// formatFindingsList renders findings as a bullet list, one formatFindingLine
-// per line — the same "- [rule] path: message" shape repairPrompt already
-// builds inline, factored out so execValidateChanges can reuse it exactly.
-func formatFindingsList(findings []themecheck.Finding) string {
-	var b strings.Builder
-	for _, f := range findings {
-		b.WriteString("- " + formatFindingLine(f) + "\n")
-	}
-	return b.String()
 }
 
 // recapAssistantTurn replays a rejected proposal's file content back to the
@@ -603,7 +598,17 @@ func recapAssistantTurn(result *ai.Result) string {
 		fmt.Fprintf(&b, "%s\n\n", result.Summary)
 	}
 	for _, f := range result.Files {
-		fmt.Fprintf(&b, "### %s (%s)\n%s\n\n", f.Path, f.Action, f.Content)
+		// f.OriginalAction, when set, is what the model actually submitted
+		// before materializeEdits overwrote f.Action — see its own doc
+		// comment. Falling back to f.Action when it's empty (the normal
+		// case: a file that was never an "edit", or a fake generator/eval
+		// fixture built directly in Go that never set it) reproduces
+		// exactly what this rendered before this field existed.
+		action := f.OriginalAction
+		if action == "" {
+			action = f.Action
+		}
+		fmt.Fprintf(&b, "### %s (%s)\n%s\n\n", f.Path, action, f.Content)
 	}
 	out := strings.TrimSpace(b.String())
 	if out == "" {
@@ -629,29 +634,39 @@ func recapAssistantTurn(result *ai.Result) string {
 // read a file before editing it — there is nothing to look up here for any
 // file already in that recap; explicitly saying so is what stops the model
 // from calling read_theme_file on it "just in case" anyway.
+//
+// Order matters here: the edit instruction leads, right after the findings,
+// with whole-file "update" demoted to an explicit, named fallback — not the
+// reverse. An earlier version opened with "resubmit the complete corrected
+// set of files (not a diff)" before ever mentioning "edit"; that phrase
+// reads as an argument against old_string/new_string (which IS diff-shaped
+// syntax, even though materialization turns it into a complete file
+// server-side) stated first, absolute, and unconditional, with the actual
+// edit guidance arriving third and hedged. Observed in production: a
+// 9-finding rejection (all the same file) that answered with a full
+// "update" re-emitting 26,170 output tokens — double the original
+// proposal — instead of nine old_string/new_string pairs. Leading with edit
+// removes the contradiction rather than trying to word around it.
 func repairPrompt(errorFindings []themecheck.Finding) string {
 	var b strings.Builder
 	b.WriteString("Your last proposal failed validation against the theme engine spec. Fix ONLY these specific " +
-		"problems, in ONLY the file(s) named below, and resubmit the complete corrected set of files (not a diff):\n\n")
+		"problems, in ONLY the file(s) named below, then call propose_changes again:\n\n")
 	for _, f := range errorFindings {
 		fmt.Fprintf(&b, "- %s\n", formatFindingLine(f))
 	}
-	b.WriteString("\nThe exact current content of every file in your last proposal is already in your message " +
-		"above — that IS the real, current content (not a reconstruction from memory), so do not call " +
-		"read_theme_file again on any file named there. Only read a file if a finding above names one your last " +
-		"proposal did NOT already include. Do not explore, read, or touch anything else — no other files, no " +
-		"re-checking components you already used correctly, no improvements beyond what's listed above.")
 	// A themecheck rejection is exactly the case action "edit" is for: the
 	// findings above already say precisely which line(s) are wrong, so a
 	// targeted old_string/new_string fix against the content you already
-	// have (see the paragraph above) is normally both correct and far
+	// have (see the paragraph below) is normally both correct and far
 	// smaller than resubmitting the whole file — action "edit"'s
 	// server-side materialization always produces that same complete,
 	// corrected file; it's just a cheaper way to submit it, not a partial
-	// one.
+	// one. Said plainly here, in place of a bare "not a diff" prohibition,
+	// so the instruction explains what materialization does instead of just
+	// forbidding the syntax that triggers it.
 	//
-	// The second escape hatch (an edit already failed once this turn) is
-	// what closes a real gap: MaterializeEdits' own retry escalation
+	// The second fallback condition (an edit already failed once this turn)
+	// is what closes a real gap: materializeEdits' own retry escalation
 	// (maxEditMaterializationFailures) is scoped to ONE Generate call, so
 	// it never fires across repair ROUNDS — each fresh checkAndRepair
 	// attempt starts that counter back at zero, even though the model's own
@@ -660,15 +675,25 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 	// file failing edit materialization on the first attempt of two
 	// separate repair rounds in the same turn, each self-correcting only
 	// after burning a whole extra model call retrying with the same
-	// (already-in-context) content. Naming the earlier failure explicitly
-	// gives the model a reason to reach for "update" instead of repeating
-	// the same old_string guess a second time.
-	b.WriteString("\n\nFor most of these, action \"edit\" on the file you already have (a precise old_string/" +
-		"new_string pair per finding) is the right fix — resubmit the whole file as action \"update\" instead if " +
-		"the correction is broad enough that a full rewrite is genuinely simpler, OR if an earlier attempt in " +
-		"THIS conversation already failed to apply an \"edit\" to this same file (check your own prior tool " +
-		"results above) — trying another old_string/new_string pair risks the identical mismatch, and the file's " +
-		"exact current content is already right here, so a full \"update\" costs nothing extra to get right.")
+	// (already-in-context) content. Naming the earlier failure explicitly,
+	// as its own condition rather than folded into the first with "OR",
+	// gives the model a clear, separate reason to reach for "update"
+	// instead of repeating the same old_string guess a second time.
+	b.WriteString("\nFix each of these with action \"edit\" against the file you already have (a precise " +
+		"old_string/new_string pair per finding) — materialized server-side, an \"edit\" produces the exact same " +
+		"complete, corrected file a full \"update\" would; it's just a cheaper way to express the same change, " +
+		"not a partial one.\n\n" +
+		"Resubmit the whole file as action \"update\" instead only when one of these applies: (1) the correction " +
+		"is broad enough that a full rewrite is genuinely simpler than several old_string/new_string pairs, or " +
+		"(2) an earlier attempt in THIS conversation already failed to apply an \"edit\" to this same file (check " +
+		"your own prior tool results above) — trying another old_string/new_string pair then risks the identical " +
+		"mismatch, and the file's exact current content is already right here, so a full \"update\" costs nothing " +
+		"extra to get right.")
+	b.WriteString("\n\nThe exact current content of every file in your last proposal is already in your message " +
+		"above — that IS the real, current content (not a reconstruction from memory), so do not call " +
+		"read_theme_file again on any file named there. Only read a file if a finding above names one your last " +
+		"proposal did NOT already include. Do not explore, read, or touch anything else — no other files, no " +
+		"re-checking components you already used correctly, no improvements beyond what's listed above.")
 	return b.String()
 }
 

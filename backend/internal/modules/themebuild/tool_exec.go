@@ -4,14 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"path"
 	"regexp"
 	"sort"
 	"strings"
 
 	"ai-chat/internal/ai"
-	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
 )
 
@@ -34,19 +32,8 @@ var grepThemeSearchableExt = map[string]bool{".liquid": true, ".css": true, ".js
 // buildToolExecutor returns the ai.ToolExecutor this generation call uses
 // to read the real theme — the only place ai.Generate ever reaches
 // themefs, and only through this closure (see ai.ToolExecutor's doc
-// comment): package ai never imports themefs's Store directly. tc and
-// snapBase back validate_changes: tc.GenerationMode lets it apply the same
-// mode restriction propose_changes' result would eventually be checked
-// against (see execValidateChanges), and snapBase is the per-turn-invariant
-// part of a themecheck.Snapshot (see buildSnapshotBase) — built once by
-// this function's caller and reused by every validate_changes call this
-// executor instance ever handles. validateCallCount is closed over here,
-// not passed in, so it persists for the life of this one ToolExecutor
-// closure — which doGenerate builds once and checkAndRepair's repair
-// rounds reuse unchanged (see their shared toolExec parameter), so the cap
-// below spans the whole merchant turn, not just one Generate call.
-func (s *Service) buildToolExecutor(store themefs.ThemeStore, storeAuth themefs.RequestAuth, tc ai.ThemeContext, snapBase themecheck.Snapshot) ai.ToolExecutor {
-	validateCallCount := 0
+// comment): package ai never imports themefs's Store directly.
+func (s *Service) buildToolExecutor(store themefs.ThemeStore, storeAuth themefs.RequestAuth) ai.ToolExecutor {
 	return func(ctx context.Context, name string, input json.RawMessage) (string, error) {
 		switch name {
 		case "list_theme_files":
@@ -55,8 +42,6 @@ func (s *Service) buildToolExecutor(store themefs.ThemeStore, storeAuth themefs.
 			return s.execReadThemeFile(ctx, store, storeAuth, input)
 		case "grep_theme":
 			return s.execGrepTheme(ctx, store, storeAuth, input)
-		case "validate_changes":
-			return s.execValidateChanges(ctx, store, storeAuth, tc, snapBase, &validateCallCount, input)
 		default:
 			return "", fmt.Errorf("unknown tool %q", name)
 		}
@@ -70,10 +55,44 @@ func (s *Service) buildToolExecutor(store themefs.ThemeStore, storeAuth themefs.
 // earlier turns' staged draft changes too, never stale saved-theme content.
 // Deliberately not routed through ToolExecutor: that returns a
 // model-facing formatted string (see execReadThemeFile), not the clean raw
-// content MaterializeEdits needs to apply a find/replace against.
+// content materializeEdits needs to apply a find/replace against.
 func (s *Service) buildFileReader(store themefs.ThemeStore, storeAuth themefs.RequestAuth) ai.FileReader {
 	return func(ctx context.Context, path string) (string, error) {
 		return store.ReadFile(ctx, storeAuth, path)
+	}
+}
+
+// repairFileReader returns an ai.FileReader for use ONLY at checkAndRepair's
+// repair-round Generate call — never the initial generation, which keeps
+// base (store-only) exactly as before: a file that doesn't exist yet
+// genuinely shouldn't be editable on a first pass. It checks previous's own
+// files (keyed by path) before falling back to base.
+//
+// previous is the proposal that just got rejected — the one checkAndRepair
+// is repairing. Its Content is already fully materialized (every "edit"
+// already resolved to real content by ai.MaterializeEdits before it became
+// this Result — see GeneratedFile.OriginalAction's doc comment), so this
+// overlay reads exactly what the model's own recapAssistantTurn shows it:
+// the same content an "edit" against a file the model just wrote needs to
+// apply against, which the real store can never have (nothing is written
+// there until checkAndRepair accepts — see buildSnapshot's doc comment).
+// On repair rounds 2+, checkAndRepair calls this again with the latest
+// rejected proposal, not the first — see its own call site.
+//
+// A path present in both previous and the store reads from previous — it's
+// what the model is actually working from, not what was last saved. A path
+// found in neither returns whatever base returns (content or error)
+// unchanged; this overlay never swallows a real read error.
+func repairFileReader(base ai.FileReader, previous *ai.Result) ai.FileReader {
+	byPath := make(map[string]string, len(previous.Files))
+	for _, f := range previous.Files {
+		byPath[f.Path] = f.Content
+	}
+	return func(ctx context.Context, path string) (string, error) {
+		if content, ok := byPath[path]; ok {
+			return content, nil
+		}
+		return base(ctx, path)
 	}
 }
 
@@ -233,94 +252,4 @@ func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, s
 		fmt.Fprintf(&b, "(stopped at %d matches — narrow your pattern/path_glob)\n", maxGrepMatches)
 	}
 	return b.String(), nil
-}
-
-// maxValidateChangesCalls bounds how many times a model can call
-// validate_changes in one merchant turn — a free-to-call validation tool is
-// the same shape of risk as the production-observed thrash pattern a plain
-// exploration tool can already cause (see thrashOutputTokenThreshold's own
-// doc comment: 285s / 24,315 output tokens / 6 grep_theme calls that
-// changed nothing), just for a new tool instead of an old one. Scoped to
-// the whole turn rather than one Generate call — see buildToolExecutor's
-// doc comment for why (avoids rebuilding toolExec, and therefore changing
-// checkAndRepair's signature, before every repair round).
-const maxValidateChangesCalls = 4
-
-// execValidateChanges lets the model check a candidate proposal — the same
-// payload it's about to send propose_changes — against themecheck's rules
-// without committing it. Advisory only: this never replaces the real,
-// authoritative post-hoc check checkAndRepair runs on the actual
-// propose_changes result (see its own doc comment) — a model that never
-// calls this tool at all is still caught exactly as before. Deliberately
-// does not run checkAndRepair's three auto-fixers: this is the model's own
-// in-loop check, not a second auto-fix path.
-func (s *Service) execValidateChanges(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, tc ai.ThemeContext, snapBase themecheck.Snapshot, callCount *int, input json.RawMessage) (string, error) {
-	var candidate ai.Result
-	if err := json.Unmarshal(input, &candidate); err != nil {
-		return "", fmt.Errorf("invalid validate_changes input: %w", err)
-	}
-	if len(candidate.Files) == 0 {
-		return "Nothing to validate — files is empty.", nil
-	}
-
-	*callCount++
-	if *callCount > maxValidateChangesCalls {
-		return fmt.Sprintf(
-			"validate_changes has already been called %d times this turn. Fix what you have using the findings "+
-				"you've already seen and call propose_changes now.", maxValidateChangesCalls), nil
-	}
-
-	// Materialize "edit" actions into real content the exact same way
-	// Generate does for a real propose_changes call (see
-	// ai.MaterializeEdits' doc comment) — otherwise this would validate the
-	// find/replace payload itself, not the file content it would actually
-	// produce. A fresh failureCounts map per call is deliberate: the
-	// escalating "this will fail the generation" messaging
-	// MaterializeEdits produces on repeat failures belongs to the real
-	// materialization path inside Generate (see editFailureCounts there),
-	// not to this advisory check, which has no generation to fail.
-	readFile := s.buildFileReader(store, storeAuth)
-	ok, retryMsg := ai.MaterializeEdits(ctx, &candidate, readFile, make(map[string]int))
-	if !ok {
-		// A materialization failure (bad old_string, missing edit target)
-		// is exactly the kind of thing this tool exists to catch cheaply —
-		// report it as a finding the model can act on, not a tool error.
-		return retryMsg, nil
-	}
-
-	// themecheck.Check itself has no GenerationMode awareness (see
-	// toolsForMode's doc comment) — validateProposal is what actually
-	// enforces mode restrictions, post-hoc, in generateValidProposal/
-	// checkAndRepair. Running it here too means a mode-restricted candidate
-	// that would later be rejected for that reason is never reported as
-	// "valid" by this tool. Brand mode itself never reaches this function at
-	// all (validate_changes isn't offered — see toolsForMode), so this
-	// matters for GenerationModeCopy/GenerationModePages today, and any
-	// future mode this file's switch doesn't already special-case.
-	if err := validateProposal(&candidate, tc.GenerationMode); err != nil {
-		return fmt.Sprintf("This candidate would be rejected: %s", err), nil
-	}
-
-	snap := s.buildSnapshot(ctx, store, storeAuth, snapBase, &candidate)
-	findings := themecheck.Check(toProposal(&candidate), snap)
-	findings = themecheck.DowngradePreExistingFindings(findings, toProposal(&candidate), snap.Files)
-	errorFindings, warningFindings := splitFindings(findings)
-
-	slog.Info("validate_changes called", "call_index", *callCount,
-		"error_count", len(errorFindings), "warning_count", len(warningFindings), "rules", findingRules(findings))
-
-	if len(errorFindings) == 0 {
-		msg := "No blocking findings — proceed to propose_changes."
-		if len(warningFindings) > 0 {
-			msg += "\n\nNon-blocking warnings (these won't block propose_changes; fix only if easy):\n" +
-				formatFindingsList(warningFindings)
-		}
-		return msg, nil
-	}
-	msg := "Blocking findings — fix these before calling propose_changes:\n" + formatFindingsList(errorFindings)
-	if len(warningFindings) > 0 {
-		msg += "\nNon-blocking warnings (these won't block propose_changes; fix only if easy):\n" +
-			formatFindingsList(warningFindings)
-	}
-	return msg, nil
 }

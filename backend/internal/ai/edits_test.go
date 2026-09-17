@@ -422,7 +422,7 @@ func TestMaterializeEdits_SuccessConvertsEditToUpdate(t *testing.T) {
 	}}
 	readFile := fixedFileReader(map[string]string{"components/footer.liquid": "before old after"})
 
-	ok, msg := MaterializeEdits(context.Background(), result, readFile, map[string]int{})
+	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
 	if !ok {
 		t.Fatalf("expected materialization to succeed, got message: %s", msg)
 	}
@@ -442,7 +442,7 @@ func TestMaterializeEdits_UnmaterializedFilesUnaffected(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "pages/new.liquid", Action: "create", Content: "hello"},
 	}}
-	ok, _ := MaterializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
+	ok, _ := materializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
 	if !ok {
 		t.Fatal("expected materialization to succeed with no edit-action files")
 	}
@@ -451,11 +451,46 @@ func TestMaterializeEdits_UnmaterializedFilesUnaffected(t *testing.T) {
 	}
 }
 
+// TestMaterializeEdits_SetsOriginalActionToEdit confirms materializeEdits
+// captures what the model actually submitted (see GeneratedFile.OriginalAction's
+// own doc comment) before overwriting Action — the write side of the fix that
+// lets recapAssistantTurn show the model its own real last turn.
+func TestMaterializeEdits_SetsOriginalActionToEdit(t *testing.T) {
+	result := &Result{Files: []GeneratedFile{
+		{Path: "components/footer.liquid", Action: "edit", Edits: []Edit{{OldString: "old", NewString: "new"}}},
+	}}
+	readFile := fixedFileReader(map[string]string{"components/footer.liquid": "before old after"})
+
+	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
+	if !ok {
+		t.Fatalf("expected materialization to succeed, got message: %s", msg)
+	}
+	if result.Files[0].OriginalAction != "edit" {
+		t.Errorf("expected OriginalAction %q, got %q", "edit", result.Files[0].OriginalAction)
+	}
+}
+
+// TestMaterializeEdits_NeverEditLeavesOriginalActionEmpty confirms a file
+// that was never an "edit" never has OriginalAction set — the empty value a
+// reader (recapAssistantTurn) is expected to treat as "same as Action".
+func TestMaterializeEdits_NeverEditLeavesOriginalActionEmpty(t *testing.T) {
+	result := &Result{Files: []GeneratedFile{
+		{Path: "pages/new.liquid", Action: "create", Content: "hello"},
+	}}
+	ok, _ := materializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
+	if !ok {
+		t.Fatal("expected materialization to succeed with no edit-action files")
+	}
+	if result.Files[0].OriginalAction != "" {
+		t.Errorf("expected OriginalAction to stay empty for a file that was never an edit, got %q", result.Files[0].OriginalAction)
+	}
+}
+
 func TestMaterializeEdits_NonexistentFileFails(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "components/ghost.liquid", Action: "edit", Edits: []Edit{{OldString: "x", NewString: "y"}}},
 	}}
-	ok, msg := MaterializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
+	ok, msg := materializeEdits(context.Background(), result, fixedFileReader(nil), map[string]int{})
 	if ok {
 		t.Fatal("expected materialization to fail for a nonexistent file")
 	}
@@ -469,7 +504,7 @@ func TestMaterializeEdits_DuplicatePathRejected(t *testing.T) {
 		{Path: "components/footer.liquid", Action: "edit", Edits: []Edit{{OldString: "x", NewString: "y"}}},
 		{Path: "components/footer.liquid", Action: "update", Content: "z"},
 	}}
-	ok, msg := MaterializeEdits(context.Background(), result, fixedFileReader(map[string]string{"components/footer.liquid": "x"}), map[string]int{})
+	ok, msg := materializeEdits(context.Background(), result, fixedFileReader(map[string]string{"components/footer.liquid": "x"}), map[string]int{})
 	if ok {
 		t.Fatal("expected edit+update on the same path in one proposal to be rejected")
 	}
@@ -482,7 +517,7 @@ func TestMaterializeEdits_EmptyEditsListFails(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "components/footer.liquid", Action: "edit", Edits: nil},
 	}}
-	ok, _ := MaterializeEdits(context.Background(), result, fixedFileReader(map[string]string{"components/footer.liquid": "x"}), map[string]int{})
+	ok, _ := materializeEdits(context.Background(), result, fixedFileReader(map[string]string{"components/footer.liquid": "x"}), map[string]int{})
 	if ok {
 		t.Fatal("expected action \"edit\" with an empty edits[] to fail")
 	}
@@ -493,7 +528,7 @@ func TestMaterializeEdits_ReadErrorFailsWithoutPanicking(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "components/footer.liquid", Action: "edit", Edits: []Edit{{OldString: "x", NewString: "y"}}},
 	}}
-	ok, msg := MaterializeEdits(context.Background(), result, readFile, map[string]int{})
+	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
 	if ok {
 		t.Fatal("expected a read error to fail materialization")
 	}
@@ -511,12 +546,12 @@ func TestMaterializeEdits_TwoFailuresFallsBackToUpdateAdvice(t *testing.T) {
 	readFile := fixedFileReader(map[string]string{"components/footer.liquid": "content with no match"})
 	counts := map[string]int{}
 
-	_, firstMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
+	_, firstMsg := materializeEdits(context.Background(), result(), readFile, counts)
 	if got := "resubmit this file with action \"update\""; strings.Contains(firstMsg, got) {
 		t.Errorf("expected the FIRST failure to just describe the problem, not already suggest falling back: %q", firstMsg)
 	}
 
-	_, secondMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
+	_, secondMsg := materializeEdits(context.Background(), result(), readFile, counts)
 	if got := `resubmit this file with action "update"`; !strings.Contains(secondMsg, got) {
 		t.Errorf("expected the SECOND failure for the same file to fall back to requesting full content, got: %q", secondMsg)
 	}
@@ -536,12 +571,12 @@ func TestMaterializeEdits_DuplicatePathsTwiceFailsGeneration(t *testing.T) {
 	readFile := fixedFileReader(map[string]string{"components/footer.liquid": "x"})
 	counts := map[string]int{}
 
-	_, firstMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
+	_, firstMsg := materializeEdits(context.Background(), result(), readFile, counts)
 	if strings.Contains(firstMsg, "fail the generation") {
 		t.Errorf("expected the FIRST duplicate-paths failure to just describe the problem, got: %q", firstMsg)
 	}
 
-	_, secondMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
+	_, secondMsg := materializeEdits(context.Background(), result(), readFile, counts)
 	if !strings.Contains(secondMsg, "fail the generation") {
 		t.Errorf("expected the SECOND duplicate-paths failure in a row to warn the generation will fail, got: %q", secondMsg)
 	}
@@ -566,7 +601,7 @@ func TestMaterializeEdits_NonexistentFileTwiceFailsGeneration(t *testing.T) {
 	readFile := fixedFileReader(nil) // "" for every path — nothing exists
 	counts := map[string]int{}
 
-	_, firstMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
+	_, firstMsg := materializeEdits(context.Background(), result(), readFile, counts)
 	if strings.Contains(firstMsg, "fail the generation") {
 		t.Errorf("expected the FIRST file-not-found failure to just describe the problem, got: %q", firstMsg)
 	}
@@ -574,11 +609,139 @@ func TestMaterializeEdits_NonexistentFileTwiceFailsGeneration(t *testing.T) {
 		t.Errorf("expected the original create-instead-of-edit guidance, got: %q", firstMsg)
 	}
 
-	_, secondMsg := MaterializeEdits(context.Background(), result(), readFile, counts)
+	_, secondMsg := materializeEdits(context.Background(), result(), readFile, counts)
 	if !strings.Contains(secondMsg, "fail the generation") {
 		t.Errorf("expected the SECOND file-not-found failure in a row to warn the generation will fail, got: %q", secondMsg)
 	}
 	if !strings.Contains(secondMsg, `action "create"`) {
 		t.Errorf("expected the original create-instead-of-edit guidance to still be present at the limit, got: %q", secondMsg)
+	}
+}
+
+// TestMaterializeEdits_NoMatchIncludesContentWhenUnderCap is the fix for the
+// expensive path observed in production: a no_match failure with no content
+// in the retry message left the model with no way to correct itself except
+// re-reading the file — exactly what it did, at real cost (~148s, 7 tool
+// calls in one observed repair round). Under noMatchContentCap, the file's
+// real content goes straight into the message instead.
+func TestMaterializeEdits_NoMatchIncludesContentWhenUnderCap(t *testing.T) {
+	content := "line one\nline two\nline three\n"
+	result := &Result{Files: []GeneratedFile{
+		{Path: "components/footer.liquid", Action: "edit", Edits: []Edit{{OldString: "nope", NewString: "y"}}},
+	}}
+	readFile := fixedFileReader(map[string]string{"components/footer.liquid": content})
+
+	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
+	if ok {
+		t.Fatal("expected materialization to fail")
+	}
+	if !strings.Contains(msg, content) {
+		t.Errorf("expected the real file content inlined in the retry message, got: %q", msg)
+	}
+}
+
+// TestMaterializeEdits_NoMatchOverCapShowsNearMissWindow confirms a file too
+// large to inline whole still gets a bounded, useful window when a cheap
+// anchor (the edit's first line) is found nearby — not the entire file.
+func TestMaterializeEdits_NoMatchOverCapShowsNearMissWindow(t *testing.T) {
+	anchor := "TARGET LINE"
+	big := strings.Repeat("filler ", 2000) + anchor + strings.Repeat(" more filler", 2000)
+	result := &Result{Files: []GeneratedFile{
+		{Path: "components/footer.liquid", Action: "edit",
+			Edits: []Edit{{OldString: anchor + "\nnope", NewString: "y"}}},
+	}}
+	readFile := fixedFileReader(map[string]string{"components/footer.liquid": big})
+
+	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
+	if ok {
+		t.Fatal("expected materialization to fail")
+	}
+	if !strings.Contains(msg, anchor) {
+		t.Errorf("expected the near-miss window to include the anchor line, got: %q", msg)
+	}
+	if strings.Contains(msg, big) {
+		t.Error("expected only a bounded window, not the entire oversized file, inlined")
+	}
+}
+
+// TestMaterializeEdits_NoMatchOverCapNoAnchorSaysReRead confirms a file too
+// large to inline, with no cheap anchor found either, falls back to a plain
+// instruction to re-read that one file — never silently drops the failure.
+func TestMaterializeEdits_NoMatchOverCapNoAnchorSaysReRead(t *testing.T) {
+	big := strings.Repeat("x", noMatchContentCap+1000)
+	result := &Result{Files: []GeneratedFile{
+		{Path: "components/footer.liquid", Action: "edit",
+			Edits: []Edit{{OldString: "this text is nowhere in the file", NewString: "y"}}},
+	}}
+	readFile := fixedFileReader(map[string]string{"components/footer.liquid": big})
+
+	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
+	if ok {
+		t.Fatal("expected materialization to fail")
+	}
+	if !strings.Contains(msg, "re-read this one file specifically") {
+		t.Errorf("expected the explicit re-read instruction when no near-miss anchor was found, got: %q", msg)
+	}
+}
+
+// overlayReader mirrors themebuild's repairFileReader (a map checked first,
+// falling back to base) without depending on that package — this file
+// tests materializeEdits' own behavior when given such a reader, which is
+// the actual mechanism repairFileReader's tests (in themebuild) rely on;
+// this test proves it end to end at the materializeEdits level.
+func overlayReader(overlay map[string]string, base FileReader) FileReader {
+	return func(ctx context.Context, path string) (string, error) {
+		if content, ok := overlay[path]; ok {
+			return content, nil
+		}
+		return base(ctx, path)
+	}
+}
+
+// TestMaterializeEdits_SucceedsAgainstOverlayOnlyFile is the Run B case:
+// a file that only exists in a rejected proposal's own overlay (nothing
+// staged to the real store yet) must still materialize an "edit" — the
+// mechanism repairFileReader (themebuild) supplies during a repair round.
+// The plain base reader alone (no overlay — the initial generation's own
+// path, see TestMaterializeEdits_NonexistentFileFails) still fails exactly
+// as before this fix.
+func TestMaterializeEdits_SucceedsAgainstOverlayOnlyFile(t *testing.T) {
+	base := fixedFileReader(nil) // nothing in the store
+	reader := overlayReader(map[string]string{"components/home-bestsellers.liquid": "<div>old</div>"}, base)
+
+	result := &Result{Files: []GeneratedFile{
+		{Path: "components/home-bestsellers.liquid", Action: "edit",
+			Edits: []Edit{{OldString: "old", NewString: "new"}}},
+	}}
+	ok, msg := materializeEdits(context.Background(), result, reader, map[string]int{})
+	if !ok {
+		t.Fatalf("expected materialization to succeed via the overlay, got: %s", msg)
+	}
+	if result.Files[0].Content != "<div>new</div>" {
+		t.Errorf("unexpected materialized content: %q", result.Files[0].Content)
+	}
+}
+
+// TestMaterializeEdits_NoReExploreInstructionAppearsOnceForBatch is the Run
+// B edge case: three failures at once (mixed types) must carry the
+// no-re-explore instruction exactly once, not once per failure.
+func TestMaterializeEdits_NoReExploreInstructionAppearsOnceForBatch(t *testing.T) {
+	result := &Result{Files: []GeneratedFile{
+		{Path: "a.liquid", Action: "edit", Edits: []Edit{{OldString: "nope-a", NewString: "y"}}},
+		{Path: "b.liquid", Action: "edit", Edits: []Edit{{OldString: "nope-b", NewString: "y"}}},
+		{Path: "c.liquid", Action: "edit", Edits: nil},
+	}}
+	readFile := fixedFileReader(map[string]string{
+		"a.liquid": "content a",
+		"b.liquid": "content b",
+	})
+
+	ok, msg := materializeEdits(context.Background(), result, readFile, map[string]int{})
+	if ok {
+		t.Fatal("expected materialization to fail")
+	}
+	want := "Do not explore, read, or touch anything else"
+	if got := strings.Count(msg, want); got != 1 {
+		t.Errorf("expected the no-re-explore instruction exactly once for a 3-failure batch, got %d occurrences: %q", got, msg)
 	}
 }

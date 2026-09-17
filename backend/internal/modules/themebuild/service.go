@@ -1504,7 +1504,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return fmt.Errorf("build snapshot base: %w", err)
 	}
 
-	toolExec := s.buildToolExecutor(store, storeAuth, tc, snapBase)
+	toolExec := s.buildToolExecutor(store, storeAuth)
 	readFile := s.buildFileReader(store, storeAuth)
 
 	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
@@ -1787,11 +1787,12 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 // (every path that exists, for rule 4's render-target-exists check — see
 // themecheck.Snapshot.Paths) plus real content for the handful of files
 // themecheck actually reads (pages.json, defaults.json, the two layout
-// files). Nothing is written to the theme until the check-and-repair loop
-// accepts a proposal, so this is safe to build once per doGenerate call and
-// reuse for every validate_changes call (see buildToolExecutor) and the
-// final buildSnapshot call below, instead of repeating this same
-// ListFiles + 4 ReadFile round trip on every check.
+// files). Split out from buildSnapshot below so the invariant part and the
+// per-candidate top-up are two separate, independently testable steps —
+// today doGenerate still only calls buildSnapshot once per turn, so this
+// split has no extra call-count saving on its own right now, but it's what
+// lets any future caller that needs to check more than one candidate per
+// turn reuse this same base instead of re-fetching it.
 func (s *Service) buildSnapshotBase(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth) (themecheck.Snapshot, error) {
 	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {

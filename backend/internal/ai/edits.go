@@ -11,7 +11,7 @@ import (
 
 // FileReader reads one theme file's current raw content by path — used only
 // to materialize a GeneratedFile's "edit" action into full content (see
-// MaterializeEdits). Distinct from ToolExecutor: that's scoped to
+// materializeEdits). Distinct from ToolExecutor: that's scoped to
 // model-invoked tool calls and returns a human-formatted string for the
 // model to read; this needs one file's exact raw bytes and a clean error,
 // never model-facing text. An empty, non-error return means the path
@@ -22,12 +22,12 @@ type FileReader func(ctx context.Context, path string) (content string, err erro
 
 // maxEditMaterializationFailures bounds how many times a materialization
 // failure is allowed to repeat — a bad old_string, a read error, a
-// nonexistent edit target — before MaterializeEdits stops just repeating
+// nonexistent edit target — before materializeEdits stops just repeating
 // its usual guidance and tells the model plainly that doing it again will
 // fail the generation. Keyed per file path for those; the duplicate-paths
 // failure below isn't about any single file, so it gets its own reserved
 // key (duplicatePathsFailureKey) in the same map instead. See
-// MaterializeEdits' own doc comment on why this is the safe fallback rather
+// materializeEdits' own doc comment on why this is the safe fallback rather
 // than looping indefinitely on something the model can't get right.
 const maxEditMaterializationFailures = 2
 
@@ -38,7 +38,7 @@ const maxEditMaterializationFailures = 2
 // collide with a real per-file count sharing the same map.
 const duplicatePathsFailureKey = "<duplicate-paths>"
 
-// MaterializeEdits turns every "edit"-action file in result into "update"
+// materializeEdits turns every "edit"-action file in result into "update"
 // with real content, in place — see GeneratedFile's own doc comment for why
 // this makes "edit" a wire-format optimization only, invisible to every
 // caller downstream of Generate. ok is false when at least one file failed
@@ -51,11 +51,8 @@ const duplicatePathsFailureKey = "<duplicate-paths>"
 // propose_changes call can take minutes to stream, so a rejected
 // materialization throws away that whole cost, not just a cheap round trip.
 // failureCounts is keyed by path and must persist across the whole Generate
-// call (not be reset per attempt) — see the constant above. Exported so
-// themebuild's validate_changes tool executor can materialize a candidate
-// proposal's edits the exact same way, before checking it — see
-// tool_exec.go's execValidateChanges.
-func MaterializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
+// call (not be reset per attempt) — see the constant above.
+func materializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
 	if dupes := duplicateFilePaths(result.Files); len(dupes) > 0 {
 		failureCounts[duplicatePathsFailureKey]++
 		msg := fmt.Sprintf(
@@ -118,12 +115,22 @@ func MaterializeEdits(ctx context.Context, result *Result, readFile FileReader, 
 					`%s: edits failed to apply %d times — resubmit this file with action "update" and its complete `+
 						`corrected content instead of another edit attempt`, f.Path, failureCounts[f.Path]))
 			} else {
-				problems = append(problems, fmt.Sprintf("%s: %s", f.Path, applyErr))
+				// Give the model the content it needs to correct itself
+				// without a tool call — findMatch already tried every tier
+				// and found nothing (or too many) to match against, so
+				// telling the model to "try again" with no content is
+				// exactly what drives it to re-read/re-grep instead. See
+				// noMatchProblem's own doc comment for the size cap.
+				problems = append(problems, noMatchProblem(f.Path, content, f.Edits, applyErr))
 			}
 			continue
 		}
 
 		slog.Info("ai: edit materialization succeeded", "path", f.Path, "tier", tier.String())
+		// Captured before Action is overwritten — see GeneratedFile.OriginalAction's
+		// own doc comment for why recapAssistantTurn needs this and nothing
+		// else downstream does.
+		f.OriginalAction = "edit"
 		f.Action = "update"
 		f.Content = newContent
 		f.Edits = nil
@@ -137,7 +144,88 @@ func MaterializeEdits(ctx context.Context, result *Result, readFile FileReader, 
 	for _, p := range problems {
 		fmt.Fprintf(&b, "- %s\n", p)
 	}
+	// repairPrompt's "don't re-read files" instruction only covers the
+	// outer retry sent after a themecheck rejection — this is Generate's
+	// OWN retry loop, triggered by a materialization failure instead, which
+	// had no equivalent (see the diagnostics that motivated this: a 3-failure
+	// batch that led to 7 exploration tool calls before the model gave up
+	// and resubmitted whole files). Said once here, after every problem
+	// listed above, not once per problem — a batch of several failures in
+	// one call must not repeat this three times.
+	b.WriteString("\nDo not explore, read, or touch anything else — everything needed to fix the edit(s) above " +
+		"is already here, or in your own last proposal already in this conversation. Fix them and call " +
+		"propose_changes again.")
 	return false, b.String()
+}
+
+// noMatchContentCap bounds how much of a file's real current content is
+// inlined into a no_match retry message — large enough to cover the large
+// majority of theme component/page files whole (most run well under this;
+// see noMatchWindowBytes for what happens when a file doesn't fit), small
+// enough that several simultaneous no_match failures in one retry message
+// (the batch case this whole fix targets) still add a bounded amount to the
+// model's context rather than approaching the cost of the full-file rewrite
+// this is meant to avoid.
+const noMatchContentCap = 8_000
+
+// noMatchWindowBytes is the total size of the near-miss window shown when a
+// file is over noMatchContentCap — half before, half after the located
+// anchor (see nearMissWindow). Big enough to comfortably include the
+// surrounding markup an old_string needs adjusting against, small enough to
+// stay cheap even when several large files fail to match in the same batch.
+const noMatchWindowBytes = 4_000
+
+// noMatchProblem builds the retry message for one no_match failure — the
+// file's real current content when it fits under noMatchContentCap (the
+// common case), a bounded window around a cheaply-located near-miss when it
+// doesn't, or a plain "re-read this file" instruction when neither applies.
+// This is what stops the model from re-reading/re-grepping the file itself
+// (expensive: the diagnostics case that motivated this spent ~148s and 7
+// tool calls doing exactly that) — everything it needs to correct
+// old_string is either already here or was never going to be found cheaply.
+func noMatchProblem(path, content string, edits []Edit, applyErr error) string {
+	base := fmt.Sprintf("%s: %s", path, applyErr)
+	if len(content) <= noMatchContentCap {
+		return fmt.Sprintf("%s\n\n%s's real current content, to find the exact text to match:\n\n%s", base, path, content)
+	}
+	if window, ok := nearMissWindow(content, edits, noMatchWindowBytes); ok {
+		return fmt.Sprintf(
+			"%s\n\n%s is %d bytes, too large to inline in full — here is the content around where this text "+
+				"looks closest:\n\n%s", base, path, len(content), window)
+	}
+	return fmt.Sprintf(
+		"%s\n\n%s is %d bytes, too large to inline, and no close match was found nearby — re-read this one "+
+			"file specifically (not the rest of the theme) before trying again.", base, path, len(content))
+}
+
+// nearMissWindow tries to locate a plausible anchor for a no_match failure
+// cheaply — a plain substring search for each edit's first line, in order,
+// no fuzzy matching, no new dependency — and returns up to windowBytes of
+// content centered on the first one found. found is false when none of the
+// edits' first lines appear in content at all, meaning there's nothing
+// cheap to anchor a window to.
+func nearMissWindow(content string, edits []Edit, windowBytes int) (window string, found bool) {
+	for _, e := range edits {
+		anchor := firstLine(e.OldString)
+		if strings.TrimSpace(anchor) == "" {
+			continue
+		}
+		idx := strings.Index(content, anchor)
+		if idx < 0 {
+			continue
+		}
+		half := windowBytes / 2
+		start := idx - half
+		if start < 0 {
+			start = 0
+		}
+		end := idx + len(anchor) + half
+		if end > len(content) {
+			end = len(content)
+		}
+		return content[start:end], true
+	}
+	return "", false
 }
 
 // matchTier identifies which matching strategy resolved an edit, in
@@ -174,7 +262,7 @@ func (t matchTier) String() string {
 // against genuinely current content rather than offsets pre-computed
 // against the original. worstTier is the loosest tier any single edit in
 // the list needed (tierExact if every one matched byte-for-byte) — the
-// summary MaterializeEdits logs for the whole file.
+// summary materializeEdits logs for the whole file.
 func applyEdits(content string, edits []Edit) (result string, worstTier matchTier, matchCount int, err error) {
 	worstTier = tierExact
 	for i, e := range edits {

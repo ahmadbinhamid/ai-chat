@@ -102,7 +102,7 @@ func updateProposeChangesFixture(content string) map[string]any {
 }
 
 // TestGenerate_ZeroMatchOldStringRetriesNotFails is the "zero matches"
-// half of MaterializeEdits' contract: a materialization failure must not
+// half of materializeEdits' contract: a materialization failure must not
 // end the generation — it's fed back as this propose_changes call's own
 // tool_result and the loop continues, exactly like an ordinary failed tool
 // call would.
