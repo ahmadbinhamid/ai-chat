@@ -46,3 +46,24 @@ func TestToolsForContext_SimpleEditOneShot(t *testing.T) {
 		t.Fatalf("simple-edit must not expose list/grep: %v", names)
 	}
 }
+
+func TestToolsForContext_PageCreatePrepared_NoExploration(t *testing.T) {
+	tools := toolsForContext(ThemeContext{PageCreatePrepared: true, GenerationMode: GenerationModePages})
+	if len(tools) != 1 || tools[0].OfTool == nil || tools[0].OfTool.Name != toolNameProposeChanges {
+		t.Fatalf("sufficient prepared page path should be propose-only, got %#v", tools)
+	}
+
+	tools = toolsForContext(ThemeContext{PageCreatePrepared: true, PageCreateAllowRead: true})
+	names := map[string]bool{}
+	for _, tu := range tools {
+		if tu.OfTool != nil {
+			names[tu.OfTool.Name] = true
+		}
+	}
+	if !names[toolNameProposeChanges] || !names[toolNameReadThemeFile] {
+		t.Fatalf("thin prepared page path should expose read+propose, got %v", names)
+	}
+	if names[toolNameGrepTheme] || names[toolNameListThemeFiles] || names[toolNameValidateChanges] {
+		t.Fatalf("prepared page path must not expose list/grep/validate: %v", names)
+	}
+}

@@ -4,7 +4,9 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
+	"ai-chat/internal/ai"
 	"ai-chat/internal/themefs"
 )
 
@@ -31,6 +33,9 @@ func TestBuildComplexPageContext_RanksPagesAndMenu(t *testing.T) {
 	}
 	if !strings.Contains(joined, "header") && !strings.Contains(joined, "menu") && !strings.Contains(joined, "nav") {
 		t.Fatalf("expected menu/header path in %v", cpc.Paths)
+	}
+	if !cpc.Sufficient {
+		t.Fatal("page+menu context should be sufficient")
 	}
 	if len(cpc.Package) < 20 {
 		t.Fatal("expected non-empty package")
@@ -60,14 +65,86 @@ func TestRankPathsForPageCreate_LimitsSamplePages(t *testing.T) {
 	}
 }
 
+func TestRankPathsForPageCreate_HomeRedesignPrefersHomeOverHeader(t *testing.T) {
+	paths := []string{
+		"pages.json",
+		"pages/home.liquid",
+		"pages/about.liquid",
+		"components/header.liquid",
+		"components/header-menu.liquid",
+		"components/css/header.css",
+		"components/css/header-menu.css",
+		"components/css/home.css",
+		"components/hero-slider.liquid",
+		"components/js/slider.js",
+	}
+	got := rankPathsForPageCreate(paths, "change home page design with a slider and beautiful home page")
+	if len(got) == 0 || got[0] != "pages/home.liquid" {
+		t.Fatalf("expected pages/home.liquid first for homepage redesign, got %v", got)
+	}
+	joined := strings.Join(got, "|")
+	if strings.Contains(joined, "header") {
+		t.Fatalf("homepage redesign must not prefer header files, got %v", got)
+	}
+	if !strings.Contains(joined, "home.css") && !strings.Contains(joined, "hero") && !strings.Contains(joined, "slider") {
+		t.Fatalf("expected homepage/hero/slider assets in %v", got)
+	}
+}
+
+func TestRankPathsForPageCreate_HeaderRequestStillPrefersHeader(t *testing.T) {
+	// Non-redesign page create that explicitly mentions menu/header.
+	paths := []string{
+		"pages.json",
+		"pages/home.liquid",
+		"components/header.liquid",
+		"components/css/header.css",
+		"components/css/home.css",
+	}
+	got := rankPathsForPageCreate(paths, "create a Contact Us page and add it to the menu")
+	joined := strings.Join(got, "|")
+	if !strings.Contains(joined, "header") && !strings.Contains(joined, "menu") {
+		t.Fatalf("menu request should include header/menu, got %v", got)
+	}
+}
+
 func TestComplexPageBudgets_Bounded(t *testing.T) {
-	if maxComplexPageModelCalls > 10 {
+	if maxComplexPageModelCalls > 6 {
 		t.Fatalf("complex page iteration budget too high: %d", maxComplexPageModelCalls)
 	}
-	if maxComplexExploration > 12 {
+	if maxComplexExploration > 2 {
 		t.Fatalf("complex exploration budget too high: %d", maxComplexExploration)
+	}
+	if maxComplexExploreStreak > 1 {
+		t.Fatalf("complex explore streak too high: %d", maxComplexExploreStreak)
 	}
 	if simpleEditMaxTokens != 8000 {
 		t.Fatalf("simple_edit max_tokens must stay 8000, got %d", simpleEditMaxTokens)
+	}
+	if ai.PreparedFirstTokenTimeout() > 20*time.Second {
+		t.Fatalf("prepared first-token timeout too high: %v", ai.PreparedFirstTokenTimeout())
+	}
+	if ai.PreparedFirstTokenTimeout() < 5*time.Second {
+		t.Fatalf("prepared first-token timeout too aggressive: %v", ai.PreparedFirstTokenTimeout())
+	}
+}
+
+func TestRecentChatTurns_NoSummarize(t *testing.T) {
+	turns := []ai.Turn{
+		{Role: "user", Content: "1"},
+		{Role: "assistant", Content: "2"},
+		{Role: "user", Content: "3"},
+		{Role: "assistant", Content: "4"},
+		{Role: "user", Content: "5"},
+		{Role: "assistant", Content: "6"},
+	}
+	got := recentChatTurns(turns, 4)
+	if len(got) != 4 {
+		t.Fatalf("got %d want 4", len(got))
+	}
+	if got[0].Content != "3" || got[3].Content != "6" {
+		t.Fatalf("unexpected window: %+v", got)
+	}
+	if len(recentChatTurns(turns, 10)) != 6 {
+		t.Fatal("n larger than len should return all")
 	}
 }

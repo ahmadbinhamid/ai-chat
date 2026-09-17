@@ -114,6 +114,15 @@ const (
 	// EventTypePreparingAI is emitted immediately before the first model
 	// Generate call for this turn.
 	EventTypePreparingAI = "preparing_ai"
+	// EventTypeWaitingForAI is emitted (live) when a provider stream attempt
+	// starts and we are waiting for the first content token.
+	EventTypeWaitingForAI = "waiting_for_ai"
+	// EventTypeAITakingLonger is emitted (live) when first-token wait has
+	// passed half the deadline with no content yet.
+	EventTypeAITakingLonger = "ai_taking_longer"
+	// EventTypeAIFirstTokenTimeout is emitted (live) when a stream attempt
+	// hits the first-token deadline (before the controlled retry).
+	EventTypeAIFirstTokenTimeout = "ai_first_token_timeout"
 )
 
 // maxPromptPreviewChars bounds EventTypeQueued's prompt_preview field.

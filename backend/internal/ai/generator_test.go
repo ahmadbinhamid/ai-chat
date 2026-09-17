@@ -415,26 +415,31 @@ func TestGenerate_MaxTokensStopReasonDoesNotMaterialize(t *testing.T) {
 	}
 }
 
-// TestGenerate_DeepSeekDoesNotForceToolChoiceWithThinking ensures we never
-// send tool_choice:{type:tool,name:propose_changes} on the DeepSeek path —
-// that combination 400s with "Thinking mode does not support this tool_choice".
-// Near the budget ceiling we still nudge via system text and keep tool_choice:any.
-func TestGenerate_DeepSeekDoesNotForceToolChoiceWithThinking(t *testing.T) {
+// TestGenerate_DeepSeekForceProposeKeepsAnyToolChoice ensures DeepSeek never
+// receives named tool_choice while adaptive thinking is on (HTTP 400). The
+// ceiling path must keep tool_choice:any + system nudge (+ thinking).
+func TestGenerate_DeepSeekForceProposeKeepsAnyToolChoice(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		body, _ := io.ReadAll(r.Body)
-		forced := strings.Contains(string(body), `"tool_choice":{"name":"propose_changes","type":"tool"}`) ||
-			strings.Contains(string(body), `"type":"tool","name":"propose_changes"`)
-		if forced {
-			t.Errorf("deepseek must not send forced tool_choice on call %d; body: %s", calls, body)
-		}
+		s := string(body)
+		forcedNamed := strings.Contains(s, `"tool_choice":{"name":"propose_changes","type":"tool"}`) ||
+			strings.Contains(s, `"type":"tool","name":"propose_changes"`)
 		w.Header().Set("Content-Type", "text/event-stream")
+		if forcedNamed {
+			t.Errorf("deepseek must not use named tool_choice; body: %s", body)
+		}
 		if calls == 1 {
 			fmt.Fprint(w, toolUseSSEResponse("msg_1", "toolu_1", "list_theme_files", map[string]any{}, 10, 5))
 			return
 		}
-		// Ceiling iteration: must still be tool_choice any (nudge-only).
+		if !strings.Contains(s, "propose_changes") || !strings.Contains(s, "tool-loop budget ceiling") && !strings.Contains(s, "call propose_changes") {
+			// System nudge should mention propose_changes on ceiling iteration.
+			if !strings.Contains(s, "propose_changes") {
+				t.Errorf("expected propose_changes nudge on deepseek ceiling call; body: %s", body)
+			}
+		}
 		fmt.Fprint(w, toolUseSSEResponse(fmt.Sprintf("msg_%d", calls), fmt.Sprintf("toolu_%d", calls),
 			"propose_changes", map[string]any{
 				"summary":               "ok",
@@ -454,7 +459,7 @@ func TestGenerate_DeepSeekDoesNotForceToolChoiceWithThinking(t *testing.T) {
 	g.model = "deepseek-v4-pro"
 	g.modelName = "deepseek-v4-pro"
 
-	// Budget 2 → second iteration is the ceiling nudge path (iteration >= 1).
+	// Budget 2 → second iteration is the ceiling force path (iteration >= 1).
 	_, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo", MaxToolIterations: 2, DisableExplorationBrake: true}, nil,
 		"change the header", nil, nil, nil,
 		func(context.Context, string, json.RawMessage) (string, error) { return "[]", nil }, nil)

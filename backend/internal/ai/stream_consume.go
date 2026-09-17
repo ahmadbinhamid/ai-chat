@@ -162,11 +162,22 @@ func (g *Generator) SetStreamFirstTokenTimeout(d time.Duration) {
 	g.firstTokenTimeout = d
 }
 
+// defaultPreparedFirstTokenTimeout bounds TTFT for PageCreatePrepared calls —
+// shorter than the interactive default so a hung prepared turn fails (~15s +
+// one retry) instead of a ~50s dead window.
+const defaultPreparedFirstTokenTimeout = 15 * time.Second
+
+// PreparedFirstTokenTimeout is the TTFT budget for PageCreatePrepared
+// generations (exported for themebuild wiring / tests).
+func PreparedFirstTokenTimeout() time.Duration {
+	return defaultPreparedFirstTokenTimeout
+}
+
 // consumeProviderStream runs one NewStreaming attempt with an idle deadline
 // independent of the parent generation timeout. Every successful Next()
 // resets the idle timer (healthy long streams that keep emitting are fine).
 // onDelta receives coalesced narration text the same way the previous inline
-// loop did.
+// loop did. firstTokenOverride, when > 0, replaces streamFirstTokenTimeout.
 func (g *Generator) consumeProviderStream(
 	ctx context.Context,
 	params anthropic.MessageNewParams,
@@ -176,6 +187,8 @@ func (g *Generator) consumeProviderStream(
 	generateStart time.Time,
 	firstTokenLogged *bool,
 	ttftMs *int64,
+	firstTokenOverride time.Duration,
+	progress ToolProgress,
 ) (anthropic.Message, streamAttemptMeta, error) {
 	meta := streamAttemptMeta{
 		Attempt:     attempt,
@@ -185,6 +198,9 @@ func (g *Generator) consumeProviderStream(
 
 	idle := g.streamIdleTimeout()
 	firstTokenDeadline := g.streamFirstTokenTimeout()
+	if firstTokenOverride > 0 {
+		firstTokenDeadline = firstTokenOverride
+	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -192,6 +208,7 @@ func (g *Generator) consumeProviderStream(
 	message := anthropic.Message{}
 	emitted := 0
 	coalescer := newDeltaCoalescer(onDelta)
+	slowNotified := false
 
 	defer func() {
 		meta.StreamEnd = time.Now()
@@ -205,10 +222,17 @@ func (g *Generator) consumeProviderStream(
 	for {
 		waitBudget := idle
 		if meta.FirstDeltaAt.IsZero() {
-			remaining := firstTokenDeadline - time.Since(meta.StreamStart)
+			elapsed := time.Since(meta.StreamStart)
+			remaining := firstTokenDeadline - elapsed
+			if !slowNotified && elapsed >= firstTokenDeadline/2 {
+				slowNotified = true
+				if sp, ok := progress.(StreamStatusProgress); ok {
+					sp.AITakingLonger(iteration, attempt)
+				}
+			}
 			if remaining <= 0 {
 				meta.FirstTokenTimeout = true
-				meta.IdleWaitMs = time.Since(meta.StreamStart).Milliseconds()
+				meta.IdleWaitMs = elapsed.Milliseconds()
 				meta.ErrorType = classifyStreamErr(errStreamFirstTokenTimeout)
 				cancel()
 				slog.Warn("ai: provider stream first-token timeout",
@@ -217,7 +241,7 @@ func (g *Generator) consumeProviderStream(
 					"iteration", iteration,
 					"attempt", attempt,
 					"first_token_timeout_ms", firstTokenDeadline.Milliseconds(),
-					"stream_elapsed_ms", time.Since(meta.StreamStart).Milliseconds())
+					"stream_elapsed_ms", elapsed.Milliseconds())
 				return message, meta, errStreamFirstTokenTimeout
 			}
 			// Cap Next() wait so first-token deadline can fire even while
@@ -271,6 +295,7 @@ func (g *Generator) consumeProviderStream(
 			now := time.Now()
 			if meta.FirstDeltaAt.IsZero() {
 				meta.FirstDeltaAt = now
+				meta.TTFTAttemptMs = now.Sub(meta.StreamStart).Milliseconds()
 			}
 			if firstTokenLogged != nil && !*firstTokenLogged && len(full) > 0 {
 				*firstTokenLogged = true
@@ -278,9 +303,9 @@ func (g *Generator) consumeProviderStream(
 					*ttftMs = now.Sub(generateStart).Milliseconds()
 				}
 			}
-			coalescer.add(full[emitted:])
+			chunk := full[emitted:]
 			emitted = len(full)
-			meta.LastProgressAt = now
+			coalescer.add(chunk)
 		}
 	}
 }

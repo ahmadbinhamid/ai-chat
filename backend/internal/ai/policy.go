@@ -45,11 +45,11 @@ func (b TokenBudgets) withDefaults() TokenBudgets {
 }
 
 // resolveEffort picks output_config.effort for one Generate call.
-// EffortOverride wins; Repair forces medium; otherwise mode policy applies
-// (never xhigh for ordinary interactive modes). Process AI_EFFORT=xhigh
-// remains available as an explicit override via EffortOverride or by
-// leaving mode empty only when callers set EffortOverride — interactive
-// modes always use the table below.
+// Precedence: EffortOverride > Repair floor > mode defaults, with process
+// AI_EFFORT (configured) honored for edit/copy when it is a valid non-empty
+// value. Interactive edit never silently upgrades to xhigh from env alone —
+// xhigh requires EffortOverride. Pages mode keeps a high default but will
+// honor an explicit configured low/medium/high.
 func resolveEffort(tc ThemeContext, configured anthropic.OutputConfigEffort) anthropic.OutputConfigEffort {
 	if tc.EffortOverride != "" {
 		return anthropic.OutputConfigEffort(tc.EffortOverride)
@@ -61,12 +61,33 @@ func resolveEffort(tc ThemeContext, configured anthropic.OutputConfigEffort) ant
 	case GenerationModeBrand:
 		return anthropic.OutputConfigEffortLow
 	case GenerationModeCopy:
-		return anthropic.OutputConfigEffortMedium
+		return effortOrDefault(configured, anthropic.OutputConfigEffortMedium, false)
 	case GenerationModePages:
-		return anthropic.OutputConfigEffortHigh
+		// Structural page work: default high; honor explicit low/medium/high.
+		return effortOrDefault(configured, anthropic.OutputConfigEffortHigh, false)
 	default:
-		// edit / empty — interactive default, not process xhigh
-		return anthropic.OutputConfigEffortMedium
+		// edit / empty — honor AI_EFFORT (e.g. low) so env is not a no-op.
+		return effortOrDefault(configured, anthropic.OutputConfigEffortMedium, true)
+	}
+}
+
+// effortOrDefault returns configured when it is a recognized effort string;
+// otherwise fallback. When blockXhigh is true, configured xhigh is demoted
+// to high so interactive edit cannot silently run at xhigh from env alone.
+func effortOrDefault(configured, fallback anthropic.OutputConfigEffort, blockXhigh bool) anthropic.OutputConfigEffort {
+	s := strings.TrimSpace(strings.ToLower(string(configured)))
+	switch s {
+	case "":
+		return fallback
+	case "low", "medium", "high":
+		return anthropic.OutputConfigEffort(s)
+	case "xhigh":
+		if blockXhigh {
+			return anthropic.OutputConfigEffortHigh
+		}
+		return anthropic.OutputConfigEffortXhigh
+	default:
+		return fallback
 	}
 }
 

@@ -78,6 +78,24 @@ func (p toolProgressEmitter) ToolFinished(_ string, summary string, _ error) {
 	p.emitter.emitLive(p.ctx, EventTypeToolResult, map[string]string{"summary": summary})
 }
 
+func (p toolProgressEmitter) WaitingForAI(iteration, attempt int) {
+	p.emitter.emitLive(p.ctx, EventTypeWaitingForAI, map[string]int{
+		"iteration": iteration, "attempt": attempt,
+	})
+}
+
+func (p toolProgressEmitter) AITakingLonger(iteration, attempt int) {
+	p.emitter.emitLive(p.ctx, EventTypeAITakingLonger, map[string]int{
+		"iteration": iteration, "attempt": attempt,
+	})
+}
+
+func (p toolProgressEmitter) FirstTokenTimeout(iteration, attempt int) {
+	p.emitter.emitLive(p.ctx, EventTypeAIFirstTokenTimeout, map[string]int{
+		"iteration": iteration, "attempt": attempt,
+	})
+}
+
 // onThinkingDelta builds the onDelta callback passed to ai.Generate — routes
 // each already-coalesced chunk (see ai.deltaCoalescer) to emitLive, never
 // emit: this is exactly the ephemeral, high-frequency case emitLive exists

@@ -176,14 +176,20 @@ type ThemeContext struct {
 	// SimpleEditOneShot is set but the local planner's excerpts may be thin.
 	SimpleEditAllowRead bool
 	// PageCreatePrepared is set for IntentComplexPage after local page/menu
-	// context is injected — tightens exploration brakes so the model does
-	// not thrash on list/grep/read before propose_changes.
+	// context is injected — tightens tools and exploration brakes so the
+	// model does not thrash on list/grep/read before propose_changes.
 	PageCreatePrepared bool
+	// PageCreateAllowRead permits a single read_theme_file when prepared
+	// context is thin (mirrors SimpleEditAllowRead).
+	PageCreateAllowRead bool
 	// MaxExplorationToolCalls overrides maxExplorationToolCalls when > 0
 	// (still subject to DisableExplorationBrake).
 	MaxExplorationToolCalls int
 	// MaxExplorationOnlyStreak overrides maxExplorationOnlyIterations when > 0.
 	MaxExplorationOnlyStreak int
+	// FirstTokenTimeoutOverride, when > 0, replaces the Generator's
+	// configured first-token deadline for this Generate call only.
+	FirstTokenTimeoutOverride time.Duration
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -727,6 +733,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			"effort", string(callEffort),
 			"max_tokens", callMaxTokens,
 			"repair", tc.Repair,
+			"page_create_prepared", tc.PageCreatePrepared,
+			"page_create_allow_read", tc.PageCreateAllowRead,
+			"simple_edit_one_shot", tc.SimpleEditOneShot,
 			"elapsed_ms", time.Since(generateStart).Milliseconds(),
 			"ttft_ms", ttftMs,
 			"model_elapsed_ms", totalModelElapsed.Milliseconds(),
@@ -742,6 +751,14 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		iterationsUsed = iteration + 1
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
 		forcingPropose := forceProposeNext || iteration >= iterationBudget-forceProposeWithinLastN
+		// Prepared page/homepage context should propose immediately when the
+		// package is sufficient (propose-only tools), or after at most one
+		// read fallback iteration — do not wait until the final budget slot.
+		if tc.PageCreatePrepared {
+			if !tc.PageCreateAllowRead || iteration >= 1 {
+				forcingPropose = true
+			}
+		}
 		forceProposeNext = false
 		if forcingPropose {
 			// DeepSeek's Anthropic-compat endpoint rejects specific
@@ -753,6 +770,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			if g.provider == "deepseek" {
 				slog.Info("ai: propose_changes nudge (deepseek: no forced tool_choice with thinking)",
 					"iteration", iteration, "max_tool_iterations", iterationBudget,
+					"page_create_prepared", tc.PageCreatePrepared,
 					"provider", g.provider, "model", g.modelName)
 			} else {
 				toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
@@ -780,14 +798,22 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			// schema-legal way to say "not ready" — this just tells the model
 			// that escape hatch exists and should be used here instead of
 			// fabricating file content.
+			nudge := "You are at the tool-loop budget ceiling and must call propose_changes now. " +
+				"Only include a file in `files` if you actually read/verified its current content " +
+				"(for an update) or have real, complete content ready (for a create) — never invent " +
+				"a placeholder path or partial content to fill the array. If you do not yet have a " +
+				"complete, verified proposal, call propose_changes with needs_clarification: true, " +
+				"files: [], and a summary explaining that the request needs to be split into a " +
+				"smaller step or retried, instead of guessing."
+			if tc.PageCreatePrepared {
+				nudge = "Local page/homepage context was pre-selected — call propose_changes now with a compact changeset " +
+					"(only changed files, one short summary, no unchanged full-file dumps). " +
+					"Do not list or grep the theme. If a critical detail is missing and read_theme_file is available, " +
+					"you already had your chance; finish with propose_changes. " +
+					"If you cannot produce a verified proposal, use needs_clarification: true with files: []."
+			}
 			params.System = append(append([]anthropic.TextBlockParam{}, system...), anthropic.TextBlockParam{
-				Text: "You are at the tool-loop budget ceiling and must call propose_changes now. " +
-					"Only include a file in `files` if you actually read/verified its current content " +
-					"(for an update) or have real, complete content ready (for a create) — never invent " +
-					"a placeholder path or partial content to fill the array. If you do not yet have a " +
-					"complete, verified proposal, call propose_changes with needs_clarification: true, " +
-					"files: [], and a summary explaining that the request needs to be split into a " +
-					"smaller step or retried, instead of guessing.",
+				Text: nudge,
 			})
 		}
 		// Adaptive thinking and output_config.effort are both rejected outright
@@ -808,11 +834,19 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		var streamRetryCount int
 		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
 			attemptsUsed = attempt
-			msg, meta, streamErr := g.consumeProviderStream(ctx, params, onDelta, attempt, iteration, generateStart, &firstTokenLogged, &ttftMs)
+			if sp, ok := progress.(StreamStatusProgress); ok {
+				sp.WaitingForAI(iteration, attempt)
+			}
+			msg, meta, streamErr := g.consumeProviderStream(ctx, params, onDelta, attempt, iteration, generateStart, &firstTokenLogged, &ttftMs, tc.FirstTokenTimeoutOverride, progress)
 			message = msg
 			if streamErr == nil {
 				logStreamAttempt(g, iteration, meta, message, nil, "success")
 				break
+			}
+			if errors.Is(streamErr, errStreamFirstTokenTimeout) {
+				if sp, ok := progress.(StreamStatusProgress); ok {
+					sp.FirstTokenTimeout(iteration, attempt)
+				}
 			}
 			retryable := isRetryableStreamErr(streamErr)
 			canRetry := retryable && attempt < streamAccumulateMaxAttempts
@@ -1259,9 +1293,12 @@ func simpleEditOneShotNote(tc ThemeContext) string {
 			"needs_clarification only if you truly cannot act safely."
 	}
 	if tc.PageCreatePrepared {
-		return "\n- PAGE_CREATE (prepared): pages.json, a sample page, and menu/nav/header excerpts were pre-selected locally. " +
-			"Prefer propose_changes promptly with only the required files (new page + registry/menu updates). " +
-			"Do not re-list the whole theme. Use at most a few targeted reads if a critical detail is missing."
+		if tc.PageCreateAllowRead {
+			return "\n- PAGE/HOMEPAGE (prepared): relevant files were pre-selected locally. Call propose_changes promptly with only required files. " +
+				"You may call read_theme_file at most once if a critical section is missing — do not list or grep."
+		}
+		return "\n- PAGE/HOMEPAGE (prepared): homepage/page files were pre-selected locally. " +
+			"Do not explore. Call propose_changes once with a compact changeset (only changed files, one short summary)."
 	}
 	return ""
 }

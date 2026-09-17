@@ -17,6 +17,18 @@ import (
 // kicks in; most chats never hit it.
 const summarizeHistoryThreshold = 20
 
+// recentChatTurns keeps the last n turns verbatim without calling Summarize —
+// used when PageCreatePrepared already supplies structural theme context so
+// a multi-second Summarize round-trip is unnecessary.
+func recentChatTurns(turns []ai.Turn, n int) []ai.Turn {
+	if n <= 0 || len(turns) <= n {
+		return turns
+	}
+	out := make([]ai.Turn, n)
+	copy(out, turns[len(turns)-n:])
+	return out
+}
+
 // summaryTurnContent formats a collapsed-history summary turn's text —
 // shared by summarizeOldTurns (always regenerates) and Service's cache-
 // aware summarizeOldTurnsCached (may reuse a cached summary string instead

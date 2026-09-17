@@ -1660,8 +1660,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			tc.MaxToolIterations = 8
 		}
 	case IntentComplexPage:
-		// Full tool loop (list/grep/read/propose) — never simple-edit one-shot.
-		// Local page/menu context first so DeepSeek does not thrash exploring.
+		// Never simple-edit one-shot. Local page/menu/homepage context first.
 		tc.SimpleEditOneShot = false
 		tc.SimpleEditAllowRead = false
 		contextStart := time.Now()
@@ -1671,6 +1670,9 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			slog.Warn("ai: complex-page context planner failed", "chat_id", c.ID, "error", cpcErr)
 		} else {
 			tc.PageCreatePrepared = true
+			// Sufficient local package → propose-only; otherwise one narrow read.
+			tc.PageCreateAllowRead = !cpc.Sufficient
+			tc.FirstTokenTimeoutOverride = ai.PreparedFirstTokenTimeout()
 			tc.FileTree = filterFileTreeToPaths(tc.FileTree, cpc.Paths)
 			tc.Manifest = nil
 			tc.PagesJSON = truncateForSimpleEditPrompt(tc.PagesJSON, 2500)
@@ -1688,6 +1690,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			"intent", string(intent),
 			"paths", cpc.Paths,
 			"page_create_prepared", tc.PageCreatePrepared,
+			"page_create_sufficient", cpc.Sufficient,
+			"page_create_allow_read", tc.PageCreateAllowRead,
 			"max_tool_iterations", tc.MaxToolIterations,
 			"max_exploration_tool_calls", tc.MaxExplorationToolCalls,
 			"max_exploration_streak", tc.MaxExplorationOnlyStreak,
@@ -1715,6 +1719,19 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	var turns []ai.Turn
 	if intentUsesSimpleEditOneShot(intent) {
 		turns = nil
+	} else if intent == IntentComplexPage && tc.PageCreatePrepared {
+		// Prepared theme package already carries structural state — replay a
+		// short recent window only; skip Summarize's multi-second API cost.
+		raw := toTurns(priorMessages)
+		turns = recentChatTurns(raw, complexPageRecentTurns)
+		slog.Info("ai: history summarization",
+			"chat_id", c.ID,
+			"ran", false,
+			"skipped_reason", "page_create_prepared",
+			"recent_turns", len(turns),
+			"prior_turns", len(raw),
+			"cache_hit", false,
+			"elapsed_ms", 0)
 	} else {
 		turns = s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
 	}

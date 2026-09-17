@@ -45,6 +45,15 @@ type ToolProgress interface {
 	ToolFinished(name string, summary string, err error)
 }
 
+// StreamStatusProgress reports first-token wait / slow / timeout states so
+// the UI is not silent during provider stalls. Optional — callers that only
+// implement ToolProgress are fine; Generate type-asserts when present.
+type StreamStatusProgress interface {
+	WaitingForAI(iteration, attempt int)
+	AITakingLonger(iteration, attempt int)
+	FirstTokenTimeout(iteration, attempt int)
+}
+
 // toolNameListThemeFiles etc. are the four tool names the generation loop
 // knows about — shared between the schema table below and Generate's
 // switch on which one terminates the loop.
@@ -188,7 +197,7 @@ func toolsForMode(mode string) []anthropic.ToolUnionParam {
 	}
 }
 
-// toolsForContext is toolsForMode plus repair / simple-edit narrowing.
+// toolsForContext is toolsForMode plus repair / simple-edit / prepared-page narrowing.
 func toolsForContext(tc ThemeContext) []anthropic.ToolUnionParam {
 	if tc.Repair {
 		return []anthropic.ToolUnionParam{
@@ -197,6 +206,16 @@ func toolsForContext(tc ThemeContext) []anthropic.ToolUnionParam {
 	}
 	if tc.SimpleEditOneShot {
 		if tc.SimpleEditAllowRead {
+			return []anthropic.ToolUnionParam{
+				readThemeFileTool(), proposeChangesTool(),
+			}
+		}
+		return []anthropic.ToolUnionParam{proposeChangesTool()}
+	}
+	// Local page/menu (or homepage redesign) excerpts were already packed —
+	// list/grep thrash burns DeepSeek turns into first-token hangs.
+	if tc.PageCreatePrepared {
+		if tc.PageCreateAllowRead {
 			return []anthropic.ToolUnionParam{
 				readThemeFileTool(), proposeChangesTool(),
 			}

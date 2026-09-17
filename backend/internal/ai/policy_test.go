@@ -8,22 +8,26 @@ import (
 )
 
 func TestResolveEffort(t *testing.T) {
-	cfg := anthropic.OutputConfigEffortXhigh
 	cases := []struct {
 		name string
 		tc   ThemeContext
+		cfg  anthropic.OutputConfigEffort
 		want anthropic.OutputConfigEffort
 	}{
-		{"edit", ThemeContext{}, anthropic.OutputConfigEffortMedium},
-		{"brand", ThemeContext{GenerationMode: GenerationModeBrand}, anthropic.OutputConfigEffortLow},
-		{"copy", ThemeContext{GenerationMode: GenerationModeCopy}, anthropic.OutputConfigEffortMedium},
-		{"pages", ThemeContext{GenerationMode: GenerationModePages}, anthropic.OutputConfigEffortHigh},
-		{"repair", ThemeContext{Repair: true}, anthropic.OutputConfigEffortMedium},
-		{"override", ThemeContext{EffortOverride: "high"}, anthropic.OutputConfigEffortHigh},
+		{"edit default medium", ThemeContext{}, "", anthropic.OutputConfigEffortMedium},
+		{"edit honors AI_EFFORT=low", ThemeContext{}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortLow},
+		{"edit honors medium", ThemeContext{}, anthropic.OutputConfigEffortMedium, anthropic.OutputConfigEffortMedium},
+		{"edit demotes env xhigh to high", ThemeContext{}, anthropic.OutputConfigEffortXhigh, anthropic.OutputConfigEffortHigh},
+		{"brand always low", ThemeContext{GenerationMode: GenerationModeBrand}, anthropic.OutputConfigEffortHigh, anthropic.OutputConfigEffortLow},
+		{"copy honors low", ThemeContext{GenerationMode: GenerationModeCopy}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortLow},
+		{"pages default high", ThemeContext{GenerationMode: GenerationModePages}, "", anthropic.OutputConfigEffortHigh},
+		{"pages honors low", ThemeContext{GenerationMode: GenerationModePages}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortLow},
+		{"repair forces medium", ThemeContext{Repair: true}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortMedium},
+		{"override wins", ThemeContext{EffortOverride: "high"}, anthropic.OutputConfigEffortLow, anthropic.OutputConfigEffortHigh},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveEffort(tc.tc, cfg); got != tc.want {
+			if got := resolveEffort(tc.tc, tc.cfg); got != tc.want {
 				t.Fatalf("got %q want %q", got, tc.want)
 			}
 		})
