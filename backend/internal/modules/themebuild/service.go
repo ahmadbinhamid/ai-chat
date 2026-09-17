@@ -345,6 +345,14 @@ func (p *pendingTokens) take(generationID string) (string, bool) {
 	return token, ok
 }
 
+// has reports whether generationID still has a token without consuming it.
+func (p *pendingTokens) has(generationID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.tokens[generationID]
+	return ok
+}
+
 // discard drops generationID's token without returning it — used when a
 // queued generation is cancelled (see QueueService.Cancel) before it ever
 // gets a chance to run, so the map doesn't hold a stale entry until process
@@ -1027,11 +1035,12 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 }
 
 // errSessionExpired is what a queued generation fails with when it has no
-// bearer token left to run with — see pendingTokens' doc comment. Sent to
-// the merchant close to verbatim (never through ai.SanitizeError, which is
-// for AI-provider failures and would mislabel this as one — see
-// doGenerate's use of it and recordGenerationFailure).
-var errSessionExpired = errors.New("your session expired before this prompt ran — send it again")
+// bearer token left to run with — see pendingTokens' doc comment. This is
+// NOT a theme-permission problem: the merchant's FlowPOS login was lost
+// while the prompt waited (server restart, orphaned queue after cancel,
+// or a long wait past token TTL). Sent to the merchant close to verbatim
+// (never through ai.SanitizeError).
+var errSessionExpired = errors.New("this prompt was waiting in queue and lost its login — please send it again (not a permission issue)")
 
 // recordGenerationFailure appends a merchant-visible failed assistant
 // message and a "failed" event for a generation that never made it into

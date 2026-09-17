@@ -182,10 +182,9 @@ func (s *Service) reapOrphanedQueues(ctx context.Context) {
 	}
 }
 
-// failOrphanedQueue drains chatID's entire stranded queue, failing each row
-// in turn — not just the first one — so a chat with several queued prompts
-// doesn't have its later prompts silently left behind once the first is
-// dealt with.
+// failOrphanedQueue drains chatID's entire stranded queue. When this
+// process still holds the generation's bearer token (cancel/reaper race,
+// not a real pod death), resume the drain instead of failing the merchant.
 func (s *Service) failOrphanedQueue(ctx context.Context, chatID string) {
 	for {
 		g, err := s.repo.DequeueNext(ctx, chatID)
@@ -203,20 +202,19 @@ func (s *Service) failOrphanedQueue(ctx context.Context, chatID string) {
 			return
 		}
 
-		// Built directly from the generation row rather than looked up
-		// through chat.Service: RecordAssistantMessage only ever reads
-		// c.ID/c.TenantID, and a reaper sweep has no tenant-scoped request
-		// to look the chat up through in the first place.
 		c := chat.Chat{ID: chatID, TenantID: g.TenantID}
-		// Warn (not Error): an orphaned queue is an expected, already-
-		// handled condition on its own (see this method's own doc comment)
-		// — but see runOneQueuedGeneration's matching log line for why a
-		// SPIKE in this message specifically is worth being able to spot:
-		// before the heartbeat fix, a chat's running generation going
-		// falsely stale (see the 20260813000002 migration) is exactly what
-		// made ChatsWithOrphanedQueues see this chat as orphaned in the
-		// first place, despite its running generation completing normally
-		// moments later.
+		if s.tokens.has(g.ID) {
+			// Same process that accepted the HTTP request still has the
+			// token — resume instead of the misleading "session expired".
+			slog.Info("resuming orphaned generation that still has a bearer token",
+				"chat_id", chatID, "generation_id", g.ID)
+			go func(gg Generation, cc chat.Chat) {
+				defer safego.Recover("themebuild.resumeOrphanedGeneration")
+				s.runGeneration(context.WithoutCancel(ctx), cc, gg)
+			}(g, c)
+			return
+		}
+
 		slog.Warn("failing an orphaned queued generation with session-expired", "chat_id", chatID, "generation_id", g.ID)
 		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
 		if endErr := s.repo.EndGeneration(ctx, chatID, errSessionExpired); endErr != nil {
