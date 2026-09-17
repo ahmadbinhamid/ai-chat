@@ -1693,6 +1693,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			// Sufficient local package → propose-only; otherwise one narrow read.
 			tc.PageCreateAllowRead = !cpc.Sufficient
 			tc.FirstTokenTimeoutOverride = ai.PreparedFirstTokenTimeout()
+			tc.StreamIdleTimeoutOverride = ai.PreparedStreamIdleTimeout()
 			tc.FileTree = filterFileTreeToPaths(tc.FileTree, cpc.Paths)
 			tc.Manifest = nil
 			tc.PagesJSON = truncateForSimpleEditPrompt(tc.PagesJSON, 2500)
@@ -1700,9 +1701,21 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			prompt = complexPagePreparedPrompt(in.Prompt, cpc)
 		}
 		tc.MaxToolIterations = maxComplexPageModelCalls
+		if isFullHomePageRedesignPrompt(in.Prompt) {
+			tc.MaxToolIterations = maxComplexHomeModelCalls
+			tc.FullHomeRedesign = true
+			// One extra stream retry — DeepSeek occasionally cold-stalls on
+			// the first forced propose for a full homepage rebuild.
+			tc.StreamMaxAttemptsOverride = 3
+		}
 		tc.MaxExplorationToolCalls = maxComplexExploration
 		tc.MaxExplorationOnlyStreak = maxComplexExploreStreak
 		if tc.MaxTokensOverride <= 0 {
+			tc.MaxTokensOverride = ai.DefaultTokenBudgets().Complex
+		}
+		// Cap full-home at Complex default (24k). Bumping to 32k delayed TTFT
+		// without improving completion rate on DeepSeek forced propose.
+		if isFullHomePageRedesignPrompt(in.Prompt) && tc.MaxTokensOverride < ai.DefaultTokenBudgets().Complex {
 			tc.MaxTokensOverride = ai.DefaultTokenBudgets().Complex
 		}
 		slog.Info("ai: complex-page path",

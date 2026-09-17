@@ -28,6 +28,28 @@ func NewService(repo *Repository) *Service {
 	return &Service{repo: repo}
 }
 
+// messageCreatedAt returns a wall-clock time for a new chat_messages row
+// that is strictly after any existing row in the same chat once truncated
+// to DATETIME second precision. Conversation fast path (and any other
+// sub-second turn pair) would otherwise share one created_at second and
+// ListMessagesByChat could surface the assistant reply above the user
+// prompt that caused it.
+func (s *Service) messageCreatedAt(ctx context.Context, chatID string) (time.Time, error) {
+	now := time.Now().UTC().Truncate(time.Second)
+	last, err := s.repo.MaxMessageCreatedAt(ctx, chatID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if last == nil {
+		return now, nil
+	}
+	prev := last.UTC().Truncate(time.Second)
+	if !now.After(prev) {
+		return prev.Add(time.Second), nil
+	}
+	return now, nil
+}
+
 // GetOrCreateChat returns the tenant's one, ongoing chat of the given type —
 // creating it on first use. chatType is supplied by the caller (themebuild
 // passes "builder") rather than owned by this package, which is what keeps
@@ -216,7 +238,10 @@ func (s *Service) RecordUserMessage(
 	ctx context.Context, c Chat, userID *uint64, userName, userEmail, content string,
 	images []MessageImage, htmlAttachmentFilename, htmlAttachmentContent *string,
 ) (Message, error) {
-	now := time.Now().UTC()
+	now, err := s.messageCreatedAt(ctx, c.ID)
+	if err != nil {
+		return Message{}, err
+	}
 	var namePtr *string
 	if userName != "" {
 		namePtr = &userName
@@ -299,7 +324,10 @@ func (s *Service) AttachHTMLToMessage(ctx context.Context, messageID string, ten
 // for. ApplyStatusPending because, like a generation turn, its file exists
 // only in the draft overlay until Apply.
 func (s *Service) RecordManualEditMessage(ctx context.Context, c Chat, filePath string) (Message, error) {
-	now := time.Now().UTC()
+	now, err := s.messageCreatedAt(ctx, c.ID)
+	if err != nil {
+		return Message{}, err
+	}
 	m := Message{
 		ID:          uuid.NewString(),
 		ChatID:      c.ID,
@@ -326,7 +354,10 @@ func (s *Service) RecordManualEditMessage(ctx context.Context, c Chat, filePath 
 // for a failed generation (status MessageStatusFailed) — see
 // chat.MessageStatusFailed's doc comment — not just a turn that completed.
 func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus) (Message, error) {
-	now := time.Now().UTC()
+	now, err := s.messageCreatedAt(ctx, c.ID)
+	if err != nil {
+		return Message{}, err
+	}
 	m := Message{
 		ID:           uuid.NewString(),
 		ChatID:       c.ID,

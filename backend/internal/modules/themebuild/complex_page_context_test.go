@@ -163,6 +163,9 @@ func TestComplexPageBudgets_Bounded(t *testing.T) {
 	if maxComplexPageModelCalls > 6 {
 		t.Fatalf("complex page iteration budget too high: %d", maxComplexPageModelCalls)
 	}
+	if maxComplexHomeModelCalls > 8 {
+		t.Fatalf("full-home iteration budget too high: %d", maxComplexHomeModelCalls)
+	}
 	if maxComplexExploration > 2 {
 		t.Fatalf("complex exploration budget too high: %d", maxComplexExploration)
 	}
@@ -172,11 +175,17 @@ func TestComplexPageBudgets_Bounded(t *testing.T) {
 	if simpleEditMaxTokens != 8000 {
 		t.Fatalf("simple_edit max_tokens must stay 8000, got %d", simpleEditMaxTokens)
 	}
-	if ai.PreparedFirstTokenTimeout() > 45*time.Second {
+	if ai.PreparedFirstTokenTimeout() > 90*time.Second {
 		t.Fatalf("prepared first-token timeout too high: %v", ai.PreparedFirstTokenTimeout())
 	}
 	if ai.PreparedFirstTokenTimeout() < 5*time.Second {
 		t.Fatalf("prepared first-token timeout too aggressive: %v", ai.PreparedFirstTokenTimeout())
+	}
+	if ai.PreparedStreamIdleTimeout() > 45*time.Second {
+		t.Fatalf("prepared stream idle timeout too high: %v", ai.PreparedStreamIdleTimeout())
+	}
+	if ai.PreparedStreamIdleTimeout() < 5*time.Second {
+		t.Fatalf("prepared stream idle timeout too aggressive: %v", ai.PreparedStreamIdleTimeout())
 	}
 }
 

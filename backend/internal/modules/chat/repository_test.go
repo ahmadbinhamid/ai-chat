@@ -508,3 +508,90 @@ func TestService_GetChat_OtherTenantsChatReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("expected the owning tenant to fetch its own chat, got %v", err)
 	}
 }
+
+// TestRepository_ListMessagesByChat_SameSecondOrdersUserBeforeAssistant
+// reproduces the merchant-facing bug where conversation fast path wrote
+// user + assistant in one DATETIME second and GET /chat could return the
+// greeting reply above the "hi" that prompted it.
+func TestRepository_ListMessagesByChat_SameSecondOrdersUserBeforeAssistant(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+
+	c := seedChat(t, repo, "builder-"+uuid.NewString())
+	sameSecond := time.Now().UTC().Truncate(time.Second)
+	userID := uint64(1)
+
+	// Insert assistant FIRST with a UUID that sorts before the user's —
+	// without the role tie-break, InnoDB often returns PK order on a
+	// created_at tie and the assistant would win.
+	assistantID := "00000000-0000-4000-8000-000000000001"
+	userMsgID := "ffffffff-ffff-4fff-8fff-ffffffffffff"
+
+	assistant := Message{
+		ID: assistantID, ChatID: c.ID, TenantID: c.TenantID,
+		Role: RoleAssistant, Content: "Hi! I'm ready to help.",
+		Status: MessageStatusCompleted, ApplyStatus: ApplyStatusNotApplicable,
+		CreatedAt: sameSecond,
+	}
+	user := Message{
+		ID: userMsgID, ChatID: c.ID, TenantID: c.TenantID,
+		Role: RoleUser, UserID: &userID, Content: "hi",
+		Status: MessageStatusCompleted, ApplyStatus: ApplyStatusNotApplicable,
+		CreatedAt: sameSecond,
+	}
+	if err := repo.CreateMessageAndTouchUsage(ctx, assistant, nil, 0, 0, sameSecond); err != nil {
+		t.Fatalf("insert assistant: %v", err)
+	}
+	if err := repo.CreateMessageAndTouchUsage(ctx, user, nil, 0, 0, sameSecond); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	messages, err := repo.ListMessagesByChat(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("ListMessagesByChat: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(messages))
+	}
+	if messages[0].Role != RoleUser || messages[0].Content != "hi" {
+		t.Fatalf("expected user prompt first, got %+v", messages[0])
+	}
+	if messages[1].Role != RoleAssistant {
+		t.Fatalf("expected assistant reply second, got %+v", messages[1])
+	}
+}
+
+// TestService_RecordMessages_CreatedAtStrictlyIncreasing covers the write
+// side of the same hazard: back-to-back RecordUserMessage +
+// RecordAssistantMessage must not share a created_at second.
+func TestService_RecordMessages_CreatedAtStrictlyIncreasing(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	svc := NewService(repo)
+	ctx := context.Background()
+
+	c := seedChat(t, repo, "builder-"+uuid.NewString())
+	userID := uint64(1)
+
+	user, err := svc.RecordUserMessage(ctx, c, &userID, "John", "", "hi", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("RecordUserMessage: %v", err)
+	}
+	assistant, err := svc.RecordAssistantMessage(ctx, c, "Hi! I'm ready to help.", MessageStatusCompleted, 0, 0, ApplyStatusNotApplicable)
+	if err != nil {
+		t.Fatalf("RecordAssistantMessage: %v", err)
+	}
+	if !assistant.CreatedAt.After(user.CreatedAt) {
+		t.Fatalf("assistant created_at %v should be strictly after user %v", assistant.CreatedAt, user.CreatedAt)
+	}
+
+	messages, err := repo.ListMessagesByChat(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("ListMessagesByChat: %v", err)
+	}
+	if len(messages) < 2 || messages[0].ID != user.ID || messages[1].ID != assistant.ID {
+		t.Fatalf("expected user then assistant order, got %+v", messages)
+	}
+}
+

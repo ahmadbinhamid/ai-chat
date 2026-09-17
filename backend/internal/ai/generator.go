@@ -190,6 +190,15 @@ type ThemeContext struct {
 	// FirstTokenTimeoutOverride, when > 0, replaces the Generator's
 	// configured first-token deadline for this Generate call only.
 	FirstTokenTimeoutOverride time.Duration
+	// StreamIdleTimeoutOverride, when > 0, replaces the Generator's
+	// configured post-first-token idle deadline for this Generate call only.
+	StreamIdleTimeoutOverride time.Duration
+	// StreamMaxAttemptsOverride, when > 0, replaces streamAccumulateMaxAttempts
+	// for this Generate call only (prepared full-home gets one extra retry).
+	StreamMaxAttemptsOverride int
+	// FullHomeRedesign marks a whole-homepage rebuild — nudge/token budgets
+	// must ship a complete proposal, never ask the merchant to split.
+	FullHomeRedesign bool
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -848,8 +857,15 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				nudge = "Local page/homepage context was pre-selected — call propose_changes now with a compact changeset " +
 					"(only changed files, one short summary, no unchanged full-file dumps). " +
 					"Do not list or grep the theme. If a critical detail is missing and read_theme_file is available, " +
-					"you already had your chance; finish with propose_changes. " +
-					"If you cannot produce a verified proposal, use needs_clarification: true with files: []."
+					"you already had your chance; finish with propose_changes."
+				if tc.FullHomeRedesign {
+					nudge = "FULL homepage redesign context was pre-selected. Call propose_changes NOW with complete file bodies " +
+						"(pages/home.liquid + hero slider liquid/CSS/JS + section CSS as needed). " +
+						"Do NOT set needs_clarification, do NOT ask the merchant to split the request, do NOT refuse for missing APIs. " +
+						"Ship a working 5-slide hero and the requested sections in-theme."
+				} else {
+					nudge += " If you cannot produce a verified proposal, use needs_clarification: true with files: []."
+				}
 			}
 			params.System = append(append([]anthropic.TextBlockParam{}, system...), anthropic.TextBlockParam{
 				Text: nudge,
@@ -866,12 +882,22 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		modelCallStart := time.Now()
 		attemptsUsed := 0
 		var streamRetryCount int
-		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
+		maxStreamAttempts := streamAccumulateMaxAttempts
+		if tc.StreamMaxAttemptsOverride > maxStreamAttempts {
+			maxStreamAttempts = tc.StreamMaxAttemptsOverride
+		}
+		for attempt := 1; attempt <= maxStreamAttempts; attempt++ {
 			attemptsUsed = attempt
 			if sp, ok := progress.(StreamStatusProgress); ok {
 				sp.WaitingForAI(iteration, attempt)
 			}
-			msg, meta, streamErr := g.consumeProviderStream(ctx, params, onDelta, attempt, iteration, generateStart, &firstTokenLogged, &ttftMs, tc.FirstTokenTimeoutOverride, progress)
+			// Escalate TTFT slightly on retries for prepared/full-home — DeepSeek
+			// sometimes queues longer on the second attempt after a cold miss.
+			ftOverride := tc.FirstTokenTimeoutOverride
+			if attempt > 1 && ftOverride > 0 {
+				ftOverride = ftOverride + 30*time.Second
+			}
+			msg, meta, streamErr := g.consumeProviderStream(ctx, params, onDelta, attempt, iteration, generateStart, &firstTokenLogged, &ttftMs, ftOverride, tc.StreamIdleTimeoutOverride, progress)
 			message = msg
 			if streamErr == nil {
 				logStreamAttempt(g, iteration, meta, message, nil, "success")
@@ -883,7 +909,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				}
 			}
 			retryable := isRetryableStreamErr(streamErr)
-			canRetry := retryable && attempt < streamAccumulateMaxAttempts
+			canRetry := retryable && attempt < maxStreamAttempts
 			retryDecision := "fail"
 			switch {
 			case canRetry:
@@ -906,7 +932,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				"error_type", classifyStreamErr(streamErr),
 				"retry_decision", retryDecision,
 				"retry_count", streamRetryCount,
-				"max_attempts", streamAccumulateMaxAttempts,
+				"max_attempts", maxStreamAttempts,
 				"error", streamErr.Error())
 			if !canRetry {
 				// Last attempt failed mid-stream — if propose_changes already

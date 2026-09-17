@@ -65,6 +65,12 @@ func TestDoGenerate_ConversationFastPath_NoDeepSeekNoTheme(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(messages) < 2 {
+		t.Fatalf("expected user + assistant, got %d messages", len(messages))
+	}
+	if messages[0].Role != chat.RoleUser || messages[0].Content != "hi" {
+		t.Fatalf("expected user hi first, got %+v", messages[0])
+	}
 	var assistant *chat.Message
 	for i := range messages {
 		if messages[i].Role == chat.RoleAssistant {

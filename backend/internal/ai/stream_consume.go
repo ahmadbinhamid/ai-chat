@@ -163,9 +163,10 @@ func (g *Generator) SetStreamFirstTokenTimeout(d time.Duration) {
 }
 
 // defaultPreparedFirstTokenTimeout bounds TTFT for PageCreatePrepared calls —
-// DeepSeek can exceed 25s even with thinking disabled; 40s cuts false
-// timeouts without waiting the full interactive 45s budget twice.
-const defaultPreparedFirstTokenTimeout = 60 * time.Second
+// DeepSeek often spends 30–70s planning a forced propose_changes (especially
+// full-homepage rebuilds) before the first tool_use/json delta. 90s avoids
+// false kills without letting a dead stream sit for minutes.
+const defaultPreparedFirstTokenTimeout = 90 * time.Second
 
 // PreparedFirstTokenTimeout is the TTFT budget for PageCreatePrepared
 // generations (exported for themebuild wiring / tests).
@@ -173,11 +174,48 @@ func PreparedFirstTokenTimeout() time.Duration {
 	return defaultPreparedFirstTokenTimeout
 }
 
+// defaultPreparedStreamIdleTimeout is the post-first-token idle budget for
+// prepared page/homepage proposes — large propose_changes JSON can pause
+// briefly between chunks without being a dead stream.
+const defaultPreparedStreamIdleTimeout = 25 * time.Second
+
+// PreparedStreamIdleTimeout is the idle budget for PageCreatePrepared
+// streams after model progress has started.
+func PreparedStreamIdleTimeout() time.Duration {
+	return defaultPreparedStreamIdleTimeout
+}
+
+// streamModelProgressBytes measures any model-produced progress that should
+// clear the first-token deadline: narration/thinking text OR tool_use
+// (name/input). Forced propose_changes with thinking disabled often emits
+// only tool_use — counting text alone caused false TTFT kills mid-stream.
+func streamModelProgressBytes(message anthropic.Message) int {
+	n := 0
+	for _, block := range message.Content {
+		switch b := block.AsAny().(type) {
+		case anthropic.TextBlock:
+			n += len(b.Text)
+		case anthropic.ThinkingBlock:
+			n += len(b.Thinking)
+		case anthropic.ToolUseBlock:
+			n += len(b.Name) + len(b.Input) + 1
+		default:
+			// Partial / compat tool_use may not decode via AsAny yet — Type
+			// alone still means the model started producing a content block.
+			if block.Type == "tool_use" {
+				n += len(block.Name) + len(block.Input) + 1
+			}
+		}
+	}
+	return n
+}
+
 // consumeProviderStream runs one NewStreaming attempt with an idle deadline
 // independent of the parent generation timeout. Every successful Next()
 // resets the idle timer (healthy long streams that keep emitting are fine).
 // onDelta receives coalesced narration text the same way the previous inline
 // loop did. firstTokenOverride, when > 0, replaces streamFirstTokenTimeout.
+// idleOverride, when > 0, replaces streamIdleTimeout for this attempt.
 func (g *Generator) consumeProviderStream(
 	ctx context.Context,
 	params anthropic.MessageNewParams,
@@ -188,6 +226,7 @@ func (g *Generator) consumeProviderStream(
 	firstTokenLogged *bool,
 	ttftMs *int64,
 	firstTokenOverride time.Duration,
+	idleOverride time.Duration,
 	progress ToolProgress,
 ) (anthropic.Message, streamAttemptMeta, error) {
 	meta := streamAttemptMeta{
@@ -197,6 +236,9 @@ func (g *Generator) consumeProviderStream(
 	meta.LastProgressAt = meta.StreamStart
 
 	idle := g.streamIdleTimeout()
+	if idleOverride > 0 {
+		idle = idleOverride
+	}
 	firstTokenDeadline := g.streamFirstTokenTimeout()
 	if firstTokenOverride > 0 {
 		firstTokenDeadline = firstTokenOverride
@@ -291,18 +333,20 @@ func (g *Generator) consumeProviderStream(
 			return message, meta, wrapped
 		}
 
-		if full := currentText(message); len(full) > emitted {
+		// Any text OR tool_use progress clears TTFT — see streamModelProgressBytes.
+		if progressBytes := streamModelProgressBytes(message); progressBytes > 0 && meta.FirstDeltaAt.IsZero() {
 			now := time.Now()
-			if meta.FirstDeltaAt.IsZero() {
-				meta.FirstDeltaAt = now
-				meta.TTFTAttemptMs = now.Sub(meta.StreamStart).Milliseconds()
-			}
-			if firstTokenLogged != nil && !*firstTokenLogged && len(full) > 0 {
+			meta.FirstDeltaAt = now
+			meta.TTFTAttemptMs = now.Sub(meta.StreamStart).Milliseconds()
+			if firstTokenLogged != nil && !*firstTokenLogged {
 				*firstTokenLogged = true
 				if ttftMs != nil {
 					*ttftMs = now.Sub(generateStart).Milliseconds()
 				}
 			}
+		}
+
+		if full := currentText(message); len(full) > emitted {
 			chunk := full[emitted:]
 			emitted = len(full)
 			coalescer.add(chunk)

@@ -22,11 +22,15 @@ type ComplexPageContext struct {
 
 const (
 	maxComplexPagePaths      = 5
+	maxComplexHomePaths      = 8 // full homepage from-scratch needs home + hero + css
 	maxComplexPagePkgRunes   = 14_000
+	maxComplexHomePkgRunes   = 16_000 // keep TTFT healthy — full bodies for home+hero only
 	maxComplexPageModelCalls = 4 // prepared path should propose quickly
+	maxComplexHomeModelCalls = 6
 	maxComplexExploration    = 1 // at most one narrow read before force-propose
 	maxComplexExploreStreak  = 1 // one explore-only turn, then force propose
 	complexPageExcerptLines  = 60
+	complexHomeExcerptLines  = 50
 	// complexPageRecentTurns is how many prior chat turns to replay when
 	// PageCreatePrepared — skip Summarize API cost when local theme context
 	// already carries the structural state.
@@ -49,18 +53,37 @@ func BuildComplexPageContext(ctx context.Context, store themefs.ThemeStore, auth
 	}
 	paths := flattenThemePaths(tree)
 	ranked := rankPathsForPageCreate(paths, prompt)
-	if len(ranked) > maxComplexPagePaths {
-		ranked = ranked[:maxComplexPagePaths]
+	pathCap := maxComplexPagePaths
+	if isFullHomePageRedesignPrompt(prompt) {
+		pathCap = maxComplexHomePaths
+	}
+	if len(ranked) > pathCap {
+		ranked = ranked[:pathCap]
 	}
 	out.Paths = ranked
 	homeRedesign := isHomePageRedesignPrompt(prompt)
+	fullHome := isFullHomePageRedesignPrompt(prompt)
 	sliderFeature := isSliderFeaturePrompt(prompt)
 	sliderImagesOnly := isSliderImagesOnlyPrompt(prompt)
 	sectionRedesign := isSectionRedesignPrompt(prompt)
-	out.Sufficient = complexPageContextSufficient(ranked, homeRedesign || sliderFeature || sectionRedesign)
+	// Full homepage rebuild wins over slider-only packaging.
+	if fullHome {
+		sliderImagesOnly = false
+	}
+	out.Sufficient = complexPageContextSufficient(ranked, homeRedesign || sliderFeature || sectionRedesign || fullHome)
 
 	var b strings.Builder
-	if sectionRedesign && !sliderFeature && !homeRedesign {
+	if fullHome {
+		b.WriteString("## Pre-selected local FULL homepage redesign context\n")
+		b.WriteString("Merchant wants the ENTIRE homepage rebuilt (software/AI company landing), not a tiny tweak.\n")
+		b.WriteString("Ship a complete pages/home.liquid (or equivalent) plus hero slider liquid/CSS/JS and any section partials/CSS needed.\n")
+		b.WriteString("Include a working 5-slide hero (data-hero-slider + data-slide-item + autoplay JS) with distinct public https image URLs (picsum/unsplash).\n")
+		b.WriteString("Build the requested sections in-theme (services, products, AI, tech stack, why us, portfolio, testimonials, CTA).\n")
+		b.WriteString("Do NOT refuse or ask for clarification because a live AI chat API is missing — use a polished static/demo chat UI if needed; do not invent backend endpoints.\n")
+		b.WriteString("Do NOT ask the merchant to split this into smaller requests — handle the full homepage in one propose_changes.\n")
+		b.WriteString("Prefer action \"update\" with FULL file bodies. Call propose_changes promptly. Do not list/grep the whole theme.\n")
+		b.WriteString("Keep footer only if merchant asked to keep it; otherwise include a professional software-house footer.\n\n")
+	} else if sectionRedesign && !sliderFeature && !homeRedesign {
 		target := "footer"
 		if strings.Contains(strings.ToLower(prompt), "header") && !strings.Contains(strings.ToLower(prompt), "footer") {
 			target = "header"
@@ -84,7 +107,7 @@ func BuildComplexPageContext(ctx context.Context, store themefs.ThemeStore, auth
 			fmt.Fprintf(&b, "  %d) %s\n", i+1, u)
 		}
 		b.WriteString("Call propose_changes once — only store-hero-banner.liquid. Do not touch JS/CSS/layout.\n\n")
-	} else if sliderFeature {
+	} else if sliderFeature && !fullHome {
 		b.WriteString("## Pre-selected local hero-slider context\n")
 		b.WriteString("Merchant wants a WORKING multi-image hero slider with autoplay/auto-scroll.\n")
 		b.WriteString("Static stacked images are NOT enough. You must ship all of:\n")
@@ -115,13 +138,19 @@ func BuildComplexPageContext(ctx context.Context, store themefs.ThemeStore, auth
 	b.WriteString(strings.TrimSpace(prompt))
 	b.WriteString("\n\n")
 
+	excerptLines := complexPageExcerptLines
+	pkgLimit := maxComplexPagePkgRunes
+	if fullHome {
+		excerptLines = complexHomeExcerptLines
+		pkgLimit = maxComplexHomePkgRunes
+	}
 	for _, p := range ranked {
 		content, rerr := store.ReadFile(ctx, auth, p)
 		if rerr != nil {
 			fmt.Fprintf(&b, "### %s\nERROR: %v\n\n", p, rerr)
 			continue
 		}
-		if sliderFeature && strings.HasSuffix(strings.ToLower(p), ".js") && strings.TrimSpace(content) == "" {
+		if sliderFeature && !fullHome && strings.HasSuffix(strings.ToLower(p), ".js") && strings.TrimSpace(content) == "" {
 			fmt.Fprintf(&b, "### %s\n(EMPTY FILE — implement autoplay slider JS here before proposing)\n\n", p)
 			continue
 		}
@@ -132,11 +161,14 @@ func BuildComplexPageContext(ctx context.Context, store themefs.ThemeStore, auth
 			fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
 		} else if sliderImagesOnly && strings.HasSuffix(lowPath, ".liquid") {
 			fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
+		} else if fullHome && (strings.Contains(lowPath, "pages/home") || strings.Contains(lowPath, "store-hero-banner")) &&
+			(strings.HasSuffix(lowPath, ".liquid") || strings.HasSuffix(lowPath, ".css") || strings.HasSuffix(lowPath, ".js")) {
+			fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
 		} else {
-			excerpt := truncateLines(content, complexPageExcerptLines)
+			excerpt := truncateLines(content, excerptLines)
 			fmt.Fprintf(&b, "### %s\n%s\n\n", p, excerpt)
 		}
-		if len([]rune(b.String())) > maxComplexPagePkgRunes {
+		if len([]rune(b.String())) > pkgLimit {
 			b.WriteString("(additional files omitted to keep context bounded)\n")
 			break
 		}
@@ -157,7 +189,26 @@ func complexPagePreparedPrompt(userPrompt string, cpc ComplexPageContext) string
 
 func isHomePageRedesignPrompt(prompt string) bool {
 	// Slider multi-image / autoplay uses the same home/hero/slider ranking.
-	return pageRedesignRe.MatchString(prompt) || isSliderFeaturePrompt(prompt)
+	return pageRedesignRe.MatchString(prompt) || isSliderFeaturePrompt(prompt) || isFullHomePageRedesignPrompt(prompt)
+}
+
+// isFullHomePageRedesignPrompt is a whole-homepage rebuild (from scratch /
+// SaaS landing with many sections) — must package pages/home.liquid, not
+// only the hero-slider wiring files.
+func isFullHomePageRedesignPrompt(prompt string) bool {
+	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	if pageRedesignRe.MatchString(p) {
+		return true
+	}
+	if !(strings.Contains(p, "homepage") || strings.Contains(p, "home page") ||
+		(strings.Contains(p, "home") && strings.Contains(p, "page"))) {
+		return false
+	}
+	return strings.Contains(p, "from scratch") || strings.Contains(p, "entire homepage") ||
+		strings.Contains(p, "whole homepage") || strings.Contains(p, "complete homepage") ||
+		strings.Contains(p, "landing page") || strings.Contains(p, "software house") ||
+		strings.Contains(p, "saas") ||
+		(strings.Contains(p, "regenerate") && strings.Contains(p, "home"))
 }
 
 func promptWantsHeaderOrNav(prompt string) bool {
@@ -212,6 +263,7 @@ func complexPageContextSufficient(paths []string, structuralFocus bool) bool {
 func rankPathsForPageCreate(paths []string, prompt string) []string {
 	p := strings.ToLower(prompt)
 	homeRedesign := isHomePageRedesignPrompt(prompt)
+	fullHome := isFullHomePageRedesignPrompt(prompt)
 	sliderFeature := isSliderFeaturePrompt(prompt)
 	sliderImagesOnly := isSliderImagesOnlyPrompt(prompt)
 	sectionRedesign := isSectionRedesignPrompt(prompt)
@@ -257,20 +309,25 @@ func rankPathsForPageCreate(paths []string, prompt string) []string {
 			default:
 				score = 0
 			}
-		} else if homeRedesign {
+		} else if homeRedesign || fullHome {
 			switch {
 			case strings.Contains(low, "pages/home") && strings.HasSuffix(low, ".liquid"):
-				score = 300
-			case (strings.Contains(low, "hero") || strings.Contains(low, "slider") || strings.Contains(low, "carousel")) &&
+				score = 320
+			case (strings.Contains(low, "hero") || strings.Contains(low, "slider") || strings.Contains(low, "carousel") || strings.Contains(low, "store-hero-banner")) &&
 				(strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js")):
-				score = 280
+				score = 300
 			case strings.Contains(low, "sections/") && strings.Contains(low, "home"):
 				score = 250
+			case strings.Contains(low, "testimonial") && (strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js")):
+				score = 230
 			case strings.Contains(low, "home") && (strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js") || strings.HasSuffix(low, ".liquid")) &&
 				!strings.Contains(low, "header") && !strings.Contains(low, "menu") && !strings.Contains(low, "nav"):
 				score = 240
+			case fullHome && strings.Contains(low, "footer") && (strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css")):
+				score = 220
+			case strings.Contains(low, "layout-end") && strings.HasSuffix(low, ".liquid"):
+				score = 210
 			case base == "pages.json":
-				// Useful registry hint, but never displace home/hero/slider.
 				score = 100
 			case strings.Contains(low, "layout") && strings.HasSuffix(low, ".liquid"):
 				score = 40
@@ -281,29 +338,25 @@ func rankPathsForPageCreate(paths []string, prompt string) []string {
 					score = 0
 				}
 			default:
-				// Drop generic high scores from the first switch (e.g. header=150).
 				if score > 0 && (strings.Contains(low, "header") || strings.Contains(low, "menu")) {
 					score = 0
 				}
 			}
 		} else if !wantsNav {
-			// Page create without an explicit menu/nav ask: keep one nav file
-			// useful for wiring, but do not flood the package with headers.
 			if strings.Contains(low, "header") || strings.Contains(low, "nav") || strings.Contains(low, "menu") {
 				if score > 110 {
 					score = 110
 				}
 			}
 		}
-		// Working autoplay needs layout script wiring + hero JS, not pages.json / home.liquid.
-		// Image-swap-only: only the liquid file — keep the package tiny for fast TTFT.
-		if sliderImagesOnly {
+		// Slider-only packaging — never demote pages/home for a full homepage rebuild.
+		if !fullHome && sliderImagesOnly {
 			if strings.Contains(low, "store-hero-banner") && strings.HasSuffix(low, ".liquid") {
 				score = 400
 			} else {
 				score = 0
 			}
-		} else if sliderFeature {
+		} else if !fullHome && sliderFeature {
 			if strings.Contains(low, "store-hero-banner") && strings.HasSuffix(low, ".js") {
 				score = 310
 			} else if strings.Contains(low, "store-hero-banner") && strings.HasSuffix(low, ".liquid") {
@@ -313,10 +366,8 @@ func rankPathsForPageCreate(paths []string, prompt string) []string {
 			} else if strings.Contains(low, "layout-end") && strings.HasSuffix(low, ".liquid") {
 				score = 290
 			} else if base == "testimonials.js" {
-				// Compact autoplay reference pattern for the model.
 				score = 270
 			} else if strings.Contains(low, "pages/home") {
-				// home.liquid only renders the component — not needed for slider wiring.
 				score = 10
 			} else if base == "pages.json" {
 				score = 20
@@ -364,7 +415,7 @@ func rankPathsForPageCreate(paths []string, prompt string) []string {
 			headerSample++
 		}
 		out = append(out, r.path)
-		if len(out) >= maxComplexPagePaths {
+		if len(out) >= maxComplexHomePaths {
 			break
 		}
 	}

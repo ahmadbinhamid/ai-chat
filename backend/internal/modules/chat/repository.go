@@ -82,6 +82,24 @@ func createMessage(ctx context.Context, e execer, m Message) error {
 	return err
 }
 
+// MaxMessageCreatedAt returns the latest created_at in chatID, or nil when
+// the chat has no messages yet. Used to keep newly recorded turns strictly
+// after prior ones despite DATETIME second-level precision (see
+// ListMessagesByChat's ORDER BY comment).
+func (r *Repository) MaxMessageCreatedAt(ctx context.Context, chatID string) (*time.Time, error) {
+	var t sql.NullTime
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT MAX(created_at) FROM chat_messages WHERE chat_id = ?
+	`, chatID).Scan(&t); err != nil {
+		return nil, err
+	}
+	if !t.Valid {
+		return nil, nil
+	}
+	tt := t.Time.UTC()
+	return &tt, nil
+}
+
 // createAttachments inserts one row per attachment — bounded (at most
 // maxImagesPerMessage images + one HTML file per message, enforced by
 // themebuild.Service.Generate before this is ever reached), so a per-row
@@ -156,9 +174,17 @@ func (r *Repository) CreateMessageAndTouchUsage(ctx context.Context, m Message, 
 // queries simple to reason about independently, and is skipped entirely
 // when the chat has no messages at all (see listAttachmentMetadata).
 func (r *Repository) ListMessagesByChat(ctx context.Context, chatID string) ([]Message, error) {
+	// created_at is DATETIME with only second-level precision (see
+	// themebuild DraftFiles / revert.go). Conversation fast path can write
+	// user + assistant in the same wall-clock second, so created_at alone
+	// is not a total order — without the role/id tie-break InnoDB can
+	// return the assistant row before the user that prompted it.
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at
-		FROM chat_messages WHERE chat_id = ? ORDER BY created_at ASC
+		FROM chat_messages WHERE chat_id = ?
+		ORDER BY created_at ASC,
+		  CASE role WHEN 'user' THEN 0 WHEN 'system' THEN 1 ELSE 2 END,
+		  id ASC
 	`, chatID)
 	if err != nil {
 		return nil, err
