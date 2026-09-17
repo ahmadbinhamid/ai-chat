@@ -1611,6 +1611,10 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	var simpleEditCtx SimpleEditContext
 	switch intent {
 	case IntentSimpleEdit:
+		if !intentUsesSimpleEditOneShot(intent) {
+			// Defensive: never enter one-shot unless the intent gate agrees.
+			break
+		}
 		contextStart := time.Now()
 		sec, secErr := BuildSimpleEditContext(ctx, store, storeAuth, in.Prompt)
 		contextMS := time.Since(contextStart).Milliseconds()
@@ -1645,15 +1649,37 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			"simple_edit_context_chars", pkgRunes,
 			"package_runes", pkgRunes)
 	case IntentThemeQuery:
+		tc.SimpleEditOneShot = false
 		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 6 {
 			tc.MaxToolIterations = 6
 		}
 		slog.Info("ai: theme-query path", "chat_id", c.ID, "max_tool_iterations", tc.MaxToolIterations)
 	case IntentRepair:
+		tc.SimpleEditOneShot = false
 		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 8 {
 			tc.MaxToolIterations = 8
 		}
-	case IntentComplexPage, IntentMultiFileEdit:
+	case IntentComplexPage:
+		// Full tool loop (list/grep/read/propose) — never simple-edit one-shot.
+		// Keep GenerationMode from the request (usually edit) so menu/nav
+		// component edits remain allowed; apply the complex token ceiling.
+		tc.SimpleEditOneShot = false
+		tc.SimpleEditAllowRead = false
+		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 14 {
+			tc.MaxToolIterations = 14
+		}
+		if tc.MaxTokensOverride <= 0 {
+			tc.MaxTokensOverride = ai.DefaultTokenBudgets().Complex
+		}
+		slog.Info("ai: complex-page path",
+			"chat_id", c.ID, "generation_id", genID,
+			"intent", string(intent),
+			"max_tool_iterations", tc.MaxToolIterations,
+			"max_tokens", tc.MaxTokensOverride,
+			"simple_edit_one_shot", false)
+	case IntentMultiFileEdit:
+		tc.SimpleEditOneShot = false
+		tc.SimpleEditAllowRead = false
 		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 14 {
 			tc.MaxToolIterations = 14
 		}
@@ -1669,7 +1695,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	readFile := s.buildFileReader(store, storeAuth)
 
 	var turns []ai.Turn
-	if intent == IntentSimpleEdit {
+	if intentUsesSimpleEditOneShot(intent) {
 		turns = nil
 	} else {
 		turns = s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
@@ -1682,9 +1708,22 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	result, turns, err := s.generateValidProposal(ctx, tc, turns, prompt, toolExec, readFile, emitter, in)
 	modelMS := time.Since(modelStart).Milliseconds()
 	if err != nil {
+		if errors.Is(err, ai.ErrMaxTokensTruncated) {
+			slog.Warn("ai: max_tokens truncation — no draft applied",
+				"chat_id", c.ID,
+				"generation_id", genID,
+				"intent", string(intent),
+				"route", RouteLocalFirst,
+				"simple_edit_one_shot", tc.SimpleEditOneShot,
+				"generation_mode", tc.GenerationMode,
+				"max_tokens", tc.MaxTokensOverride,
+				"model_ms", modelMS,
+				"propose_changes_parsed", false,
+				"error", err.Error())
+		}
 		return err
 	}
-	if intent == IntentSimpleEdit {
+	if intentUsesSimpleEditOneShot(intent) {
 		if vErr := validateSimpleEditCompactness(result); vErr != nil {
 			slog.Warn("ai: simple-edit changeset rejected",
 				"chat_id", c.ID, "generation_id", genID, "error", vErr.Error(),

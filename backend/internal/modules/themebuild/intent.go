@@ -53,6 +53,31 @@ var (
 	repairRe      = regexp.MustCompile(`(?i)\b(fix|broken|error|bug|crash|not working|doesn'?t work|render failed|blank|missing)\b`)
 	complexRe     = regexp.MustCompile(`(?i)\b(from scratch|entire theme|whole site|all pages|every page|new theme|brand kit|redesign (the )?site|multi[- ]page)\b`)
 	multiFileRe   = regexp.MustCompile(`(?i)\b(and also|as well as|both .+ and|homepage and|header and footer|all components|several files|multiple files)\b`)
+
+	// pageCreateRe matches NEW PAGE / route creation. Checked BEFORE
+	// simple_edit so "create a Contact Us page" never enters the 8k one-shot.
+	// Kept narrow: "add a section" / "change the header" must stay simple_edit.
+	pageCreateRe = regexp.MustCompile(`(?i)(?:` +
+		`\b(?:create|make|build)\s+(?:a\s+|an\s+|the\s+|new\s+)?(?:` +
+		`landing\s*page|contact(?:\s*us)?(?:\s*page)?|about(?:\s*page)?|faq(?:\s*page)?|page` +
+		`)\b` +
+		`|` +
+		`\badd\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:` +
+		`landing\s*page|(?:faq|about|contact(?:\s*us)?)\s*page|page` +
+		`)\b` +
+		`|` +
+		`\b(?:new)\s+(?:landing\s*page|page|route)\b` +
+		`|` +
+		// Roman-Urdu / free word order: "page create …", "ek page create kr …"
+		`\bpage\b[\s\S]{0,24}\bcreate\b` +
+		`)`)
+
+	// pageAndMenuRe: page + menu/nav together with a create/add/new action —
+	// structural multi-file work (register page + wire navigation).
+	pageAndMenuRe = regexp.MustCompile(`(?i)\b(?:create|make|build|add|new)\b`)
+	menuNavRe     = regexp.MustCompile(`(?i)\b(?:menu|navigation|navbar)\b|\bnav\b`)
+	addToMenuRe   = regexp.MustCompile(`(?i)\b(?:add|put|include)\b[\s\S]{0,48}\b(?:to\s+)?(?:the\s+)?(?:menu|navigation|navbar)\b`)
+	pageLikeNameRe = regexp.MustCompile(`(?i)\b(?:contact|about|faq|landing)\b`)
 )
 
 // ClassifyIntent is a deterministic local router. Attachments / non-edit modes
@@ -99,6 +124,10 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 	if complexRe.MatchString(p) {
 		return IntentComplexPage
 	}
+	// Page create / page+menu MUST run before simple_edit matching.
+	if isPageCreateOrStructural(p) {
+		return IntentComplexPage
+	}
 	if repairRe.MatchString(p) && (themeTargetRe.MatchString(p) || strings.Contains(p, "render") || strings.Contains(p, "liquid") || strings.Contains(p, "error")) {
 		return IntentRepair
 	}
@@ -121,6 +150,33 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 
 	// Ambiguous → theme path (safer than wrong conversation classification).
 	return IntentSimpleEdit
+}
+
+// isPageCreateOrStructural reports new-page / page+menu work that must use
+// the full multi-file generation path, never SIMPLE_EDIT one-shot.
+func isPageCreateOrStructural(p string) bool {
+	if pageCreateRe.MatchString(p) {
+		return true
+	}
+	// "… page … menu …" (or nav) with create/add/new — e.g. create page and add to menu.
+	hasPage := strings.Contains(p, "page")
+	hasMenu := menuNavRe.MatchString(p)
+	if hasPage && hasMenu && pageAndMenuRe.MatchString(p) {
+		return true
+	}
+	// Explicit "add … to (the) menu/navigation" with a page-like object.
+	if hasMenu && addToMenuRe.MatchString(p) {
+		if hasPage || pageLikeNameRe.MatchString(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// intentUsesSimpleEditOneShot is the single gate for the narrow one-shot
+// path — kept here so route selection cannot silently diverge from intent.
+func intentUsesSimpleEditOneShot(intent Intent) bool {
+	return intent == IntentSimpleEdit
 }
 
 func mostlyNonThemeNoise(p string) bool {

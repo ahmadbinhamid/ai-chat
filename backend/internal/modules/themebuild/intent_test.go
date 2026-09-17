@@ -23,6 +23,8 @@ func TestClassifyIntent_ThemeEdit(t *testing.T) {
 		{"can you change the header desgin please do it fast", IntentSimpleEdit},
 		{"make the header modern", IntentSimpleEdit},
 		{"change button color", IntentSimpleEdit},
+		{"change the header color", IntentSimpleEdit},
+		{"update logo in header", IntentSimpleEdit},
 		{"update homepage hero", IntentSimpleEdit},
 		{"add a section", IntentSimpleEdit},
 		{"change product card design", IntentSimpleEdit},
@@ -31,8 +33,41 @@ func TestClassifyIntent_ThemeEdit(t *testing.T) {
 		{"change the header and footer", IntentMultiFileEdit},
 	}
 	for _, tc := range cases {
-		if got := ClassifyIntent(tc.prompt, "", false); got != tc.want {
+		got := ClassifyIntent(tc.prompt, "", false)
+		if got != tc.want {
 			t.Errorf("ClassifyIntent(%q)=%s want %s", tc.prompt, got, tc.want)
+		}
+		if tc.want == IntentSimpleEdit && !intentUsesSimpleEditOneShot(got) {
+			t.Errorf("ClassifyIntent(%q): simple_edit must use one-shot gate", tc.prompt)
+		}
+	}
+}
+
+func TestClassifyIntent_PageCreateNotSimpleEdit(t *testing.T) {
+	cases := []string{
+		"create a Contact Us page",
+		"create a page and add it to menu",
+		"add a new FAQ page",
+		"create a landing page",
+		"make a page for about us",
+		"create About page",
+		"add a new page",
+		"new page for contact",
+		"Create a new Contact Us page and add it to the menu",
+		"ek page create kr dty ho test jis me bs contact us ka page ho or wo menu me b add kr do",
+		"add contact us to the menu",
+		"create FAQ page and add to navigation",
+	}
+	for _, p := range cases {
+		got := ClassifyIntent(p, "", false)
+		if got == IntentSimpleEdit {
+			t.Errorf("ClassifyIntent(%q)=simple_edit — must be complex_page (page create / menu)", p)
+		}
+		if got != IntentComplexPage {
+			t.Errorf("ClassifyIntent(%q)=%s want complex_page", p, got)
+		}
+		if intentUsesSimpleEditOneShot(got) {
+			t.Errorf("ClassifyIntent(%q): must not enter simple-edit one-shot", p)
 		}
 	}
 }

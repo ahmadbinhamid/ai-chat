@@ -564,12 +564,15 @@ const maxToolIterations = maxToolIterationsCeiling
 // large page-generation proposals mid-JSON.
 const defaultMaxTokens = 64000
 
-// errMaxTokensTruncated is returned instead of attempting to json.Unmarshal
+// ErrMaxTokensTruncated is returned instead of attempting to json.Unmarshal
 // a propose_changes input that Claude's own StopReason says was cut off
 // mid-stream — unmarshaling truncated JSON either errors confusingly or,
 // worse, could succeed on a coincidentally-valid prefix and silently accept
-// a partial proposal.
-var errMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
+// a partial proposal. Callers must not materialize or stage a draft.
+var ErrMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
+
+// errMaxTokensTruncated is kept as an alias for older call sites in this package.
+var errMaxTokensTruncated = ErrMaxTokensTruncated
 
 // Generate asks Claude for the file changes implementing prompt, given the
 // theme context and prior conversation turns. The model drives a tool loop:
@@ -935,9 +938,23 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// JSON that far) is truncated, not a real proposal. Unmarshaling it
 		// anyway either fails confusingly or, worse, could succeed against a
 		// coincidentally well-formed prefix and silently accept a partial
-		// result — fail explicitly instead.
+		// result — fail explicitly instead. Never MaterializeEdits / stage.
 		if message.StopReason == anthropic.StopReasonMaxTokens {
-			return nil, errMaxTokensTruncated
+			callMax := resolveMaxTokens(tc, g.maxTokens, g.tokenBudgets)
+			slog.Warn("ai: max_tokens truncation before propose_changes",
+				"provider", g.provider,
+				"model", g.modelName,
+				"max_tokens", callMax,
+				"stop_reason", string(message.StopReason),
+				"output_tokens", message.Usage.OutputTokens,
+				"input_tokens", message.Usage.InputTokens,
+				"propose_changes_parsed", false,
+				"propose_changes_block_present", len(proposeInput) > 0,
+				"simple_edit_one_shot", tc.SimpleEditOneShot,
+				"generation_mode", tc.GenerationMode,
+				"iteration", iteration,
+				"elapsed_ms", time.Since(modelCallStart).Milliseconds())
+			return nil, ErrMaxTokensTruncated
 		}
 
 		// materializeFailureMsg, when non-empty, is fed back below as the

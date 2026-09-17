@@ -73,7 +73,7 @@ func TestSanitizeError(t *testing.T) {
 		},
 		{
 			name:        "max tokens truncation",
-			err:         errMaxTokensTruncated,
+			err:         ErrMaxTokensTruncated,
 			wantContain: "too large",
 		},
 		{

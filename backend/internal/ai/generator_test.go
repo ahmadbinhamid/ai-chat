@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -337,6 +338,80 @@ func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 	// expected iteration rather than earlier or never.
 	if calls != forceBoundary+1 {
 		t.Errorf("expected %d calls before the model proposed, got %d", forceBoundary+1, calls)
+	}
+}
+
+// TestGenerate_MaxTokensStopReasonDoesNotMaterialize ensures StopReasonMaxTokens
+// fails closed: no MaterializeEdits, no partial Result, ErrMaxTokensTruncated.
+func TestGenerate_MaxTokensStopReasonDoesNotMaterialize(t *testing.T) {
+	materializeCalls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Complete tool_use JSON can still arrive with stop_reason=max_tokens
+		// (cut mid-stream after the block closed). Must NOT materialize.
+		var b strings.Builder
+		sseEvent(&b, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": "msg_trunc", "type": "message", "role": "assistant", "model": "claude-test",
+				"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+				"usage": map[string]any{"input_tokens": 100, "output_tokens": 0},
+			},
+		})
+		sseEvent(&b, "content_block_start", map[string]any{
+			"type": "content_block_start", "index": 0,
+			"content_block": map[string]any{"type": "tool_use", "id": "toolu_1", "name": "propose_changes", "input": map[string]any{}},
+		})
+		inputJSON, _ := json.Marshal(map[string]any{
+			"summary":             "partial page",
+			"needs_clarification": false,
+			"files": []map[string]any{{
+				"path": "pages/contact.liquid", "action": "create",
+				"content": "<h1>Contact</h1>",
+			}},
+			"page_registry_entry":   nil,
+			"layout_links_to_add":   []string{},
+			"layout_scripts_to_add": []string{},
+		})
+		sseEvent(&b, "content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": 0,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": string(inputJSON)},
+		})
+		sseEvent(&b, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+		sseEvent(&b, "message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "max_tokens", "stop_sequence": nil},
+			"usage": map[string]any{"output_tokens": 8000},
+		})
+		sseEvent(&b, "message_stop", map[string]any{"type": "message_stop"})
+		fmt.Fprint(w, b.String())
+	}))
+	defer ts.Close()
+
+	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
+	g := newTestGenerator(client)
+	g.provider = "deepseek"
+	g.modelName = "deepseek-v4-pro"
+
+	readFile := FileReader(func(ctx context.Context, path string) (string, error) {
+		materializeCalls++
+		return "", fmt.Errorf("should not materialize on truncation")
+	})
+
+	result, err := g.Generate(context.Background(),
+		ThemeContext{ThemeSlug: "demo", SimpleEditOneShot: true, MaxTokensOverride: 8000},
+		nil, "create a page", nil, nil, nil, nil, readFile)
+	if !errors.Is(err, ErrMaxTokensTruncated) {
+		t.Fatalf("want ErrMaxTokensTruncated, got result=%v err=%v", result, err)
+	}
+	if result != nil {
+		t.Fatal("must not return a partial Result on max_tokens truncation")
+	}
+	if materializeCalls != 0 {
+		t.Fatalf("MaterializeEdits/readFile must not run on truncation, got %d reads", materializeCalls)
+	}
+	if msg := SanitizeError(err); msg == "" || strings.Contains(strings.ToLower(msg), "deepseek") {
+		t.Fatalf("merchant-facing sanitize unexpected: %q", msg)
 	}
 }
 
