@@ -1644,6 +1644,75 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return nil
 	}
 
+	// Deterministic register-existing-page: file on disk, missing from
+	// pages.json → merge page_registry_entry. Never regenerates content.
+	if isRegisterExistingPagePrompt(in.Prompt) {
+		regResult, handled, regErr := buildDeterministicRegisterExisting(ctx, store, storeAuth, in.Prompt)
+		if regErr != nil {
+			return fmt.Errorf("register existing page: %w", regErr)
+		}
+		if handled {
+			routedIntent = IntentComplexPage
+			if !proposalHasChanges(regResult) {
+				summary = regResult.Summary
+				if summary == "" {
+					summary = "Done."
+				}
+				status := chat.ApplyStatusNotApplicable
+				if regResult.NeedsClarification {
+					// Clarification replies are not drafts.
+					status = chat.ApplyStatusNotApplicable
+				}
+				if _, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, status); err != nil {
+					return fmt.Errorf("record register-existing reply: %w", err)
+				}
+				skipDraftRefresh = true
+				slog.Info("ai: register-existing fast path (no draft)",
+					"generation_id", genID, "chat_id", c.ID, "route", "register_existing_local")
+				return nil
+			}
+			unlock, lockErr := s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
+			if lockErr != nil {
+				return fmt.Errorf("stage register existing: %w", lockErr)
+			}
+			defer unlock()
+
+			plan, planErr := s.buildWritePlan(ctx, store, storeAuth, regResult)
+			if planErr != nil {
+				return fmt.Errorf("stage register existing: %w", planErr)
+			}
+			stagedFiles := planToStaged(plan)
+			hasChanges = true
+			summary = regResult.Summary
+			if summary == "" {
+				summary = "Done."
+			}
+			emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(regResult.Files)})
+			emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": plan.paths()})
+
+			commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer commitCancel()
+			assistantMsg, recErr := s.chats.RecordAssistantMessage(commitCtx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusPending)
+			if recErr != nil {
+				return fmt.Errorf("record register-existing reply: %w", recErr)
+			}
+			if _, err := s.persistFileRecords(commitCtx, c, assistantMsg.ID, stagedFiles); err != nil {
+				return fmt.Errorf("persist register-existing draft: %w", err)
+			}
+			slog.Info("ai: register-existing fast path",
+				"generation_id", genID,
+				"chat_id", c.ID,
+				"intent", string(IntentComplexPage),
+				"route", "register_existing_local",
+				"workspace_loaded", workspaceLoaded,
+				"deepseek_called", false,
+				"file_count", len(regResult.Files),
+				"paths", proposalPaths(regResult),
+				"duration_ms", time.Since(doGenerateStart).Milliseconds())
+			return nil
+		}
+	}
+
 	// Deterministic page/file deletes: orphans not in pages.json, blog rows,
 	// etc. DeepSeek kept claiming "done" while only editing card-essentials —
 	// compute deletes in Go and stage real action=delete drafts.
@@ -2278,6 +2347,28 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// attached as PageMeta (FlowPOS upserts pages.json) — no forced
 		// full-file pages.json rewrite from the model.
 		extras := compoundExtraRegistryEntries(result, compoundRegistries)
+		// File ↔ registry consistency before anything is staged. On failure,
+		// do not persist partial deletes/creates that would orphan pages.json.
+		currentPagesJSON := tc.PagesJSON
+		if strings.TrimSpace(currentPagesJSON) == "" {
+			if raw, readErr := store.ReadFile(ctx, storeAuth, pathPagesJSON); readErr == nil {
+				currentPagesJSON = raw
+			}
+		}
+		expectedNew := make([]string, 0, 1+len(extras))
+		if result.PageRegistryEntry != nil {
+			if id := pageEntryIdentity(normalizeRegistryEntry(result.PageRegistryEntry)); id != "" {
+				expectedNew = append(expectedNew, id)
+			}
+		}
+		for _, e := range extras {
+			if id := pageEntryIdentity(normalizeRegistryEntry(e)); id != "" {
+				expectedNew = append(expectedNew, id)
+			}
+		}
+		if err := validatePageFileRegistryConsistency(currentPagesJSON, result, expectedNew); err != nil {
+			return fmt.Errorf("stage theme changes: %w", err)
+		}
 		plan, err := s.buildWritePlan(ctx, store, storeAuth, result, extras...)
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)

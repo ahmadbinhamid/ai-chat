@@ -450,6 +450,25 @@ func (s *Service) generateValidProposal(
 				nextPrompt = "Resubmit a complete multi-page create via propose_changes only — N liquid creates + pages.json update, no exploration."
 				continue
 			}
+			if err := ensureCreateHasRegistry(merchantPrompt, result); err != nil {
+				if attempt >= maxThemeCheckRetries+1 {
+					return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
+				}
+				slog.Warn("page create missing registry, retrying if budget remains",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+				emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+					"attempt": attempt, "message": err.Error(),
+				})
+				turns = append(turns,
+					ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
+					ai.Turn{Role: "user", Content: fmt.Sprintf(
+						"That proposal created a page file without registering it: %s. "+
+							"Call propose_changes NOW with the page liquid create AND page_registry_entry for that slug. "+
+							"FORBIDDEN: rewriting the whole pages.json. FORBIDDEN: creating the file without registration.", err)},
+				)
+				nextPrompt = "Resubmit page create with page_registry_entry — do not regenerate unrelated files."
+				continue
+			}
 		}
 
 		if err := incompleteAddToMenuProposal(merchantPrompt, result); err != nil {

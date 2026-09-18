@@ -67,11 +67,15 @@ func TestBuildDeterministicBulkDelete_Orphans(t *testing.T) {
 	for _, want := range []string{
 		"pages/affiliates.liquid",
 		"pages/best-numbing-cream-for-tattoos.liquid",
-		"pages/blog.liquid",
 	} {
 		if actions[want] != "delete" {
 			t.Fatalf("expected delete %s, got %+v", want, actions)
 		}
+	}
+	// Unregistered blog.liquid is still a core listing template — orphan
+	// cleanup must not delete it (register it instead if missing from pages.json).
+	if actions["pages/blog.liquid"] == "delete" {
+		t.Fatalf("must not orphan-delete core blog listing: %+v", actions)
 	}
 	if actions["pages/home.liquid"] == "delete" || actions["pages/about-us.liquid"] == "delete" || actions["pages/cart.liquid"] == "delete" {
 		t.Fatalf("must not delete registered/core pages: %+v", actions)

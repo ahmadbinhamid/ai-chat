@@ -16,6 +16,8 @@ import (
 
 // Core storefront templates — never auto-deleted as "orphans" even if missing
 // from pages.json (a registry bug must not wipe cart/home/auth).
+// "blog" is the listing page: orphan/blog-post cleanup must not remove it
+// unless the merchant explicitly deletes the blog listing itself.
 var protectedOrphanBases = map[string]bool{
 	"home": true, "cart": true, "product": true, "products": true,
 	"shop": true, "category": true, "categories": true, "checkout": true,
@@ -24,7 +26,9 @@ var protectedOrphanBases = map[string]bool{
 	"privacy": true, "terms": true, "cookie": true, "faq": true,
 	"contact": true, "contact-us": true, "about": true, "about-us": true,
 	"delivery-info": true, "return-refunds": true,
+	"blog": true,
 }
+
 
 // deleteConfirmRe: short confirmations after the merchant already asked to
 // delete ("ok do it please fast") — must NOT fall into simple_edit.
@@ -80,9 +84,36 @@ func wantsBlogPageCleanup(prompt string) bool {
 	return strings.Contains(strings.ToLower(prompt), "blog")
 }
 
+// wantsExplicitBlogListingDelete is true only when the merchant asks to remove
+// the core blog listing page itself — not when cleaning orphan/extra blog posts.
+func wantsExplicitBlogListingDelete(prompt string) bool {
+	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	if !pageMutateRe.MatchString(p) {
+		return false
+	}
+	if strings.Contains(p, "all blog") || strings.Contains(p, "every blog") ||
+		strings.Contains(p, "sary blog") || strings.Contains(p, "saare blog") ||
+		strings.Contains(p, "sab blog") || strings.Contains(p, "sb blog") {
+		return true
+	}
+	return regexp.MustCompile(`(?i)\b(?:delete|remove|drop|purge|erase|hata)\b[\s\S]{0,32}\b(?:the\s+)?blog\s*page\b`).MatchString(p) ||
+		regexp.MustCompile(`(?i)\b(?:the\s+)?blog\s*page\b[\s\S]{0,24}\b(?:delete|remove|drop|hata)\b`).MatchString(p) ||
+		strings.Contains(p, "delete blog listing") ||
+		strings.Contains(p, "remove blog listing")
+}
+
+// isCanonicalBlogListingRow is the storefront blog index (page/slug == blog),
+// not a one-off blog post page.
+func isCanonicalBlogListingRow(r pagesJSONRow) bool {
+	page := strings.ToLower(strings.TrimSpace(r.Page))
+	slug := strings.ToLower(strings.TrimSpace(r.Slug))
+	return page == "blog" || slug == "blog"
+}
+
 func wantsAffiliatesCleanup(prompt string) bool {
 	return strings.Contains(strings.ToLower(prompt), "affiliate")
 }
+
 
 func isBlogLikeRow(r pagesJSONRow) bool {
 	blob := strings.ToLower(strings.Join([]string{r.Title, r.Slug, r.Type, r.Page, r.Path}, " "))
@@ -242,6 +273,8 @@ func buildDeterministicBulkDelete(
 	}
 
 	pagesJSONChanged := false
+	var removeIDs []string
+	explicitBlogListing := wantsExplicitBlogListingDelete(prompt)
 	if blog || affiliates {
 		for i, rr := range rawRows {
 			meta := pagesJSONRow{}
@@ -251,8 +284,16 @@ func buildDeterministicBulkDelete(
 				_ = json.Unmarshal(rr, &meta)
 			}
 			drop := (blog && isBlogLikeRow(meta)) || (affiliates && isAffiliatesRow(meta))
+			// Never unregister the core blog listing during "blog pages" /
+			// orphan-style cleanup unless the merchant explicitly deletes it.
+			if drop && blog && isCanonicalBlogListingRow(meta) && !explicitBlogListing {
+				drop = false
+			}
 			if drop {
 				pagesJSONChanged = true
+				if id := pageRegistryIdentity(meta.Page, meta.Slug); id != "" {
+					removeIDs = append(removeIDs, id)
+				}
 				if p := rowLiquidPath(meta); p != "" {
 					addDelete(p)
 				}
@@ -260,9 +301,10 @@ func buildDeterministicBulkDelete(
 			}
 			keptRows = append(keptRows, rr)
 		}
-		// Always remove pages/blog.liquid when blog cleanup is requested.
-		if blog {
+		// Only delete pages/blog.liquid when the listing itself is targeted.
+		if blog && explicitBlogListing {
 			addDelete("pages/blog.liquid")
+			removeIDs = append(removeIDs, "blog")
 		}
 	}
 
@@ -276,16 +318,52 @@ func buildDeterministicBulkDelete(
 		return nil, false, nil
 	}
 
+	// Consistency: never shrink pages.json for an identity whose liquid file
+	// is still present and not staged for delete (avoids file-without-registry).
+	originalPagesJSON := pagesRaw
+	var mergedPagesJSON string
+	if pagesJSONChanged {
+		filteredRemove := make([]string, 0, len(removeIDs))
+		seenRm := map[string]bool{}
+		for _, id := range removeIDs {
+			id = strings.TrimSpace(id)
+			if id == "" || seenRm[id] {
+				continue
+			}
+			seenRm[id] = true
+			liquid := "pages/" + id + ".liquid"
+			low := strings.ToLower(liquid)
+			stagedDelete := false
+			for p := range deleteSet {
+				if strings.ToLower(p) == low {
+					stagedDelete = true
+					break
+				}
+			}
+			fileAbsent := !onDisk[liquid] && !onDisk[low]
+			if stagedDelete || fileAbsent {
+				filteredRemove = append(filteredRemove, id)
+			}
+		}
+		removeIDs = filteredRemove
+		if len(removeIDs) == 0 {
+			pagesJSONChanged = false
+		} else {
+			var mErr error
+			mergedPagesJSON, mErr = removePageRegistryIdentities(originalPagesJSON, removeIDs)
+			if mErr != nil {
+				return nil, false, mErr
+			}
+			keptRows, _ = parsePagesJSONRaw(mergedPagesJSON)
+		}
+	}
+
 	files := make([]ai.GeneratedFile, 0, len(deleteSet)+1)
 	if pagesJSONChanged {
-		body, mErr := json.MarshalIndent(keptRows, "", "  ")
-		if mErr != nil {
-			return nil, false, mErr
-		}
 		files = append(files, ai.GeneratedFile{
 			Path:    pathPagesJSON,
 			Action:  "update",
-			Content: string(body) + "\n",
+			Content: mergedPagesJSON,
 		})
 	}
 
@@ -312,8 +390,15 @@ func buildDeterministicBulkDelete(
 	}
 	summary += ". Review the draft, then Apply to remove them from the theme."
 
-	return &ai.Result{
+	result = &ai.Result{
 		Summary: summary,
 		Files:   files,
-	}, true, nil
+	}
+	if pagesJSONChanged {
+		if err := validatePageFileRegistryConsistency(originalPagesJSON, result, nil); err != nil {
+			return nil, false, err
+		}
+	}
+
+	return result, true, nil
 }
