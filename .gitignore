@@ -2,13 +2,12 @@
 backend/tmp/
 backend/build-errors.log
 backend/bin/
+backend/.gopath/
 *.exe
 *.test
 *.out
 
 # Env
-.env
-.env.*
 !.env.example
 backend/.env
 backend/.env.*
@@ -18,10 +17,10 @@ backend/.env.*
 node_modules/
 
 # Editor and agent config (executable surface)
-.vscode/
 .idea/
 .claude/settings.json
 .claude/settings.local.json
 
 # OS
 .DS_Store
+config.bat

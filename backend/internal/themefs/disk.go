@@ -134,37 +134,51 @@ func (s *Store) ReadFileBytes(ctx context.Context, auth RequestAuth, relPath str
 // ReadFile and ReadFileBytes — the only difference between the two is
 // whether the caller wants the result as text or as binary-safe bytes.
 func (s *Store) readFileRaw(ctx context.Context, auth RequestAuth, relPath string) ([]byte, error) {
+	start := time.Now()
+	status := 0
+	var retErr error
+	defer func() {
+		logThemeAPIRequest(ctx, "ReadFile", auth.TenantID, start, status, retErr)
+	}()
+
 	if err := ValidatePathSafety(relPath); err != nil {
+		retErr = err
 		return nil, err
 	}
 
 	req, err := s.newRequest(ctx, auth, http.MethodGet, relPath, nil)
 	if err != nil {
+		retErr = err
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := s.doReadWithRetry(req)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", relPath, err)
+		retErr = fmt.Errorf("read %s: %w", relPath, err)
+		return nil, retErr
 	}
 	defer func() { _ = resp.Body.Close() }()
+	status = resp.StatusCode
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("read %s: %s", relPath, statusErr(resp))
+		retErr = fmt.Errorf("read %s: %s", relPath, statusErr(resp))
+		return nil, retErr
 	}
 
 	var out themeFileEnvelope
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("read %s: decode response: %w", relPath, err)
+		retErr = fmt.Errorf("read %s: decode response: %w", relPath, err)
+		return nil, retErr
 	}
 	if out.Data.Encoding == "base64" {
 		decoded, err := base64.StdEncoding.DecodeString(out.Data.Content)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: decode base64 content: %w", relPath, err)
+			retErr = fmt.Errorf("read %s: decode base64 content: %w", relPath, err)
+			return nil, retErr
 		}
 		return decoded, nil
 	}
@@ -174,7 +188,15 @@ func (s *Store) readFileRaw(ctx context.Context, auth RequestAuth, relPath strin
 // WriteFile upserts a theme file's content. meta is only meaningful for a
 // pages/*.liquid path — see PageMeta — and nil otherwise.
 func (s *Store) WriteFile(ctx context.Context, auth RequestAuth, relPath, content string, meta *PageMeta) error {
+	start := time.Now()
+	status := 0
+	var retErr error
+	defer func() {
+		logThemeAPIRequest(ctx, "WriteFile", auth.TenantID, start, status, retErr)
+	}()
+
 	if err := ValidatePathSafety(relPath); err != nil {
+		retErr = err
 		return err
 	}
 
@@ -182,32 +204,39 @@ func (s *Store) WriteFile(ctx context.Context, auth RequestAuth, relPath, conten
 	if meta != nil {
 		metaJSON, err := json.Marshal(meta)
 		if err != nil {
-			return fmt.Errorf("write %s: encode page meta: %w", relPath, err)
+			retErr = fmt.Errorf("write %s: encode page meta: %w", relPath, err)
+			return retErr
 		}
 		if err := json.Unmarshal(metaJSON, &body); err != nil {
-			return fmt.Errorf("write %s: encode page meta: %w", relPath, err)
+			retErr = fmt.Errorf("write %s: encode page meta: %w", relPath, err)
+			return retErr
 		}
 		body["content"] = content
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("write %s: encode request: %w", relPath, err)
+		retErr = fmt.Errorf("write %s: encode request: %w", relPath, err)
+		return retErr
 	}
 
 	req, err := s.newRequest(ctx, auth, http.MethodPost, relPath, bytes.NewReader(encoded))
 	if err != nil {
+		retErr = err
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("write %s: %w", relPath, err)
+		retErr = fmt.Errorf("write %s: %w", relPath, err)
+		return retErr
 	}
 	defer func() { _ = resp.Body.Close() }()
+	status = resp.StatusCode
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("write %s: %s", relPath, statusErr(resp))
+		retErr = fmt.Errorf("write %s: %s", relPath, statusErr(resp))
+		return retErr
 	}
 	return nil
 }
@@ -219,26 +248,38 @@ func (s *Store) WriteFile(ctx context.Context, auth RequestAuth, relPath, conten
 // too when relPath is a pages/*.liquid file (see ThemeFileService::delete),
 // so a reverted new page is fully removed, not just its file.
 func (s *Store) DeleteFile(ctx context.Context, auth RequestAuth, relPath string) error {
+	start := time.Now()
+	status := 0
+	var retErr error
+	defer func() {
+		logThemeAPIRequest(ctx, "DeleteFile", auth.TenantID, start, status, retErr)
+	}()
+
 	if err := ValidatePathSafety(relPath); err != nil {
+		retErr = err
 		return err
 	}
 
 	req, err := s.newRequest(ctx, auth, http.MethodDelete, relPath, nil)
 	if err != nil {
+		retErr = err
 		return err
 	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("delete %s: %w", relPath, err)
+		retErr = fmt.Errorf("delete %s: %w", relPath, err)
+		return retErr
 	}
 	defer func() { _ = resp.Body.Close() }()
+	status = resp.StatusCode
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("delete %s: %s", relPath, statusErr(resp))
+		retErr = fmt.Errorf("delete %s: %s", relPath, statusErr(resp))
+		return retErr
 	}
 	return nil
 }
@@ -266,9 +307,17 @@ type fileTreeEnvelope struct {
 // (phase 1) and the AI tool loop's list_theme_files tool (phase 2) both call
 // this rather than each hitting the endpoint their own way.
 func (s *Store) ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntry, error) {
+	start := time.Now()
+	status := 0
+	var retErr error
+	defer func() {
+		logThemeAPIRequest(ctx, "ListFiles", auth.TenantID, start, status, retErr)
+	}()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/store/themes/active/files", nil)
 	if err != nil {
-		return nil, fmt.Errorf("list files: build request: %w", err)
+		retErr = fmt.Errorf("list files: build request: %w", err)
+		return nil, retErr
 	}
 	req.Header.Set("Authorization", "Bearer "+auth.Token)
 	req.Header.Set("TID", strconv.FormatUint(auth.TenantID, 10))
@@ -276,17 +325,21 @@ func (s *Store) ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntr
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("list files: %w", err)
+		retErr = fmt.Errorf("list files: %w", err)
+		return nil, retErr
 	}
 	defer func() { _ = resp.Body.Close() }()
+	status = resp.StatusCode
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list files: %s", statusErr(resp))
+		retErr = fmt.Errorf("list files: %s", statusErr(resp))
+		return nil, retErr
 	}
 
 	var out fileTreeEnvelope
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, fmt.Errorf("list files: decode response: %w", err)
+		retErr = fmt.Errorf("list files: decode response: %w", err)
+		return nil, retErr
 	}
 	return out.Data.Files, nil
 }

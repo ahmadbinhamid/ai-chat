@@ -57,8 +57,39 @@ func BuildComplexPageContext(ctx context.Context, store themefs.ThemeStore, auth
 	if isFullHomePageRedesignPrompt(prompt) {
 		pathCap = maxComplexHomePaths
 	}
+	if isBrandScrubOrLegalRewritePrompt(prompt) {
+		pathCap = maxComplexHomePaths
+	}
+	if isBulkPageDeletePrompt(prompt) {
+		pathCap = 80
+	}
+	if isMultiPageCreatePrompt(prompt) {
+		pathCap = 6
+	}
+	if named := promptNamedPageSlug(prompt); named != "" && promptScopesToNamedPage(prompt) && !isFullHomePageRedesignPrompt(prompt) {
+		pathCap = 4
+	}
+	if isBlogOrMetaRewritePrompt(prompt) {
+		pathCap = 6
+	}
 	if len(ranked) > pathCap {
 		ranked = ranked[:pathCap]
+	}
+	if isHomePageRedesignPrompt(prompt) || isFullHomePageRedesignPrompt(prompt) {
+		ranked = ensureCanonicalHomePaths(paths, ranked, pathCap)
+	}
+	if isBlogOrMetaRewritePrompt(prompt) && !isFullHomePageRedesignPrompt(prompt) && !isBulkPageDeletePrompt(prompt) && !isMultiPageCreatePrompt(prompt) {
+		ranked = ensureBlogMetaPaths(paths, ranked, pathCap)
+	} else if named := promptNamedPageSlug(prompt); named != "" && promptScopesToNamedPage(prompt) && !isFullHomePageRedesignPrompt(prompt) && !isBulkPageDeletePrompt(prompt) {
+		ranked = ensureNamedPagePaths(paths, ranked, named, pathCap)
+	} else if isBulkPageDeletePrompt(prompt) {
+		ranked = ensureBulkDeletePaths(paths, ranked, pathCap)
+	} else if isMultiPageCreatePrompt(prompt) {
+		ranked = ensureMultiPageCreatePaths(paths, ranked, pathCap)
+	} else if isAddToMenuPrompt(prompt) {
+		ranked = ensureAddToMenuPaths(paths, ranked, pathCap)
+	} else if isBrandScrubOrLegalRewritePrompt(prompt) {
+		ranked = ensureBrandScrubPaths(paths, ranked, pathCap)
 	}
 	out.Paths = ranked
 	homeRedesign := isHomePageRedesignPrompt(prompt)
@@ -66,21 +97,152 @@ func BuildComplexPageContext(ctx context.Context, store themefs.ThemeStore, auth
 	sliderFeature := isSliderFeaturePrompt(prompt)
 	sliderImagesOnly := isSliderImagesOnlyPrompt(prompt)
 	sectionRedesign := isSectionRedesignPrompt(prompt)
+	brandScrub := isBrandScrubOrLegalRewritePrompt(prompt)
+	bulkDelete := isBulkPageDeletePrompt(prompt)
+	multiCreate := isMultiPageCreatePrompt(prompt)
+	multiCreateN := requestedNewPageCount(prompt)
 	// Full homepage rebuild wins over slider-only packaging.
 	if fullHome {
 		sliderImagesOnly = false
 	}
-	out.Sufficient = complexPageContextSufficient(ranked, homeRedesign || sliderFeature || sectionRedesign || fullHome)
+	out.Sufficient = complexPageContextSufficient(ranked, homeRedesign || sliderFeature || sectionRedesign || fullHome || brandScrub || bulkDelete || multiCreate || isAddToMenuPrompt(prompt) || isPageContentRewritePrompt(prompt) || isNamedPageCSSBrokenPrompt(prompt) || isBlogOrMetaRewritePrompt(prompt))
 
 	var b strings.Builder
-	if fullHome {
+	if multiCreate && !fullHome && !bulkDelete {
+		want := multiCreateN
+		batch := multiPageCreateBatchSize(prompt)
+		fmt.Fprintf(&b, "## Pre-selected local MULTI-PAGE CREATE context (merchant asked %d; create %d THIS turn via AI)\n", want, batch)
+		b.WriteString("You (the model) must author real page content matching the merchant's topic — do NOT invent unrelated filler.\n")
+		if want > batch {
+			fmt.Fprintf(&b, "Merchant asked for %d pages; THIS TURN create only the first %d. Say the rest can follow in the next message.\n", want, batch)
+		}
+		b.WriteString("Do this in ONE propose_changes:\n")
+		fmt.Fprintf(&b, "1) Create %d files: `pages/<slug>.liquid` (action \"create\") — layout-start + layout-end boilerplate, concise real copy on-topic (≈150–250 words each), unique kebab-case slug.\n", batch)
+		b.WriteString("2) Direct-update `pages.json` (FULL body, action \"update\"): keep EVERY existing entry, APPEND one published entry per new page.\n")
+		b.WriteString("CRITICAL: `page_registry_entry` registers ONLY ONE page — for N>1 edit pages.json directly.\n")
+		b.WriteString("FORBIDDEN: updating `pages/blog.liquid`, `pages/css/blog.css`, `pages/home.liquid`, or card-essentials — those are NOT new pages and cause validation churn.\n")
+		b.WriteString("FORBIDDEN: only editing blog.liquid / card-essentials.liquid. FORBIDDEN: Go-style generic unrelated posts when they named a different topic.\n")
+		b.WriteString("Call propose_changes promptly with the batch of liquid creates + pages.json update.\n\n")
+	} else if isBlogOrMetaRewritePrompt(prompt) && !fullHome && !bulkDelete && !multiCreate {
+		b.WriteString("## Pre-selected local BLOG + META/SEO rewrite context\n")
+		b.WriteString("Merchant wants blog listing/post copy aligned to a software house AND/OR meta titles scrubbed (remove JPRO / old ecommerce branding from titles).\n")
+		b.WriteString("Do this in ONE propose_changes (full file bodies, action update):\n")
+		b.WriteString("1) Update `pages/blog.liquid` (+ `pages/css/blog.css` if present) with software-house on-topic blog copy. Keep layout-start/end.\n")
+		b.WriteString("2) If they mentioned meta titles / SEO / JPRO titles: update `pages.json` FULL body — keep EVERY route; only rewrite title/meta fields that still show the old brand.\n")
+		b.WriteString("FORBIDDEN: inventing dozens of new blog pages. FORBIDDEN: editing home/header/footer/card-essentials unless required for titles.\n")
+		b.WriteString("Call propose_changes promptly with the focused blog (+ pages.json when meta titles were requested).\n\n")
+	} else if (isPageContentRewritePrompt(prompt) || isNamedPageCSSBrokenPrompt(prompt)) && !fullHome && !bulkDelete && !isAddToMenuPrompt(prompt) {
+		named := promptNamedPageSlug(prompt)
+		if named == "" {
+			named = "the named"
+		}
+		fmt.Fprintf(&b, "## Pre-selected local PAGE CONTENT rewrite (%s)\n", named)
+		fmt.Fprintf(&b, "Merchant wants substantial on-topic content / CSS fix on the **%s** page (software-company copy, theme regenerate, CSS not applying).\n", named)
+		fmt.Fprintf(&b, "ONLY update `pages/%s.liquid` (+ matching CSS) with action \"update\" and FULL file bodies.\n", named)
+		if named == "products" {
+			b.WriteString("Shop route `/shop` IS `pages/products.liquid`.\n")
+			b.WriteString("CRITICAL CSS: layout-start links `pages/css/product-list.css` (not only products.css). Update `pages/css/product-list.css` to match liquid class names so styles apply. If you also write `pages/css/products.css`, add it via layout_links_to_add.\n")
+			b.WriteString("Remove JPRO / numbing-cream ecommerce branding from THIS page + its CSS.\n")
+		}
+		b.WriteString("Match their topic (CRM/POS/services/software house — whatever they said). Keep layout-start/end boilerplate.\n")
+		if named == "blog" {
+			b.WriteString("This IS the blog listing page — update `pages/blog.liquid` (and blog CSS). If meta titles were also requested, include a `pages.json` full-body update for titles only.\n")
+		} else {
+			b.WriteString("FORBIDDEN: editing card-essentials.liquid, contact-inquiry.liquid, blog.liquid, header, or unrelated pages. FORBIDDEN: simple tiny tweaks / ±0 no-ops that ignore the rewrite ask.\n")
+		}
+		b.WriteString("Call propose_changes promptly with the named page file(s).\n\n")
+	} else if pageCreateRe.MatchString(prompt) && !fullHome && !bulkDelete && !brandScrub {
+		b.WriteString("## Pre-selected local SINGLE NEW PAGE create (AI-authored)\n")
+		b.WriteString("Merchant wants ONE new page that matches THEIR words (e.g. services list with CRM + POS).\n")
+		b.WriteString("Do this in ONE propose_changes:\n")
+		b.WriteString("1) Create `pages/<kebab-slug>.liquid` (action \"create\") with layout-start/end + real content for what they asked (services/CRM/POS/etc.).\n")
+		b.WriteString("2) Register it: prefer `page_registry_entry` (single page) OR pages.json full-body update keeping every existing route.\n")
+		b.WriteString("3) Optional matching `pages/css/<slug>.css` + layout_links_to_add if needed.\n")
+		b.WriteString("FORBIDDEN: creating a batch of unrelated blog posts. FORBIDDEN: only editing card-essentials / blog.liquid.\n")
+		b.WriteString("Call propose_changes promptly with the new page file + registration.\n\n")
+	} else if isAddToMenuPrompt(prompt) && !fullHome && !bulkDelete {
+		label := menuLabelFromAddPrompt(prompt)
+		b.WriteString("## Pre-selected local ADD-TO-MENU context\n")
+		b.WriteString("Merchant wants a nav link added. The live storefront menu is `defaults.json` → `menu.items[]` (rendered by header-menu.liquid).\n")
+		if label != "" {
+			fmt.Fprintf(&b, "Add an item labeled %q (sensible url e.g. /%s) to menu.items.\n", label, strings.ToLower(strings.ReplaceAll(label, " ", "-")))
+		}
+		b.WriteString("Do this in ONE propose_changes:\n")
+		b.WriteString("1) action \"update\" on `defaults.json` with the FULL file body — keep every existing menu item and top-level key, APPEND the new item to menu.items (id, label, url, children:[]).\n")
+		b.WriteString("2) Prefer action \"update\" with the complete JSON (not a tiny edit that can no-op).\n")
+		b.WriteString("FORBIDDEN: claiming the menu was updated without the new label appearing under menu.items. FORBIDDEN: only editing header.liquid/CSS without defaults.json.\n")
+		b.WriteString("Call propose_changes promptly with defaults.json.\n\n")
+	} else if bulkDelete && !fullHome {
+		b.WriteString("## Pre-selected local PAGE/FILE DELETE context\n")
+		b.WriteString("Merchant asked to DELETE/REMOVE pages and/or theme files (any language). This is NOT a list request and NOT a clarify-only answer.\n")
+		b.WriteString("Understand WHICH paths from their words (blog pages, orphan pages/*.liquid not in pages.json, components, etc.).\n")
+		b.WriteString("Do this in ONE propose_changes:\n")
+		b.WriteString("1) If pages/routes are removed: direct-update `pages.json` (FULL body) — keep every core route (home/shop/product/cart/auth/privacy/terms/contact/faq/about/…). Drop only the entries they meant.\n")
+		b.WriteString("2) For each removed page/component FILE: include `{path, action:\"delete\", content:\"\", edits:[]}` so Apply deletes the file from disk. Do not leave orphan liquid files.\n")
+		b.WriteString("3) Extra files in pages/ that are NOT registered in pages.json: delete those files when the merchant asks to clean extras/orphans.\n")
+		b.WriteString("FORBIDDEN: answering with only a list/table or \"let me know if you want…\". FORBIDDEN: deleting pages.json, defaults.json, home.liquid, or layout-start/end.\n")
+		b.WriteString("Call propose_changes promptly with pages.json update + delete actions as needed.\n\n")
+		if pagesRaw, readErr := store.ReadFile(ctx, auth, pathPagesJSON); readErr == nil {
+			if rows, parseErr := parsePagesJSONRows(pagesRaw); parseErr == nil {
+				orphans := orphanPageLiquidPaths(paths, registeredLiquidPaths(rows))
+				if len(orphans) > 0 {
+					b.WriteString("ORPHAN pages/*.liquid NOT in pages.json (you MUST action:\"delete\" each when cleaning extras):\n")
+					max := 40
+					if len(orphans) < max {
+						max = len(orphans)
+					}
+					for _, p := range orphans[:max] {
+						fmt.Fprintf(&b, "- %s\n", p)
+					}
+					if len(orphans) > max {
+						fmt.Fprintf(&b, "- … and %d more\n", len(orphans)-max)
+					}
+					b.WriteString("\n")
+				}
+			}
+		}
+	} else if brandScrub && !fullHome {
+		named := promptNamedPageSlug(prompt)
+		if named != "" && promptScopesToNamedPage(prompt) {
+			fmt.Fprintf(&b, "## Pre-selected local SINGLE-PAGE edit context (%s)\n", named)
+			fmt.Fprintf(&b, "Merchant named the **%s** page. Scope THIS turn to that page only.\n", named)
+			fmt.Fprintf(&b, "ONLY edit `pages/%s.liquid` and `pages/css/%s.css` (if present). Full file bodies, action update.\n", named, named)
+			b.WriteString("If rewriting for a software/SaaS company: replace old ecommerce/JPRO product copy on THIS page only.\n")
+			b.WriteString("FORBIDDEN: editing other pages/*.liquid, header/footer, defaults.json, or SEO/blog pages in this turn.\n")
+			b.WriteString("FORBIDDEN: endless list/grep. Call propose_changes promptly with only the named page's files.\n\n")
+		} else {
+			b.WriteString("## Pre-selected local brand-scrub / legal-page rewrite context\n")
+			b.WriteString("Merchant wants privacy/legal copy rewritten for a SOFTWARE company AND/OR old ecommerce brand (JPRO / J Pro / jpronumbingcream) removed.\n")
+			b.WriteString("THIS TURN priority (propose these, full file bodies, action update):\n")
+			b.WriteString("1) pages/privacy.liquid (+ pages/css/privacy.css if present) — rewrite Privacy Policy for a software/SaaS company (no numbing-cream / JPRO product copy, no jpronumbingcream.co.uk).\n")
+			b.WriteString("2) Shared shell if they still say JPRO: components/footer.liquid, components/header.liquid, defaults.json — strip brand names/URLs/classes that expose JPRO to visitors.\n")
+			b.WriteString("3) Optionally terms/cookie pages if present in the package.\n")
+			b.WriteString("Do NOT try to rewrite every SEO/blog page in one propose_changes — focus on privacy + shared shell this turn.\n")
+			b.WriteString("FORBIDDEN: endless list/grep of the theme; reading dozens of files without proposing; leaving \"Privacy Policy for J Pro Numbing Cream\" intact.\n")
+			b.WriteString("Call propose_changes promptly with FULL updated file bodies. Prefer update over create.\n\n")
+		}
+	} else if fullHome {
 		b.WriteString("## Pre-selected local FULL homepage redesign context\n")
 		b.WriteString("Merchant wants the ENTIRE homepage rebuilt (software/AI company landing), not a tiny tweak.\n")
+		if isHomeReferenceClonePrompt(prompt) {
+			b.WriteString("REFERENCE CLONE REQUEST: rebuild the homepage to match the attached/fetched reference site (section order, hero treatment, spacing, typography, polish).\n")
+			b.WriteString("Extract design intent from the reference — do NOT copy raw HTML/CSS/class names.\n")
+			b.WriteString("FORBIDDEN outcomes: spelling fixes (e.g. Bestsellers→Best Sellers), editing only card-essentials.liquid, or any single tiny file change while claiming the homepage matches the reference.\n")
+			b.WriteString("You MUST propose a multi-file homepage redesign (home.liquid + home.css + hero liquid/css/js at minimum) in one propose_changes.\n")
+		}
+		b.WriteString("CANONICAL paths: update pages/home.liquid + pages/css/home.css + components/store-hero-banner.liquid + components/css/store-hero-banner.css + js/store-hero-banner.js together.\n")
+		b.WriteString("CRITICAL FAILURE MODE TO AVOID: shipping pages/css/home.css with new class names (e.g. t1-sw-*) while pages/home.liquid still renders old ecommerce components (store-hero-banner with t1-shb-*, product grids). That looks like \"plain HTML / no CSS\" to the merchant.\n")
+		b.WriteString("CSS selectors MUST match the liquid class names you emit in the SAME propose_changes. Rewrite liquid and CSS as one matched pair.\n")
+		b.WriteString("Do NOT create or edit obsolete duplicates (e.g. components/hero-slider.*) when store-hero-banner exists.\n")
+		b.WriteString("Do NOT add a second hero slider script — reuse js/store-hero-banner.js and layout-end wiring.\n")
 		b.WriteString("Ship a complete pages/home.liquid (or equivalent) plus hero slider liquid/CSS/JS and any section partials/CSS needed.\n")
 		b.WriteString("Include a working 5-slide hero (data-hero-slider + data-slide-item + autoplay JS) with distinct public https image URLs (picsum/unsplash).\n")
 		b.WriteString("Build the requested sections in-theme (services, products, AI, tech stack, why us, portfolio, testimonials, CTA).\n")
+		b.WriteString("Register any NEW css/js paths via layout_links_to_add / layout_scripts_to_add.\n")
+		b.WriteString("page_registry_entry for home must keep type/slug/page = home and status = published.\n")
 		b.WriteString("Do NOT refuse or ask for clarification because a live AI chat API is missing — use a polished static/demo chat UI if needed; do not invent backend endpoints.\n")
 		b.WriteString("Do NOT ask the merchant to split this into smaller requests — handle the full homepage in one propose_changes.\n")
+		b.WriteString("Do NOT touch only one unrelated component (e.g. card-essentials.liquid) and claim CSS was fixed.\n")
 		b.WriteString("Prefer action \"update\" with FULL file bodies. Call propose_changes promptly. Do not list/grep the whole theme.\n")
 		b.WriteString("Keep footer only if merchant asked to keep it; otherwise include a professional software-house footer.\n\n")
 	} else if sectionRedesign && !sliderFeature && !homeRedesign {
@@ -159,6 +321,14 @@ func BuildComplexPageContext(ctx context.Context, store themefs.ThemeStore, auth
 		if sectionRedesign && (strings.Contains(lowPath, "footer") || strings.Contains(lowPath, "header")) &&
 			(strings.HasSuffix(lowPath, ".liquid") || strings.HasSuffix(lowPath, ".css")) {
 			fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
+		} else if bulkDelete && (lowPath == "pages.json" || strings.HasSuffix(lowPath, "/pages.json")) {
+			fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
+		} else if brandScrub && (strings.Contains(lowPath, "privacy") || strings.Contains(lowPath, "footer") ||
+			strings.Contains(lowPath, "header") || strings.Contains(lowPath, "defaults.json") ||
+			strings.Contains(lowPath, "terms") || strings.Contains(lowPath, "cookie") ||
+			(promptNamedPageSlug(prompt) != "" && strings.Contains(lowPath, promptNamedPageSlug(prompt)))) &&
+			(strings.HasSuffix(lowPath, ".liquid") || strings.HasSuffix(lowPath, ".css") || strings.HasSuffix(lowPath, ".json")) {
+			fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
 		} else if sliderImagesOnly && strings.HasSuffix(lowPath, ".liquid") {
 			fmt.Fprintf(&b, "### %s\n%s\n\n", p, content)
 		} else if fullHome && (strings.Contains(lowPath, "pages/home") || strings.Contains(lowPath, "store-hero-banner")) &&
@@ -197,6 +367,12 @@ func isHomePageRedesignPrompt(prompt string) bool {
 // only the hero-slider wiring files.
 func isFullHomePageRedesignPrompt(prompt string) bool {
 	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	if isHomeCSSBrokenPrompt(p) {
+		return true
+	}
+	if isHomeReferenceClonePrompt(p) {
+		return true
+	}
 	if pageRedesignRe.MatchString(p) {
 		return true
 	}
@@ -229,7 +405,18 @@ func complexPageContextSufficient(paths []string, structuralFocus bool) bool {
 	if structuralFocus {
 		for _, p := range paths {
 			low := strings.ToLower(p)
-			if strings.Contains(low, "pages/home") && strings.HasSuffix(low, ".liquid") {
+			// Any packed page liquid is enough to propose (shop→products,
+			// services, privacy, home, …). Requiring only home/privacy here
+			// left products.liquid as "insufficient" → allow_read thrash →
+			// "another pass couldn't finish" without propose_changes.
+			if strings.HasPrefix(low, "pages/") && strings.HasSuffix(low, ".liquid") &&
+				!strings.HasPrefix(low, "pages/css/") {
+				return true
+			}
+			if strings.HasSuffix(low, "pages.json") || low == "pages.json" {
+				return true
+			}
+			if low == "defaults.json" {
 				return true
 			}
 			if strings.Contains(low, "hero") || strings.Contains(low, "slider") || strings.Contains(low, "carousel") {
@@ -239,9 +426,6 @@ func complexPageContextSufficient(paths []string, structuralFocus bool) bool {
 				return true
 			}
 			if strings.Contains(low, "header") && (strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css")) {
-				return true
-			}
-			if strings.Contains(low, "home") && (strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js") || strings.HasSuffix(low, ".liquid")) {
 				return true
 			}
 		}
@@ -267,6 +451,9 @@ func rankPathsForPageCreate(paths []string, prompt string) []string {
 	sliderFeature := isSliderFeaturePrompt(prompt)
 	sliderImagesOnly := isSliderImagesOnlyPrompt(prompt)
 	sectionRedesign := isSectionRedesignPrompt(prompt)
+	brandScrub := isBrandScrubOrLegalRewritePrompt(prompt)
+	bulkDelete := isBulkPageDeletePrompt(prompt)
+	blogMeta := isBlogOrMetaRewritePrompt(prompt)
 	wantsNav := promptWantsHeaderOrNav(prompt)
 	var ranked []pathScore
 	seen := map[string]bool{}
@@ -292,7 +479,64 @@ func rankPathsForPageCreate(paths []string, prompt string) []string {
 		case base == "defaults.json":
 			score = 40
 		}
-		if sectionRedesign && !homeRedesign && !sliderFeature {
+		if bulkDelete && !homeRedesign && !sliderFeature && !sectionRedesign {
+			switch {
+			case base == "pages.json":
+				score = 500
+			case strings.Contains(low, "pages/blog") && strings.HasSuffix(low, ".liquid"):
+				score = 200
+			case strings.HasPrefix(low, "pages/") && strings.HasSuffix(low, ".liquid") && !strings.HasPrefix(low, "pages/css/") && !strings.HasPrefix(low, "pages/auth/"):
+				score = 160
+			default:
+				score = 0
+			}
+		} else if blogMeta && !homeRedesign && !sliderFeature && !sectionRedesign {
+			switch {
+			case strings.Contains(low, "pages/blog") && strings.HasSuffix(low, ".liquid"):
+				score = 450
+			case strings.Contains(low, "blog") && strings.Contains(low, "pages/css/") && strings.HasSuffix(low, ".css"):
+				score = 430
+			case base == "pages.json":
+				score = 420
+			default:
+				score = 0
+			}
+		} else if brandScrub && !homeRedesign && !sliderFeature && !sectionRedesign {
+			named := promptNamedPageSlug(prompt)
+			if named != "" && promptScopesToNamedPage(prompt) {
+				switch {
+				case strings.Contains(low, "pages/"+named) && strings.HasSuffix(low, ".liquid"):
+					score = 420
+				case strings.Contains(low, named) && strings.Contains(low, "pages/css/") && strings.HasSuffix(low, ".css"):
+					score = 410
+				default:
+					score = 0
+				}
+			} else {
+				switch {
+				case strings.Contains(low, "pages/privacy") && strings.HasSuffix(low, ".liquid"):
+					score = 420
+				case strings.Contains(low, "privacy") && strings.HasSuffix(low, ".css"):
+					score = 410
+				case strings.Contains(low, "pages/terms") && strings.HasSuffix(low, ".liquid"):
+					score = 380
+				case strings.Contains(low, "pages/cookie") && strings.HasSuffix(low, ".liquid"):
+					score = 370
+				case strings.Contains(low, "footer") && strings.HasSuffix(low, ".liquid"):
+					score = 360
+				case strings.Contains(low, "footer") && strings.HasSuffix(low, ".css"):
+					score = 350
+				case strings.Contains(low, "header") && strings.HasSuffix(low, ".liquid"):
+					score = 340
+				case base == "defaults.json":
+					score = 330
+				default:
+					if score > 0 && score < 200 {
+						score = 20 // keep SEO pages out of the package
+					}
+				}
+			}
+		} else if sectionRedesign && !homeRedesign && !sliderFeature {
 			wantFooter := strings.Contains(p, "footer")
 			wantHeader := strings.Contains(p, "header") && !wantFooter
 			switch {
@@ -313,9 +557,17 @@ func rankPathsForPageCreate(paths []string, prompt string) []string {
 			switch {
 			case strings.Contains(low, "pages/home") && strings.HasSuffix(low, ".liquid"):
 				score = 320
-			case (strings.Contains(low, "hero") || strings.Contains(low, "slider") || strings.Contains(low, "carousel") || strings.Contains(low, "store-hero-banner")) &&
+			case strings.Contains(low, "store-hero-banner") &&
 				(strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js")):
-				score = 300
+				// Canonical hero used by live themes — prefer over obsolete hero-slider.
+				score = 310
+			case strings.Contains(low, "hero-slider") &&
+				(strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js")):
+				// Obsolete duplicate — keep low so it rarely enters the package.
+				score = 40
+			case (strings.Contains(low, "hero") || strings.Contains(low, "slider") || strings.Contains(low, "carousel")) &&
+				(strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js")):
+				score = 280
 			case strings.Contains(low, "sections/") && strings.Contains(low, "home"):
 				score = 250
 			case strings.Contains(low, "testimonial") && (strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js")):
@@ -417,6 +669,229 @@ func rankPathsForPageCreate(paths []string, prompt string) []string {
 		out = append(out, r.path)
 		if len(out) >= maxComplexHomePaths {
 			break
+		}
+	}
+	return out
+}
+
+// ensureCanonicalHomePaths guarantees pages/home.liquid and the live hero
+// (store-hero-banner.*) are in the package when they exist on disk, and
+// drops obsolete hero-slider.* when store-hero-banner is available.
+func ensureCanonicalHomePaths(allPaths, ranked []string, pathCap int) []string {
+	onDisk := make(map[string]bool, len(allPaths))
+	for _, p := range allPaths {
+		onDisk[p] = true
+	}
+	hasStoreHero := onDisk["components/store-hero-banner.liquid"]
+	must := []string{
+		"pages/home.liquid",
+		"pages/css/home.css",
+		"components/store-hero-banner.liquid",
+		"components/css/store-hero-banner.css",
+		"js/store-hero-banner.js",
+	}
+
+	out := make([]string, 0, pathCap)
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] || !onDisk[p] || len(out) >= pathCap {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, p := range must {
+		add(p)
+	}
+	for _, p := range ranked {
+		low := strings.ToLower(p)
+		if hasStoreHero && strings.Contains(low, "hero-slider") {
+			continue
+		}
+		add(p)
+	}
+	return out
+}
+
+func ensureBrandScrubPaths(allPaths, ranked []string, pathCap int) []string {
+	onDisk := make(map[string]bool, len(allPaths))
+	for _, p := range allPaths {
+		onDisk[p] = true
+	}
+	must := []string{
+		"pages/privacy.liquid",
+		"pages/css/privacy.css",
+		"components/footer.liquid",
+		"components/header.liquid",
+		"defaults.json",
+		"pages/terms.liquid",
+		"pages/cookie.liquid",
+	}
+	out := make([]string, 0, pathCap)
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] || !onDisk[p] || len(out) >= pathCap {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, p := range must {
+		add(p)
+	}
+	for _, p := range ranked {
+		add(p)
+	}
+	return out
+}
+
+func ensureBulkDeletePaths(allPaths, ranked []string, pathCap int) []string {
+	onDisk := make(map[string]bool, len(allPaths))
+	for _, p := range allPaths {
+		onDisk[p] = true
+	}
+	out := make([]string, 0, pathCap)
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] || !onDisk[p] || len(out) >= pathCap {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	add("pages.json")
+	for _, p := range allPaths {
+		low := strings.ToLower(p)
+		if strings.Contains(low, "pages/blog") && strings.HasSuffix(low, ".liquid") {
+			add(p)
+		}
+	}
+	for _, p := range ranked {
+		add(p)
+	}
+	return out
+}
+
+func ensureMultiPageCreatePaths(allPaths, ranked []string, pathCap int) []string {
+	onDisk := make(map[string]bool, len(allPaths))
+	for _, p := range allPaths {
+		onDisk[p] = true
+	}
+	out := make([]string, 0, pathCap)
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] || !onDisk[p] || len(out) >= pathCap {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	// pages.json only — packing blog.liquid/home.liquid caused the model to
+	// full-rewrite the index (−1800 lines) instead of creating new pages.
+	add("pages.json")
+	for _, p := range ranked {
+		low := strings.ToLower(p)
+		if low == "pages/blog.liquid" || low == "pages/css/blog.css" ||
+			low == "pages/home.liquid" || low == "pages/css/home.css" {
+			continue
+		}
+		add(p)
+	}
+	return out
+}
+
+// ensureBlogMetaPaths focuses the package on blog listing + pages.json
+// (meta titles) — not the entire theme.
+func ensureBlogMetaPaths(allPaths, ranked []string, pathCap int) []string {
+	onDisk := make(map[string]bool, len(allPaths))
+	for _, p := range allPaths {
+		onDisk[p] = true
+	}
+	out := make([]string, 0, pathCap)
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] || !onDisk[p] || len(out) >= pathCap {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	add("pages/blog.liquid")
+	add("pages/css/blog.css")
+	add("pages.json")
+	for _, p := range allPaths {
+		low := strings.ToLower(p)
+		if strings.HasPrefix(low, "pages/blog") && (strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css")) {
+			add(p)
+		}
+	}
+	for _, p := range ranked {
+		add(p)
+	}
+	return out
+}
+
+func ensureAddToMenuPaths(allPaths, ranked []string, pathCap int) []string {
+	onDisk := make(map[string]bool, len(allPaths))
+	for _, p := range allPaths {
+		onDisk[p] = true
+	}
+	out := make([]string, 0, pathCap)
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] || !onDisk[p] || len(out) >= pathCap {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	add("defaults.json")
+	add("components/header-menu.liquid")
+	add("components/header.liquid")
+	for _, p := range ranked {
+		add(p)
+	}
+	return out
+}
+
+func ensureNamedPagePaths(allPaths, ranked []string, slug string, pathCap int) []string {
+	onDisk := make(map[string]bool, len(allPaths))
+	for _, p := range allPaths {
+		onDisk[p] = true
+	}
+	must := []string{
+		"pages/" + slug + ".liquid",
+		"pages/css/" + slug + ".css",
+	}
+	// Shop route /shop uses pages/products.liquid but layout-start historically
+	// links pages/css/product-list.css — pack BOTH so CSS "not applying" fixes
+	// land on the file the storefront actually loads.
+	if slug == "products" {
+		must = append(must, "pages/css/product-list.css")
+	}
+	// Common alt filenames for about/contact.
+	if slug == "about-us" {
+		must = append(must, "pages/about.liquid", "pages/css/about.css")
+	}
+	if slug == "contact-us" {
+		must = append(must, "pages/contact.liquid", "pages/css/contact-us.css", "pages/css/contact.css")
+	}
+	out := make([]string, 0, pathCap)
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] || !onDisk[p] || len(out) >= pathCap {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	for _, p := range must {
+		add(p)
+	}
+	for _, p := range ranked {
+		low := strings.ToLower(p)
+		if strings.Contains(low, slug) || (slug == "home" && strings.Contains(low, "pages/home")) {
+			add(p)
 		}
 	}
 	return out

@@ -114,7 +114,12 @@ func AutoFixMissingBoilerplate(p Proposal) (fixed map[string]string, anyFixed bo
 	var paths []string
 	fixCount := 0
 	for _, f := range p.Files {
-		if !isPagesLiquidFile(f.Path) {
+		if !isPagesLiquidFile(f.Path) || isDeleteAction(f) {
+			continue
+		}
+		// Never invent a full page wrapper around an empty stub — that
+		// produces placeholder-body failures on delete/clear attempts.
+		if strings.TrimSpace(f.Content) == "" {
 			continue
 		}
 

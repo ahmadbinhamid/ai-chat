@@ -74,16 +74,19 @@ func TestGenerateValidProposal_FailsCleanlyWhenBudgetExhausted(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	_, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, nil, in)
-	if err == nil {
-		t.Fatal("expected an error once the retry budget is exhausted")
+	// After retries are exhausted we keep the last well-formed (even if
+	// schema-invalid action) proposal rather than hard-failing the merchant
+	// turn — see generateValidProposal's "keeping prior" path.
+	got, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "make it nice", nil, nil, nil, in)
+	if err != nil {
+		t.Fatalf("expected keep-prior on exhausted invalid retries, got error: %v", err)
 	}
 	if fg.calls != maxThemeCheckRetries+1 {
 		t.Errorf("expected exactly %d Generate calls (1 original + %d retries), got %d",
 			maxThemeCheckRetries+1, maxThemeCheckRetries, fg.calls)
 	}
-	if wantPrefix := "invalid model proposal: "; len(err.Error()) < len(wantPrefix) || err.Error()[:len(wantPrefix)] != wantPrefix {
-		t.Errorf("expected error to be wrapped as %q..., got %q", wantPrefix, err.Error())
+	if got == nil || len(got.Files) == 0 {
+		t.Fatal("expected prior proposal files to be retained")
 	}
 }
 

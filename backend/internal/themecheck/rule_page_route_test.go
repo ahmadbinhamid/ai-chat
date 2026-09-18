@@ -55,28 +55,57 @@ func TestCheckPageRoute_SlugMustEqualPageForCustom(t *testing.T) {
 	}
 }
 
-func TestCheckPageRoute_SlugAlreadyTaken(t *testing.T) {
+func TestCheckPageRoute_UpsertSameSlugAllowed(t *testing.T) {
+	// Homepage regenerate / SEO refresh re-sends page_registry_entry for an
+	// existing route — must not fail as "slug already taken".
 	p := Proposal{
-		PageRegistryEntry: &themefs.PageEntry{Page: "offers", Slug: "offers", Path: "/pages", Type: "custom"},
+		Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update"}},
+		PageRegistryEntry: &themefs.PageEntry{
+			Page: "offers", Slug: "offers", Path: "/pages", Type: "custom", Status: "published",
+		},
 	}
-	snap := Snapshot{Files: map[string]string{"pages.json": `[{"slug":"offers","type":"custom"}]`}}
-	got := checkPageRoute(p, snap)
-	if len(got) != 1 {
-		t.Fatalf("expected 1 finding for an already-taken slug, got %+v", got)
+	snap := Snapshot{Files: map[string]string{"pages.json": `[{"slug":"offers","page":"offers","type":"custom"}]`}}
+	if got := checkPageRoute(p, snap); len(got) != 0 {
+		t.Fatalf("expected upsert of same page to pass, got %+v", got)
 	}
 }
 
-func TestCheckPageRoute_DuplicateSystemType(t *testing.T) {
+func TestCheckPageRoute_HomeUpsertAllowed(t *testing.T) {
 	p := Proposal{
-		PageRegistryEntry: &themefs.PageEntry{Page: "home", Slug: "home", Path: "/pages", Type: "home"},
+		Files: []ProposedFile{{Path: "pages/home.liquid", Action: "update"}},
+		PageRegistryEntry: &themefs.PageEntry{
+			Page: "home", Slug: "home", Path: "/pages", Type: "home", Status: "published",
+		},
 	}
-	snap := Snapshot{Files: map[string]string{"pages.json": `[{"slug":"home","type":"home"}]`}}
+	snap := Snapshot{Files: map[string]string{
+		"pages.json": `[{"slug":"home","page":"home","type":"home","status":"published"}]`,
+	}}
+	if got := checkPageRoute(p, snap); len(got) != 0 {
+		t.Fatalf("expected homepage registry upsert to pass, got %+v", got)
+	}
+}
+
+func TestCheckPageRoute_SlugTakenByDifferentPage(t *testing.T) {
+	p := Proposal{
+		PageRegistryEntry: &themefs.PageEntry{Page: "offers", Slug: "offers", Path: "/pages", Type: "custom"},
+	}
+	snap := Snapshot{Files: map[string]string{
+		"pages.json": `[{"slug":"offers","page":"old-offers","type":"custom"}]`,
+	}}
 	got := checkPageRoute(p, snap)
-	// slug-taken and duplicate-system-type both fire here since the fixture
-	// reuses the same slug — that's realistic (a system route's slug is
-	// already registered) and both findings are independently correct.
-	if len(got) != 2 {
-		t.Fatalf("expected 2 findings (slug taken + duplicate system type), got %+v", got)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 finding when another page owns the slug, got %+v", got)
+	}
+}
+
+func TestCheckPageRoute_DuplicateSystemTypeDifferentPage(t *testing.T) {
+	p := Proposal{
+		PageRegistryEntry: &themefs.PageEntry{Page: "home-2", Slug: "home-2", Path: "/pages", Type: "home"},
+	}
+	snap := Snapshot{Files: map[string]string{"pages.json": `[{"slug":"home","page":"home","type":"home"}]`}}
+	got := checkPageRoute(p, snap)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 finding for a second system-type entry, got %+v", got)
 	}
 }
 

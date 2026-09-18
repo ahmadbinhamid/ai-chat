@@ -182,7 +182,7 @@ func TestExecGrepTheme_FindsMatchesWithLineNumbers(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(grepThemeInput{Pattern: `render 'components/testimonials'`})
-	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
+	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestExecGrepTheme_PathGlobRestriction(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(grepThemeInput{Pattern: "TODO", PathGlob: "pages/*.liquid"})
-	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
+	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestExecGrepTheme_ReadsConcurrently(t *testing.T) {
 
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 	input, _ := json.Marshal(grepThemeInput{Pattern: "needle-"})
-	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
+	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -260,6 +260,9 @@ func TestExecGrepTheme_ReadsConcurrently(t *testing.T) {
 	}
 	if maxInFlight < 2 {
 		t.Fatalf("expected concurrent ReadFile (maxInFlight>=2), got %d", maxInFlight)
+	}
+	if maxInFlight > int32(loadThemeFilesConcurrency) {
+		t.Fatalf("maxInFlight %d exceeded loadThemeFilesConcurrency %d", maxInFlight, loadThemeFilesConcurrency)
 	}
 }
 
@@ -296,7 +299,7 @@ func TestExecGrepTheme_ShortCircuitsAtMaxMatches(t *testing.T) {
 
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 	input, _ := json.Marshal(grepThemeInput{Pattern: "MATCH"})
-	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input)
+	out, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -318,7 +321,7 @@ func TestExecGrepTheme_InvalidPattern(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(grepThemeInput{Pattern: "(unclosed"})
-	if _, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input); err == nil {
+	if _, err := svc.execGrepTheme(context.Background(), svc.store, testStoreAuth(), input, nil); err == nil {
 		t.Error("expected an error for an invalid regex pattern")
 	}
 }

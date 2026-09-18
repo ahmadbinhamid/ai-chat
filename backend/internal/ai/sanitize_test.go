@@ -77,6 +77,18 @@ func TestSanitizeError(t *testing.T) {
 			wantContain: "too large",
 		},
 		{
+			name:        "first-token timeout is distinct from idle",
+			err:         errStreamFirstTokenTimeout,
+			wantContain: "taking longer than expected to start",
+			mustNotHave: []string{"stalled mid-stream"},
+		},
+		{
+			name:        "idle stream timeout is distinct from first-token",
+			err:         errStreamIdleTimeout,
+			wantContain: "stalled mid-stream",
+			mustNotHave: []string{"taking longer than expected to start"},
+		},
+		{
 			name:        "context deadline",
 			err:         errors.New("load theme context: context deadline exceeded"),
 			wantContain: "timed out",

@@ -201,3 +201,51 @@ func (c *countingListStore) ReadFile(ctx context.Context, auth themefs.RequestAu
 	c.readCalls++
 	return c.memStore.ReadFile(ctx, auth, relPath)
 }
+
+func TestWorkspace_InvalidateForcesResync(t *testing.T) {
+	root := t.TempDir()
+	mgr := NewManager(root)
+	remote := &countingListStore{memStore: memStore{files: map[string]string{
+		"pages/home.liquid": "v1\n",
+	}}}
+	ws, err := mgr.Open(9, "demo-theme", remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := themefs.RequestAuth{Token: "t", TenantID: 9}
+	if _, err := ws.EnsureSynced(context.Background(), auth); err != nil {
+		t.Fatal(err)
+	}
+	listsBefore := remote.listCalls
+	if err := ws.Invalidate(); err != nil {
+		t.Fatal(err)
+	}
+	if ws.meta.Revision < 1 {
+		t.Fatalf("expected revision bumped, got %d", ws.meta.Revision)
+	}
+	if !ws.meta.SyncedAt.IsZero() {
+		t.Fatal("expected SyncedAt cleared")
+	}
+	if len(ws.meta.Hashes) != 0 {
+		t.Fatalf("expected hashes cleared, got %d", len(ws.meta.Hashes))
+	}
+	remote.files["pages/home.liquid"] = "v2-after-apply\n"
+	stats, err := ws.EnsureSynced(context.Background(), auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.listCalls <= listsBefore {
+		t.Fatalf("invalidate must force ListFiles; lists=%d→%d", listsBefore, remote.listCalls)
+	}
+	if stats.Fetched < 1 {
+		t.Fatalf("expected refetch after invalidate, stats=%+v", stats)
+	}
+	got, err := ws.ReadFile(context.Background(), auth, "pages/home.liquid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "v2-after-apply\n" {
+		t.Fatalf("expected post-apply content, got %q", got)
+	}
+}
+

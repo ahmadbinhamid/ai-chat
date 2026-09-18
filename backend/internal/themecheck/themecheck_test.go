@@ -70,3 +70,43 @@ func TestCheck_CleanProposalProducesNoFindings(t *testing.T) {
 		t.Errorf("expected no findings for a clean proposal, got %+v", got)
 	}
 }
+
+func TestCheck_SkipsDeletes(t *testing.T) {
+	proposal := Proposal{
+		Files: []ProposedFile{
+			{Path: "pages/about-us.liquid", Action: "delete", Content: ""},
+			{Path: "pages/blog.liquid", Action: "delete", Content: ""},
+			{Path: "components/blog-hero.liquid", Action: "delete"},
+		},
+	}
+	snap := Snapshot{
+		Files: map[string]string{
+			"pages.json":                 `[{"slug":"home","file":"pages/home.liquid"}]`,
+			"liquid/layout-start.liquid": "<html>",
+			"liquid/layout-end.liquid":   "</html>",
+			"pages/about-us.liquid": `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
+<section class="about"><h1>About</h1><p>Real copy about the company that is long enough.</p></section>
+{% render 'liquid/layout-end', theme: theme, store: store %}`,
+		},
+		Paths: map[string]bool{
+			"pages/about-us.liquid":      true,
+			"pages/blog.liquid":          true,
+			"components/blog-hero.liquid": true,
+			"liquid/layout-start.liquid": true,
+			"liquid/layout-end.liquid":   true,
+		},
+	}
+	if got := Check(proposal, snap); len(got) != 0 {
+		t.Fatalf("delete-only proposal must not produce findings, got %+v", got)
+	}
+}
+
+func TestAutoFixMissingBoilerplate_SkipsEmptyAndDeletes(t *testing.T) {
+	p := Proposal{Files: []ProposedFile{
+		{Path: "pages/about-us.liquid", Action: "delete", Content: ""},
+		{Path: "pages/blog.liquid", Action: "update", Content: "   "},
+	}}
+	if fixed, any := AutoFixMissingBoilerplate(p); any || len(fixed) != 0 {
+		t.Fatalf("expected no autofix for deletes/empty stubs, got any=%v fixed=%v", any, fixed)
+	}
+}

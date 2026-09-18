@@ -3,6 +3,8 @@ package themebuild
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/themefs"
@@ -69,13 +71,17 @@ func (p writePlan) paths() []string {
 }
 
 // buildWritePlan computes every file this turn would write — proposed
-// files verbatim (with page metadata attached to the one matching
-// PageRegistryEntry, if any), plus the layout-file splices — using only
-// reads, never a write. Nothing is committed until commitWritePlan runs, so
+// files verbatim (with page metadata attached to files matching
+// PageRegistryEntry / extraEntries), plus the layout-file splices — using
+// only reads, never a write. Nothing is committed until commitWritePlan runs, so
 // a failure here (a layout file missing its insertion marker, a page
 // registry entry with no matching file) leaves the real theme completely
 // untouched instead of partially, silently modified.
-func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, result *ai.Result) (writePlan, error) {
+//
+// extraEntries lets compound workflows register one page per atomic step
+// without forcing a full pages.json rewrite (canonical single-page contract
+// is page_registry_entry → PageMeta on the liquid file).
+func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, result *ai.Result, extraEntries ...*themefs.PageEntry) (writePlan, error) {
 	var plan writePlan
 
 	// Reads run concurrently (errgroup, capped at 8 in flight) rather than
@@ -112,6 +118,9 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 					content:  f.Content,
 					previous: previousPtr,
 				}
+				if files[i].action == FileActionDelete {
+					files[i].content = DraftDeleteMarker
+				}
 				return nil
 			})
 		}
@@ -121,38 +130,23 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 		plan.files = files
 	}
 
+	entries := make([]*themefs.PageEntry, 0, 1+len(extraEntries))
 	if result.PageRegistryEntry != nil {
-		entry := result.PageRegistryEntry
-		// entry.Path is the route prefix ("/pages" or "/pages/auth"), never a
-		// file path — the proposed file's actual theme-relative path has to be
-		// derived from it the same way §5 requires: page == the .liquid file's
-		// basename.
-		wantPath := "pages/" + entry.Page + ".liquid"
-		if entry.Path == "/pages/auth" {
-			wantPath = "pages/auth/" + entry.Page + ".liquid"
+		entries = append(entries, result.PageRegistryEntry)
+	}
+	entries = append(entries, extraEntries...)
+	seenPath := map[string]bool{}
+	for _, entry := range entries {
+		if entry == nil {
+			continue
 		}
-		matched := false
-		for i := range plan.files {
-			if plan.files[i].path != wantPath {
-				continue
-			}
-			plan.files[i].pageMeta = &themefs.PageMeta{
-				Title:          entry.Title,
-				Slug:           entry.Slug,
-				Type:           entry.Type,
-				Status:         entry.Status,
-				SEOTitle:       entry.SEOTitle,
-				SEODescription: entry.SEODescription,
-				SEOKeywords:    entry.SEOKeywords,
-				OGTitle:        entry.OGTitle,
-				OGDescription:  entry.OGDescription,
-				OGImagePath:    entry.OGImagePath,
-			}
-			matched = true
-			break
+		wantPath := pageRegistryWantPath(entry)
+		if seenPath[wantPath] {
+			continue
 		}
-		if !matched {
-			return writePlan{}, fmt.Errorf("register page: page_registry_entry (page %q, path %q) has no matching proposed file at %q", entry.Page, entry.Path, wantPath)
+		seenPath[wantPath] = true
+		if err := attachPageRegistryEntry(&plan, entry); err != nil {
+			return writePlan{}, err
 		}
 	}
 
@@ -231,12 +225,68 @@ func hasDirectEdit(files []planFile, path string) bool {
 // themefs.Store.WriteFile). Only the proposed files (plan.files) get an
 // audit trail (see persistFileRecords) — the layout files are shared,
 // structurally-spliced config, not "generated files" in their own right.
+//
+// If any write fails, already-written files in this plan are rolled back
+// (restore PreviousContent, or DeleteFile for creates without previous)
+// so Apply never leaves a half-updated live theme with draft still pending.
 func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.RequestAuth, plan writePlan) ([]writtenFile, error) {
+	type appliedStep struct {
+		path     string
+		previous *string
+		action   FileAction
+		pageMeta *themefs.PageMeta
+		isLayout bool
+	}
+	var steps []appliedStep
 	written := make([]writtenFile, 0, len(plan.files))
-	for _, f := range plan.files {
-		if err := s.store.WriteFile(ctx, storeAuth, f.path, f.content, f.pageMeta); err != nil {
-			return written, fmt.Errorf("write %q: %w", f.path, err)
+
+	rollback := func(failedPath string, writeErr error) error {
+		slog.Warn("ai: apply rollback started",
+			"failed_path", failedPath, "written_before_fail", len(steps), "error", writeErr.Error())
+		for i := len(steps) - 1; i >= 0; i-- {
+			st := steps[i]
+			var rbErr error
+			switch {
+			case st.action == FileActionDelete:
+				// Undo delete → restore previous content if we had it.
+				if st.previous != nil {
+					rbErr = s.store.WriteFile(ctx, storeAuth, st.path, *st.previous, st.pageMeta)
+					slog.Info("ai: apply rollback restore-after-delete", "path", st.path, "error", errString(rbErr))
+				} else {
+					slog.Warn("ai: apply rollback skipped — deleted file had no previous content", "path", st.path)
+				}
+			case st.action == FileActionCreate && (st.previous == nil || *st.previous == ""):
+				rbErr = s.store.DeleteFile(ctx, storeAuth, st.path)
+				slog.Info("ai: apply rollback delete", "path", st.path, "error", errString(rbErr))
+			case st.previous != nil:
+				rbErr = s.store.WriteFile(ctx, storeAuth, st.path, *st.previous, st.pageMeta)
+				slog.Info("ai: apply rollback restore", "path", st.path, "error", errString(rbErr))
+			default:
+				slog.Warn("ai: apply rollback skipped — no previous content", "path", st.path, "action", string(st.action))
+			}
+			if rbErr != nil {
+				slog.Error("ai: apply rollback step failed",
+					"path", st.path, "error", rbErr.Error(), "original_error", writeErr.Error())
+			}
 		}
+		slog.Warn("ai: apply rollback finished", "failed_path", failedPath)
+		return fmt.Errorf("write %q: %w", failedPath, writeErr)
+	}
+
+	for _, f := range plan.files {
+		slog.Info("ai: apply file write", "path", f.path, "action", string(f.action))
+		var err error
+		if f.action == FileActionDelete || f.content == DraftDeleteMarker {
+			err = s.store.DeleteFile(ctx, storeAuth, f.path)
+		} else {
+			err = s.store.WriteFile(ctx, storeAuth, f.path, f.content, f.pageMeta)
+		}
+		if err != nil {
+			return nil, rollback(f.path, err)
+		}
+		steps = append(steps, appliedStep{
+			path: f.path, previous: f.previous, action: f.action, pageMeta: f.pageMeta,
+		})
 		written = append(written, writtenFile{
 			generated: ai.GeneratedFile{Path: f.path, Action: string(f.action), Content: f.content},
 			previous:  f.previous,
@@ -246,11 +296,22 @@ func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.Request
 		if f == nil {
 			continue
 		}
+		slog.Info("ai: apply file write", "path", f.path, "action", string(f.action), "kind", "layout")
 		if err := s.store.WriteFile(ctx, storeAuth, f.path, f.content, nil); err != nil {
-			return written, fmt.Errorf("write %q: %w", f.path, err)
+			return nil, rollback(f.path, err)
 		}
+		steps = append(steps, appliedStep{
+			path: f.path, previous: f.previous, action: f.action, isLayout: true,
+		})
 	}
 	return written, nil
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // planToStaged converts a writePlan into the same writtenFile shape
@@ -266,8 +327,14 @@ func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.Request
 func planToStaged(plan writePlan) []writtenFile {
 	staged := make([]writtenFile, 0, len(plan.files)+2)
 	for _, f := range plan.files {
+		content := f.content
+		action := string(f.action)
+		if f.action == FileActionDelete {
+			content = DraftDeleteMarker
+			action = string(FileActionDelete)
+		}
 		staged = append(staged, writtenFile{
-			generated: ai.GeneratedFile{Path: f.path, Action: string(f.action), Content: f.content},
+			generated: ai.GeneratedFile{Path: f.path, Action: action, Content: content},
 			previous:  f.previous,
 			kind:      GeneratedFileKindProposed,
 			pageMeta:  f.pageMeta,
@@ -283,4 +350,73 @@ func planToStaged(plan writePlan) []writtenFile {
 		})
 	}
 	return staged
+}
+
+// normalizePageRegistryStatus keeps AI-proposed page registration from
+// unpublishing a live storefront route. Omitted/empty status and regenerating
+// home must land as published — draft home is a live 404 (PageAccessGuard).
+func normalizePageRegistryStatus(entry *themefs.PageEntry) string {
+	if entry == nil {
+		return "published"
+	}
+	status := strings.TrimSpace(strings.ToLower(entry.Status))
+	page := strings.TrimSpace(strings.ToLower(entry.Page))
+	slug := strings.TrimSpace(strings.ToLower(entry.Slug))
+	typ := strings.TrimSpace(strings.ToLower(entry.Type))
+	if page == "home" || slug == "home" || typ == "home" {
+		return "published"
+	}
+	if status == "" || status == "published" {
+		return "published"
+	}
+	return status
+}
+
+// pageRegistryWantPath derives the theme-relative liquid path for a registry
+// entry (entry.Path is a route prefix, not a file path).
+func pageRegistryWantPath(entry *themefs.PageEntry) string {
+	if entry == nil {
+		return ""
+	}
+	page := strings.TrimSpace(entry.Page)
+	if page == "" {
+		page = strings.TrimSpace(entry.Slug)
+	}
+	if page == "" {
+		return ""
+	}
+	wantPath := "pages/" + page + ".liquid"
+	if entry.Path == "/pages/auth" {
+		wantPath = "pages/auth/" + page + ".liquid"
+	}
+	return wantPath
+}
+
+// attachPageRegistryEntry sets PageMeta on the matching proposed liquid file.
+// FlowPOS upserts pages.json from that metadata — the canonical single-page
+// registration path (prefer page_registry_entry over rewriting pages.json).
+func attachPageRegistryEntry(plan *writePlan, entry *themefs.PageEntry) error {
+	if plan == nil || entry == nil {
+		return nil
+	}
+	wantPath := pageRegistryWantPath(entry)
+	for i := range plan.files {
+		if plan.files[i].path != wantPath {
+			continue
+		}
+		plan.files[i].pageMeta = &themefs.PageMeta{
+			Title:          entry.Title,
+			Slug:           entry.Slug,
+			Type:           entry.Type,
+			Status:         normalizePageRegistryStatus(entry),
+			SEOTitle:       entry.SEOTitle,
+			SEODescription: entry.SEODescription,
+			SEOKeywords:    entry.SEOKeywords,
+			OGTitle:        entry.OGTitle,
+			OGDescription:  entry.OGDescription,
+			OGImagePath:    entry.OGImagePath,
+		}
+		return nil
+	}
+	return fmt.Errorf("register page: page_registry_entry (page %q, path %q) has no matching proposed file at %q", entry.Page, entry.Path, wantPath)
 }

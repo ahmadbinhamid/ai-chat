@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"ai-chat/internal/auth"
+	"ai-chat/internal/genlifecycle"
 	"ai-chat/internal/logging"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/modules/themebuild"
@@ -87,10 +88,11 @@ var ioTimeout = 10 * time.Second
 // independent of Go struct tag mechanics elsewhere in this codebase (this
 // type is deliberately local to this handler, not reused).
 type streamEventMessage struct {
-	Seq       int64           `json:"seq"`
-	Type      string          `json:"type"`
-	Payload   json.RawMessage `json:"payload"`
-	CreatedAt time.Time       `json:"created_at"`
+	Seq          int64           `json:"seq"`
+	Type         string          `json:"type"`
+	GenerationID string          `json:"generation_id,omitempty"`
+	Payload      json.RawMessage `json:"payload"`
+	CreatedAt    time.Time       `json:"created_at"`
 }
 
 // streamReadyMessage tells the client replay has finished and it's now
@@ -167,6 +169,18 @@ func (h *StreamHandler) Stream(c *gin.Context) {
 		return
 	}
 	defer func() { _ = conn.CloseNow() }()
+
+	genlifecycle.ConnectionAttempts.Add(1)
+	connectedAt := time.Now()
+	slog.Info("ai: websocket connected",
+		"tenant_id", tenantID, "chat_id", chatID, "request_id", logging.RequestID(c))
+	defer func() {
+		genlifecycle.DisconnectCount.Add(1)
+		slog.Info("ai: websocket disconnected",
+			"tenant_id", tenantID, "chat_id", chatID,
+			"connection_duration_ms", time.Since(connectedAt).Milliseconds(),
+			"request_id", logging.RequestID(c))
+	}()
 
 	// This connection is server -> client only from the start: any data
 	// message from the client is a protocol violation CloseRead enforces
@@ -287,6 +301,7 @@ func (h *StreamHandler) waitForLiveEvents(ctx context.Context, conn *websocket.C
 			}
 			if ev.Seq != 0 {
 				if ev.Seq <= *watermark {
+					genlifecycle.DuplicateEventsSuppressed.Add(1)
 					continue // already delivered during replay — see Stream's doc comment
 				}
 			}
@@ -315,12 +330,19 @@ func parseLastSeq(raw string) (int64, error) {
 }
 
 func writeStreamEvent(ctx context.Context, conn *websocket.Conn, ev themebuild.GenerationEvent) bool {
-	encoded, err := json.Marshal(streamEventMessage{Seq: ev.Seq, Type: ev.Type, Payload: ev.Payload, CreatedAt: ev.CreatedAt})
+	encoded, err := json.Marshal(streamEventMessage{
+		Seq: ev.Seq, Type: ev.Type, GenerationID: ev.GenerationID,
+		Payload: ev.Payload, CreatedAt: ev.CreatedAt,
+	})
 	if err != nil {
 		slog.Error("stream: failed to encode event", "error", err)
 		return true // skip this one event, the connection itself is still fine
 	}
-	return writeWithTimeout(ctx, conn, encoded)
+	ok := writeWithTimeout(ctx, conn, encoded)
+	if !ok {
+		genlifecycle.EventSendFailures.Add(1)
+	}
+	return ok
 }
 
 // writeReady sends the {"type":"ready","last_seq":N} frame marking the end

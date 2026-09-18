@@ -72,8 +72,13 @@ type streamAttemptMeta struct {
 
 // isRetryableStreamErr reports whether a stream attempt failure should get
 // the single controlled retry (idle timeout or truncated/garbled accumulate).
+// Explicitly non-retryable: cancellation, deadline, auth/forbidden, and other
+// permanent client/config failures — those must not multiply AI work.
 func isRetryableStreamErr(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	if errors.Is(err, errStreamIdleTimeout) ||
@@ -81,10 +86,20 @@ func isRetryableStreamErr(err error) bool {
 		errors.Is(err, errStreamTruncated) {
 		return true
 	}
-	msg := err.Error()
+	msg := strings.ToLower(err.Error())
+	// Permanent / non-transient — never retry.
+	if strings.Contains(msg, "401") ||
+		strings.Contains(msg, "403") ||
+		strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "forbidden") ||
+		strings.Contains(msg, "invalid api") ||
+		strings.Contains(msg, "invalid_request") ||
+		strings.Contains(msg, "authentication") {
+		return false
+	}
 	return strings.Contains(msg, "accumulate stream") ||
-		strings.Contains(msg, "unexpected end of JSON input") ||
-		strings.Contains(msg, "error converting content block to JSON")
+		strings.Contains(msg, "unexpected end of json input") ||
+		strings.Contains(msg, "error converting content block to json")
 }
 
 // classifyStreamErr returns a short error_type tag for structured logs.
@@ -162,16 +177,17 @@ func (g *Generator) SetStreamFirstTokenTimeout(d time.Duration) {
 	g.firstTokenTimeout = d
 }
 
-// defaultPreparedFirstTokenTimeout bounds TTFT for PageCreatePrepared calls —
-// DeepSeek often spends 30–70s planning a forced propose_changes (especially
-// full-homepage rebuilds) before the first tool_use/json delta. 90s avoids
-// false kills without letting a dead stream sit for minutes.
-const defaultPreparedFirstTokenTimeout = 90 * time.Second
-
-// PreparedFirstTokenTimeout is the TTFT budget for PageCreatePrepared
-// generations (exported for themebuild wiring / tests).
+// PreparedFirstTokenTimeout is the TTFT budget for PageCreatePrepared /
+// complex_page generations (exported for themebuild wiring / tests).
+// Mode-aware: complex/compound work may wait up to MaxFirstTokenTimeout.
 func PreparedFirstTokenTimeout() time.Duration {
-	return defaultPreparedFirstTokenTimeout
+	return FirstTokenTimeoutForMode(FirstTokenModeComplex)
+}
+
+// PreparedFullPageFirstTokenTimeout is the TTFT budget for full-page /
+// full-homepage prepared proposes.
+func PreparedFullPageFirstTokenTimeout() time.Duration {
+	return FirstTokenTimeoutForMode(FirstTokenModeFullPage)
 }
 
 // defaultPreparedStreamIdleTimeout is the post-first-token idle budget for
@@ -243,6 +259,8 @@ func (g *Generator) consumeProviderStream(
 	if firstTokenOverride > 0 {
 		firstTokenDeadline = firstTokenOverride
 	}
+	// Child of parent generation deadline — never outlive the 10-minute budget.
+	firstTokenDeadline = ClampFirstTokenToParent(ctx, firstTokenDeadline)
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -343,6 +361,14 @@ func (g *Generator) consumeProviderStream(
 				if ttftMs != nil {
 					*ttftMs = now.Sub(generateStart).Milliseconds()
 				}
+				slog.Info("ai: first model progress",
+					"provider", g.provider,
+					"model", g.modelName,
+					"iteration", iteration,
+					"attempt", attempt,
+					"ttft_ms", meta.TTFTAttemptMs,
+					"progress_bytes", progressBytes,
+					"has_text", currentText(message) != "")
 			}
 		}
 

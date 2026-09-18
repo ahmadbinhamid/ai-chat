@@ -115,7 +115,12 @@ type Config struct {
 	// spending real API tokens while that plumbing is broken. Never leave
 	// this on — nothing gets written to the theme while it's set. Also
 	// makes ANTHROPIC_API_KEY optional, since it's never actually used.
+	// Requires AllowFakeAIMode=true as a second deliberate opt-in so a
+	// stray AI_CHAT_FAKE_MODE in production cannot silently no-op generations.
 	FakeAIMode bool
+	// AllowFakeAIMode must be true alongside FakeAIMode or the process
+	// refuses to start (production safety).
+	AllowFakeAIMode bool
 	// FakeAIDelay simulates real generation latency in fake mode — long
 	// enough that a client watching the stream WebSocket live still sees a
 	// realistic "generating" window instead of an instant no-op.
@@ -220,6 +225,7 @@ func Load() Config {
 		MaxTokensComplex:     int64(getenvInt("AI_MAX_TOKENS_COMPLEX", 24000)),
 		MaxTokensRepair:      int64(getenvInt("AI_MAX_TOKENS_REPAIR", 8000)),
 		FakeAIMode:           getenvBool("AI_CHAT_FAKE_MODE", false),
+		AllowFakeAIMode:      getenvBool("AI_CHAT_ALLOW_FAKE_MODE", false),
 		FakeAIDelay:          time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
 		DeepSeekAPIKey:      os.Getenv("DEEPSEEK_API_KEY"),
