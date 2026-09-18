@@ -255,6 +255,10 @@ type Service struct {
 	historySummarizationEnabled bool
 	historySummaries            *historySummaryCache
 	historySummaryLocks         *stripedMutex
+	// builderPlanEnabled gates CPU-only BuilderPlan observation/preparation
+	// before DeepSeek (see observeBuilderPlan). Default OFF — existing
+	// pipeline unchanged until BUILDER_PLAN_ENABLED=true.
+	builderPlanEnabled bool
 	// workspaceRoot, when non-empty, enables local-first theme mirrors for
 	// generation reads/greps (see themeworkspace). Set once via
 	// SetThemeWorkspaceRoot from server wiring.
@@ -267,6 +271,12 @@ type Service struct {
 // concurrently with a generation already reading the field.
 func (s *Service) SetHistorySummarizationEnabled(enabled bool) {
 	s.historySummarizationEnabled = enabled
+}
+
+// SetBuilderPlanEnabled turns on CPU-only BuilderPlan observation before
+// DeepSeek. Default false — production behavior unchanged until enabled.
+func (s *Service) SetBuilderPlanEnabled(enabled bool) {
+	s.builderPlanEnabled = enabled
 }
 
 // SetThemeWorkspaceRoot enables local-first on-disk theme mirrors under
@@ -1292,6 +1302,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		intentContextMs int64
 		snapshotBaseMs  int64
 		historyMs       int64
+		builderPlanMs   int64
 	)
 	defer func() {
 		route := RouteLocalFirst
@@ -1549,6 +1560,27 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		"workspace_loaded", false,
 		"deepseek_called", false,
 		"draft_refresh", true)
+
+	// BuilderPlan observation/preparation (feature-flagged, default OFF).
+	// CPU-only: classify + validate + candidate context. Never mutates theme
+	// files, pages.json, or generation state. Soft-escalate intent only.
+	var planObs planObservation
+	if s.builderPlanEnabled {
+		planObs = observeBuilderPlan(in.Prompt)
+		builderPlanMs = planObs.PlannerElapsedMs + planObs.ContextElapsedMs
+		priorIntent := intent
+		if escalated, applied := escalateIntentFromPlan(intent, planObs); applied {
+			intent = escalated
+			routedIntent = intent
+			planObs.AppliedEscalate = true
+			slog.Info("ai: builderplan escalate intent",
+				"generation_id", genID,
+				"from", string(priorIntent),
+				"to", string(intent),
+				"plan_intent", string(planObs.Plan.Intent))
+		}
+		logBuilderPlanObservation(genID, in.TenantID, c.ID, planObs, priorIntent)
+	}
 
 	// The draft overlay this whole feature exists for: every prior turn's
 	// still-'pending' file content, read first before falling through to
@@ -1996,6 +2028,19 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		} else {
 			simpleEditCtx = sec
 		}
+		if s.builderPlanEnabled && planObs.Valid {
+			narrowed, used := narrowPathsWithCandidates(simpleEditCtx.Paths, planObs.CandidateContext)
+			slog.Info("ai: builderplan context compare",
+				"generation_id", genID,
+				"path", "simple_edit",
+				"existing_paths", simpleEditCtx.Paths,
+				"candidate_paths", planObs.CandidateContext,
+				"narrowed", used,
+				"builder_plan_ms", builderPlanMs)
+			if used {
+				simpleEditCtx.Paths = narrowed
+			}
+		}
 		tc.SimpleEditOneShot = true
 		// Targeted read fallback stays OFF when local context is sufficient;
 		// only enabled when the planner found no usable excerpts.
@@ -2078,6 +2123,21 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			tc.PagesJSON = truncateForSimpleEditPrompt(tc.PagesJSON, 2500)
 			tc.DefaultsJSON = truncateForSimpleEditPrompt(tc.DefaultsJSON, 800)
 			prompt = complexPagePreparedPrompt(in.Prompt, cpc)
+		}
+		if s.builderPlanEnabled && planObs.Valid {
+			existingPaths := []string(nil)
+			if cpcErr == nil {
+				existingPaths = cpc.Paths
+			}
+			_, used := narrowPathsWithCandidates(existingPaths, planObs.CandidateContext)
+			slog.Info("ai: builderplan context compare",
+				"generation_id", genID,
+				"path", "complex_page",
+				"existing_paths", existingPaths,
+				"candidate_paths", planObs.CandidateContext,
+				"narrowed", used,
+				"applied_narrow", false, // complex path keeps existing ranking; candidates are observational
+				"builder_plan_ms", builderPlanMs)
 		}
 		tc.MaxToolIterations = maxComplexPageModelCalls
 		if isFullHomePageRedesignPrompt(in.Prompt) {
@@ -2185,6 +2245,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		"intent_context_ms", intentContextMs,
 		"snapshot_base_ms", snapshotBaseMs,
 		"history_ms", historyMs,
+		"builder_plan_ms", builderPlanMs,
+		"builder_plan_enabled", s.builderPlanEnabled,
 		"pre_model_ms", preModelMs)
 	emitter.emit(ctx, EventTypePreparingAI, struct{}{})
 	deepseekCalled = true

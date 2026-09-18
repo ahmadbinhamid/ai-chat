@@ -109,6 +109,10 @@ type Config struct {
 	// summarization outright (full history is always resent verbatim) if a
 	// deployment still finds it not worth the tradeoff.
 	HistorySummarizationEnabled bool
+	// BuilderPlanEnabled turns on CPU-only BuilderPlan observation before
+	// DeepSeek (classify / validate / candidate context). Default false —
+	// existing generation pipeline is unchanged until explicitly enabled.
+	BuilderPlanEnabled bool
 	// FakeAIMode, when true, skips the real Claude API entirely — see
 	// ai.NewFake. For debugging the surrounding plumbing (the async
 	// generation lifecycle, the stream WebSocket, the dashboard) without
@@ -234,6 +238,7 @@ func Load() Config {
 		DeepSeekBaseURL:     getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
 
 		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
+		BuilderPlanEnabled:          getenvBool("BUILDER_PLAN_ENABLED", false),
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 

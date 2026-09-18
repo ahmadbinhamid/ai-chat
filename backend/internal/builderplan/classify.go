@@ -33,6 +33,19 @@ var (
 	buttonRe = regexp.MustCompile(`(?i)\b(?:button|btn|link)\b`)
 
 	themeCueRe = regexp.MustCompile(`(?i)\b(?:page|theme|header|footer|button|blog|menu|nav|css|liquid|section|home|slider|color|colour|meta|seo)\b`)
+
+	// registerExistingRe: pure registry of an existing page (no create).
+	registerExistingRe = regexp.MustCompile(`(?i)(?:` +
+		`\bif\s+(?:the\s+)?\w[\w-]*\s+page\s+is\s+not\s+registered\b` +
+		`|` +
+		`\bif\s+not\s+register\b` +
+		`|` +
+		`\b(?:please\s+)?register\s+(?:it|them|this|the\s+page|the\s+blog|blog|page)\b` +
+		`|` +
+		`\bnot\s+registered\b[\s\S]{0,48}\bregister\b` +
+		`|` +
+		`\bregister\b[\s\S]{0,40}\b(?:pages?\.json|registry)\b` +
+		`)`)
 )
 
 func normalizePrompt(prompt string) string {
@@ -51,17 +64,27 @@ func (DeterministicClassifier) Classify(prompt string) Classification {
 	signals := make([]string, 0, 4)
 	multi := requestedPageCount(p) >= 2
 	wantsCreate := createPageRe.MatchString(p) || multi
+	wantsRegisterExisting := registerExistingRe.MatchString(p) && !wantsCreate
 	wantsNav := navRe.MatchString(p) && (addNavRe.MatchString(p) || wantsCreate)
 	wantsSEO := seoMetaRe.MatchString(p)
 	wantsSection := sectionRe.MatchString(p) && simpleActionRe.MatchString(p) && !wantsCreate
 	wantsFull := fullPageRe.MatchString(p)
 	wantsContent := contentRewriteRe.MatchString(p) && (strings.Contains(p, "blog") || strings.Contains(p, "page") || strings.Contains(p, "software"))
+	// "change the blogs and update only meta titles" — dual op, not SEO-only.
+	if !wantsContent && wantsSEO && strings.Contains(p, "blog") && strings.Contains(p, " and ") && simpleActionRe.MatchString(p) {
+		wantsContent = true
+		signals = append(signals, "blog_and_seo")
+	}
 	wantsSimple := simpleStyleRe.MatchString(p) && simpleActionRe.MatchString(p) && !wantsCreate && !wantsSEO && !wantsFull
 
 	opCount := 0
 	if multi || wantsCreate {
 		opCount++
 		signals = append(signals, "page_create")
+	}
+	if wantsRegisterExisting {
+		opCount++
+		signals = append(signals, "register_existing")
 	}
 	if wantsNav {
 		opCount++
@@ -94,6 +117,9 @@ func (DeterministicClassifier) Classify(prompt string) Classification {
 	}
 	if wantsCreate && !multi {
 		return Classification{Intent: IntentPageCreate, Confidence: 0.9, Source: "deterministic", Signals: signals}
+	}
+	if wantsRegisterExisting {
+		return Classification{Intent: IntentNavigationRegistry, Confidence: 0.9, Source: "deterministic", Signals: signals}
 	}
 	if wantsNav && !wantsCreate {
 		return Classification{Intent: IntentNavigationRegistry, Confidence: 0.85, Source: "deterministic", Signals: signals}

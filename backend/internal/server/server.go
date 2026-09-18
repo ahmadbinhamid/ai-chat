@@ -90,6 +90,10 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	buildRepo := themebuild.NewRepository(conn)
 	buildSvc := themebuild.NewService(buildRepo, chatSvc, generator, store, rdb)
 	buildSvc.SetHistorySummarizationEnabled(cfg.HistorySummarizationEnabled)
+	buildSvc.SetBuilderPlanEnabled(cfg.BuilderPlanEnabled)
+	if cfg.BuilderPlanEnabled {
+		logger.Info("builderplan observation enabled")
+	}
 	if cfg.ThemeWorkspaceDir != "" {
 		buildSvc.SetThemeWorkspaceRoot(cfg.ThemeWorkspaceDir)
 		logger.Info("theme workspace enabled", "dir", cfg.ThemeWorkspaceDir)

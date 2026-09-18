@@ -55,16 +55,32 @@ func BuildPlanWith(c Classifier, prompt string) (BuilderPlan, error) {
 		}}
 	case IntentNavigationRegistry:
 		plan.Complexity = ComplexityMedium
-		plan.Operations = []Operation{{
-			Kind: OpAddToNavigation, Target: "defaults.json", Label: "Update navigation",
-			ProtectExisting: true,
-		}}
+		if registerExistingRe.MatchString(p) {
+			target := "pages.json"
+			slug := "page"
+			if strings.Contains(p, "blog") {
+				slug = "blog"
+				target = "pages/blog.liquid"
+			}
+			plan.Operations = []Operation{{
+				Kind: OpRegisterPage, Target: target, Label: "Register existing " + slug,
+				ProtectExisting: true,
+			}}
+		} else {
+			plan.Operations = []Operation{{
+				Kind: OpAddToNavigation, Target: "defaults.json", Label: "Update navigation",
+				ProtectExisting: true,
+			}}
+		}
 	case IntentSEOMeta:
 		plan.Complexity = ComplexityLow
 		plan.Operations = []Operation{{
 			Kind: OpUpdateSEOMeta, Target: "pages.json", Label: "Update meta titles",
 			ProtectExisting: true,
 		}}
+		if strings.Contains(p, "only") {
+			plan.Constraints = append(plan.Constraints, "seo_titles_only_preserve_other_seo_fields")
+		}
 	case IntentFullPage:
 		plan.Complexity = ComplexityHigh
 		target := "pages/blog.liquid"
@@ -85,6 +101,9 @@ func BuildPlanWith(c Classifier, prompt string) (BuilderPlan, error) {
 				Kind: OpUpdateSEOMeta, Target: "pages.json", Label: "Update meta titles",
 				ProtectExisting: true,
 			})
+			if strings.Contains(p, "only") {
+				plan.Constraints = append(plan.Constraints, "seo_titles_only_preserve_other_seo_fields")
+			}
 		}
 	case IntentSectionEdit:
 		plan.Complexity = ComplexityMedium
@@ -117,6 +136,9 @@ func BuildPlanWith(c Classifier, prompt string) (BuilderPlan, error) {
 
 	plan.Targets = uniqueTargets(plan.Operations)
 	plan.RequiredFiles = SelectContextFiles(plan)
+	if strings.Contains(p, "only") && seoMetaRe.MatchString(p) {
+		plan.Constraints = append(plan.Constraints, "seo_titles_only_preserve_other_seo_fields")
+	}
 	if len(plan.AcceptanceCriteria) == 0 {
 		plan.AcceptanceCriteria = defaultAcceptance(plan)
 	}
@@ -152,7 +174,8 @@ func buildCompoundOps(p string) []Operation {
 			ProtectExisting: true,
 		})
 	}
-	if contentRewriteRe.MatchString(p) && (strings.Contains(p, "blog") || strings.Contains(p, "software")) && n < 2 {
+	if (contentRewriteRe.MatchString(p) || (strings.Contains(p, "blog") && strings.Contains(p, " and ") && seoMetaRe.MatchString(p))) &&
+		(strings.Contains(p, "blog") || strings.Contains(p, "software")) && n < 2 {
 		ops = append(ops, Operation{
 			Kind: OpUpdatePageContent, Target: "pages/blog.liquid", Label: "Update blog content",
 			ProtectExisting: true,
