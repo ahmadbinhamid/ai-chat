@@ -170,6 +170,36 @@ func toProposal(r *ai.Result) themecheck.Proposal {
 	}
 }
 
+// normalizeProposedDeletes coerces intentional removals into action=delete
+// so themecheck content rules / AutoFix boilerplate never treat an empty
+// page stub as a bad update (the validation loop that showed merchants
+// "couldn't be validated after multiple attempts" on orphan-page deletes).
+func normalizeProposedDeletes(r *ai.Result, prompt string) {
+	if r == nil {
+		return
+	}
+	deleteIntent := isBulkPageDeletePrompt(prompt)
+	for i := range r.Files {
+		f := &r.Files[i]
+		if strings.EqualFold(strings.TrimSpace(f.Action), "delete") || f.Content == themefs.DraftDeleteMarker {
+			f.Action = "delete"
+			f.Content = ""
+			f.Edits = nil
+			continue
+		}
+		if !deleteIntent {
+			continue
+		}
+		low := strings.ToLower(f.Path)
+		isPageLiquid := strings.HasPrefix(low, "pages/") && strings.HasSuffix(low, ".liquid") && !strings.HasPrefix(low, "pages/css/")
+		isComponent := strings.HasPrefix(low, "components/") && (strings.HasSuffix(low, ".liquid") || strings.HasSuffix(low, ".css") || strings.HasSuffix(low, ".js"))
+		if (isPageLiquid || isComponent) && strings.TrimSpace(f.Content) == "" {
+			f.Action = "delete"
+			f.Edits = nil
+		}
+	}
+}
+
 // proposalHasChanges reports whether result proposes anything to write —
 // shared by doGenerate (deciding whether to run themecheck/buildWritePlan at
 // all) and its post-repair recheck (a retry that ends in NeedsClarification
@@ -255,6 +285,14 @@ func (s *Service) generateValidProposal(
 	in GenerateInput,
 ) (*ai.Result, []ai.Turn, error) {
 	nextPrompt := prompt
+	// Merchant-facing validators MUST use in.Prompt — not the prepared
+	// complex-page package prepended onto `prompt`. That package lists
+	// pages/privacy.liquid etc. and falsely trips named-page rewrite gates
+	// (observed: gen ed85fff1 — "create 2 blog pages" → "must update privacy").
+	merchantPrompt := in.Prompt
+	if strings.TrimSpace(merchantPrompt) == "" {
+		merchantPrompt = prompt
+	}
 	// Only for the two Warn lines below — emitter's own emit is already
 	// nil-safe, but a direct field read on a nil *eventEmitter (tests pass
 	// nil — see generate_valid_proposal_test.go) is not.
@@ -262,6 +300,11 @@ func (s *Service) generateValidProposal(
 	if emitter != nil {
 		chatID = emitter.chatID
 	}
+
+	// lastUsable keeps a well-formed proposal across retries so a later
+	// Generate that thrash-fails (DeepSeek ignoring forced propose_changes)
+	// does not wipe a merchant-visible homepage that already nearly landed.
+	var lastUsable *ai.Result
 
 	// attempt counts total Generate calls made here, including the first —
 	// mirrors checkAndRepair's own budget: maxThemeCheckRetries+1 total
@@ -274,11 +317,23 @@ func (s *Service) generateValidProposal(
 	// but suspiciously empty proposal needs its own check here rather than
 	// being accepted as a real answer.
 	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastUsable != nil && len(lastUsable.Files) > 0 {
+				slog.Warn("generateValidProposal: context ended — keeping prior proposal",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "chat_id", chatID,
+					"attempt", attempt, "error", err)
+				return lastUsable, turns, nil
+			}
+			return nil, turns, err
+		}
 		result, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(nextPrompt, in), imagesFromInput(in), onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
 		if genErr != nil {
-			// A hard API/transport error is a different failure mode from an
-			// invalid proposal — already handled by the caller/reaper, not
-			// retried here.
+			if lastUsable != nil && len(lastUsable.Files) > 0 && isTransientRepairErr(genErr) {
+				slog.Warn("generateValidProposal: retry failed — keeping prior proposal",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "chat_id", chatID,
+					"attempt", attempt, "prior_files", len(lastUsable.Files), "error", genErr)
+				return lastUsable, turns, nil
+			}
 			return nil, turns, genErr
 		}
 
@@ -286,6 +341,11 @@ func (s *Service) generateValidProposal(
 
 		if err := validateProposal(result, tc.GenerationMode); err != nil {
 			if attempt >= maxThemeCheckRetries+1 {
+				if lastUsable != nil && len(lastUsable.Files) > 0 {
+					slog.Warn("generateValidProposal: invalid proposal exhausted retries — keeping prior",
+						"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "error", err)
+					return lastUsable, turns, nil
+				}
 				return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
 			}
 			slog.Warn("initial generation produced an invalid proposal, retrying if budget remains",
@@ -293,6 +353,9 @@ func (s *Service) generateValidProposal(
 			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
 				"attempt": attempt, "message": "invalid model proposal: " + err.Error(),
 			})
+			if len(result.Files) > 0 {
+				lastUsable = result
+			}
 			turns = append(turns,
 				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
 				ai.Turn{Role: "user", Content: fmt.Sprintf(
@@ -303,12 +366,22 @@ func (s *Service) generateValidProposal(
 						"of guessing. Action \"edit\" is fine for this — it isn't a diff, it still produces the "+
 						"complete corrected file, just via old_string/new_string instead of retyping it whole.", err)},
 			)
-			nextPrompt = "Please resubmit a corrected, complete proposal as instructed above."
+			nextPrompt = "Please resubmit a corrected, complete proposal as instructed above. Call propose_changes only — do not list/grep/read the theme."
 			continue
 		}
 
-		if err := incompleteSliderFeatureProposal(prompt, result); err != nil {
+		if err := incompleteSliderFeatureProposal(merchantPrompt, result); err != nil {
 			if attempt >= maxThemeCheckRetries+1 {
+				if lastUsable != nil && len(lastUsable.Files) > 0 {
+					slog.Warn("generateValidProposal: slider gate exhausted — keeping prior proposal",
+						"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "error", err)
+					return lastUsable, turns, nil
+				}
+				if len(result.Files) > 0 {
+					slog.Warn("generateValidProposal: slider gate exhausted — keeping current files",
+						"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "error", err)
+					return result, turns, nil
+				}
 				return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
 			}
 			slog.Warn("slider autoplay proposal incomplete, retrying if budget remains",
@@ -316,31 +389,119 @@ func (s *Service) generateValidProposal(
 			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
 				"attempt": attempt, "message": err.Error(),
 			})
+			if len(result.Files) > 0 {
+				lastUsable = result
+			}
 			turns = append(turns,
 				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
 				ai.Turn{Role: "user", Content: fmt.Sprintf(
 					"That proposal is incomplete for a working autoplay slider: %s. "+
-						"Do NOT only edit CSS. Resubmit propose_changes including ALL of: "+
+						"Do NOT only edit CSS. Call propose_changes NOW including ALL of: "+
 						"(1) store-hero-banner.liquid with 2+ data-slide-item slides, "+
 						"(2) js/store-hero-banner.js with real setInterval/is-active autoplay, "+
 						"(3) liquid/layout-end.liquid script tag for store-hero-banner.js. "+
+						"Do not list/grep/read — fix from the files already in your last proposal above. "+
 						"CSS-only or static stacked images will be rejected again.", err)},
 			)
-			nextPrompt = "Resubmit a complete working multi-image autoplay slider proposal as instructed above."
+			nextPrompt = "Resubmit a complete working multi-image autoplay slider via propose_changes only — no exploration tools."
+			continue
+		}
+
+		// Strip forbidden index rewrites before the completeness gate so a
+		// proposal that also created the right new pages is not discarded
+		// solely because it dragged in a blog.liquid full rewrite.
+		if isMultiPageCreatePrompt(merchantPrompt) {
+			if err := RejectOversizedMultiPageIndexRewrite(merchantPrompt, result); err != nil {
+				slog.Warn("multi-page create rejected index rewrite — stripping",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+				result = StripMultiPageIndexRewrites(result)
+				emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+					"attempt": attempt, "message": err.Error(),
+				})
+			}
+		}
+
+		// Compound atomic steps use the single-page contract
+		// (liquid create + page_registry_entry). Never apply the batch
+		// N-page / pages.json gate — that is the tool-contract mismatch
+		// that rejected valid Step 1 registry proposals.
+		if !tc.CompoundAtomicCreate {
+			if err := incompleteMultiPageCreateProposal(merchantPrompt, result); err != nil {
+				if attempt >= maxThemeCheckRetries+1 {
+					// Never stage a fake "Generated N pages" stub (blog.liquid /
+					// card-essentials only) — that is exactly the merchant bug.
+					return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
+				}
+				slog.Warn("multi-page create proposal incomplete, retrying if budget remains",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+				emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+					"attempt": attempt, "message": err.Error(),
+				})
+				want := multiPageCreateBatchSize(merchantPrompt)
+				turns = append(turns,
+					ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
+					ai.Turn{Role: "user", Content: fmt.Sprintf(
+						"That proposal does NOT create the requested pages: %s. "+
+							"Call propose_changes NOW with: (1) exactly %d NEW pages/<kebab-slug>.liquid files (action create, full layout-start/end boilerplate, real on-topic copy matching the merchant), "+
+							"(2) a direct pages.json FULL-body update that keeps every existing entry and appends %d new published entries. "+
+							"page_registry_entry alone is NOT enough for multiple pages in a single-shot batch. "+
+							"FORBIDDEN: updating blog.liquid, blog.css, home.liquid, or card-essentials — create NEW slug files only.", err, want, want)},
+				)
+				nextPrompt = "Resubmit a complete multi-page create via propose_changes only — N liquid creates + pages.json update, no exploration."
+				continue
+			}
+		}
+
+		if err := incompleteAddToMenuProposal(merchantPrompt, result); err != nil {
+			if attempt >= maxThemeCheckRetries+1 {
+				return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
+			}
+			slog.Warn("add-to-menu proposal incomplete, retrying if budget remains",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+				"attempt": attempt, "message": err.Error(),
+			})
+			label := menuLabelFromAddPrompt(merchantPrompt)
+			hint := "the new nav label"
+			if label != "" {
+				hint = fmt.Sprintf("%q", label)
+			}
+			turns = append(turns,
+				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
+				ai.Turn{Role: "user", Content: fmt.Sprintf(
+					"That proposal does NOT add %s to the storefront menu: %s. "+
+						"Call propose_changes NOW with action \"update\" on defaults.json — FULL body, keep every existing menu.items entry, APPEND the new item. "+
+						"FORBIDDEN: claiming success without the label under menu.items. FORBIDDEN: only editing header.liquid/CSS.", err, hint)},
+			)
+			nextPrompt = "Resubmit a complete add-to-menu via propose_changes on defaults.json only."
+			continue
+		}
+
+		if err := incompleteNamedPageRewriteProposal(merchantPrompt, result); err != nil {
+			if attempt >= maxThemeCheckRetries+1 {
+				return nil, turns, fmt.Errorf("invalid model proposal: %w", err)
+			}
+			slog.Warn("named-page rewrite proposal incomplete, retrying if budget remains",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
+				"attempt": attempt, "message": err.Error(),
+			})
+			slug := promptNamedPageSlug(merchantPrompt)
+			want := "pages/" + slug + ".liquid"
+			turns = append(turns,
+				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
+				ai.Turn{Role: "user", Content: fmt.Sprintf(
+					"That proposal missed the named page: %s. "+
+						"Call propose_changes NOW with a FULL action \"update\" on `%s` (and `%s` CSS if needed) matching the merchant's software-company / theme rewrite. "+
+						"FORBIDDEN: editing only components/card-essentials.liquid, contact-inquiry.liquid, or blog.liquid. FORBIDDEN: claiming the page was updated without touching `%s`.",
+					err, want, "pages/css/"+slug+".css", want)},
+			)
+			nextPrompt = fmt.Sprintf("Resubmit a complete rewrite of %s via propose_changes — no unrelated components.", want)
 			continue
 		}
 
 		if isUnexploredEmptyProposal(result) {
 			if attempt >= maxThemeCheckRetries+1 {
-				// Fail open, per this whole mechanism's own rule: never turn
-				// a working generation into a failed one. The merchant sees
-				// an honest "nothing happened" instead of the model's own
-				// fabricated summary — see emptyProposalFallbackSummary.
-				// Replacing it HERE (not further down doGenerate) is what
-				// keeps the chat transcript consistent: whatever gets
-				// recorded as the assistant message is exactly result.Summary
-				// from this point on, nothing downstream ever sees the
-				// original fabricated text.
 				slog.Warn("generateValidProposal: empty proposal with no exploration survived every retry, replacing summary with an honest fallback",
 					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "chat_id", chatID, "attempts_used", attempt)
 				result.Summary = emptyProposalFallbackSummary
@@ -353,14 +514,11 @@ func (s *Service) generateValidProposal(
 			})
 			turns = append(turns,
 				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
-				ai.Turn{Role: "user", Content: "Your last reply described a change but proposed an empty files array " +
-					"without reading or exploring any theme files first. If you have a real change to make, read the " +
-					"relevant files (or use grep_theme/list_theme_files to find them) and propose it fully. If there " +
-					"is genuinely nothing to change for this request, call propose_changes again with " +
-					"needs_clarification: true, files: [], and a summary explaining why — never describe changes " +
-					"that were not made."},
+				ai.Turn{Role: "user", Content: "Your last reply described a change but proposed an empty files array. " +
+					"Call propose_changes again with real file changes (or needs_clarification: true with files: []). " +
+					"Do not list/grep the theme on this turn — propose from context you already have."},
 			)
-			nextPrompt = "Please try again as instructed above."
+			nextPrompt = "Please try again as instructed above — propose_changes only."
 			continue
 		}
 
@@ -395,6 +553,52 @@ func (s *Service) checkAndRepair(
 ) (*ai.Result, []themecheck.Finding, error) {
 	turns := append([]ai.Turn(nil), history...)
 	totalInput, totalOutput := result.InputTokens, result.OutputTokens
+	checkStart := time.Now()
+	repairGenerateCalls := 0
+	var totalRepairGenerateMs int64
+	lastSkip := RepairSkipNone
+	lastReason := RepairReasonNone
+	aiRepairStarted := false
+
+	// scopeBaseline is the full first proposal (refreshed after free
+	// autofixes). Repair replies often return only the finding-named CSS
+	// files; merging back onto this baseline is what stops a full-home
+	// redesign from collapsing to "theme-token CSS only" in the staged draft.
+	preserveScope := shouldPreserveProposalScope(in, tc)
+	normalizeProposedDeletes(result, in.Prompt)
+	scopeBaseline := cloneResultFiles(result)
+	slog.Info("checkAndRepair: initial proposal paths",
+		"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+		"preserve_scope", preserveScope,
+		"paths", proposalPaths(result),
+		"file_count", len(result.Files))
+
+	defer func() {
+		tc.Metrics.SetRepairOutcome(
+			!aiRepairStarted && lastSkip != RepairSkipNone,
+			string(lastSkip),
+			string(lastReason),
+			lastSkip == RepairSkipBudgetExhausted,
+		)
+		slog.Info("ai: check_and_repair finished",
+			"tenant_id", in.TenantID,
+			"theme_slug", in.ThemeSlug,
+			"chat_id", chatID,
+			"generation_id", tc.GenerationID,
+			"repair_attempts", func() int {
+				if tc.Metrics == nil {
+					return 0
+				}
+				return tc.Metrics.Snapshot().RepairAttempts
+			}(),
+			"repair_generate_calls", repairGenerateCalls,
+			"repair_elapsed_ms", totalRepairGenerateMs,
+			"repair_skipped", !aiRepairStarted && lastSkip != RepairSkipNone,
+			"repair_skip_reason", string(lastSkip),
+			"repair_reason", string(lastReason),
+			"repair_budget_exhausted", lastSkip == RepairSkipBudgetExhausted,
+			"total_elapsed_ms", time.Since(checkStart).Milliseconds())
+	}()
 
 	for attempt := 1; ; attempt++ {
 		// Best-effort: recorded so retry frequency is measurable via the
@@ -406,6 +610,7 @@ func (s *Service) checkAndRepair(
 				slog.Warn("failed to record generation attempt count", "chat_id", chatID, "error", err)
 			}
 		}
+		tc.Metrics.SetRepairAttempts(attempt)
 
 		emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": attempt})
 		findings := themecheck.Check(toProposal(result), snap)
@@ -464,6 +669,11 @@ func (s *Service) checkAndRepair(
 			}
 			if fixedAny {
 				findings = themecheck.Check(toProposal(result), snap)
+				// Autofix only rewrites content; keep the scope baseline in
+				// sync so a later restore does not roll back free token fixes.
+				if attempt == 1 {
+					scopeBaseline = cloneResultFiles(result)
+				}
 			}
 		}
 
@@ -488,6 +698,17 @@ func (s *Service) checkAndRepair(
 		errorFindings, warningFindings := splitFindings(findings)
 
 		if len(errorFindings) == 0 {
+			if !aiRepairStarted {
+				lastSkip = RepairSkipNoErrors
+			}
+			if preserveScope {
+				if missing := missingProposalPaths(scopeBaseline, result); len(missing) > 0 {
+					slog.Warn("checkAndRepair: accepted proposal missing baseline paths — restoring",
+						"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+						"attempt", attempt, "missing", missing)
+					result = mergeRepairIntoProposal(scopeBaseline, result)
+				}
+			}
 			if attempt > 1 {
 				slog.Info("themecheck accepted proposal after retry",
 					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "warning_count", len(warningFindings))
@@ -496,48 +717,57 @@ func (s *Service) checkAndRepair(
 			// attempt > 1) so a first-try success is distinguishable from a
 			// retried one in the logs — see theory 4 in the diagnostics task
 			// this instruments.
-			slog.Info("checkAndRepair succeeded", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempts_used", attempt)
+			slog.Info("checkAndRepair succeeded",
+				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+				"attempts_used", attempt,
+				"preserve_scope", preserveScope,
+				"staged_final_paths", proposalPaths(result),
+				"file_count", len(result.Files))
 			result.InputTokens, result.OutputTokens = totalInput, totalOutput
 			return result, warningFindings, nil
 		}
 
 		slog.Warn("themecheck rejected proposal",
 			"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt,
-			"error_count", len(errorFindings), "rules", findingRules(errorFindings))
+			"error_count", len(errorFindings), "rules", findingRules(errorFindings),
+			"finding_paths", findingPaths(errorFindings),
+			"current_paths", proposalPaths(result))
 		emitter.emit(ctx, EventTypeCheckFailed, map[string]any{"findings": errorFindings, "attempt": attempt})
 
-		if attempt > maxThemeCheckRetries {
-			return nil, nil, fmt.Errorf("the generated changes didn't pass validation after %d attempts: %s",
-				attempt, summarizeFindings(errorFindings))
+		lastReason = repairReasonCategory(errorFindings)
+		ok, skip := shouldStartRepairGenerate(ctx, attempt, maxThemeCheckRetries, len(errorFindings))
+		if !ok {
+			lastSkip = skip
+			switch skip {
+			case RepairSkipBudgetExhausted:
+				return nil, nil, fmt.Errorf("the generated changes didn't pass validation after %d attempts: %s",
+					attempt, summarizeFindings(errorFindings))
+			case RepairSkipContextCanceled, RepairSkipDeadlineExceeded:
+				if result != nil && len(result.Files) > 0 {
+					slog.Warn("ai: repair skipped — generation context ended; keeping prior proposal",
+						"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+						"attempt", attempt, "repair_skip_reason", string(skip))
+					result.InputTokens, result.OutputTokens = totalInput, totalOutput
+					return result, append(warningFindings, errorFindings...), nil
+				}
+				return nil, nil, ctx.Err()
+			default:
+				return result, warningFindings, nil
+			}
 		}
 
 		emitter.emit(ctx, EventTypeRepairing, map[string]int{"attempt": attempt})
 		turns = append(turns, ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)})
-		repair := repairPrompt(errorFindings)
+		repair := repairPrompt(errorFindings, preserveScope)
 
-		repairTC := tc
-		repairTC.Repair = true
-		repairTC.EffortOverride = "medium"
-		// Never inherit simple_edit one-shot (2 iters / 8k) into repair —
-		// that is what surfaced as "too complex… break into smaller requests"
-		// after a large footer redesign nearly succeeded on the first pass.
-		repairTC.SimpleEditOneShot = false
-		repairTC.SimpleEditAllowRead = false
-		if repairTC.MaxToolIterations < 6 {
-			repairTC.MaxToolIterations = 6
-		}
-		if repairTC.MaxTokensOverride > 0 && repairTC.MaxTokensOverride < 16_000 {
-			repairTC.MaxTokensOverride = 16_000
-		}
-		// Targeted repair: drop full theme tree/manifest from the dynamic
-		// system prompt — recapAssistantTurn + repairPrompt already carry
-		// affected file bodies and findings. toolsForContext(Repair) also
-		// drops list/grep so the model cannot re-explore the whole theme.
-		repairTC.FileTree = nil
-		repairTC.Manifest = nil
+		repairTC := prepareRepairThemeContext(tc)
 		repairStart := time.Now()
 		retried, genErr := s.gen.Generate(ctx, repairTC, turns, promptWithHTMLAttachment(repair, in), imagesFromInput(in), onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
 		repairElapsed := time.Since(repairStart)
+		totalRepairGenerateMs += repairElapsed.Milliseconds()
+		tc.Metrics.AddRepairElapsedMs(repairElapsed.Milliseconds())
+		aiRepairStarted = true
+		repairGenerateCalls++
 		if genErr != nil {
 			// Surfaced distinctly from the generic reaper cleanup: without
 			// this, a repair call that runs out the remaining generateTimeout
@@ -545,7 +775,7 @@ func (s *Service) checkAndRepair(
 			// the chat just sits on "repairing" until the reaper's 1-minute
 			// sweep marks it failed, with nothing in the logs explaining why.
 			slog.Error("repair generation failed",
-				"retry_reason", "themecheck_repair",
+				"retry_reason", string(lastReason),
 				"retry_stage", "generate",
 				"attempt", attempt,
 				"elapsed_ms", repairElapsed.Milliseconds(),
@@ -567,7 +797,7 @@ func (s *Service) checkAndRepair(
 			return nil, nil, fmt.Errorf("retry generation: %w", genErr)
 		}
 		slog.Info("repair generation completed",
-			"retry_reason", "themecheck_repair",
+			"retry_reason", string(lastReason),
 			"retry_stage", "generate",
 			"attempt", attempt,
 			"elapsed_ms", repairElapsed.Milliseconds(),
@@ -605,7 +835,45 @@ func (s *Service) checkAndRepair(
 					"complete corrected file, just via old_string/new_string instead of retyping it whole.", err)})
 			continue
 		}
-		result = retried
+
+		repairPaths := proposalPaths(retried)
+		priorPaths := proposalPaths(result)
+		slog.Info("checkAndRepair: repair response paths",
+			"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+			"attempt", attempt,
+			"preserve_scope", preserveScope,
+			"prior_paths", priorPaths,
+			"repair_paths", repairPaths,
+			"repair_file_count", len(retried.Files),
+			"prior_file_count", len(result.Files))
+
+		// Never replace the full proposal with a subset repair reply —
+		// overlay repaired files onto the prior set (and keep baseline
+		// paths for full-home / prepared complex-page generations).
+		merged := mergeRepairIntoProposal(result, retried)
+		if preserveScope {
+			if missing := missingProposalPaths(scopeBaseline, merged); len(missing) > 0 {
+				slog.Warn("checkAndRepair: repair shrank full-home proposal — restoring baseline files",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+					"attempt", attempt, "missing", missing,
+					"repair_paths", repairPaths)
+				merged = mergeRepairIntoProposal(scopeBaseline, merged)
+			} else if len(repairPaths) > 0 && len(repairPaths) < len(scopeBaseline.Files) {
+				slog.Info("checkAndRepair: repair returned subset — merged into full-home baseline",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+					"attempt", attempt,
+					"baseline_count", len(scopeBaseline.Files),
+					"repair_count", len(repairPaths),
+					"merged_count", len(merged.Files))
+			}
+		}
+		slog.Info("checkAndRepair: merged final proposal paths",
+			"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+			"attempt", attempt,
+			"paths", proposalPaths(merged),
+			"file_count", len(merged.Files))
+		result = merged
+		normalizeProposedDeletes(result, in.Prompt)
 	}
 }
 
@@ -714,12 +982,26 @@ func recapAssistantTurn(result *ai.Result) string {
 // read a file before editing it — there is nothing to look up here for any
 // file already in that recap; explicitly saying so is what stops the model
 // from calling read_theme_file on it "just in case" anyway.
-func repairPrompt(errorFindings []themecheck.Finding) string {
+//
+// preserveComplete is true for full-home / prepared complex-page generations:
+// the server merges any subset repair back onto the prior proposal, but the
+// model still needs an explicit instruction not to drop homepage sections
+// when it re-emits propose_changes.
+func repairPrompt(errorFindings []themecheck.Finding, preserveComplete bool) string {
 	var b strings.Builder
 	b.WriteString("Your last proposal failed validation against the theme engine spec. Fix ONLY these specific " +
 		"problems, in ONLY the file(s) named below, and resubmit the complete corrected set of files (not a diff):\n\n")
 	for _, f := range errorFindings {
 		fmt.Fprintf(&b, "- %s\n", formatFindingLine(f))
+	}
+	if preserveComplete {
+		b.WriteString("\nThis was a full homepage / complex-page generation. Preserve the complete previous " +
+			"proposal: every liquid, CSS, and JS file already listed in your message above must remain in the " +
+			"final propose_changes call. Only correct the reported validation findings — do not remove unrelated " +
+			"homepage files or sections (hero/slider, services, products, portfolio, testimonials, CTA, footer, etc.). " +
+			"If you only need to fix CSS theme tokens, you may re-emit just those corrected files; the server will " +
+			"merge them into the prior full proposal. Prefer re-emitting the complete proposal when practical so " +
+			"nothing is omitted.\n")
 	}
 	b.WriteString("\nThe exact current content of every file in your last proposal is already in your message " +
 		"above — that IS the real, current content (not a reconstruction from memory), so do not call " +
@@ -755,6 +1037,179 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 		"results above) — trying another old_string/new_string pair risks the identical mismatch, and the file's " +
 		"exact current content is already right here, so a full \"update\" costs nothing extra to get right.")
 	return b.String()
+}
+
+// shouldPreserveProposalScope reports whether this generation must keep the
+// first proposal's file set as the minimum scope across themecheck repairs
+// (full homepage redesign or prepared complex-page create).
+// Multi-page create is excluded: preserving scope re-staged huge blog.liquid
+// rewrites through repair and caused the −1800-line churn failure mode.
+func shouldPreserveProposalScope(in GenerateInput, tc ai.ThemeContext) bool {
+	if isMultiPageCreatePrompt(in.Prompt) {
+		return false
+	}
+	return tc.PageCreatePrepared || isFullHomePageRedesignPrompt(in.Prompt)
+}
+
+// proposalPaths returns the file paths in result for structured logging.
+func proposalPaths(result *ai.Result) []string {
+	if result == nil {
+		return nil
+	}
+	paths := make([]string, len(result.Files))
+	for i, f := range result.Files {
+		paths[i] = f.Path
+	}
+	return paths
+}
+
+func findingPaths(findings []themecheck.Finding) []string {
+	seen := map[string]bool{}
+	var paths []string
+	for _, f := range findings {
+		if f.Path == "" || seen[f.Path] {
+			continue
+		}
+		seen[f.Path] = true
+		paths = append(paths, f.Path)
+	}
+	return paths
+}
+
+// cloneResultFiles deep-copies Files / layout registration fields used as the
+// repair-scope baseline. Summary and token counters are copied shallowly.
+func cloneResultFiles(result *ai.Result) *ai.Result {
+	if result == nil {
+		return nil
+	}
+	out := *result
+	if result.Files != nil {
+		out.Files = make([]ai.GeneratedFile, len(result.Files))
+		for i, f := range result.Files {
+			out.Files[i] = f
+			if f.Edits != nil {
+				out.Files[i].Edits = append([]ai.Edit(nil), f.Edits...)
+			}
+		}
+	}
+	if result.LayoutLinksToAdd != nil {
+		out.LayoutLinksToAdd = append([]string(nil), result.LayoutLinksToAdd...)
+	}
+	if result.LayoutScriptsToAdd != nil {
+		out.LayoutScriptsToAdd = append([]string(nil), result.LayoutScriptsToAdd...)
+	}
+	if result.PageRegistryEntry != nil {
+		entry := *result.PageRegistryEntry
+		out.PageRegistryEntry = &entry
+	}
+	return &out
+}
+
+// mergeRepairIntoProposal overlays repair's files onto prior. Untouched prior
+// paths are preserved; repair paths replace by path; new repair paths append.
+// An empty/nil repair file list leaves prior files intact (the audit failure
+// mode where a CSS-only repair wiped the homepage).
+func mergeRepairIntoProposal(prior, repair *ai.Result) *ai.Result {
+	if prior == nil {
+		return repair
+	}
+	if repair == nil {
+		return cloneResultFiles(prior)
+	}
+	out := cloneResultFiles(prior)
+	if repair.Summary != "" {
+		out.Summary = repair.Summary
+	}
+	out.ExplorationToolCalls = repair.ExplorationToolCalls
+	// Tokens are accumulated by the caller; keep repair's per-call counts on
+	// the object for diagnostics until the success path overwrites totals.
+	out.InputTokens = repair.InputTokens
+	out.OutputTokens = repair.OutputTokens
+	// Never inherit needs_clarification / answered_question from a subset
+	// repair: clearIfNoChangesIntended may have emptied repair.Files, and
+	// those flags would otherwise mark a still-full merged draft as a no-op.
+	out.NeedsClarification = false
+	out.AnsweredQuestion = false
+
+	if len(repair.Files) == 0 {
+		// Subset/empty repair: keep prior files. Still merge any layout
+		// registration the repair managed to include.
+		out.LayoutLinksToAdd = unionStrings(out.LayoutLinksToAdd, repair.LayoutLinksToAdd)
+		out.LayoutScriptsToAdd = unionStrings(out.LayoutScriptsToAdd, repair.LayoutScriptsToAdd)
+		if repair.PageRegistryEntry != nil {
+			out.PageRegistryEntry = repair.PageRegistryEntry
+		}
+		return out
+	}
+	out.NeedsClarification = repair.NeedsClarification
+	out.AnsweredQuestion = repair.AnsweredQuestion
+
+	byPath := make(map[string]int, len(out.Files))
+	for i, f := range out.Files {
+		byPath[f.Path] = i
+	}
+	for _, f := range repair.Files {
+		// Never let an empty repair overwrite a prior full file — that is
+		// how apply later 422s ("content field is required") after a
+		// themecheck "fix" that blanked a path. Explicit deletes are OK.
+		if strings.TrimSpace(f.Content) == "" && f.Action != "delete" {
+			continue
+		}
+		if i, ok := byPath[f.Path]; ok {
+			out.Files[i] = f
+			continue
+		}
+		byPath[f.Path] = len(out.Files)
+		out.Files = append(out.Files, f)
+	}
+	out.LayoutLinksToAdd = unionStrings(out.LayoutLinksToAdd, repair.LayoutLinksToAdd)
+	out.LayoutScriptsToAdd = unionStrings(out.LayoutScriptsToAdd, repair.LayoutScriptsToAdd)
+	if repair.PageRegistryEntry != nil {
+		out.PageRegistryEntry = repair.PageRegistryEntry
+	}
+	return out
+}
+
+func missingProposalPaths(baseline, current *ai.Result) []string {
+	if baseline == nil || len(baseline.Files) == 0 {
+		return nil
+	}
+	have := map[string]bool{}
+	if current != nil {
+		for _, f := range current.Files {
+			have[f.Path] = true
+		}
+	}
+	var missing []string
+	for _, f := range baseline.Files {
+		if !have[f.Path] {
+			missing = append(missing, f.Path)
+		}
+	}
+	return missing
+}
+
+func unionStrings(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(a)+len(b))
+	for _, s := range a {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, s := range b {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // appendWarningsNote appends a short, merchant-readable note listing any
@@ -797,8 +1252,20 @@ func validateProposal(r *ai.Result, mode string) error {
 		if err := themefs.ValidateGeneratedFilePath(f.Path); err != nil {
 			return fmt.Errorf("proposed file rejected: %w", err)
 		}
-		if f.Action != "create" && f.Action != "update" {
+		if f.Action != "create" && f.Action != "update" && f.Action != "delete" {
 			return fmt.Errorf("file %q: invalid action %q", f.Path, f.Action)
+		}
+		if f.Action == "delete" {
+			if err := rejectProtectedDelete(f.Path); err != nil {
+				return err
+			}
+			continue
+		}
+		// flowpos StoreThemeFileRequest requires content (or a file upload).
+		// An empty string fails as 422 "content field is required" at apply —
+		// reject here so the draft never stages a write that cannot succeed.
+		if strings.TrimSpace(f.Content) == "" {
+			return fmt.Errorf("file %q: content must not be empty", f.Path)
 		}
 		// liquid/layout-start.liquid and liquid/layout-end.liquid are no
 		// longer rejected here — a files[] entry may edit either directly
@@ -822,6 +1289,17 @@ func validateProposal(r *ai.Result, mode string) error {
 		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
 			return fmt.Errorf("proposed layout js link rejected: %w", err)
 		}
+	}
+	return nil
+}
+
+// rejectProtectedDelete blocks deleting files that would brick the theme.
+func rejectProtectedDelete(relPath string) error {
+	low := strings.ToLower(strings.TrimSpace(relPath))
+	switch low {
+	case "pages.json", "defaults.json", "pages/home.liquid",
+		"liquid/layout-start.liquid", "liquid/layout-end.liquid":
+		return fmt.Errorf("file %q: cannot delete this core theme file — update it instead", relPath)
 	}
 	return nil
 }

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -51,18 +52,15 @@ type Image struct {
 	MediaType string
 }
 
-// GeneratedFile is one file the model proposes creating, updating, or
-// editing. Action "edit" is a wire-format optimization only — see
-// MaterializeEdits, which Generate calls immediately after parsing
+// GeneratedFile is one file the model proposes creating, updating,
+// editing, or deleting. Action "edit" is a wire-format optimization only —
+// see MaterializeEdits, which Generate calls immediately after parsing
 // propose_changes' input: by the time a *Result leaves Generate, every file
-// is "create" or "update" with real Content, and Edits is always empty.
-// Nothing downstream of Generate (themebuild, themecheck, the write plan)
-// ever sees "edit" — this field's zero value (nil) already behaves as "no
-// edits", so a fake generator or eval fixture built directly in Go, never
-// through JSON, needs no special-casing.
+// is "create", "update", or "delete" with real Content ("" / marker for
+// delete), and Edits is always empty.
 type GeneratedFile struct {
 	Path    string `json:"path"`
-	Action  string `json:"action"` // "create" | "update" | "edit"
+	Action  string `json:"action"` // "create" | "update" | "edit" | "delete"
 	Content string `json:"content"`
 	Edits   []Edit `json:"edits"`
 }
@@ -182,6 +180,11 @@ type ThemeContext struct {
 	// PageCreateAllowRead permits a single read_theme_file when prepared
 	// context is thin (mirrors SimpleEditAllowRead).
 	PageCreateAllowRead bool
+	// CompoundAtomicCreate marks one step of a compound multi-page workflow.
+	// When set, generateValidProposal must NOT apply the batch N-page +
+	// pages.json gate — each step uses the canonical single-page contract
+	// (one liquid create + page_registry_entry).
+	CompoundAtomicCreate bool
 	// MaxExplorationToolCalls overrides maxExplorationToolCalls when > 0
 	// (still subject to DisableExplorationBrake).
 	MaxExplorationToolCalls int
@@ -199,6 +202,15 @@ type ThemeContext struct {
 	// FullHomeRedesign marks a whole-homepage rebuild — nudge/token budgets
 	// must ship a complete proposal, never ask the merchant to split.
 	FullHomeRedesign bool
+	// TenantID / ChatID / GenerationID are observability-only correlation
+	// fields set by themebuild for structured logs. They never affect
+	// prompts, tools, budgets, or model selection.
+	TenantID     uint64
+	ChatID       string
+	GenerationID string
+	// Metrics, when non-nil, accumulates Phase 0 counters for this
+	// generation. Owned by themebuild.doGenerate; never a global map.
+	Metrics *TurnMetrics
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -327,8 +339,17 @@ func (g *Generator) SupportsVision() bool {
 // that plumbing is still being debugged. Swap back to New(...) once done —
 // see config.Config.FakeAIMode / the AI_CHAT_FAKE_MODE env var.
 func NewFake(fakeDelay time.Duration) *Generator {
-	return &Generator{fake: true, fakeDelay: fakeDelay, tokenBudgets: DefaultTokenBudgets()}
+	return &Generator{
+		fake: true, fakeDelay: fakeDelay, tokenBudgets: DefaultTokenBudgets(),
+		provider: "fake", modelName: "fake",
+	}
 }
+
+// Provider returns the coarse log tag ("anthropic" | "deepseek" | "fake").
+func (g *Generator) Provider() string { return g.provider }
+
+// ModelName returns the configured text-model string used in timing logs.
+func (g *Generator) ModelName() string { return g.modelName }
 
 // fakeGenerate is NewFake's whole implementation — see its doc comment.
 // Deliberately proposes zero file changes: a fixed placeholder path/content
@@ -402,18 +423,20 @@ var resultSchema = map[string]any{
 				"properties": map[string]any{
 					"path": map[string]any{"type": "string", "description": "Theme-root-relative path, e.g. 'pages/offers.liquid'."},
 					"action": map[string]any{
-						"type": "string", "enum": []string{"create", "update", "edit"},
+						"type": "string", "enum": []string{"create", "update", "edit", "delete"},
 						"description": "'create'/'update': content is the full file, edits is []. 'edit': content is \"\", " +
-							"edits is a non-empty list of find/replace pairs applied to the file's current content.",
+							"edits is a non-empty list of find/replace pairs applied to the file's current content. " +
+							"'delete': remove the file from the theme entirely — content must be \"\", edits []. " +
+							"Use delete when the merchant asks to remove/delete page or component files (and drop matching pages.json entries in the same turn when deleting pages).",
 					},
 					"content": map[string]any{
 						"type": "string",
 						"description": "Full file content for 'create'/'update' — never a diff or partial snippet. " +
-							"\"\" for 'edit', where edits carries the change instead.",
+							"\"\" for 'edit' (edits carries the change) and for 'delete'.",
 					},
 					"edits": map[string]any{
 						"type":        "array",
-						"description": "Find/replace pairs for action 'edit' — [] for 'create'/'update'. Applied in order.",
+						"description": "Find/replace pairs for action 'edit' — [] for 'create'/'update'/'delete'. Applied in order.",
 						"items": map[string]any{
 							"type":                 "object",
 							"additionalProperties": false,
@@ -485,12 +508,10 @@ func modelSupportsAdaptiveThinking(model anthropic.Model) bool {
 	return !strings.Contains(strings.ToLower(model), "haiku")
 }
 
-// deepSeekMustDisableThinking is true for DeepSeek prepared/simple-edit turns.
-// DeepSeek V4 enables thinking by DEFAULT when the field is omitted — that
-// alone caused 25s+ TTFT hangs and 400s on named tool_choice. Explicit
-// thinking:{type:disabled} turns it off so we can force propose_changes.
+// deepSeekMustDisableThinking is kept as a thin alias for call sites/tests
+// that historically used this name — prefer mustDisableThinking.
 func (g *Generator) deepSeekMustDisableThinking(tc ThemeContext) bool {
-	return g.provider == "deepseek" && (tc.PageCreatePrepared || tc.SimpleEditOneShot)
+	return g.mustDisableThinking(tc)
 }
 
 // useAdaptiveThinking reports whether this call sends thinking:adaptive.
@@ -498,16 +519,17 @@ func (g *Generator) useAdaptiveThinking(tc ThemeContext, model anthropic.Model) 
 	if !modelSupportsAdaptiveThinking(model) {
 		return false
 	}
-	if g.deepSeekMustDisableThinking(tc) {
+	if g.mustDisableThinking(tc) {
 		return false
 	}
 	return true
 }
 
 // applyThinkingConfig sets Thinking / OutputConfig on params for this call.
-// DeepSeek prepared turns MUST send type=disabled (omit ≠ off on V4).
+// DeepSeek prepared/simple-edit/repair turns MUST send type=disabled
+// (omit ≠ off on V4).
 func (g *Generator) applyThinkingConfig(params *anthropic.MessageNewParams, tc ThemeContext, model anthropic.Model, effort anthropic.OutputConfigEffort) {
-	if g.deepSeekMustDisableThinking(tc) {
+	if g.mustDisableThinking(tc) {
 		disabled := anthropic.NewThinkingConfigDisabledParam()
 		params.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &disabled}
 		return
@@ -642,6 +664,7 @@ func proposeInputFromMessage(message anthropic.Message) json.RawMessage {
 	}
 	return nil
 }
+
 // Generate asks Claude for the file changes implementing prompt, given the
 // theme context and prior conversation turns. The model drives a tool loop:
 // each call may return one or more tool_use blocks, which toolExec executes
@@ -710,9 +733,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	if last := len(messages) - 1; last >= 0 {
 		lastBlock := messages[last].Content[len(messages[last].Content)-1]
 		if lastBlock.OfText != nil && lastBlock.OfText.Text != "" {
-			cacheControl := anthropic.NewCacheControlEphemeralParam()
-			cacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
-			lastBlock.OfText.CacheControl = cacheControl
+			g.applyCacheControlEphemeral(lastBlock.OfText)
 		}
 	}
 	if len(images) > 0 {
@@ -739,10 +760,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	// requires a minimum prefix length (512-4096 tokens depending on
 	// model) below which this silently doesn't cache rather than erroring.
 	dynamicBlock := anthropic.TextBlockParam{Text: dynamicSystemPrompt(tc)}
-	dynamicCacheControl := anthropic.NewCacheControlEphemeralParam()
-	dynamicCacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
-	dynamicBlock.CacheControl = dynamicCacheControl
-	system := []anthropic.TextBlockParam{staticSystemPromptBlock(), dynamicBlock}
+	g.applyCacheControlEphemeral(&dynamicBlock)
+	system := []anthropic.TextBlockParam{g.staticSystemPromptBlock(), dynamicBlock}
 
 	var totalInputTokens, totalOutputTokens int64
 	// explorationToolCalls counts every list_theme_files/read_theme_file/
@@ -771,13 +790,24 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	forceProposeNext := false
 	explorationOnlyStreak := 0
 	zeroToolNudges := 0
+	forcedProposeCount := 0
+	proposeNudgeCount := 0
 	readPathCounts := map[string]int{}
 	var firstTokenLogged bool
 	var ttftMs int64
+	var ttftAvailable bool
+	systemPromptBytes := len(system[0].Text) + len(system[1].Text)
+	toolSchemaBytes := estimateToolsSchemaBytes(tools)
+	tc.Metrics.RecordGenerateCall(tc.Repair)
+	tc.Metrics.RecordRequestShape(systemPromptBytes, toolSchemaBytes, estimateMessagesBytes(messages), len(messages))
 	defer func() {
-		slog.Info("ai: generate call finished",
+		attrs := []any{
+			"tenant_id", tc.TenantID,
+			"chat_id", tc.ChatID,
+			"generation_id", tc.GenerationID,
 			"provider", g.provider,
 			"model", g.modelName,
+			"generation_mode", tc.GenerationMode,
 			"iterations_used", iterationsUsed,
 			"iteration_budget", iterationBudget,
 			"effort", string(callEffort),
@@ -786,8 +816,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			"page_create_prepared", tc.PageCreatePrepared,
 			"page_create_allow_read", tc.PageCreateAllowRead,
 			"simple_edit_one_shot", tc.SimpleEditOneShot,
+			"thinking_disabled", g.mustDisableThinking(tc),
 			"elapsed_ms", time.Since(generateStart).Milliseconds(),
-			"ttft_ms", ttftMs,
+			"ttft_available", ttftAvailable,
 			"model_elapsed_ms", totalModelElapsed.Milliseconds(),
 			"tool_elapsed_ms", totalToolElapsed.Milliseconds(),
 			"total_input_tokens", totalInputTokens,
@@ -795,7 +826,19 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			"total_reasoning_tokens", totalReasoningTokens,
 			"reasoning_tokens_reported", reasoningTokensReported,
 			"exploration_tool_calls", explorationToolCalls,
-			"zero_tool_nudges", zeroToolNudges)
+			"zero_tool_nudges", zeroToolNudges,
+			"forced_propose_count", forcedProposeCount,
+			"propose_nudge_count", proposeNudgeCount,
+			"system_prompt_bytes", systemPromptBytes,
+			"tool_schema_bytes", toolSchemaBytes,
+			"message_input_bytes", estimateMessagesBytes(messages),
+			"message_count", len(messages),
+			"total_input_bytes", systemPromptBytes + toolSchemaBytes + estimateMessagesBytes(messages),
+		}
+		if ttftAvailable {
+			attrs = append(attrs, "ttft_ms", ttftMs)
+		}
+		slog.Info("ai: generate call finished", attrs...)
 	}()
 	for iteration := 0; iteration < iterationBudget; iteration++ {
 		iterationsUsed = iteration + 1
@@ -810,21 +853,33 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			}
 		}
 		forceProposeNext = false
+		callTools := tools
+		if forcingPropose && (tc.PageCreatePrepared || tc.SimpleEditOneShot) {
+			// DeepSeek sometimes ignores tool_choice=propose_changes while
+			// read_theme_file remains available — explore until budget dies
+			// ("another pass couldn't finish"). When forcing, expose ONLY
+			// propose_changes so the model cannot keep grepping.
+			callTools = []anthropic.ToolUnionParam{proposeChangesTool()}
+		}
 		if forcingPropose {
 			// DeepSeek V4 defaults to thinking ON; named tool_choice 400s unless
-			// we explicitly send thinking:{type:disabled}. When disabled, force
-			// propose_changes like Anthropic. Otherwise nudge + any.
-			if g.provider == "deepseek" && !g.deepSeekMustDisableThinking(tc) {
+			// we explicitly send thinking:{type:disabled}. When disabled (or on
+			// Anthropic), force propose_changes. Otherwise nudge + any.
+			if !g.canForceNamedToolChoice(tc) {
 				slog.Info("ai: propose_changes nudge (deepseek: no forced tool_choice with thinking)",
 					"iteration", iteration, "max_tool_iterations", iterationBudget,
 					"page_create_prepared", tc.PageCreatePrepared,
 					"provider", g.provider, "model", g.modelName)
+				proposeNudgeCount++
+				tc.Metrics.RecordProposeNudge()
 			} else {
 				toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
 				slog.Info("ai: forcing propose_changes near tool-loop budget ceiling",
 					"iteration", iteration, "max_tool_iterations", iterationBudget,
 					"provider", g.provider, "model", g.modelName,
-					"thinking_disabled", g.deepSeekMustDisableThinking(tc))
+					"thinking_disabled", g.mustDisableThinking(tc))
+				forcedProposeCount++
+				tc.Metrics.RecordForcedPropose()
 			}
 		}
 		params := anthropic.MessageNewParams{
@@ -832,7 +887,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			MaxTokens:  callMaxTokens,
 			System:     system,
 			Messages:   messages,
-			Tools:      tools,
+			Tools:      callTools,
 			ToolChoice: toolChoice,
 		}
 		if forcingPropose {
@@ -874,6 +929,24 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// Haiku rejects adaptive thinking/effort (400). DeepSeek prepared
 		// turns must send thinking:disabled — omit leaves V4 thinking ON.
 		g.applyThinkingConfig(&params, tc, callModel, callEffort)
+		tc.Metrics.RecordRequestShape(systemPromptBytes, estimateToolsSchemaBytes(callTools), estimateMessagesBytes(messages), len(messages))
+		slog.Info("ai: provider request shape",
+			"tenant_id", tc.TenantID,
+			"chat_id", tc.ChatID,
+			"generation_id", tc.GenerationID,
+			"provider", g.provider,
+			"model", string(callModel),
+			"iteration", iteration,
+			"generation_mode", tc.GenerationMode,
+			"effort", string(callEffort),
+			"max_tokens", callMaxTokens,
+			"forcing_propose", forcingPropose,
+			"thinking_disabled", g.mustDisableThinking(tc),
+			"system_prompt_bytes", systemPromptBytes,
+			"tool_schema_bytes", estimateToolsSchemaBytes(callTools),
+			"message_input_bytes", estimateMessagesBytes(messages),
+			"message_count", len(messages),
+			"total_input_bytes", systemPromptBytes+estimateToolsSchemaBytes(callTools)+estimateMessagesBytes(messages))
 		var message anthropic.Message
 		// modelCallStart/attemptsUsed cover every streamAccumulateMaxAttempts
 		// retry within this one iteration — a slow iteration due to a
@@ -882,23 +955,41 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		modelCallStart := time.Now()
 		attemptsUsed := 0
 		var streamRetryCount int
+		var streamRetryWaitMs int64
+		var callTTFTMs int64
+		var callTTFTAvailable bool
 		maxStreamAttempts := streamAccumulateMaxAttempts
 		if tc.StreamMaxAttemptsOverride > maxStreamAttempts {
 			maxStreamAttempts = tc.StreamMaxAttemptsOverride
 		}
+		// Shared TTFT child budget across retries in this iteration — retries
+		// must not each receive a fresh full timeout window.
+		sharedFirstTokenBudget := tc.FirstTokenTimeoutOverride
+		if sharedFirstTokenBudget <= 0 {
+			sharedFirstTokenBudget = g.streamFirstTokenTimeout()
+		}
+		sharedFirstTokenBudget = ClampFirstTokenToParent(ctx, sharedFirstTokenBudget)
 		for attempt := 1; attempt <= maxStreamAttempts; attempt++ {
 			attemptsUsed = attempt
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if sp, ok := progress.(StreamStatusProgress); ok {
 				sp.WaitingForAI(iteration, attempt)
 			}
-			// Escalate TTFT slightly on retries for prepared/full-home — DeepSeek
-			// sometimes queues longer on the second attempt after a cold miss.
-			ftOverride := tc.FirstTokenTimeoutOverride
-			if attempt > 1 && ftOverride > 0 {
-				ftOverride = ftOverride + 30*time.Second
+			if attempt > 1 && sharedFirstTokenBudget < minFirstTokenRetryBudget {
+				tc.Metrics.RecordProviderRetries(streamRetryCount)
+				tc.Metrics.AddProviderRetryWaitMs(streamRetryWaitMs)
+				return nil, errStreamFirstTokenTimeout
 			}
+			ftOverride := sharedFirstTokenBudget
+			attemptStart := time.Now()
 			msg, meta, streamErr := g.consumeProviderStream(ctx, params, onDelta, attempt, iteration, generateStart, &firstTokenLogged, &ttftMs, ftOverride, tc.StreamIdleTimeoutOverride, progress)
 			message = msg
+			if !meta.FirstDeltaAt.IsZero() {
+				callTTFTMs, callTTFTAvailable = ComputeTTFTMs(meta.StreamStart, meta.FirstDeltaAt)
+				ttftAvailable = true
+			}
 			if streamErr == nil {
 				logStreamAttempt(g, iteration, meta, message, nil, "success")
 				break
@@ -907,9 +998,18 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				if sp, ok := progress.(StreamStatusProgress); ok {
 					sp.FirstTokenTimeout(iteration, attempt)
 				}
+				used := time.Since(attemptStart)
+				if used < sharedFirstTokenBudget {
+					sharedFirstTokenBudget -= used
+				} else {
+					sharedFirstTokenBudget = 0
+				}
 			}
 			retryable := isRetryableStreamErr(streamErr)
 			canRetry := retryable && attempt < maxStreamAttempts
+			if errors.Is(streamErr, errStreamFirstTokenTimeout) && sharedFirstTokenBudget < minFirstTokenRetryBudget {
+				canRetry = false
+			}
 			retryDecision := "fail"
 			switch {
 			case canRetry:
@@ -929,6 +1029,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				"attempt", attempt,
 				"stream_elapsed_ms", meta.StreamDurationMs,
 				"last_progress_ms", meta.IdleWaitMs,
+				"ttft_available", callTTFTAvailable,
 				"error_type", classifyStreamErr(streamErr),
 				"retry_decision", retryDecision,
 				"retry_count", streamRetryCount,
@@ -949,28 +1050,24 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 						break
 					}
 				}
+				tc.Metrics.RecordProviderRetries(streamRetryCount)
+				tc.Metrics.AddProviderRetryWaitMs(streamRetryWaitMs)
 				return nil, streamErr
 			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(streamAccumulateRetryDelay):
+				streamRetryWaitMs += streamAccumulateRetryDelay.Milliseconds()
 			}
 		}
 		modelElapsed := time.Since(modelCallStart)
 		totalModelElapsed += modelElapsed
 		totalInputTokens += message.Usage.InputTokens
 		totalOutputTokens += message.Usage.OutputTokens
-		// OutputTokensDetails is a plain value struct (never nil), and
-		// ThinkingTokens a plain int64 — no pointer to guard. Whether the
-		// provider actually populated it is instead tracked by the SDK's own
-		// presence marker (respjson.Field.Valid, same mechanism used for
-		// every other optional field on Usage): reasoningTokensValid is
-		// false when DeepSeek's response omitted output_tokens_details (or
-		// its thinking_tokens) entirely, distinguishing that from a
-		// genuinely-reported 0.
-		reasoningTokens := message.Usage.OutputTokensDetails.ThinkingTokens
-		reasoningTokensValid := message.Usage.OutputTokensDetails.JSON.ThinkingTokens.Valid()
+		tc.Metrics.RecordProviderRetries(streamRetryCount)
+		tc.Metrics.AddProviderRetryWaitMs(streamRetryWaitMs)
+		_, _, reasoningTokens, reasoningTokensValid, cacheRead, cacheCreate, cacheReadOK, cacheCreateOK := usageTokenParts(message.Usage)
 		totalReasoningTokens += reasoningTokens
 		if reasoningTokensValid {
 			reasoningTokensReported = true
@@ -1008,27 +1105,36 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		slog.Info("ai: tool-loop iteration", "iteration", iteration, "tools_called", toolNames, "stop_reason", message.StopReason)
 		// Model-call latency/token breakdown for this iteration only — see
 		// theories 1 (reasoning tax) and 2 (prompt caching) in the
-		// diagnostics task this instruments. cache_read_input_tokens > 0 on
-		// iteration 2+ means caching is actually working (whether or not
-		// Anthropic's cache_control is what triggered it).
-		slog.Info("ai: model call timing",
+		// diagnostics task this instruments. Optional token fields use
+		// *_available rather than a fake zero when the provider omitted them.
+		modelTimingAttrs := []any{
+			"tenant_id", tc.TenantID,
+			"chat_id", tc.ChatID,
+			"generation_id", tc.GenerationID,
 			"provider", g.provider,
 			"model", g.modelName,
 			"iteration", iteration,
+			"model_call_started_at", modelCallStart.UTC().Format(time.RFC3339Nano),
 			"elapsed_ms", modelElapsed.Milliseconds(),
+			"ttft_available", callTTFTAvailable,
 			"attempts_used", attemptsUsed,
 			"stream_retry_count", streamRetryCount,
 			"forcing_propose", forcingPropose,
-			"input_tokens", message.Usage.InputTokens,
-			"output_tokens", message.Usage.OutputTokens,
-			"cache_read_input_tokens", message.Usage.CacheReadInputTokens,
-			"cache_creation_input_tokens", message.Usage.CacheCreationInputTokens,
-			"reasoning_tokens", reasoningTokens,
-			"reasoning_tokens_reported", reasoningTokensValid,
 			"text_block_count", textBlockCount,
 			"text_chars", textChars,
-			"tool_use_count", len(toolUses))
-
+			"tool_use_count", len(toolUses),
+		}
+		if callTTFTAvailable {
+			modelTimingAttrs = append(modelTimingAttrs, "ttft_ms", callTTFTMs)
+		}
+		modelTimingAttrs = append(modelTimingAttrs, usageTokenAttrs(message.Usage)...)
+		slog.Info("ai: model call timing", modelTimingAttrs...)
+		tc.Metrics.RecordModelIteration(
+			modelElapsed.Milliseconds(), callTTFTMs, callTTFTAvailable,
+			message.Usage.InputTokens, message.Usage.OutputTokens,
+			reasoningTokens, reasoningTokensValid,
+			cacheRead, cacheCreate, cacheReadOK, cacheCreateOK,
+		)
 		// Thrash brake: exploration-only iterations that burn huge output
 		// tokens (or too many consecutive exploration turns / tool calls)
 		// force propose_changes on the next iteration instead of only
@@ -1124,6 +1230,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				result.InputTokens = totalInputTokens
 				result.OutputTokens = totalOutputTokens
 				result.ExplorationToolCalls = explorationToolCalls
+				tc.Metrics.RecordProposeCall()
 				return &result, nil
 			}
 			slog.Warn("ai: propose_changes edit materialization failed, retrying", "iteration", iteration)
@@ -1135,6 +1242,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			// round-trips) in the diagnostics task this instruments.
 			slog.Warn("ai: tool-loop nudge fired (zero tool calls despite forced tool_choice)", "iteration", iteration)
 			zeroToolNudges++
+			tc.Metrics.RecordZeroToolNudge()
 			// Real Anthropic's ToolChoice: OfAny guarantees at least one tool
 			// call. DeepSeek's Anthropic-compat endpoint does NOT honor that
 			// guarantee — confirmed empirically: a plain "hello"/"hi" gets a
@@ -1186,10 +1294,16 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			output, err := toolExec(ctx, tu.Name, tu.Input)
 			toolElapsed := time.Since(toolCallStart)
 			totalToolElapsed += toolElapsed
+			tc.Metrics.RecordToolCall(tu.Name, toolElapsed.Milliseconds())
 			slog.Info("ai: tool exec timing",
+				"tenant_id", tc.TenantID,
+				"chat_id", tc.ChatID,
+				"generation_id", tc.GenerationID,
 				"provider", g.provider, "model", g.modelName,
 				"iteration", iteration, "tool", tu.Name,
-				"elapsed_ms", toolElapsed.Milliseconds(), "error", err != nil)
+				"elapsed_ms", toolElapsed.Milliseconds(),
+				"success", err == nil,
+				"error", err != nil)
 			isError := err != nil
 			if progress != nil {
 				progress.ToolFinished(tu.Name, summarizeToolResult(tu.Name, output, err), err)
@@ -1200,6 +1314,15 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				output = excerptReadThemeFileResult(output)
 				output, forceProposeNext = compactReadThemeFileResult(output, tu.Input, readPathCounts, forceProposeNext)
 			}
+			tc.Metrics.AddToolResultBytes(len(output))
+			slog.Info("ai: tool result size",
+				"tenant_id", tc.TenantID,
+				"chat_id", tc.ChatID,
+				"generation_id", tc.GenerationID,
+				"iteration", iteration,
+				"tool", tu.Name,
+				"result_bytes", len(output),
+				"error", isError)
 			resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, output, isError))
 		}
 		messages = append(messages, anthropic.NewUserMessage(resultBlocks...))
@@ -1257,14 +1380,10 @@ func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error)
 
 // staticSystemPromptBlock is the theme-engine spec plus the fixed generation
 // rules — byte-identical on every single call, regardless of tenant, theme,
-// or request. It carries a 1h cache_control breakpoint so Anthropic's prompt
-// cache serves it on every call after the first instead of Claude
-// re-processing the full spec (and paying full input-token price for it) on
-// every single message.
-func staticSystemPromptBlock() anthropic.TextBlockParam {
-	cacheControl := anthropic.NewCacheControlEphemeralParam()
-	cacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
-	return anthropic.TextBlockParam{
+// or request. On Anthropic it carries a 1h cache_control breakpoint; DeepSeek
+// omits cache_control (unsupported on the compat endpoint).
+func (g *Generator) staticSystemPromptBlock() anthropic.TextBlockParam {
+	block := anthropic.TextBlockParam{
 		Text: fmt.Sprintf(`You generate Liquid theme code for the flowPOS storefront platform. You strictly
 follow the theme engine convention below — never Shopify's real theme conventions, never a
 different templating language, never a UI framework. This is a proprietary, simplified Liquid
@@ -1307,8 +1426,9 @@ Rules for every request:
     that matches defaults.json — do not spend many tool rounds then return needs_clarification
     with no files. Ask for clarification only when you truly cannot act safely; if you must ask,
     call propose_changes with needs_clarification immediately (no long exploration first).`, themeEngineSpec),
-		CacheControl: cacheControl,
 	}
+	g.applyCacheControlEphemeral(&block)
+	return block
 }
 
 // dynamicSystemPrompt is the per-request grounding that varies on every call
@@ -1348,10 +1468,14 @@ func formatManifest(m *themefs.Manifest) string {
 	if m == nil || len(m.Components) == 0 {
 		return ""
 	}
+	components := append([]themefs.ComponentInfo(nil), m.Components...)
+	sort.Slice(components, func(i, j int) bool { return components[i].Path < components[j].Path })
 	var b strings.Builder
 	b.WriteString("- Existing components/partials and their inferred params (pass these explicitly when you render one; read_theme_file it first if a param's purpose isn't obvious from its name):\n")
-	for _, c := range m.Components {
-		fmt.Fprintf(&b, "  - %s(%s)\n", c.Path, strings.Join(c.Params, ", "))
+	for _, c := range components {
+		params := append([]string(nil), c.Params...)
+		sort.Strings(params)
+		fmt.Fprintf(&b, "  - %s(%s)\n", c.Path, strings.Join(params, ", "))
 	}
 	return b.String()
 }

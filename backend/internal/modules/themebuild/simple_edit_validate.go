@@ -23,19 +23,19 @@ const (
 // when SimpleEditOneShot is set.
 func validateSimpleEditCompactness(result *ai.Result) error {
 	if result == nil {
-		return fmt.Errorf("simple_edit: empty proposal")
+		return fmt.Errorf("%w: empty proposal", ai.ErrSimpleEditBudget)
 	}
 	if len(result.Files) == 0 {
 		return nil // clarification / question — ok
 	}
 	if len(result.Files) > simpleEditMaxFiles {
-		return fmt.Errorf("simple_edit: too many files in changeset (%d > %d) — split the request",
-			len(result.Files), simpleEditMaxFiles)
+		return fmt.Errorf("%w: too many files in changeset (%d > %d)",
+			ai.ErrSimpleEditBudget, len(result.Files), simpleEditMaxFiles)
 	}
 	for _, f := range result.Files {
 		if strings.EqualFold(f.Action, "create") && utf8.RuneCountInString(f.Content) > simpleEditMaxUpdateChars {
-			return fmt.Errorf("simple_edit: create for %s is too large (%d chars) for a simple edit",
-				f.Path, utf8.RuneCountInString(f.Content))
+			return fmt.Errorf("%w: create for %s is too large (%d chars)",
+				ai.ErrSimpleEditBudget, f.Path, utf8.RuneCountInString(f.Content))
 		}
 	}
 	return nil

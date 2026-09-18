@@ -246,8 +246,10 @@ func TestDoGenerate_ZeroAttachmentMessage_SkipsContentFetch(t *testing.T) {
 	if strings.Contains(gotPrompt, "Attached reference file") {
 		t.Errorf("expected no HTML-attachment framing in the prompt for a text-only turn, got: %s", gotPrompt)
 	}
-	if gotPrompt != "make the header blue" {
-		t.Errorf("expected the prompt to pass through unmodified, got: %s", gotPrompt)
+	// Simple-edit one-shot wraps the merchant text in a local context package;
+	// the merchant prompt must still appear verbatim inside it.
+	if !strings.Contains(gotPrompt, "make the header blue") {
+		t.Errorf("expected merchant prompt inside model input, got: %s", gotPrompt)
 	}
 }
 

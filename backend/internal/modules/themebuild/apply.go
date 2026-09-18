@@ -5,9 +5,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"time"
 
 	"ai-chat/internal/themefs"
+	"ai-chat/internal/themeworkspace"
 
 	"github.com/google/uuid"
 )
@@ -91,22 +94,52 @@ func (s *Service) ApplyDraft(ctx context.Context, tenantID uint64, token, chatID
 	defer unlock()
 
 	plan := pendingFilesToPlan(files)
+	slog.Info("ai: apply started",
+		"chat_id", chatID, "tenant_id", tenantID, "theme_slug", themeSlug,
+		"file_count", len(plan.files),
+		"has_layout_start", plan.layoutStart != nil,
+		"has_layout_end", plan.layoutEnd != nil)
 
 	storeAuth := themefs.RequestAuth{Token: token, TenantID: tenantID}
 	written, err := s.commitWritePlan(ctx, storeAuth, plan)
 	if err != nil {
+		slog.Error("ai: apply failed",
+			"chat_id", chatID, "tenant_id", tenantID, "theme_slug", themeSlug, "error", err.Error())
 		return ApplyResult{}, fmt.Errorf("apply draft: %w", err)
 	}
 
 	if err := s.repo.MarkMessagesApplied(ctx, chatID, time.Now().UTC()); err != nil {
+		slog.Error("ai: apply mark-applied failed after successful writes",
+			"chat_id", chatID, "error", err.Error())
 		return ApplyResult{}, fmt.Errorf("mark draft applied: %w", err)
 	}
+
+	s.invalidateWorkspaceAfterApply(tenantID, themeSlug)
 
 	paths := make([]string, 0, len(written))
 	for _, w := range written {
 		paths = append(paths, w.generated.Path)
 	}
+	slog.Info("ai: apply completed",
+		"chat_id", chatID, "tenant_id", tenantID, "theme_slug", themeSlug,
+		"applied_paths", paths, "path_count", len(paths))
 	return ApplyResult{AppliedPaths: paths}, nil
+}
+
+// invalidateWorkspaceAfterApply bumps the local-first mirror so the next
+// generation cannot reuse a pre-Apply 15-minute-fresh workspace.
+func (s *Service) invalidateWorkspaceAfterApply(tenantID uint64, themeSlug string) {
+	if strings.TrimSpace(s.workspaceRoot) == "" {
+		slog.Info("ai: workspace cache invalidation skipped", "reason", "workspace_disabled")
+		return
+	}
+	mgr := themeworkspace.NewManager(s.workspaceRoot)
+	if err := mgr.InvalidateTheme(tenantID, themeSlug); err != nil {
+		slog.Warn("ai: workspace cache invalidation failed",
+			"tenant_id", tenantID, "theme_slug", themeSlug, "error", err.Error())
+		return
+	}
+	slog.Info("ai: workspace cache invalidated", "tenant_id", tenantID, "theme_slug", themeSlug)
 }
 
 func (s *Service) DraftFiles(ctx context.Context, tenantID uint64, token, chatID string) (map[string]string, error) {
@@ -127,6 +160,19 @@ func pendingFilesToPlan(files []GeneratedFile) writePlan {
 	proposedByPath := make(map[string]int) // path -> index into plan.files
 
 	for _, f := range files {
+		// Skip 0-byte proposed writes — flowpos rejects empty content with
+		// 422 and would roll back the whole apply. Deletes use a marker.
+		// Layout splices are also dropped if empty (a blank layout-* would brick the theme).
+		isDelete := f.Action == FileActionDelete || f.Content == DraftDeleteMarker
+		if !isDelete && strings.TrimSpace(f.Content) == "" {
+			slog.Warn("ai: apply skipping empty-content file",
+				"path", f.FilePath, "kind", string(f.Kind), "action", string(f.Action))
+			continue
+		}
+		if isDelete {
+			f.Action = FileActionDelete
+			f.Content = DraftDeleteMarker
+		}
 		switch f.Kind {
 		case GeneratedFileKindLayout:
 			pf := &planFile{path: f.FilePath, action: f.Action, content: f.Content}

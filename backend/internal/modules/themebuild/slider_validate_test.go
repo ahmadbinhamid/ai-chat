@@ -139,3 +139,16 @@ func TestIncompleteSliderImagesOnlyProposal(t *testing.T) {
 		t.Fatalf("images-only complete proposal must pass: %v", err)
 	}
 }
+
+func TestIncompleteSliderFeatureProposal_FullHomeSkipped(t *testing.T) {
+	prompt := `Regenerate the entire homepage from scratch as a premium software house website.
+Create a complete homepage with a 5-slide AI/technology image slider and services section.`
+	err := incompleteSliderFeatureProposal(prompt, &ai.Result{Files: []ai.GeneratedFile{{
+		Path:    "pages/home.liquid",
+		Action:  "update",
+		Content: "<h1>Software House</h1>",
+	}}})
+	if err != nil {
+		t.Fatalf("full-home redesign must not hard-fail on slider gate, got %v", err)
+	}
+}

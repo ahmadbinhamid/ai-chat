@@ -21,10 +21,12 @@ type fakeGenerator struct {
 	// none of them care); set true only in a test that specifically needs
 	// Generate's own len(in.Images) > 0 && !SupportsVision() gate to pass.
 	visionSupported bool
+	lastTC          ai.ThemeContext
 }
 
-func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ []ai.Image, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
+func (f *fakeGenerator) Generate(_ context.Context, tc ai.ThemeContext, _ []ai.Turn, _ string, _ []ai.Image, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
 	f.calls++
+	f.lastTC = tc
 	idx := f.calls - 1
 	if idx >= len(f.results) {
 		idx = len(f.results) - 1
@@ -285,13 +287,29 @@ func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
 	fg := &fakeGenerator{results: []*ai.Result{fixed}}
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
+	tc := ai.ThemeContext{
+		MaxTokensOverride: 24_000,
+		MaxToolIterations: 28,
+		FullHomeRedesign:  true,
+		Metrics:           &ai.TurnMetrics{},
+	}
 
-	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, first, snap, nil, nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", tc, nil, first, snap, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if fg.calls != 1 {
 		t.Fatalf("expected a violation in a brand-new file to trigger exactly 1 repair round-trip, got %d", fg.calls)
+	}
+	if !fg.lastTC.Repair {
+		t.Fatal("repair Generate must set ThemeContext.Repair")
+	}
+	if fg.lastTC.MaxTokensOverride != 0 {
+		t.Fatalf("repair must not inherit MaxTokensOverride, got %d", fg.lastTC.MaxTokensOverride)
+	}
+	if fg.lastTC.MaxToolIterations != 0 || fg.lastTC.FullHomeRedesign {
+		t.Fatalf("repair must strip full-page overrides, got iters=%d fullHome=%v",
+			fg.lastTC.MaxToolIterations, fg.lastTC.FullHomeRedesign)
 	}
 	if got.Summary != "fixed" {
 		t.Fatalf("expected the repaired result to be returned, got %+v", got)
@@ -346,5 +364,288 @@ func TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip(t *testing.T)
 `
 	if got.Files[0].Content != want {
 		t.Errorf("got %q, want %q", got.Files[0].Content, want)
+	}
+}
+
+func fileByPath(files []ai.GeneratedFile, path string) (ai.GeneratedFile, bool) {
+	for _, f := range files {
+		if f.Path == path {
+			return f, true
+		}
+	}
+	return ai.GeneratedFile{}, false
+}
+
+func TestMergeRepairIntoProposal_ReplacesOnlyTouchedFiles(t *testing.T) {
+	prior := &ai.Result{
+		Summary: "full home",
+		Files: []ai.GeneratedFile{
+			{Path: "pages/home.liquid", Action: "update", Content: "HOME_V1"},
+			{Path: "pages/css/home.css", Action: "create", Content: "CSS_BAD"},
+			{Path: "components/store-hero-banner.liquid", Action: "update", Content: "HERO_V1"},
+			{Path: "js/store-hero-banner.js", Action: "update", Content: "JS_V1"},
+		},
+		LayoutLinksToAdd: []string{"pages/css/home.css"},
+	}
+	repair := &ai.Result{
+		Summary: "fixed tokens",
+		Files: []ai.GeneratedFile{
+			{Path: "pages/css/home.css", Action: "create", Content: "CSS_FIXED"},
+		},
+	}
+	got := mergeRepairIntoProposal(prior, repair)
+	if len(got.Files) != 4 {
+		t.Fatalf("expected 4 files preserved, got %d: %v", len(got.Files), proposalPaths(got))
+	}
+	home, _ := fileByPath(got.Files, "pages/home.liquid")
+	if home.Content != "HOME_V1" {
+		t.Errorf("home.liquid should be untouched, got %q", home.Content)
+	}
+	css, _ := fileByPath(got.Files, "pages/css/home.css")
+	if css.Content != "CSS_FIXED" {
+		t.Errorf("home.css should be replaced, got %q", css.Content)
+	}
+	if got.Summary != "fixed tokens" {
+		t.Errorf("expected repair summary, got %q", got.Summary)
+	}
+}
+
+func TestMergeRepairIntoProposal_MultipleRepairFiles(t *testing.T) {
+	prior := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "pages/home.liquid", Action: "update", Content: "HOME"},
+			{Path: "pages/css/home.css", Action: "create", Content: "CSS1"},
+			{Path: "components/css/hero.css", Action: "create", Content: "CSS2"},
+			{Path: "components/testimonials.liquid", Action: "create", Content: "TESTI"},
+		},
+	}
+	repair := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "pages/css/home.css", Action: "create", Content: "CSS1_FIXED"},
+			{Path: "components/css/hero.css", Action: "create", Content: "CSS2_FIXED"},
+		},
+	}
+	got := mergeRepairIntoProposal(prior, repair)
+	if len(got.Files) != 4 {
+		t.Fatalf("expected 4 files, got %d", len(got.Files))
+	}
+	css1, _ := fileByPath(got.Files, "pages/css/home.css")
+	css2, _ := fileByPath(got.Files, "components/css/hero.css")
+	testi, _ := fileByPath(got.Files, "components/testimonials.liquid")
+	if css1.Content != "CSS1_FIXED" || css2.Content != "CSS2_FIXED" {
+		t.Errorf("repaired CSS not applied: %q / %q", css1.Content, css2.Content)
+	}
+	if testi.Content != "TESTI" {
+		t.Errorf("untouched file changed: %q", testi.Content)
+	}
+}
+
+func TestMergeRepairIntoProposal_EmptyRepairKeepsPrior(t *testing.T) {
+	prior := &ai.Result{
+		Summary: "full home",
+		Files: []ai.GeneratedFile{
+			{Path: "pages/home.liquid", Action: "update", Content: "HOME"},
+			{Path: "pages/css/home.css", Action: "create", Content: "CSS"},
+		},
+	}
+	repair := &ai.Result{Summary: "could not fix", Files: nil, NeedsClarification: true}
+	got := mergeRepairIntoProposal(prior, repair)
+	if len(got.Files) != 2 {
+		t.Fatalf("empty repair must keep prior files, got %d", len(got.Files))
+	}
+	if got.NeedsClarification {
+		t.Error("empty subset repair must not mark merged result as needs_clarification")
+	}
+	if got.Summary != "could not fix" {
+		t.Errorf("summary=%q", got.Summary)
+	}
+}
+
+func TestMergeRepairIntoProposal_EmptyContentDoesNotOverwritePrior(t *testing.T) {
+	prior := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "pages/home.liquid", Action: "update", Content: "HOME_V1"},
+			{Path: "components/store-hero-banner.liquid", Action: "update", Content: "HERO_V1"},
+		},
+	}
+	repair := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "components/store-hero-banner.liquid", Action: "update", Content: ""},
+			{Path: "pages/css/home.css", Action: "create", Content: "CSS_NEW"},
+		},
+	}
+	got := mergeRepairIntoProposal(prior, repair)
+	hero, ok := fileByPath(got.Files, "components/store-hero-banner.liquid")
+	if !ok || hero.Content != "HERO_V1" {
+		t.Fatalf("empty repair must not blank prior hero, got %+v", hero)
+	}
+	if _, ok := fileByPath(got.Files, "pages/css/home.css"); !ok {
+		t.Fatal("non-empty repair path should still append")
+	}
+}
+
+func fullHomeProposal(badCSS string) *ai.Result {
+	return &ai.Result{
+		Summary: "regenerated homepage",
+		Files: []ai.GeneratedFile{
+			{Path: "pages/home.liquid", Action: "update", Content: goodPageContent},
+			{Path: "pages/css/home.css", Action: "create", Content: badCSS},
+			{Path: "components/store-hero-banner.liquid", Action: "update", Content: "<section class=\"hero\">{{ store.name }}</section>"},
+			{Path: "components/css/store-hero-banner.css", Action: "create", Content: ".hero { display: block; }"},
+			{Path: "js/store-hero-banner.js", Action: "update", Content: "window.hero = true;"},
+			{Path: "components/testimonials.liquid", Action: "create", Content: "<section class=\"testimonials\">ok</section>"},
+		},
+		LayoutLinksToAdd:   []string{"pages/css/home.css", "components/css/store-hero-banner.css"},
+		LayoutScriptsToAdd: []string{"js/store-hero-banner.js"},
+		InputTokens:        100,
+		OutputTokens:       50,
+	}
+}
+
+func fullHomeSnapshot() themecheck.Snapshot {
+	return themecheck.Snapshot{
+		Paths: map[string]bool{
+			"liquid/layout-start.liquid": true,
+			"liquid/layout-end.liquid":   true,
+		},
+		Files: map[string]string{
+			"defaults.json": `{"colors": {"primary": "#1e3a8a", "secondary": "#111111", "background": "#ffffff"}}`,
+		},
+	}
+}
+
+// TestCheckAndRepair_FullHomeCSSRepairPreservesAllFiles is the audit failure
+// mode: first propose returns the complete homepage; themecheck theme-token
+// repair returns only CSS; staged result must still contain every original file.
+func TestCheckAndRepair_FullHomeCSSRepairPreservesAllFiles(t *testing.T) {
+	// #cafe01 is not in defaults.json — AutoFixThemeTokens cannot map it,
+	// so a real repair Generate round-trip is required.
+	badCSS := `.hero-title { color: #cafe01; }`
+	fixedCSS := `.hero-title { color: var(--theme-primary, #1e3a8a); }`
+
+	first := fullHomeProposal(badCSS)
+	repairOnlyCSS := &ai.Result{
+		Summary:      "fixed theme tokens",
+		Files:        []ai.GeneratedFile{{Path: "pages/css/home.css", Action: "create", Content: fixedCSS}},
+		InputTokens:  20,
+		OutputTokens: 10,
+	}
+
+	fg := &fakeGenerator{results: []*ai.Result{repairOnlyCSS}}
+	svc := &Service{gen: fg}
+	in := GenerateInput{
+		TenantID:  1,
+		ThemeSlug: "demo",
+		Prompt:    "Regenerate the entire homepage from scratch as a premium software house website",
+	}
+	tc := ai.ThemeContext{PageCreatePrepared: true}
+
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", tc, nil, first, fullHomeSnapshot(), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fg.calls != 1 {
+		t.Fatalf("expected 1 repair Generate call, got %d", fg.calls)
+	}
+	wantPaths := []string{
+		"pages/home.liquid",
+		"pages/css/home.css",
+		"components/store-hero-banner.liquid",
+		"components/css/store-hero-banner.css",
+		"js/store-hero-banner.js",
+		"components/testimonials.liquid",
+	}
+	if len(got.Files) != len(wantPaths) {
+		t.Fatalf("expected %d staged files, got %d (%v)", len(wantPaths), len(got.Files), proposalPaths(got))
+	}
+	for _, p := range wantPaths {
+		if _, ok := fileByPath(got.Files, p); !ok {
+			t.Errorf("staged draft missing %s (repair collapsed scope)", p)
+		}
+	}
+	css, _ := fileByPath(got.Files, "pages/css/home.css")
+	if css.Content != fixedCSS {
+		t.Errorf("home.css not repaired: %q", css.Content)
+	}
+	home, _ := fileByPath(got.Files, "pages/home.liquid")
+	if home.Content != goodPageContent {
+		t.Error("pages/home.liquid content was altered unexpectedly")
+	}
+}
+
+func TestCheckAndRepair_FullHomeEmptyRepairKeepsOriginal(t *testing.T) {
+	badCSS := `.hero-title { color: #cafe01; }`
+	fixedCSS := `.hero-title { color: var(--theme-primary, #1e3a8a); }`
+	first := fullHomeProposal(badCSS)
+
+	// First repair returns nothing useful; second returns the CSS fix.
+	empty := &ai.Result{Summary: "still looking", Files: nil, InputTokens: 5, OutputTokens: 2}
+	fixed := &ai.Result{
+		Summary:      "fixed",
+		Files:        []ai.GeneratedFile{{Path: "pages/css/home.css", Action: "create", Content: fixedCSS}},
+		InputTokens:  10,
+		OutputTokens: 8,
+	}
+	fg := &fakeGenerator{results: []*ai.Result{empty, fixed}}
+	svc := &Service{gen: fg}
+	in := GenerateInput{
+		TenantID:  1,
+		ThemeSlug: "demo",
+		Prompt:    "Regenerate the entire homepage from scratch",
+	}
+	tc := ai.ThemeContext{PageCreatePrepared: true}
+
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", tc, nil, first, fullHomeSnapshot(), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fg.calls != 2 {
+		t.Fatalf("expected 2 repair calls, got %d", fg.calls)
+	}
+	if len(got.Files) != 6 {
+		t.Fatalf("expected full homepage still staged, got %d files: %v", len(got.Files), proposalPaths(got))
+	}
+	if _, ok := fileByPath(got.Files, "pages/home.liquid"); !ok {
+		t.Fatal("pages/home.liquid missing after empty repair round")
+	}
+}
+
+// TestCheckAndRepair_NonHomeSingleFileRepairUnchanged covers case E: a normal
+// single-file repair still replaces that file and does not invent extras.
+func TestCheckAndRepair_NonHomeSingleFileRepairUnchanged(t *testing.T) {
+	fg := &fakeGenerator{results: []*ai.Result{goodResult()}}
+	svc := &Service{gen: fg}
+	in := GenerateInput{TenantID: 1, ThemeSlug: "demo", Prompt: "fix the offers page field"}
+
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got.Files) != 1 || got.Files[0].Path != "pages/offers.liquid" {
+		t.Fatalf("expected single-file offers repair, got %v", proposalPaths(got))
+	}
+	if got.Files[0].Content != goodPageContent {
+		t.Errorf("expected repaired content")
+	}
+}
+
+func TestShouldPreserveProposalScope(t *testing.T) {
+	if !shouldPreserveProposalScope(
+		GenerateInput{Prompt: "Regenerate the entire homepage from scratch as a SaaS site"},
+		ai.ThemeContext{},
+	) {
+		t.Error("full-home prompt should preserve scope")
+	}
+	if !shouldPreserveProposalScope(
+		GenerateInput{Prompt: "tweak footer"},
+		ai.ThemeContext{PageCreatePrepared: true},
+	) {
+		t.Error("PageCreatePrepared should preserve scope")
+	}
+	if shouldPreserveProposalScope(
+		GenerateInput{Prompt: "make the offers button blue"},
+		ai.ThemeContext{},
+	) {
+		t.Error("simple edit should not preserve full-home scope")
 	}
 }

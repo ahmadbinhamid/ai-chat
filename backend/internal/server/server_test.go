@@ -32,6 +32,7 @@ func testConfig() config.Config {
 		FlowposHTTPTimeout:           time.Second,
 		AIProvider:                   "anthropic",
 		FakeAIMode:                   true,
+		AllowFakeAIMode:              true,
 		FakeAIDelay:                  time.Millisecond,
 		GenerationRateLimitPerMinute: 10,
 		MaxRequestBodyBytes:          10 * 1024 * 1024,

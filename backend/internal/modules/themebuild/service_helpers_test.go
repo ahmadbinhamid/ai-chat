@@ -143,7 +143,7 @@ func TestRepairPrompt(t *testing.T) {
 	findings := []themecheck.Finding{
 		{Rule: "known-fields", Path: "pages/offers.liquid", Message: "invented field"},
 	}
-	got := repairPrompt(findings)
+	got := repairPrompt(findings, false)
 	if !strings.Contains(got, "known-fields") || !strings.Contains(got, "pages/offers.liquid") || !strings.Contains(got, "invented field") {
 		t.Errorf("repair prompt missing expected content: %q", got)
 	}
@@ -155,6 +155,21 @@ func TestRepairPrompt(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected repair prompt to constrain scope with %q, got: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "full homepage / complex-page") {
+		t.Errorf("non-preserve repair prompt should not include full-home instructions, got: %s", got)
+	}
+
+	fullHome := repairPrompt(findings, true)
+	for _, want := range []string{
+		"full homepage / complex-page",
+		"Preserve the complete previous proposal",
+		"do not remove unrelated homepage files or sections",
+		"server will merge",
+	} {
+		if !strings.Contains(fullHome, want) {
+			t.Errorf("expected full-home repair prompt to contain %q, got: %s", want, fullHome)
 		}
 	}
 }

@@ -2,6 +2,7 @@
 backend/tmp/
 backend/build-errors.log
 backend/bin/
+backend/.gopath/
 *.exe
 *.test
 *.out

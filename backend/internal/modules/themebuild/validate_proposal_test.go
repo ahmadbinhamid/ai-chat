@@ -1,6 +1,7 @@
 package themebuild
 
 import (
+	"strings"
 	"testing"
 
 	"ai-chat/internal/ai"
@@ -102,5 +103,41 @@ func TestValidateProposal_BrandModeRejectsLayoutRegistrations(t *testing.T) {
 	}
 	if err := validateProposal(r, ai.GenerationModeBrand); err == nil {
 		t.Error("expected a layout link registration to be rejected in brand mode")
+	}
+}
+
+func TestValidateProposal_RejectsEmptyContent(t *testing.T) {
+	r := &ai.Result{Files: []ai.GeneratedFile{{Path: "components/store-hero-banner.liquid", Action: "update", Content: ""}}}
+	err := validateProposal(r, "")
+	if err == nil {
+		t.Fatal("expected empty content to be rejected")
+	}
+	if !strings.Contains(err.Error(), "content must not be empty") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateProposal_AllowsDelete(t *testing.T) {
+	r := &ai.Result{Files: []ai.GeneratedFile{{Path: "pages/old-blog.liquid", Action: "delete", Content: ""}}}
+	if err := validateProposal(r, ""); err != nil {
+		t.Fatalf("delete should be allowed: %v", err)
+	}
+	r2 := &ai.Result{Files: []ai.GeneratedFile{{Path: "pages/home.liquid", Action: "delete", Content: ""}}}
+	if err := validateProposal(r2, ""); err == nil {
+		t.Fatal("deleting home.liquid must be rejected")
+	}
+}
+
+func TestPendingFilesToPlan_SkipsEmptyContent(t *testing.T) {
+	plan := pendingFilesToPlan([]GeneratedFile{
+		{FilePath: "pages/home.liquid", Action: FileActionUpdate, Content: "HOME", Kind: GeneratedFileKindProposed},
+		{FilePath: "components/store-hero-banner.liquid", Action: FileActionUpdate, Content: "", Kind: GeneratedFileKindProposed},
+		{FilePath: pathLayoutStart, Action: FileActionUpdate, Content: "<html>", Kind: GeneratedFileKindLayout},
+	})
+	if len(plan.files) != 1 || plan.files[0].path != "pages/home.liquid" {
+		t.Fatalf("expected only home.liquid, got %+v", plan.files)
+	}
+	if plan.layoutStart == nil {
+		t.Fatal("expected layout-start to remain")
 	}
 }
