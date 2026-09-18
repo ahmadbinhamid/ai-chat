@@ -23,11 +23,18 @@ type fakeApplyServer struct {
 	calls    int
 	writes   map[string]int            // path -> write count
 	bodies   map[string]map[string]any // path -> last decoded request body
+	content  map[string]string         // path -> last written content (for rollback asserts)
+	deletes  map[string]int            // path -> delete count
 	failPath string                    // if set, POST to this path 500s
 }
 
 func newFakeApplyServer() *fakeApplyServer {
-	return &fakeApplyServer{writes: make(map[string]int), bodies: make(map[string]map[string]any)}
+	return &fakeApplyServer{
+		writes:  make(map[string]int),
+		bodies:  make(map[string]map[string]any),
+		content: make(map[string]string),
+		deletes: make(map[string]int),
+	}
 }
 
 func (f *fakeApplyServer) handler() http.HandlerFunc {
@@ -51,6 +58,15 @@ func (f *fakeApplyServer) handler() http.HandlerFunc {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.writes[reqPath]++
 			f.bodies[reqPath] = body
+			if c, ok := body["content"].(string); ok {
+				f.content[reqPath] = c
+			}
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.deletes[reqPath]++
+			delete(f.content, reqPath)
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -257,8 +273,8 @@ func TestPendingFilesToPlan_CollapseAcrossTurns(t *testing.T) {
 		{
 			name: "newer turn's own PageMeta wins over older turn's",
 			files: []GeneratedFile{
-				{FilePath: "pages/about.liquid", Action: FileActionCreate, PageMeta: metaV1, CreatedAt: older},
-				{FilePath: "pages/about.liquid", Action: FileActionUpdate, PageMeta: metaV2, CreatedAt: newer},
+				{FilePath: "pages/about.liquid", Action: FileActionCreate, Content: "v1", PageMeta: metaV1, CreatedAt: older},
+				{FilePath: "pages/about.liquid", Action: FileActionUpdate, Content: "v2", PageMeta: metaV2, CreatedAt: newer},
 			},
 			wantPageMeta: metaV2,
 			wantAction:   FileActionCreate,
@@ -266,8 +282,8 @@ func TestPendingFilesToPlan_CollapseAcrossTurns(t *testing.T) {
 		{
 			name: "create then update collapses to create",
 			files: []GeneratedFile{
-				{FilePath: "pages/about.liquid", Action: FileActionCreate, CreatedAt: older},
-				{FilePath: "pages/about.liquid", Action: FileActionUpdate, CreatedAt: newer},
+				{FilePath: "pages/about.liquid", Action: FileActionCreate, Content: "v1", CreatedAt: older},
+				{FilePath: "pages/about.liquid", Action: FileActionUpdate, Content: "v2", CreatedAt: newer},
 			},
 			wantPageMeta: nil,
 			wantAction:   FileActionCreate,
@@ -275,8 +291,8 @@ func TestPendingFilesToPlan_CollapseAcrossTurns(t *testing.T) {
 		{
 			name: "update-only path stays update",
 			files: []GeneratedFile{
-				{FilePath: "pages/about.liquid", Action: FileActionUpdate, CreatedAt: older},
-				{FilePath: "pages/about.liquid", Action: FileActionUpdate, CreatedAt: newer},
+				{FilePath: "pages/about.liquid", Action: FileActionUpdate, Content: "v1", CreatedAt: older},
+				{FilePath: "pages/about.liquid", Action: FileActionUpdate, Content: "v2", CreatedAt: newer},
 			},
 			wantPageMeta: nil,
 			wantAction:   FileActionUpdate,
@@ -369,8 +385,8 @@ func TestApplyDraft_AppliedPathsExcludesLayoutRows(t *testing.T) {
 	}
 }
 
-// Item 9: ApplyDraft partial failure leaves messages pending and names the
-// failed path — a retryable partial beats a draft falsely marked applied.
+// Item 9: ApplyDraft partial failure rolls back already-written files and
+// leaves messages pending — never a half-applied live theme.
 func TestApplyDraft_PartialFailureLeavesMessagesPendingAndNamesPath(t *testing.T) {
 	fake := newFakeApplyServer()
 	fake.failPath = "pages/about.liquid"
@@ -393,6 +409,17 @@ func TestApplyDraft_PartialFailureLeavesMessagesPendingAndNamesPath(t *testing.T
 		t.Errorf("expected the error to name the failed path, got %v", err)
 	}
 
+	// Create-without-previous → rollback deletes the successful earlier write.
+	if fake.deletes["pages/home.liquid"] != 1 {
+		t.Fatalf("expected pages/home.liquid rolled back via delete, deletes=%+v content=%+v", fake.deletes, fake.content)
+	}
+	if _, ok := fake.content["pages/home.liquid"]; ok {
+		t.Fatalf("expected home content cleared after rollback, still have %q", fake.content["pages/home.liquid"])
+	}
+	if _, ok := fake.content["pages/about.liquid"]; ok {
+		t.Fatalf("about should never have been written, got %q", fake.content["pages/about.liquid"])
+	}
+
 	messages, err := chatSvc.ListMessagesForVerifiedChat(ctx, c.ID)
 	if err != nil {
 		t.Fatalf("ListMessagesForVerifiedChat failed: %v", err)
@@ -404,6 +431,47 @@ func TestApplyDraft_PartialFailureLeavesMessagesPendingAndNamesPath(t *testing.T
 		if m.ApplyStatus != chat.ApplyStatusPending {
 			t.Errorf("expected message %s to remain pending after a partial failure, got %q", m.ID, m.ApplyStatus)
 		}
+	}
+}
+
+func TestApplyDraft_PartialFailureRestoresPreviousContent(t *testing.T) {
+	fake := newFakeApplyServer()
+	fake.failPath = "pages/about.liquid"
+	svc, chatSvc, buildRepo := newApplyTestService(t, fake)
+	ctx := context.Background()
+	tenantID := uint64(time.Now().UnixNano())
+
+	c, err := chatSvc.GetOrCreateChat(ctx, tenantID, ChatType)
+	if err != nil {
+		t.Fatalf("GetOrCreateChat failed: %v", err)
+	}
+	prev := "<h1>was live</h1>"
+	seedPendingUpdate(t, chatSvc, buildRepo, c, "pages/home.liquid", "<h1>draft</h1>", prev)
+	seedPendingFile(t, chatSvc, buildRepo, c, "pages/about.liquid", "there", GeneratedFileKindProposed)
+
+	_, err = svc.ApplyDraft(ctx, tenantID, "tok", c.ID, "demo-theme")
+	if err == nil {
+		t.Fatal("expected apply error")
+	}
+	if fake.content["pages/home.liquid"] != prev {
+		t.Fatalf("expected home restored to previous %q, got %q (writes=%+v)", prev, fake.content["pages/home.liquid"], fake.writes)
+	}
+}
+
+func seedPendingUpdate(t *testing.T, chatSvc *chat.Service, buildRepo *Repository, c chat.Chat, path, content, previous string) {
+	t.Helper()
+	msg, err := chatSvc.RecordAssistantMessage(context.Background(), c, "turn", chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusPending)
+	if err != nil {
+		t.Fatalf("RecordAssistantMessage failed: %v", err)
+	}
+	now := time.Now().UTC()
+	prev := previous
+	if err := buildRepo.CreateFile(context.Background(), GeneratedFile{
+		ID: uuid.NewString(), MessageID: msg.ID, ChatID: c.ID, FilePath: path,
+		Action: FileActionUpdate, Kind: GeneratedFileKindProposed, Content: content,
+		PreviousContent: &prev, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("CreateFile failed: %v", err)
 	}
 }
 

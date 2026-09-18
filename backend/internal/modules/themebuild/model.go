@@ -21,7 +21,13 @@ type FileAction string
 const (
 	FileActionCreate FileAction = "create"
 	FileActionUpdate FileAction = "update"
+	FileActionDelete FileAction = "delete"
 )
+
+// DraftDeleteMarker is staged as chat_generated_files.content for an
+// action=delete proposal. Prefer themefs.DraftDeleteMarker — kept here as
+// an alias so themebuild call sites stay short.
+const DraftDeleteMarker = themefs.DraftDeleteMarker
 
 // GeneratedFileKind distinguishes an audited file the model explicitly
 // proposed from the shared layout splices (layout-start.liquid/

@@ -46,9 +46,11 @@ func TestResolveMaxTokens(t *testing.T) {
 		{"edit under ceiling", ThemeContext{}, 64000, budgets.Interactive},
 		{"pages", ThemeContext{GenerationMode: GenerationModePages}, 64000, budgets.Complex},
 		{"repair", ThemeContext{Repair: true}, 64000, budgets.Repair},
+		{"repair ignores pages mode for tokens", ThemeContext{Repair: true, GenerationMode: GenerationModePages}, 64000, budgets.Repair},
 		{"brand", ThemeContext{GenerationMode: GenerationModeBrand}, 64000, budgets.Brand},
 		{"respects low ceiling", ThemeContext{}, 4000, 4000},
 		{"override", ThemeContext{MaxTokensOverride: 12000}, 64000, 12000},
+		{"override wins over repair flag", ThemeContext{Repair: true, MaxTokensOverride: 16000}, 64000, 16000},
 		{"simple_edit one-shot", ThemeContext{SimpleEditOneShot: true}, 64000, 8000},
 		{"simple_edit override wins", ThemeContext{SimpleEditOneShot: true, MaxTokensOverride: 5000}, 64000, 5000},
 	}

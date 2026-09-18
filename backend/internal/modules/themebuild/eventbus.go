@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"ai-chat/internal/genlifecycle"
 	"ai-chat/internal/safego"
 
 	"github.com/redis/go-redis/v9"
@@ -60,13 +61,7 @@ func (b *inProcessEventBus) Publish(_ context.Context, chatID string, ev Generat
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, ch := range b.subs[chatID] {
-		select {
-		case ch <- ev:
-		default:
-			// Slow consumer: drop rather than block emit — see
-			// subscriberBufferSize's doc comment.
-			slog.Warn("in-process event bus: dropped event, subscriber buffer full", "chat_id", chatID, "type", ev.Type)
-		}
+		deliverToSubscriber(ch, chatID, ev)
 	}
 }
 
@@ -139,15 +134,44 @@ func (b *redisEventBus) Subscribe(ctx context.Context, chatID string) (<-chan Ge
 					slog.Error("redis event bus: failed to decode published event", "chat_id", chatID, "error", err)
 					return
 				}
-				select {
-				case ch <- ev:
-				default:
-					slog.Warn("redis event bus: dropped event, subscriber buffer full", "chat_id", chatID, "type", ev.Type)
-				}
+				deliverToSubscriber(ch, chatID, ev)
 			}()
 		}
 	}()
 
 	cancel := func() { _ = sub.Close() }
 	return ch, cancel
+}
+
+// deliverToSubscriber pushes ev onto ch without blocking the publisher.
+// Non-terminal events drop when the buffer is full. Terminal events make
+// room by discarding one buffered event (if any) so done/failed/cancelled
+// still reach the client — reconnect via EventsSince remains the backup.
+func deliverToSubscriber(ch chan GenerationEvent, chatID string, ev GenerationEvent) {
+	select {
+	case ch <- ev:
+		return
+	default:
+	}
+	if !genlifecycle.IsTerminal(ev.Type) {
+		slog.Warn("event bus: dropped event, subscriber buffer full",
+			"chat_id", chatID, "generation_id", ev.GenerationID, "type", ev.Type)
+		return
+	}
+	// Make room for the terminal: discard at most one buffered event.
+	select {
+	case dropped := <-ch:
+		slog.Warn("event bus: discarded buffered event to deliver terminal",
+			"chat_id", chatID, "generation_id", ev.GenerationID,
+			"dropped_type", dropped.Type, "terminal", ev.Type)
+	default:
+	}
+	select {
+	case ch <- ev:
+		genlifecycle.TerminalBusForcedDeliveries.Add(1)
+	default:
+		slog.Error("event bus: failed to deliver terminal event",
+			"chat_id", chatID, "generation_id", ev.GenerationID, "type", ev.Type)
+		genlifecycle.EventSendFailures.Add(1)
+	}
 }

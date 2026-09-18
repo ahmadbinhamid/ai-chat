@@ -17,6 +17,13 @@ func incompleteSliderFeatureProposal(prompt string, result *ai.Result) error {
 	if result == nil || !isSliderFeaturePrompt(prompt) {
 		return nil
 	}
+	// Full homepage rebuilds include a hero slider as one of many sections —
+	// hard-failing the whole changeset for imperfect slider wiring caused a
+	// propose→reject→explore-thrash loop ("another pass couldn't finish")
+	// that discarded an otherwise usable pages/home.liquid proposal.
+	if isFullHomePageRedesignPrompt(prompt) {
+		return nil
+	}
 	if result.NeedsClarification || result.AnsweredQuestion {
 		return nil
 	}

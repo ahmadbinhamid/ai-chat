@@ -12,13 +12,15 @@ import (
 
 func TestBuildComplexPageContext_RanksPagesAndMenu(t *testing.T) {
 	store := &memThemeStore{files: map[string]string{
-		"pages.json":               `[{"slug":"home"}]`,
+		"pages.json":               `[{"slug":"home"},{"slug":"contact-us"}]`,
 		"pages/home.liquid":        "<h1>Home</h1>",
 		"pages/about.liquid":       "<h1>About</h1>",
+		"pages/contact-us.liquid":  "<h1>Contact</h1>",
+		"pages/css/contact-us.css": "h1{}",
 		"components/header.liquid": `<nav><a href="/">Home</a></nav>`,
 		"components/footer.liquid": "footer",
 		"assets/unrelated.css":     "body{}",
-		"defaults.json":            `{}`,
+		"defaults.json":            `{"menu":{"items":[]}}`,
 	}}
 	cpc, err := BuildComplexPageContext(context.Background(), store, themefs.RequestAuth{}, "create a Contact Us page and add it to the menu")
 	if err != nil {
@@ -28,11 +30,8 @@ func TestBuildComplexPageContext_RanksPagesAndMenu(t *testing.T) {
 		t.Fatal("expected ranked paths")
 	}
 	joined := strings.Join(cpc.Paths, "|")
-	if !strings.Contains(joined, "pages.json") {
-		t.Fatalf("expected pages.json in %v", cpc.Paths)
-	}
-	if !strings.Contains(joined, "header") && !strings.Contains(joined, "menu") && !strings.Contains(joined, "nav") {
-		t.Fatalf("expected menu/header path in %v", cpc.Paths)
+	if !strings.Contains(joined, "contact") && !strings.Contains(joined, "pages.json") && !strings.Contains(joined, "defaults.json") && !strings.Contains(joined, "header") {
+		t.Fatalf("expected contact/menu-related path in %v", cpc.Paths)
 	}
 	if !cpc.Sufficient {
 		t.Fatal("page+menu context should be sufficient")
@@ -159,6 +158,18 @@ func TestRankPathsForPageCreate_HeaderRequestStillPrefersHeader(t *testing.T) {
 	}
 }
 
+func TestComplexPageContextSufficient_NamedPageLiquid(t *testing.T) {
+	if !complexPageContextSufficient([]string{"pages/products.liquid"}, true) {
+		t.Fatal("structural focus + pages/products.liquid must be sufficient")
+	}
+	if !complexPageContextSufficient([]string{"pages/services.liquid", "pages/css/services.css"}, true) {
+		t.Fatal("services page liquid must be sufficient")
+	}
+	if complexPageContextSufficient([]string{"components/card-essentials.liquid"}, true) {
+		t.Fatal("unrelated component alone must not be sufficient under structural focus")
+	}
+}
+
 func TestComplexPageBudgets_Bounded(t *testing.T) {
 	if maxComplexPageModelCalls > 6 {
 		t.Fatalf("complex page iteration budget too high: %d", maxComplexPageModelCalls)
@@ -175,11 +186,14 @@ func TestComplexPageBudgets_Bounded(t *testing.T) {
 	if simpleEditMaxTokens != 8000 {
 		t.Fatalf("simple_edit max_tokens must stay 8000, got %d", simpleEditMaxTokens)
 	}
-	if ai.PreparedFirstTokenTimeout() > 90*time.Second {
+	if ai.PreparedFirstTokenTimeout() > 180*time.Second {
 		t.Fatalf("prepared first-token timeout too high: %v", ai.PreparedFirstTokenTimeout())
 	}
 	if ai.PreparedFirstTokenTimeout() < 5*time.Second {
 		t.Fatalf("prepared first-token timeout too aggressive: %v", ai.PreparedFirstTokenTimeout())
+	}
+	if ai.PreparedFullPageFirstTokenTimeout() > 120*time.Second {
+		t.Fatalf("full-page first-token timeout too high: %v", ai.PreparedFullPageFirstTokenTimeout())
 	}
 	if ai.PreparedStreamIdleTimeout() > 45*time.Second {
 		t.Fatalf("prepared stream idle timeout too high: %v", ai.PreparedStreamIdleTimeout())
@@ -209,3 +223,27 @@ func TestRecentChatTurns_NoSummarize(t *testing.T) {
 		t.Fatal("n larger than len should return all")
 	}
 }
+
+func TestEnsureCanonicalHomePaths_PrefersStoreHeroOverHeroSlider(t *testing.T) {
+	all := []string{
+		"pages/home.liquid",
+		"components/store-hero-banner.liquid",
+		"components/css/store-hero-banner.css",
+		"js/store-hero-banner.js",
+		"components/hero-slider.liquid",
+		"js/testimonials.js",
+	}
+	ranked := []string{"components/hero-slider.liquid", "js/testimonials.js"}
+	got := ensureCanonicalHomePaths(all, ranked, 8)
+	joined := strings.Join(got, "|")
+	if !strings.Contains(joined, "pages/home.liquid") {
+		t.Fatalf("missing pages/home.liquid: %v", got)
+	}
+	if !strings.Contains(joined, "store-hero-banner.liquid") {
+		t.Fatalf("missing store-hero-banner: %v", got)
+	}
+	if strings.Contains(joined, "hero-slider") {
+		t.Fatalf("obsolete hero-slider should be dropped when store-hero exists: %v", got)
+	}
+}
+

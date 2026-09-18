@@ -53,3 +53,21 @@ func TestNewPerTenantLimiter_ClampsNonPositiveRate(t *testing.T) {
 		t.Fatal("expected the second request to be denied — clamped burst is 1")
 	}
 }
+
+func TestPerTenantLimiter_BoundedEviction(t *testing.T) {
+	l := NewPerTenantLimiter(10)
+	l.maxTenants = 3
+	for id := uint64(1); id <= 5; id++ {
+		if !l.Allow(id) {
+			t.Fatalf("tenant %d should be allowed on first request", id)
+		}
+	}
+	if l.Len() > 3 {
+		t.Fatalf("Len=%d want ≤3", l.Len())
+	}
+	// Most recently used (5,4,3) should remain; 1 should have been evicted.
+	if !l.Allow(5) {
+		// burst was 10 so still allowed
+		t.Fatal("tenant 5 should still have a limiter")
+	}
+}

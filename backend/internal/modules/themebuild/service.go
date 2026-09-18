@@ -15,6 +15,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/prodhardening"
 	"ai-chat/internal/safego"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
@@ -132,15 +133,33 @@ var attachmentLimits = map[chat.AttachmentKind]attachmentKindLimit{
 // background goroutine is reading it.
 var generateTimeoutNanos = func() *atomic.Int64 {
 	var v atomic.Int64
-	// 65 minutes: not unbounded, but generous enough for a full-site
-	// redesign at high effort, which can legitimately run close to an hour.
-	// Also reused as the staleness threshold for reaping abandoned
-	// "in progress" rows (see ReapStaleGenerations) — raising this means a
-	// truly stuck generation stays marked in-progress that much longer
-	// before being cleaned up.
-	v.Store(int64(65 * time.Minute))
+	// 10 minutes: one parent AI Builder generation/workflow wall budget.
+	// Child stream first-token / idle / HTTP / WebSocket timeouts stay
+	// separately bounded (see prodhardening.DefaultPolicy). Queued
+	// generations each get a fresh budget via runOneQueuedGeneration —
+	// retries and repair within one generation share this same deadline.
+	v.Store(int64(10 * time.Minute))
 	return &v
 }()
+
+// ParentGenerationTimeoutMinutes is the merchant-facing parent budget
+// (must match generateTimeoutNanos / prodhardening.GenerationTimeout).
+const ParentGenerationTimeoutMinutes = 10
+
+// generationWaitNotice is the non-error informational copy shown when a
+// generation starts. Compound/multi-step prompts get a clearer variant.
+func generationWaitNotice(prompt string) string {
+	if _, ok := PlanCompoundWorkflow(prompt); ok {
+		return fmt.Sprintf(
+			"This is a multi-step change and may take a few minutes. We're working through each step and can take up to %d minutes.",
+			ParentGenerationTimeoutMinutes,
+		)
+	}
+	return fmt.Sprintf(
+		"This may take a few minutes for larger changes. We're working on it and can take up to %d minutes.",
+		ParentGenerationTimeoutMinutes,
+	)
+}
 
 // generateTimeout bounds one drain-loop iteration's background work — see
 // runOneQueuedGeneration, which gives every queued generation its own fresh
@@ -332,7 +351,21 @@ func newPendingTokens() *pendingTokens {
 func (p *pendingTokens) store(generationID, token string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	cap := prodhardening.DefaultPolicy().PendingTokensSoftCap
+	if _, exists := p.tokens[generationID]; !exists && len(p.tokens) >= cap {
+		prodhardening.PendingTokensRejected.Add(1)
+		slog.Error("ai: pending tokens map at soft cap — refusing store",
+			"generation_id", generationID, "cap", cap, "size", len(p.tokens))
+		return
+	}
 	p.tokens[generationID] = token
+}
+
+// lenForTest returns current map size (tests / observability).
+func (p *pendingTokens) lenForTest() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.tokens)
 }
 
 // take returns generationID's token and whether one was found, removing it
@@ -794,10 +827,17 @@ func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) 
 func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Generation) {
 	emitter := newEventEmitter(ctx, s.repo, s.bus, g.ID, c.ID)
 	emitter.emit(ctx, EventTypeDequeued, struct{}{})
+	generationStartedAt := time.Now()
+	var queueWaitMs int64
 	if g.QueuedAt != nil {
+		queueWaitMs = generationStartedAt.Sub(*g.QueuedAt).Milliseconds()
 		slog.Info("ai: queue wait",
-			"chat_id", c.ID, "generation_id", g.ID,
-			"queue_wait_ms", time.Since(*g.QueuedAt).Milliseconds())
+			"tenant_id", g.TenantID,
+			"chat_id", c.ID,
+			"generation_id", g.ID,
+			"queued_at", formatRFC3339(*g.QueuedAt),
+			"generation_started_at", formatRFC3339(generationStartedAt),
+			"queue_wait_ms", queueWaitMs)
 	}
 
 	token, ok := s.tokens.take(g.ID)
@@ -996,7 +1036,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		}
 	}()
 
-	err := s.doGenerate(workCtx, in, c, g.ID, &cancelledByUser)
+	err := s.doGenerate(workCtx, in, c, g.ID, &cancelledByUser, queueWaitMs)
 
 	// A deliberately fresh, short-lived context for this one bookkeeping
 	// write: workCtx may already be expired (a generation that hit
@@ -1209,9 +1249,12 @@ func looksTruncatedByStoredLength(filename string, contentLength int64) bool {
 // cancel machinery of their own (see
 // TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext) — only
 // runOneQueuedGeneration ever passes a real one.
-func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat, genID string, cancelledByUser *atomic.Bool) (retErr error) {
+func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat, genID string, cancelledByUser *atomic.Bool, queueWaitMs int64) (retErr error) {
 	emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
-	emitter.emit(ctx, EventTypeStarted, struct{}{})
+	emitter.emit(ctx, EventTypeStarted, map[string]any{
+		"wait_notice":            generationWaitNotice(in.Prompt),
+		"max_generation_minutes": ParentGenerationTimeoutMinutes,
+	})
 
 	// summary is declared here (not with := at its point of use below) so
 	// this defer's closure captures the same variable and sees its final
@@ -1229,18 +1272,133 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	var routedIntent Intent
 	var workspaceLoaded bool
 	var deepseekCalled bool
+	// deferSkipFailedAssistant is set when compound partial already recorded
+	// a failed assistant message with staged draft files — defer must emit
+	// failed but must not insert a second empty failed message.
+	var deferSkipFailedAssistant bool
+	turnMetrics := &ai.TurnMetrics{}
+	flowPOSCounters := &themefs.FlowPOSCounters{}
+	ctx = themefs.ContextWithFlowPOSCounters(ctx, flowPOSCounters)
+	var themeCache *themefs.CachingStore
+	var preModelMs int64
+	// Pre-model phase breakdown (Phase 0 observability). Sums are not required
+	// to equal pre_model_ms — intent routing / attachment loads sit between
+	// marks; the totals still show where time went before the first model call.
+	var (
+		draftLoadMs     int64
+		workspaceSyncMs int64
+		urlFetchMs      int64
+		themeContextMs  int64
+		intentContextMs int64
+		snapshotBaseMs  int64
+		historyMs       int64
+	)
 	defer func() {
 		route := RouteLocalFirst
 		if routedIntent == IntentConversation {
 			route = RouteFastConversation
 		}
-		slog.Info("ai: generation wall-clock", "chat_id", c.ID, "mode", in.Mode,
+		provider, model := s.generatorIdentity()
+		endedAt := time.Now()
+		totalMs := endedAt.Sub(doGenerateStart).Milliseconds()
+		status := wallClockStatus(retErr, cancelledByUser)
+		slog.Info("ai: generation wall-clock",
+			"tenant_id", in.TenantID,
+			"chat_id", c.ID,
 			"generation_id", genID,
-			"elapsed_ms", time.Since(doGenerateStart).Milliseconds(), "has_changes", hasChanges,
+			"provider", provider,
+			"model", model,
+			"mode", in.Mode,
+			"generation_started_at", formatRFC3339(doGenerateStart),
+			"generation_ended_at", formatRFC3339(endedAt),
+			"total_elapsed_ms", totalMs,
+			"elapsed_ms", totalMs, // alias for existing log queries
+			"status", status,
+			"has_changes", hasChanges,
 			"intent", string(routedIntent), "route", route,
 			"workspace_loaded", workspaceLoaded, "deepseek_called", deepseekCalled,
 			"draft_refresh", !skipDraftRefresh && routedIntent != IntentConversation,
 			"skip_draft_refresh", skipDraftRefresh)
+
+		snap := turnMetrics.Snapshot()
+		summaryAttrs := []any{
+			"tenant_id", in.TenantID,
+			"chat_id", c.ID,
+			"generation_id", genID,
+			"provider", provider,
+			"model", model,
+			"status", status,
+			"queue_wait_ms", queueWaitMs,
+			"pre_model_ms", preModelMs,
+			"model_elapsed_ms", snap.ModelElapsedMs,
+			"tool_elapsed_ms", snap.ToolElapsedMs,
+			"total_elapsed_ms", totalMs,
+			"total_generate_calls", snap.GenerateCalls,
+			"initial_generate_calls", snap.InitialGenerateCalls,
+			"repair_generate_calls", snap.RepairGenerateCalls,
+			"total_model_iterations", snap.ModelIterations,
+			"total_tool_calls", snap.ToolCalls,
+			"list_calls", snap.ListCalls,
+			"read_calls", snap.ReadCalls,
+			"grep_calls", snap.GrepCalls,
+			"validate_calls", snap.ValidateCalls,
+			"propose_calls", snap.ProposeCalls,
+			"repair_attempts", snap.RepairAttempts,
+			"provider_retries", snap.ProviderRetries,
+			"repair_elapsed_ms", snap.RepairElapsedMs,
+			"provider_retry_wait_ms", snap.ProviderRetryWaitMs,
+			"repair_budget_exhausted", snap.RepairBudgetExhausted,
+			"repair_skipped", snap.RepairSkipped,
+			"repair_skip_reason", snap.RepairSkipReason,
+			"repair_reason", snap.RepairReasonCategory,
+			"zero_tool_nudges", snap.ZeroToolNudges,
+			"forced_propose_count", snap.ForcedProposeCount,
+			"propose_nudge_count", snap.ProposeNudgeCount,
+			"system_prompt_bytes", snap.SystemPromptBytes,
+			"tool_schema_bytes", snap.ToolSchemaBytes,
+			"message_input_bytes", snap.MessageInputBytes,
+			"tool_result_bytes", snap.ToolResultBytes,
+			"message_count", snap.LastMessageCount,
+			"input_tokens", snap.InputTokens,
+			"output_tokens", snap.OutputTokens,
+			"flowpos_list_files", flowPOSCounters.ListFiles.Load(),
+			"flowpos_read_file", flowPOSCounters.ReadFile.Load(),
+			"flowpos_write_file", flowPOSCounters.WriteFile.Load(),
+			"flowpos_delete_file", flowPOSCounters.DeleteFile.Load(),
+			"flowpos_elapsed_ms", flowPOSCounters.ElapsedMs.Load(),
+		}
+		if themeCache != nil {
+			cs := themeCache.Stats()
+			summaryAttrs = append(summaryAttrs,
+				"theme_cache_hits", cs.Hits,
+				"theme_cache_misses", cs.Misses,
+				"theme_cache_entries", cs.Entries,
+				"theme_cache_bytes", cs.Bytes,
+				"list_files_cache_hits", cs.ListHits,
+				"read_file_cache_hits", cs.ReadHits,
+			)
+		}
+		if snap.FirstTTFTAvailable {
+			summaryAttrs = append(summaryAttrs, "ttft_ms", snap.FirstTTFTMs, "ttft_available", true)
+		} else {
+			summaryAttrs = append(summaryAttrs, "ttft_available", false)
+		}
+		if snap.ReasoningReported {
+			summaryAttrs = append(summaryAttrs, "reasoning_tokens", snap.ReasoningTokens, "reasoning_tokens_available", true)
+		} else {
+			summaryAttrs = append(summaryAttrs, "reasoning_tokens_available", false)
+		}
+		if snap.CacheReadReported {
+			summaryAttrs = append(summaryAttrs, "cache_read_input_tokens", snap.CacheReadTokens, "cache_read_input_tokens_available", true)
+		} else {
+			summaryAttrs = append(summaryAttrs, "cache_read_input_tokens_available", false)
+		}
+		if snap.CacheCreationReported {
+			summaryAttrs = append(summaryAttrs, "cache_creation_input_tokens", snap.CacheCreationTokens, "cache_creation_input_tokens_available", true)
+		} else {
+			summaryAttrs = append(summaryAttrs, "cache_creation_input_tokens_available", false)
+		}
+		slog.Info("ai: generation performance summary", summaryAttrs...)
 	}()
 	defer func() {
 		// A deliberately fresh, short-lived context for this defer's own
@@ -1314,9 +1472,28 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				// actually explains it and tells them what to do.
 				message = errSessionExpired.Error()
 			}
-			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
-			if _, err := s.chats.RecordAssistantMessage(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
-				slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
+			fail := ai.FailureClassification(retErr)
+			slog.Error("ai: generation failed classified",
+				"chat_id", c.ID, "tenant_id", in.TenantID, "generation_id", genID,
+				"failure_code", string(fail.Code), "failure_stage", fail.Stage,
+				"retryable", fail.Retryable, "error", retErr)
+			failedPayload := map[string]any{
+				"message":       message,
+				"failure_code":  string(fail.Code),
+				"failure_stage": fail.Stage,
+				"retryable":     fail.Retryable,
+				"generation_id": genID,
+			}
+			if isUnauthorizedErr(retErr) {
+				failedPayload["failure_code"] = "SESSION_EXPIRED"
+				failedPayload["failure_stage"] = "auth"
+				failedPayload["retryable"] = false
+			}
+			emitter.emit(emitCtx, EventTypeFailed, failedPayload)
+			if !deferSkipFailedAssistant {
+				if _, err := s.chats.RecordAssistantMessage(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
+					slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
+				}
 			}
 		} else {
 			payload := map[string]any{"summary": summary}
@@ -1382,13 +1559,16 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// all read from, so a second/third prompt in this chat always sees
 	// what earlier turns in the SAME draft already changed, never the
 	// stale saved theme. See doGenerate's package-level doc comment.
+	phaseMark := time.Now()
 	draft, err := s.repo.DraftFiles(ctx, c.ID)
 	if err != nil {
 		return fmt.Errorf("load draft overlay: %w", err)
 	}
+	draftLoadMs = time.Since(phaseMark).Milliseconds()
 	// Local-first: sync theme to on-disk workspace (CPU mirror), then layer
 	// draft overlay + generation cache. DeepSeek remains the only model.
 	baseStore := s.store
+	phaseMark = time.Now()
 	if s.workspaceRoot != "" {
 		mgr := themeworkspace.NewManager(s.workspaceRoot)
 		if ws, wsErr := mgr.Open(in.TenantID, in.ThemeSlug, s.store); wsErr != nil {
@@ -1410,16 +1590,111 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			}
 		}
 	}
-	// CachingStore wraps the draft overlay for this generation only — so
-	// buildThemeContext, buildSnapshotBase, read_theme_file, and grep_theme
-	// share ListFiles/ReadFile results instead of re-hitting FlowPOS for the
-	// same paths. Scoped to this call; never shared across tenants/gens.
-	store := themefs.NewCachingStore(themefs.NewOverlayStore(baseStore, draft))
+	workspaceSyncMs = time.Since(phaseMark).Milliseconds()
+	// Generation-scoped theme cache under the draft overlay:
+	//   OverlayStore → CachingStore → FlowPOS/workspace
+	// so draft/staged content always wins, and ListFiles/ReadFile results
+	// are reused by buildThemeContext, buildSnapshotBase, tools, and grep
+	// without duplicate FlowPOS round trips. Fresh per doGenerate; keyed by
+	// tenant_id+theme_slug; never shared across tenants or generations.
+	themeCache = themefs.NewCachingStore(baseStore, themefs.ThemeKey{
+		TenantID:  in.TenantID,
+		ThemeSlug: in.ThemeSlug,
+	})
+	store := themefs.NewOverlayStore(themeCache, draft)
 	defer func() {
-		hits, misses, invalidated := store.Stats()
+		cs := themeCache.Stats()
 		slog.Info("ai: theme cache stats",
-			"chat_id", c.ID, "cache_hits", hits, "cache_misses", misses, "cache_invalidated", invalidated)
+			"tenant_id", in.TenantID,
+			"chat_id", c.ID,
+			"generation_id", genID,
+			"theme_slug", in.ThemeSlug,
+			"theme_cache_hits", cs.Hits,
+			"theme_cache_misses", cs.Misses,
+			"theme_cache_entries", cs.Entries,
+			"theme_cache_bytes", cs.Bytes,
+			"list_files_cache_hits", cs.ListHits,
+			"read_file_cache_hits", cs.ReadHits,
+			"cache_invalidated", cs.Invalidated)
 	}()
+
+	// Deterministic pages-list answer: parse pages.json locally and return a
+	// markdown table — no DeepSeek. Fixes "list return kro" falling into
+	// simple_edit and rewriting an unrelated component.
+	if isPagesListPrompt(in.Prompt) {
+		pagesRaw, readErr := store.ReadFile(ctx, storeAuth, pathPagesJSON)
+		if readErr != nil {
+			return fmt.Errorf("read pages.json for list: %w", readErr)
+		}
+		summary = formatPagesRegistryTable(pagesRaw)
+		if _, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
+			return fmt.Errorf("record pages list reply: %w", err)
+		}
+		skipDraftRefresh = true
+		routedIntent = IntentThemeQuery
+		slog.Info("ai: pages-list fast path",
+			"generation_id", genID,
+			"chat_id", c.ID,
+			"intent", string(IntentThemeQuery),
+			"route", "pages_list_local",
+			"workspace_loaded", workspaceLoaded,
+			"deepseek_called", false,
+			"pages_json_bytes", len(pagesRaw),
+			"duration_ms", time.Since(doGenerateStart).Milliseconds())
+		return nil
+	}
+
+	// Deterministic page/file deletes: orphans not in pages.json, blog rows,
+	// etc. DeepSeek kept claiming "done" while only editing card-essentials —
+	// compute deletes in Go and stage real action=delete drafts.
+	if deletePrompt := resolveBulkDeletePrompt(in.Prompt, priorMessages); deletePrompt != "" {
+		delResult, handled, delErr := buildDeterministicBulkDelete(ctx, store, storeAuth, deletePrompt)
+		if delErr != nil {
+			return fmt.Errorf("bulk delete plan: %w", delErr)
+		}
+		if handled && proposalHasChanges(delResult) {
+			routedIntent = IntentComplexPage
+			unlock, lockErr := s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
+			if lockErr != nil {
+				return fmt.Errorf("stage bulk delete: %w", lockErr)
+			}
+			defer unlock()
+
+			plan, planErr := s.buildWritePlan(ctx, store, storeAuth, delResult)
+			if planErr != nil {
+				return fmt.Errorf("stage bulk delete: %w", planErr)
+			}
+			stagedFiles := planToStaged(plan)
+			hasChanges = true
+			summary = delResult.Summary
+			if summary == "" {
+				summary = "Done."
+			}
+			emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(delResult.Files)})
+			emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": plan.paths()})
+
+			commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer commitCancel()
+			assistantMsg, recErr := s.chats.RecordAssistantMessage(commitCtx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusPending)
+			if recErr != nil {
+				return fmt.Errorf("record bulk delete reply: %w", recErr)
+			}
+			if _, err := s.persistFileRecords(commitCtx, c, assistantMsg.ID, stagedFiles); err != nil {
+				return fmt.Errorf("persist bulk delete draft: %w", err)
+			}
+			slog.Info("ai: bulk-delete fast path",
+				"generation_id", genID,
+				"chat_id", c.ID,
+				"intent", string(IntentComplexPage),
+				"route", "bulk_delete_local",
+				"workspace_loaded", workspaceLoaded,
+				"deepseek_called", false,
+				"file_count", len(delResult.Files),
+				"paths", proposalPaths(delResult),
+				"duration_ms", time.Since(doGenerateStart).Milliseconds())
+			return nil
+		}
+	}
 
 	// priorMessages was loaded above for intent routing. in arrives here
 	// rebuilt fresh from the generations row (see
@@ -1487,6 +1762,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// Generate already applies for an uploaded file vs. a URL in the
 	// prompt.
 	if in.HTMLAttachmentContent == nil && in.ReferenceURL != "" && s.links != nil {
+		phaseMark := time.Now()
 		emitter.emit(ctx, EventTypeFetchingLink, map[string]string{"url": in.ReferenceURL})
 		htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
 		// Fetching the HTML, fetching its stylesheets, and building the
@@ -1562,6 +1838,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				}
 			}
 		}
+		urlFetchMs = time.Since(phaseMark).Milliseconds()
 	}
 
 	// Carry-forward fallback: this turn attached no HTML reference of its
@@ -1621,14 +1898,21 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	}
 
 	emitter.emit(ctx, EventTypeLoadingTheme, struct{}{})
-	preModelStart := time.Now()
+	phaseMark = time.Now()
 	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)
 	if err != nil {
 		return fmt.Errorf("load theme context: %w", err)
 	}
+	themeContextMs = time.Since(phaseMark).Milliseconds()
+	provider, model := s.generatorIdentity()
+	tc.TenantID = in.TenantID
+	tc.ChatID = c.ID
+	tc.GenerationID = genID
+	tc.Metrics = turnMetrics
 	tc.GenerationMode = in.Mode
 	prompt := in.Prompt
 	var simpleEditCtx SimpleEditContext
+	intentContextStart := time.Now()
 	switch intent {
 	case IntentSimpleEdit:
 		if !intentUsesSimpleEditOneShot(intent) {
@@ -1650,6 +1934,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		tc.MaxToolIterations = maxSimpleEditModelCalls
 		tc.MaxTokensOverride = simpleEditMaxTokens
 		tc.DisableExplorationBrake = true
+		tc.FirstTokenTimeoutOverride = ai.FirstTokenTimeoutForMode(ai.FirstTokenModeSimple)
 		tc.FileTree = filterFileTreeToPaths(tc.FileTree, simpleEditCtx.Paths)
 		tc.Manifest = nil
 		tc.PagesJSON = truncateForSimpleEditPrompt(tc.PagesJSON, 800)
@@ -1670,14 +1955,39 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			"package_runes", pkgRunes)
 	case IntentThemeQuery:
 		tc.SimpleEditOneShot = false
+		tc.FirstTokenTimeoutOverride = ai.FirstTokenTimeoutForMode(ai.FirstTokenModeSection)
 		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 6 {
 			tc.MaxToolIterations = 6
 		}
 		slog.Info("ai: theme-query path", "chat_id", c.ID, "max_tool_iterations", tc.MaxToolIterations)
 	case IntentRepair:
 		tc.SimpleEditOneShot = false
+		tc.FirstTokenTimeoutOverride = ai.FirstTokenTimeoutForMode(ai.FirstTokenModeSection)
 		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 8 {
 			tc.MaxToolIterations = 8
+		}
+		// "Still looks the same" after a homepage edit — treat as full-home
+		// liquid+css resync, not an open-ended explore (which often edits one
+		// unrelated component and claims CSS was fixed).
+		if changeNotVisibleRe.MatchString(in.Prompt) || isHomeCSSBrokenPrompt(in.Prompt) {
+			cpc, cpcErr := BuildComplexPageContext(ctx, store, storeAuth, "Regenerate the entire homepage from scratch — previous edit did not show; liquid and CSS class names must match")
+			if cpcErr != nil {
+				slog.Warn("ai: repair→home context failed", "chat_id", c.ID, "error", cpcErr)
+			} else {
+				tc.PageCreatePrepared = true
+				tc.PageCreateAllowRead = !cpc.Sufficient
+				tc.FirstTokenTimeoutOverride = ai.FirstTokenTimeoutForMode(ai.FirstTokenModeFullPage)
+				tc.StreamIdleTimeoutOverride = ai.PreparedStreamIdleTimeout()
+				tc.FileTree = filterFileTreeToPaths(tc.FileTree, cpc.Paths)
+				tc.Manifest = nil
+				tc.MaxToolIterations = maxComplexHomeModelCalls
+				if tc.MaxTokensOverride < ai.DefaultTokenBudgets().Complex {
+					tc.MaxTokensOverride = ai.DefaultTokenBudgets().Complex
+				}
+				prompt = complexPagePreparedPrompt(in.Prompt+"\n\nPrevious change did not appear on the live homepage. Rewrite pages/home.liquid AND matching CSS (and hero liquid/css/js) so class names match. Do not edit a single unrelated component.", cpc)
+				slog.Info("ai: repair escalated to full-home package",
+					"chat_id", c.ID, "paths", cpc.Paths, "sufficient", cpc.Sufficient)
+			}
 		}
 	case IntentComplexPage:
 		// Never simple-edit one-shot. Local page/menu/homepage context first.
@@ -1704,9 +2014,26 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		if isFullHomePageRedesignPrompt(in.Prompt) {
 			tc.MaxToolIterations = maxComplexHomeModelCalls
 			tc.FullHomeRedesign = true
+			tc.FirstTokenTimeoutOverride = ai.PreparedFullPageFirstTokenTimeout()
 			// One extra stream retry — DeepSeek occasionally cold-stalls on
 			// the first forced propose for a full homepage rebuild.
 			tc.StreamMaxAttemptsOverride = 3
+		}
+		if isBrandScrubOrLegalRewritePrompt(in.Prompt) && tc.MaxToolIterations < maxComplexHomeModelCalls {
+			tc.MaxToolIterations = maxComplexHomeModelCalls
+		}
+		if isMultiPageCreatePrompt(in.Prompt) {
+			if tc.MaxToolIterations < maxComplexHomeModelCalls {
+				tc.MaxToolIterations = maxComplexHomeModelCalls
+			}
+			if tc.MaxTokensOverride < ai.DefaultTokenBudgets().Complex {
+				tc.MaxTokensOverride = ai.DefaultTokenBudgets().Complex
+			}
+			// Same extra stream attempt as full-home: dual liquid + pages.json
+			// proposals are large and DeepSeek occasionally cold-stalls.
+			if tc.StreamMaxAttemptsOverride < 3 {
+				tc.StreamMaxAttemptsOverride = 3
+			}
 		}
 		tc.MaxExplorationToolCalls = maxComplexExploration
 		tc.MaxExplorationOnlyStreak = maxComplexExploreStreak
@@ -1736,20 +2063,25 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	case IntentMultiFileEdit:
 		tc.SimpleEditOneShot = false
 		tc.SimpleEditAllowRead = false
+		tc.FirstTokenTimeoutOverride = ai.FirstTokenTimeoutForMode(ai.FirstTokenModeSection)
 		if tc.MaxToolIterations <= 0 || tc.MaxToolIterations > 14 {
 			tc.MaxToolIterations = 14
 		}
 	}
+	intentContextMs = time.Since(intentContextStart).Milliseconds()
 
 	emitter.emit(ctx, EventTypePreparingContext, struct{}{})
+	phaseMark = time.Now()
 	snapBase, err := s.buildSnapshotBase(ctx, store, storeAuth)
 	if err != nil {
 		return fmt.Errorf("build snapshot base: %w", err)
 	}
+	snapshotBaseMs = time.Since(phaseMark).Milliseconds()
 
 	toolExec := s.buildToolExecutor(store, storeAuth, tc, snapBase)
 	readFile := s.buildFileReader(store, storeAuth)
 
+	phaseMark = time.Now()
 	var turns []ai.Turn
 	if intentUsesSimpleEditOneShot(intent) {
 		turns = nil
@@ -1769,13 +2101,102 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	} else {
 		turns = s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
 	}
+	historyMs = time.Since(phaseMark).Milliseconds()
+	preModelMs = time.Since(doGenerateStart).Milliseconds()
 	slog.Info("ai: pre-model phase finished",
-		"chat_id", c.ID, "pre_model_ms", time.Since(preModelStart).Milliseconds())
+		"tenant_id", in.TenantID,
+		"chat_id", c.ID,
+		"generation_id", genID,
+		"provider", provider,
+		"model", model,
+		"draft_load_ms", draftLoadMs,
+		"workspace_sync_ms", workspaceSyncMs,
+		"url_fetch_ms", urlFetchMs,
+		"theme_context_ms", themeContextMs,
+		"intent_context_ms", intentContextMs,
+		"snapshot_base_ms", snapshotBaseMs,
+		"history_ms", historyMs,
+		"pre_model_ms", preModelMs)
 	emitter.emit(ctx, EventTypePreparingAI, struct{}{})
 	deepseekCalled = true
 	modelStart := time.Now()
-	result, turns, err := s.generateValidProposal(ctx, tc, turns, prompt, toolExec, readFile, emitter, in)
+
+	var result *ai.Result
+	var compoundPartial *errCompoundPartial
+	var compoundRegistries []*themefs.PageEntry
+	usedCompound := false
+	if plan, ok := PlanCompoundWorkflow(in.Prompt); ok {
+		usedCompound = true
+		slog.Info("ai: using compound workflow",
+			"chat_id", c.ID, "generation_id", genID, "steps", len(plan.Steps))
+		var compoundErr error
+		result, turns, compoundRegistries, compoundErr = s.runCompoundMultiPageCreate(ctx, in, c, genID, tc, store, storeAuth, snapBase, readFile, emitter)
+		err = compoundErr
+		if err != nil {
+			if errors.As(err, &compoundPartial) && compoundPartial.Accum != nil {
+				result = compoundPartial.Accum
+				if len(compoundPartial.Registries) > 0 {
+					compoundRegistries = compoundPartial.Registries
+				}
+				// Clear err so staging runs; re-apply compoundPartial after stage.
+				err = nil
+			} else {
+				return err
+			}
+		}
+	} else {
+		result, turns, err = s.generateValidProposal(ctx, tc, turns, prompt, toolExec, readFile, emitter, in)
+	}
 	modelMS := time.Since(modelStart).Milliseconds()
+
+	// Simple-edit one-shot has a hard patch/token budget. When the model
+	// needs a bigger rewrite (or the stream truncates), escalate ONCE to the
+	// complex_page path instead of failing the merchant with "too large".
+	simpleEditEscalated := false
+	if !usedCompound && intentUsesSimpleEditOneShot(intent) {
+		escalateReason := ""
+		if err != nil && shouldEscalateSimpleEdit(err) {
+			escalateReason = err.Error()
+		} else if err == nil {
+			if vErr := validateSimpleEditCompactness(result); vErr != nil {
+				escalateReason = vErr.Error()
+				err = vErr
+			}
+		}
+		if escalateReason != "" {
+			slog.Warn("ai: simple-edit budget exceeded — escalating to complex_page",
+				"chat_id", c.ID,
+				"generation_id", genID,
+				"reason", escalateReason,
+				"model_ms", modelMS)
+			escTC, escPrompt, escTurns, escErr := s.prepareSimpleEditEscalation(ctx, store, storeAuth, in, priorMessages)
+			if escErr != nil {
+				slog.Warn("ai: simple-edit escalation prep failed", "chat_id", c.ID, "error", escErr)
+			} else {
+				simpleEditEscalated = true
+				tc = escTC
+				tc.TenantID = in.TenantID
+				tc.ChatID = c.ID
+				tc.GenerationID = genID
+				tc.Metrics = turnMetrics
+				prompt = escPrompt
+				turns = escTurns
+				toolExec = s.buildToolExecutor(store, storeAuth, tc, snapBase)
+				emitter.emit(ctx, EventTypePreparingContext, struct{}{})
+				emitter.emit(ctx, EventTypePreparingAI, struct{}{})
+				modelStart = time.Now()
+				result, turns, err = s.generateValidProposal(ctx, tc, turns, prompt, toolExec, readFile, emitter, in)
+				modelMS = time.Since(modelStart).Milliseconds()
+				slog.Info("ai: simple-edit escalated generate finished",
+					"chat_id", c.ID,
+					"generation_id", genID,
+					"ok", err == nil,
+					"model_ms", modelMS,
+					"max_tokens", tc.MaxTokensOverride)
+			}
+		}
+	}
+
 	if err != nil {
 		if errors.Is(err, ai.ErrMaxTokensTruncated) {
 			slog.Warn("ai: max_tokens truncation — no draft applied",
@@ -1784,6 +2205,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				"intent", string(intent),
 				"route", RouteLocalFirst,
 				"simple_edit_one_shot", tc.SimpleEditOneShot,
+				"simple_edit_escalated", simpleEditEscalated,
 				"generation_mode", tc.GenerationMode,
 				"max_tokens", tc.MaxTokensOverride,
 				"model_ms", modelMS,
@@ -1792,16 +2214,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 		return err
 	}
-	if intentUsesSimpleEditOneShot(intent) {
-		if vErr := validateSimpleEditCompactness(result); vErr != nil {
-			slog.Warn("ai: simple-edit changeset rejected",
-				"chat_id", c.ID, "generation_id", genID, "error", vErr.Error(),
-				"simple_edit_patch_size", simpleEditPatchSize(result),
-				"simple_edit_model_call_count", 1,
-				"simple_edit_model_input_tokens", result.InputTokens,
-				"simple_edit_model_output_tokens", result.OutputTokens)
-			return vErr
-		}
+	if intentUsesSimpleEditOneShot(intent) && !simpleEditEscalated && !usedCompound {
 		slog.Info("ai: simple-edit metrics",
 			"chat_id", c.ID,
 			"generation_id", genID,
@@ -1826,10 +2239,14 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// "Writing M files…" for the same turn).
 		emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(result.Files)})
 
-		snap := s.buildSnapshot(ctx, store, storeAuth, snapBase, result)
-		result, warnings, err = s.checkAndRepair(ctx, in, c.ID, tc, turns, result, snap, toolExec, readFile, emitter)
-		if err != nil {
-			return err
+		// Compound workflow already ran per-step checkAndRepair — do not
+		// re-run global repair (that reintroduced blog.liquid churn).
+		if !usedCompound {
+			snap := s.buildSnapshot(ctx, store, storeAuth, snapBase, result)
+			result, warnings, err = s.checkAndRepair(ctx, in, c.ID, tc, turns, result, snap, toolExec, readFile, emitter)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1857,7 +2274,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// completely untouched, rather than a validation error arriving
 		// after some files already landed in chat_generated_files with
 		// nothing recording that they did.
-		plan, err := s.buildWritePlan(ctx, store, storeAuth, result)
+		// Compound registries: each atomic step's page_registry_entry is
+		// attached as PageMeta (FlowPOS upserts pages.json) — no forced
+		// full-file pages.json rewrite from the model.
+		extras := compoundExtraRegistryEntries(result, compoundRegistries)
+		plan, err := s.buildWritePlan(ctx, store, storeAuth, result, extras...)
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
@@ -1903,7 +2324,13 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer commitCancel()
 
-	assistantMsg, err := s.chats.RecordAssistantMessage(commitCtx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
+	persistStart := time.Now()
+	msgStatus := chat.MessageStatusCompleted
+	if compoundPartial != nil {
+		summary = compoundPartial.Error()
+		msgStatus = chat.MessageStatusFailed
+	}
+	assistantMsg, err := s.chats.RecordAssistantMessage(commitCtx, c, summary, msgStatus, result.InputTokens, result.OutputTokens, applyStatus)
 	if err != nil {
 		return fmt.Errorf("record assistant message: %w", err)
 	}
@@ -1911,7 +2338,21 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	if _, err := s.persistFileRecords(commitCtx, c, assistantMsg.ID, staged); err != nil {
 		return fmt.Errorf("persist generated-file audit rows: %w", err)
 	}
+	slog.Info("ai: draft persist finished",
+		"tenant_id", in.TenantID,
+		"chat_id", c.ID,
+		"generation_id", genID,
+		"provider", provider,
+		"model", model,
+		"elapsed_ms", time.Since(persistStart).Milliseconds(),
+		"file_count", len(staged),
+		"has_changes", hasChanges,
+		"compound_partial", compoundPartial != nil)
 
+	if compoundPartial != nil {
+		deferSkipFailedAssistant = true
+		return compoundPartial
+	}
 	return nil
 }
 
@@ -1996,6 +2437,63 @@ func (s *Service) FetchStoreSettings(ctx context.Context, storeAuth themefs.Requ
 		return themefs.StoreSettings{}, fmt.Errorf("theme store does not support store settings fetch")
 	}
 	return fetcher.FetchStoreSettings(ctx, storeAuth)
+}
+
+// shouldEscalateSimpleEdit is true when the simple_edit one-shot failed for
+// size/scope (or truncated mid-response) and a complex_page retry can absorb it.
+func shouldEscalateSimpleEdit(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ai.ErrMaxTokensTruncated) {
+		return true
+	}
+	return ai.IsSimpleEditBudgetError(err)
+}
+
+// prepareSimpleEditEscalation rebuilds a complex_page ThemeContext + prompt
+// after simple_edit hit its patch/token ceiling. Fresh theme context so the
+// filtered simple_edit FileTree is not reused.
+func (s *Service) prepareSimpleEditEscalation(
+	ctx context.Context,
+	store themefs.ThemeStore,
+	storeAuth themefs.RequestAuth,
+	in GenerateInput,
+	priorMessages []chat.Message,
+) (ai.ThemeContext, string, []ai.Turn, error) {
+	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)
+	if err != nil {
+		return ai.ThemeContext{}, "", nil, err
+	}
+	tc.GenerationMode = in.Mode
+	tc.SimpleEditOneShot = false
+	tc.SimpleEditAllowRead = false
+	cpc, cpcErr := BuildComplexPageContext(ctx, store, storeAuth, in.Prompt)
+	prompt := in.Prompt
+	if cpcErr != nil {
+		slog.Warn("ai: escalation complex-page context failed", "error", cpcErr)
+	} else {
+		tc.PageCreatePrepared = true
+		tc.PageCreateAllowRead = !cpc.Sufficient
+		tc.FirstTokenTimeoutOverride = ai.PreparedFirstTokenTimeout()
+		tc.StreamIdleTimeoutOverride = ai.PreparedStreamIdleTimeout()
+		tc.FileTree = filterFileTreeToPaths(tc.FileTree, cpc.Paths)
+		tc.Manifest = nil
+		tc.PagesJSON = truncateForSimpleEditPrompt(tc.PagesJSON, 2500)
+		tc.DefaultsJSON = truncateForSimpleEditPrompt(tc.DefaultsJSON, 800)
+		prompt = complexPagePreparedPrompt(
+			in.Prompt+"\n\nPrevious simple-edit pass could not fit this change — apply a full file update for the named page/files.",
+			cpc,
+		)
+	}
+	tc.MaxToolIterations = maxComplexPageModelCalls
+	tc.MaxExplorationToolCalls = maxComplexExploration
+	tc.MaxExplorationOnlyStreak = maxComplexExploreStreak
+	if tc.MaxTokensOverride <= 0 || tc.MaxTokensOverride < ai.DefaultTokenBudgets().Complex {
+		tc.MaxTokensOverride = ai.DefaultTokenBudgets().Complex
+	}
+	turns := recentChatTurns(toTurns(priorMessages), complexPageRecentTurns)
+	return tc, prompt, turns, nil
 }
 
 // FetchThemeMenu reads the tenant's real defaults.json and returns its

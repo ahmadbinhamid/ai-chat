@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 
+	"ai-chat/internal/genfail"
+
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/shared"
 )
@@ -18,33 +20,24 @@ const genericGenerationError = "something went wrong while generating a response
 
 // SanitizeError turns any error from Generate/Summarize into a short,
 // vendor-neutral message safe to show a merchant or store as chat history.
-// The raw error can contain the backing AI provider's name (config.AIProvider
-// is an internal implementation detail, never something a merchant should
-// see referenced), request IDs, and a raw JSON error body — none of that is
-// merchant-appropriate regardless of which provider is configured. Callers
-// should still log the original error server-side (slog.Error et al.) for
-// debugging; this is only for anything a merchant can see.
 func SanitizeError(err error) string {
 	if err == nil {
 		return ""
 	}
+	// Prefer genfail whenever Classify knows a specific code — compound
+	// multi-page create used to fall through to the generic message.
+	c := genfail.Classify(err)
+	if c.Code != genfail.CodeUnknown && strings.TrimSpace(c.Message) != "" {
+		return fmt.Sprintf("Error from AI agent: %s", c.Message)
+	}
 	return fmt.Sprintf("Error from AI agent: %s", categorizeError(err))
 }
 
-// categorizeError maps err to a short, actionable, provider-neutral reason.
-// Anthropic's own SDK wraps every HTTP-level API failure in a typed
-// *anthropic.Error carrying a real StatusCode and a Type() (rate_limit_error,
-// overloaded_error, billing_error, ...) — checked first, since it's exact by
-// construction, unlike matching on err.Error()'s text. strings.Contains on
-// "502"/"521" et al. used to be the only check here, and could false-match a
-// request ID or file size that happened to contain the same digits; that
-// string-matching fallback still exists below, but now only runs when
-// there's no typed error to classify from — which covers two real cases:
-// errors this codebase generates itself (never wrapped in *anthropic.Error
-// to begin with), and the DeepSeek compat endpoint (config.AIProvider ==
-// "deepseek" — see ai.New's doc comment), which speaks the same wire
-// protocol but isn't guaranteed to always surface a typed error the SDK
-// recognizes.
+// FailureClassification returns structured failure metadata for events/logs.
+func FailureClassification(err error) genfail.Classification {
+	return genfail.Classify(err)
+}
+
 func categorizeError(err error) string {
 	var apiErr *anthropic.Error
 	if errors.As(err, &apiErr) {
@@ -57,11 +50,6 @@ func categorizeError(err error) string {
 			return "the request timed out — please try again"
 		case apiErr.Type() == shared.ErrorTypeOverloadedError || apiErr.StatusCode == http.StatusBadGateway ||
 			apiErr.StatusCode == http.StatusServiceUnavailable || (apiErr.StatusCode >= 520 && apiErr.StatusCode <= 524):
-			// 521-524 are Cloudflare's own origin-unreachable/timeout codes
-			// (see developers.cloudflare.com/support/troubleshooting/http-status-codes)
-			// — seen in practice when buildSnapshot's read of a theme file
-			// hits a momentarily-down origin behind Cloudflare, not an AI
-			// provider issue.
 			return "temporarily unavailable — please try again shortly"
 		}
 	}
@@ -69,8 +57,11 @@ func categorizeError(err error) string {
 	if errors.Is(err, ErrMaxTokensTruncated) {
 		return "the response was too large to complete — please try a smaller request"
 	}
-	if errors.Is(err, errStreamIdleTimeout) || errors.Is(err, errStreamFirstTokenTimeout) {
-		return "the request timed out — please try again"
+	if errors.Is(err, errStreamFirstTokenTimeout) {
+		return "the AI provider is taking longer than expected to start — please try again"
+	}
+	if errors.Is(err, errStreamIdleTimeout) {
+		return "the AI response stalled mid-stream — please try again"
 	}
 	if errors.Is(err, errStreamTruncated) {
 		return "the connection to the AI provider was interrupted mid-response — please try again"
@@ -83,26 +74,18 @@ func categorizeError(err error) string {
 
 	lower := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(lower, "incomplete multi-page"):
+		return "the AI did not create all requested pages and register them in Pages. Please try again."
+	case strings.Contains(lower, "invalid model proposal"):
+		return "the generated changes could not be validated. Please try again."
 	case strings.Contains(lower, "accumulate stream") || strings.Contains(lower, "error converting content block to json") ||
 		strings.Contains(lower, "provider stream truncated") || strings.Contains(lower, "provider stream idle"):
-		// The provider's streamed response was cut off or garbled mid-chunk
-		// before the SDK could reassemble it into valid JSON (seen in
-		// production as both "unexpected end of JSON input" and "invalid
-		// character '}' after top-level value" — a dropped connection or
-		// truncated response, not anything about the request itself).
-		// Checked before the generic "timeout"/"unavailable" matches below
-		// since those substrings don't otherwise appear here.
 		return "the connection to the AI provider was interrupted mid-response — please try again"
 	case strings.Contains(lower, "credit balance") || strings.Contains(lower, "insufficient balance") ||
 		strings.Contains(lower, "payment required") || (strings.Contains(lower, "insufficient") && strings.Contains(lower, "credit")):
-		// "insufficient balance"/"payment required" cover DeepSeek's own
-		// wording for the same condition (its compat endpoint's 402 body is
-		// {"error":{"message":"Insufficient Balance",...}} — no "credit" in
-		// it at all, so the original credit-only check silently missed it
-		// and fell through to the generic message). Observed in production.
 		return "the account is out of credits — please contact support"
-	case strings.Contains(lower, "simple_edit:"):
-		return "the change was too large for a simple edit — please try a smaller, more specific request"
+	case strings.Contains(lower, "simple_edit:") || errors.Is(err, ErrSimpleEditBudget):
+		return "the change needed a larger edit pass — please try again"
 	case strings.Contains(lower, "did not call propose_changes within"):
 		return "the change needed another pass and couldn't finish — please try again"
 	case strings.Contains(lower, "didn't pass validation after"):

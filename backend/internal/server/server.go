@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"reflect"
@@ -43,6 +44,9 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	var generator *ai.Generator
 	switch {
 	case cfg.FakeAIMode:
+		if !cfg.AllowFakeAIMode {
+			return nil, fmt.Errorf("AI_CHAT_FAKE_MODE is set without AI_CHAT_ALLOW_FAKE_MODE=true — refusing canned generation in this environment")
+		}
 		logger.Warn("AI_CHAT_FAKE_MODE is enabled — every generation returns a canned no-op result, " +
 			"the AI provider is never called, and nothing is ever written to a theme. Do not leave this on.")
 		generator = ai.NewFake(cfg.FakeAIDelay)

@@ -108,7 +108,8 @@ type workspaceMeta struct {
 	ThemeSlug string            `json:"theme_slug"`
 	TenantID  uint64            `json:"tenant_id"`
 	SyncedAt  time.Time         `json:"synced_at"`
-	Hashes    map[string]string `json:"hashes"` // relPath → sha256 hex
+	Revision  uint64            `json:"revision"` // bumped by Invalidate after Apply
+	Hashes    map[string]string `json:"hashes"`   // relPath → sha256 hex
 }
 
 // Open returns (and creates) the on-disk workspace for tenant/slug backed by remote.
@@ -160,11 +161,50 @@ func (w *Workspace) loadMeta() error {
 
 func (w *Workspace) saveMeta() error {
 	w.meta.SyncedAt = time.Now().UTC()
+	return w.writeMetaFile()
+}
+
+func (w *Workspace) writeMetaFile() error {
 	raw, err := json.MarshalIndent(w.meta, "", "  ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(w.dir, metaFileName), raw, 0o644)
+}
+
+// Invalidate forces the next EnsureSynced to re-list and re-fetch from
+// FlowPOS. Call after a successful ApplyDraft — otherwise the 15-minute
+// freshness TTL keeps serving pre-Apply local content (matching stale
+// hashes) while live theme files have already changed.
+func (w *Workspace) Invalidate() error {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.meta.SyncedAt = time.Time{}
+	w.meta.Hashes = map[string]string{}
+	w.meta.Revision++
+	if err := w.writeMetaFile(); err != nil {
+		return fmt.Errorf("invalidate workspace meta: %w", err)
+	}
+	slog.Info("themeworkspace: invalidated after apply",
+		"tenant_id", w.tenantID, "theme_slug", w.slug, "revision", w.meta.Revision)
+	return nil
+}
+
+// InvalidateTheme opens the on-disk workspace for tenant/slug (if the
+// manager is enabled) and invalidates it. remote may be nil — Open only
+// needs it for later sync, not for bumping meta.
+func (m *Manager) InvalidateTheme(tenantID uint64, slug string) error {
+	if !m.Enabled() {
+		return nil
+	}
+	ws, err := m.Open(tenantID, slug, nil)
+	if err != nil {
+		return err
+	}
+	return ws.Invalidate()
 }
 
 func hashContent(s string) string {

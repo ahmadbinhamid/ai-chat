@@ -12,6 +12,10 @@ import (
 // side effect of code that thinks it's writing to a theme.
 var ErrOverlayIsReadOnly = errors.New("draft overlay is read-only — apply the draft to write it to the theme")
 
+// DraftDeleteMarker is staged content meaning "delete this path on Apply".
+// Overlay ReadFile returns "" for it; ListFiles hides the path.
+const DraftDeleteMarker = "__AI_CHAT_DELETED__"
+
 // OverlayStore serves reads from an in-memory draft first, falling through
 // to the real store for anything the draft doesn't cover — this is what
 // lets a whole chat's worth of turns build on each other (read their own
@@ -36,14 +40,49 @@ func NewOverlayStore(base ThemeStore, draft map[string]string) *OverlayStore {
 	return &OverlayStore{base: base, draft: draft}
 }
 
+// Base returns the ThemeStore under this overlay (FlowPOS, workspace, or
+// generation-scoped CachingStore). Used for metrics and diagnostics only —
+// callers that need draft-aware reads must keep using the OverlayStore itself.
+func (o *OverlayStore) Base() ThemeStore {
+	if o == nil {
+		return nil
+	}
+	return o.base
+}
+
+// AsCachingStore returns the generation-scoped CachingStore when store is one,
+// or when store is an OverlayStore wrapping one. Nil when absent — grep/tool
+// metrics use this to report cache hit deltas without requiring every
+// ThemeStore to expose cache counters.
+func AsCachingStore(store ThemeStore) *CachingStore {
+	switch s := store.(type) {
+	case *CachingStore:
+		return s
+	case *OverlayStore:
+		if s == nil {
+			return nil
+		}
+		if c, ok := s.base.(*CachingStore); ok {
+			return c
+		}
+	}
+	return nil
+}
+
 // ReadFile returns the draft's content for relPath if the draft has an
 // entry for it — including an explicitly empty one, since a draft entry
 // existing at all means some earlier turn in this chat wrote it, and ""
 // there is a real deleted-to-empty content, not "no draft entry" (Go's map
 // lookup ", ok" is what disambiguates the two, not a truthiness check on
 // the string). Falls through to base otherwise.
+//
+// Draft delete tombstones (themebuild.DraftDeleteMarker) return "" so
+// readers treat the path as gone until Apply runs DeleteFile.
 func (o *OverlayStore) ReadFile(ctx context.Context, auth RequestAuth, relPath string) (string, error) {
 	if content, ok := o.draft[relPath]; ok {
+		if content == DraftDeleteMarker {
+			return "", nil
+		}
 		return content, nil
 	}
 	return o.base.ReadFile(ctx, auth, relPath)
@@ -77,7 +116,11 @@ func (o *OverlayStore) ListFiles(ctx context.Context, auth RequestAuth) ([]FileT
 	collectPaths(tree, existing)
 
 	root := treeToDirNode(tree)
-	for path := range o.draft {
+	for path, content := range o.draft {
+		if content == DraftDeleteMarker {
+			removePath(root, strings.Split(path, "/"))
+			continue
+		}
 		if existing[path] {
 			continue
 		}
@@ -175,6 +218,36 @@ func insertPath(root *dirNode, segments []string) {
 			child.isFile = last
 			node.children[seg] = child
 			node.order = append(node.order, seg)
+		}
+		node = child
+		if last {
+			child.isFile = true
+		}
+	}
+}
+
+// removePath drops a file (last segment) from the mutable tree — used when
+// the draft marks a path deleted so list_theme_files no longer shows it.
+func removePath(root *dirNode, segments []string) {
+	if len(segments) == 0 {
+		return
+	}
+	node := root
+	for i, seg := range segments {
+		child, ok := node.children[seg]
+		if !ok {
+			return
+		}
+		if i == len(segments)-1 {
+			delete(node.children, seg)
+			out := node.order[:0]
+			for _, n := range node.order {
+				if n != seg {
+					out = append(out, n)
+				}
+			}
+			node.order = out
+			return
 		}
 		node = child
 	}

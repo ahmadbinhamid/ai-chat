@@ -52,6 +52,47 @@ func TestBuildWritePlan_PageRegistryEntryMatchesFile_TopLevelPages(t *testing.T)
 	}
 }
 
+func TestBuildWritePlan_HomeRegistryForcesPublished(t *testing.T) {
+	ts := newTestStoreServer(t)
+	defer ts.Close()
+
+	svc := &Service{store: themefs.NewStore(ts.URL)}
+	auth := themefs.RequestAuth{Token: "t", TenantID: 1}
+	result := &ai.Result{
+		Files: []ai.GeneratedFile{{Path: "pages/home.liquid", Action: "update", Content: "..."}},
+		PageRegistryEntry: &themefs.PageEntry{
+			Title: "Home", Slug: "home", Path: "/pages", Type: "home", Page: "home", Status: "draft",
+		},
+	}
+
+	plan, err := svc.buildWritePlan(context.Background(), svc.store, auth, result)
+	if err != nil {
+		t.Fatalf("buildWritePlan returned an error: %v", err)
+	}
+	if plan.files[0].pageMeta == nil || plan.files[0].pageMeta.Status != "published" {
+		t.Fatalf("expected home pageMeta status published, got %+v", plan.files[0].pageMeta)
+	}
+}
+
+func TestNormalizePageRegistryStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		in   *themefs.PageEntry
+		want string
+	}{
+		{"nil", nil, "published"},
+		{"empty status custom", &themefs.PageEntry{Page: "offers", Type: "custom"}, "published"},
+		{"explicit draft custom", &themefs.PageEntry{Page: "offers", Type: "custom", Status: "draft"}, "draft"},
+		{"home draft coerced", &themefs.PageEntry{Page: "home", Type: "home", Status: "draft"}, "published"},
+		{"home by slug", &themefs.PageEntry{Slug: "home", Page: "home", Status: "draft"}, "published"},
+	}
+	for _, tc := range cases {
+		if got := normalizePageRegistryStatus(tc.in); got != tc.want {
+			t.Errorf("%s: got %q want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestBuildWritePlan_PageRegistryEntryMatchesFile_AuthSubdir(t *testing.T) {
 	ts := newTestStoreServer(t)
 	defer ts.Close()

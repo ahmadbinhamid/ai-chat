@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"time"
 
+	"ai-chat/internal/genlifecycle"
+
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -253,6 +255,10 @@ type eventEmitter struct {
 	generationID string
 	chatID       string
 	nextSeq      int64
+	// terminal ensures at most one of done/failed/cancelled is persisted
+	// and published for this generation — see genlifecycle.TerminalGuard.
+	// Bound to this emitter only (never a global map of generation IDs).
+	terminal genlifecycle.TerminalGuard
 	// lastHeartbeat is when this emitter last wrote last_heartbeat_at (see
 	// updateHeartbeatThrottled) — shared by emit and emitLive so the two
 	// paths' liveness signal lands in the same place instead of double-
@@ -330,6 +336,9 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 	if e == nil || e.repo == nil {
 		return
 	}
+	if !e.allowEmit(eventType) {
+		return
+	}
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
 		slog.Error("failed to marshal generation event payload", "type", eventType, "error", err)
@@ -351,6 +360,34 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 	if e.bus != nil {
 		e.bus.Publish(ctx, e.chatID, ev)
 	}
+	if genlifecycle.IsTerminal(eventType) {
+		genlifecycle.TerminalEventsEmitted.Add(1)
+		slog.Info("ai: terminal event emitted",
+			"chat_id", e.chatID, "generation_id", e.generationID, "type", eventType)
+	}
+}
+
+// allowEmit enforces Phase 6 terminal exactly-once and blocks late
+// progress after a terminal for this emitter's generation.
+func (e *eventEmitter) allowEmit(eventType string) bool {
+	if genlifecycle.IsTerminal(eventType) {
+		if !e.terminal.TryClaimTerminal(eventType) {
+			genlifecycle.TerminalEventsSuppressed.Add(1)
+			slog.Info("ai: duplicate terminal suppressed",
+				"chat_id", e.chatID, "generation_id", e.generationID,
+				"type", eventType, "claimed", e.terminal.Kind())
+			return false
+		}
+		return true
+	}
+	if !e.terminal.ShouldEmitNonTerminal() {
+		genlifecycle.StaleEventsIgnored.Add(1)
+		slog.Info("ai: stale event ignored",
+			"chat_id", e.chatID, "generation_id", e.generationID,
+			"type", eventType, "terminal", e.terminal.Kind())
+		return false
+	}
+	return true
 }
 
 // emitLive publishes an event to the live bus only — never to
@@ -382,6 +419,11 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 // never sees "thinking" narration either way.
 func (e *eventEmitter) emitLive(ctx context.Context, eventType string, payload any) {
 	if e == nil {
+		return
+	}
+	// Live narration must not continue after a terminal — same guard as emit.
+	if !e.terminal.ShouldEmitNonTerminal() {
+		genlifecycle.StaleEventsIgnored.Add(1)
 		return
 	}
 	e.updateHeartbeatThrottled(ctx)

@@ -54,11 +54,41 @@ var (
 	complexRe     = regexp.MustCompile(`(?i)\b(from scratch|entire theme|whole site|all pages|every page|new theme|brand kit|redesign (the )?site|multi[- ]page)\b`)
 	multiFileRe   = regexp.MustCompile(`(?i)\b(and also|as well as|both .+ and|homepage and|header and footer|all components|several files|multiple files)\b`)
 
+	// brandScrubRe: merchant wants old brand (JPRO / store name) gone across
+	// pages/files — Roman Urdu ("kisi b page", "sari files/fies", "jpro ni")
+	// and English. Must NOT use the 2-iter simple_edit one-shot (model greps
+	// forever and dies with "another pass couldn't finish").
+	brandScrubRe = regexp.MustCompile(`(?i)(?:` +
+		`\b(?:no|remove|strip|delete|clear)\b[\s\S]{0,48}\bjpro\b` +
+		`|` +
+		`\bjpro\b[\s\S]{0,64}\b(?:ni|nahi|nhi|not|dont|don't|any\s+page|every\s+page|all\s+pages?)\b` +
+		`|` +
+		`\b(?:kisi|kissi)\s*b(?:hi)?\s*page\b` +
+		`|` +
+		`\b(?:sari|saari|sab)\s*(?:files?|fies|pages?)\b` +
+		`|` +
+		`\b(?:all|every|entire)\s+(?:theme\s+)?files?\b` +
+		`|` +
+		`\b(?:across|throughout)\b[\s\S]{0,32}\b(?:theme|pages?|site)\b` +
+		`|` +
+		`\b(?:rebrand|brand\s*scrub|remove\s+branding)\b` +
+		`)`)
+
+	// legalPageRewriteRe: privacy/terms/cookie content rewrite (often paired
+	// with "software company") — large liquid bodies, not an 8k one-shot.
+	legalPageRewriteRe = regexp.MustCompile(`(?i)(?:` +
+		`\b(?:update|rewrite|replace|change|edit)\b[\s\S]{0,80}\b(?:privacy|terms|cookie)\b` +
+		`|` +
+		`\b(?:privacy|terms|cookie)\b[\s\S]{0,64}\b(?:page|policy|content|contnent)\b[\s\S]{0,80}\b(?:update|rewrite|software|company|saas)\b` +
+		`|` +
+		`\b(?:privacy|terms|cookie)\b[\s\S]{0,48}\b(?:software\s*company|saas|according\s+to)\b` +
+		`)`)
+
 	// pageCreateRe matches NEW PAGE / route creation. Checked BEFORE
 	// simple_edit so "create a Contact Us page" never enters the 8k one-shot.
 	// Kept narrow: "add a section" / "change the header" must stay simple_edit.
 	pageCreateRe = regexp.MustCompile(`(?i)(?:` +
-		`\b(?:create|make|build)\s+(?:a\s+|an\s+|the\s+|new\s+)?(?:` +
+		`\b(?:create|make|build|generate|genrate)\s+(?:a\s+|an\s+|the\s+|new\s+)?(?:` +
 		`landing\s*page|contact(?:\s*us)?(?:\s*page)?|about(?:\s*page)?|faq(?:\s*page)?|page` +
 		`)\b` +
 		`|` +
@@ -69,14 +99,24 @@ var (
 		`\b(?:new)\s+(?:landing\s*page|page|route)\b` +
 		`|` +
 		// Roman-Urdu / free word order: "page create …", "ek page create kr …"
-		`\bpage\b[\s\S]{0,24}\bcreate\b` +
+		`\bpage\b[\s\S]{0,24}\b(?:create|generate|genrate)\b` +
+		`|` +
+		// "10 blog pages" / "generate 10 blog pages" (digit required — not "add pages.json")
+		`\b(?:\d{1,2})\s+blogs?\s*pages?\b` +
+		`|` +
+		`\b(?:create|make|build|generate|genrate|add)\b[\s\S]{0,48}\b\d{1,2}\s+(?:blog\s*)?pages?\b` +
+		`|` +
+		`\b(?:create|make|build|generate|genrate)\b[\s\S]{0,48}\bblog\s*pages?\b` +
 		`)`)
+
+	// multiPageCreateCountRe extracts how many new pages the merchant wants.
+	multiPageCreateCountRe = regexp.MustCompile(`(?i)\b(\d{1,2})\s+(?:blog\s*)?pages?\b|\b(\d{1,2})\s+blogs?\b`)
 
 	// pageAndMenuRe: page + menu/nav together with a create/add/new action —
 	// structural multi-file work (register page + wire navigation).
 	pageAndMenuRe = regexp.MustCompile(`(?i)\b(?:create|make|build|add|new)\b`)
 	menuNavRe     = regexp.MustCompile(`(?i)\b(?:menu|navigation|navbar)\b|\bnav\b`)
-	addToMenuRe   = regexp.MustCompile(`(?i)\b(?:add|put|include)\b[\s\S]{0,48}\b(?:to\s+)?(?:the\s+)?(?:menu|navigation|navbar)\b`)
+	addToMenuRe   = regexp.MustCompile(`(?i)\b(?:add|put|include)\b[\s\S]{0,48}\b(?:to\s+|in\s+)?(?:the\s+)?(?:menu|navigation|navbar)\b`)
 	pageLikeNameRe = regexp.MustCompile(`(?i)\b(?:contact|about|faq|landing)\b`)
 
 	// pageRedesignRe matches substantial homepage/page redesigns (slider,
@@ -92,6 +132,28 @@ var (
 		`\b(?:home\s*page|homepage)\b[\s\S]{0,48}\b(?:slider|carousel)\b` +
 		`|` +
 		`\b(?:beautiful|beautifull|proper)\b[\s\S]{0,40}\b(?:home\s*page|homepage)\b` +
+		`|` +
+		// Merchant: homepage wrong / looks like plain HTML / CSS missing —
+		// must rebuild liquid+css together, never a one-file ±0 tweak.
+		`\b(?:home\s*page|homepage)\b[\s\S]{0,96}\b(?:not\s+correct|incorrect|wrong|broken|only\s+(?:like\s+)?html|like\s+html|plain\s+html|no\s+css|without\s+css|css\s*(?:not|ni|nahi)|desgin|design)\b` +
+		`|` +
+		`\b(?:only\s+(?:like\s+)?html|like\s+html|plain\s+html|not\s+any\s+css|no\s+css\s+apply)\b[\s\S]{0,64}\b(?:home\s*page|homepage|home)\b` +
+		`)`)
+
+	// changeNotVisibleRe: merchant says the last edit still looks the same
+	// (English + Roman Urdu). Must not fall through to "couldn't understand".
+	changeNotVisibleRe = regexp.MustCompile(`(?i)(?:` +
+		`\bstill\s+(?:looks?|looking|the\s+same|same|showing)\b` +
+		`|` +
+		`\b(?:looks?|looking)\s+(?:the\s+)?same\b` +
+		`|` +
+		`\bno\s+change\b|\bnothing\s+changed\b|\bdidn'?t\s+change\b` +
+		`|` +
+		`\b(?:abi|abhi)\s*b?h?i?\b[\s\S]{0,32}\b(?:wasy|waisi|wese|waisa|same)\b` +
+		`|` +
+		`\b(?:wasy|waisi|wese|waisa)\s*e?\b[\s\S]{0,24}\b(?:dek|dekh)\b` +
+		`|` +
+		`\bsame\s+(?:dikha?|dekh|look|page)\b` +
 		`)`)
 
 	// sliderFeatureRe: multi-image / autoplay / auto-scroll on a slider —
@@ -181,13 +243,45 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 		}
 	}
 
+	if isPagesListPrompt(p) {
+		return IntentThemeQuery
+	}
+	if isBulkPageDeletePrompt(p) {
+		return IntentComplexPage
+	}
 	if complexRe.MatchString(p) {
+		return IntentComplexPage
+	}
+	// Theme-wide brand scrub / privacy-legal rewrite — never simple_edit.
+	if isBrandScrubOrLegalRewritePrompt(p) {
+		return IntentComplexPage
+	}
+	// Substantial page content rewrite/fill (e.g. "services page pe zada
+	// content add kro") — never the 8k simple_edit one-shot (that rejects
+	// large updates and often targets the wrong file).
+	if isPageContentRewritePrompt(p) {
 		return IntentComplexPage
 	}
 	// Page create / redesign / page+menu / slider MUST run before simple_edit
 	// matching — including when a ReferenceURL made hasAttachments=true.
 	if isPageCreateOrStructural(p) {
 		return IntentComplexPage
+	}
+	if isHomeCSSBrokenPrompt(p) {
+		return IntentComplexPage
+	}
+	if isNamedPageCSSBrokenPrompt(p) {
+		return IntentComplexPage
+	}
+	// Reference URL / "make homepage same as this" (incl. Roman Urdu
+	// "asa chy" / "same kro") — never simple_edit typo/card tweaks.
+	if isHomeReferenceClonePrompt(p) {
+		return IntentComplexPage
+	}
+	// "Still looks the same" / Roman Urdu "abi b wasy e dek rha" — previous
+	// edit didn't show. Route to repair (not conversation / empty clarify).
+	if changeNotVisibleRe.MatchString(p) {
+		return IntentRepair
 	}
 	if repairRe.MatchString(p) && (themeTargetRe.MatchString(p) || strings.Contains(p, "render") || strings.Contains(p, "liquid") || strings.Contains(p, "error")) {
 		return IntentRepair
@@ -241,9 +335,29 @@ var sectionCSSBrokenRe = regexp.MustCompile(`(?i)(?:` +
 	`\b(?:css|style)\b[\s\S]{0,24}\b(?:e\s+)?(?:ni|nahi|nhi)\b` +
 	`)`)
 
+// isBrandScrubOrLegalRewritePrompt is theme-wide "no JPRO on any page" /
+// "look at all files" OR a privacy/terms/cookie rewrite for a software
+// company — both need complex_page budgets, not simple_edit explore thrash.
+func isBrandScrubOrLegalRewritePrompt(p string) bool {
+	p = strings.ToLower(strings.Join(strings.Fields(p), " "))
+	if brandScrubRe.MatchString(p) {
+		return true
+	}
+	return legalPageRewriteRe.MatchString(p)
+}
+
 // isPageCreateOrStructural reports new-page / page redesign / page+menu work
 // that must use the full multi-file generation path, never SIMPLE_EDIT one-shot.
 func isPageCreateOrStructural(p string) bool {
+	if isMultiPageCreatePrompt(p) {
+		return true
+	}
+	if isPageContentRewritePrompt(p) {
+		return true
+	}
+	if isNamedPageCSSBrokenPrompt(p) {
+		return true
+	}
 	if pageCreateRe.MatchString(p) {
 		return true
 	}
@@ -262,13 +376,177 @@ func isPageCreateOrStructural(p string) bool {
 	if hasPage && hasMenu && pageAndMenuRe.MatchString(p) {
 		return true
 	}
-	// Explicit "add … to (the) menu/navigation" with a page-like object.
+	// Explicit "add … to/in (the) menu/navigation" — Services, FAQ, etc.
 	if hasMenu && addToMenuRe.MatchString(p) {
-		if hasPage || pageLikeNameRe.MatchString(p) {
-			return true
-		}
+		return true
 	}
 	return false
+}
+
+// isMultiPageCreatePrompt is true when the merchant wants several NEW pages
+// created in one turn (e.g. "generate 10 blog pages"). Must use complex_page
+// with a pages.json full-body update — never simple_edit on blog.liquid alone.
+func isMultiPageCreatePrompt(prompt string) bool {
+	if isBulkPageDeletePrompt(prompt) {
+		return false
+	}
+	n := requestedNewPageCount(prompt)
+	if n < 2 {
+		return false
+	}
+	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	return pageCreateRe.MatchString(p) ||
+		strings.Contains(p, "blog") ||
+		strings.Contains(p, "generate") ||
+		strings.Contains(p, "genrate") ||
+		strings.Contains(p, "create") ||
+		strings.Contains(p, "make") ||
+		strings.Contains(p, "build") ||
+		strings.Contains(p, "add")
+}
+
+// requestedNewPageCount returns how many new pages the merchant asked for
+// (0 if unclear). Capped at 10 for intent display; the model still only
+// creates multiPageCreateBatchSize per turn (see that helper).
+func requestedNewPageCount(prompt string) int {
+	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	m := multiPageCreateCountRe.FindStringSubmatch(p)
+	if len(m) == 0 {
+		return 0
+	}
+	raw := m[1]
+	if raw == "" {
+		raw = m[2]
+	}
+	n := 0
+	for _, ch := range raw {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+		n = n*10 + int(ch-'0')
+	}
+	if n < 2 {
+		return 0
+	}
+	if n > 10 {
+		return 10
+	}
+	return n
+}
+
+// multiPageCreateBatchSize is how many pages the AI must create THIS turn.
+// Large N (e.g. 10) truncates DeepSeek streams — batch so content stays
+// merchant-specific and AI-authored, not a Go template dump.
+const maxMultiPageCreateBatch = 3
+
+func multiPageCreateBatchSize(prompt string) int {
+	n := requestedNewPageCount(prompt)
+	if n <= 0 {
+		return 0
+	}
+	if n > maxMultiPageCreateBatch {
+		return maxMultiPageCreateBatch
+	}
+	return n
+}
+
+// isPageContentRewritePrompt is a substantial rewrite/fill of a named page
+// ("services page pe software company content add kro", "zada sara content",
+// "shop page ko software company theme ke mutabiq regenerate").
+// Must use complex_page — simple_edit rejects large patches and often edits
+// an unrelated component (card-essentials / contact-inquiry) instead.
+func isPageContentRewritePrompt(prompt string) bool {
+	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	if isBulkPageDeletePrompt(p) || isAddToMenuPrompt(p) || isMultiPageCreatePrompt(p) {
+		return false
+	}
+	if isBlogOrMetaRewritePrompt(p) {
+		return true
+	}
+	slug := promptNamedPageSlug(p)
+	if slug == "" && !strings.Contains(p, "page") && !strings.Contains(p, "blog") {
+		return false
+	}
+	// Named page + regenerate / software-theme redesign (typos intentional).
+	if slug != "" && namedPageThemeRegenCue(p) {
+		return true
+	}
+	if slug != "" && isNamedPageStillWrongPrompt(p) {
+		return true
+	}
+	contentCue := strings.Contains(p, "content") || strings.Contains(p, "contnent") ||
+		strings.Contains(p, "conent") || // common typo
+		strings.Contains(p, "copy") || strings.Contains(p, "rewrite") ||
+		strings.Contains(p, "recreate") || strings.Contains(p, "fill") ||
+		strings.Contains(p, "zada") || strings.Contains(p, "zyada") ||
+		strings.Contains(p, "lots") || strings.Contains(p, "more text") ||
+		strings.Contains(p, "software company") || strings.Contains(p, "software house") ||
+		strings.Contains(p, "software compan") || // compnay typo
+		strings.Contains(p, "saas")
+	actionCue := strings.Contains(p, "add") || strings.Contains(p, "update") ||
+		strings.Contains(p, "change") || strings.Contains(p, "edit") ||
+		strings.Contains(p, "write") || strings.Contains(p, "rewrite") ||
+		strings.Contains(p, "recreate") || strings.Contains(p, "make") ||
+		strings.Contains(p, "regen") || strings.Contains(p, "redesign") ||
+		strings.Contains(p, "kr") || strings.Contains(p, "kar")
+	return contentCue && actionCue
+}
+
+// isBlogOrMetaRewritePrompt is blog listing / post copy rewrite and/or
+// meta-title / SEO scrub (e.g. "change the blogs according to software house
+// … still not change the jpro meta titles"). Must use complex_page — never
+// multi_file_edit explore thrash with a 45s TTFT budget.
+func isBlogOrMetaRewritePrompt(prompt string) bool {
+	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	if isMultiPageCreatePrompt(p) || isBulkPageDeletePrompt(p) {
+		return false
+	}
+	hasBlog := strings.Contains(p, "blog")
+	hasMeta := strings.Contains(p, "meta") || strings.Contains(p, "seo") ||
+		(strings.Contains(p, "title") && (strings.Contains(p, "meta") || strings.Contains(p, "jpro") || strings.Contains(p, "site")))
+	if !hasBlog && !hasMeta {
+		return false
+	}
+	topic := strings.Contains(p, "software") || strings.Contains(p, "saas") ||
+		strings.Contains(p, "jpro") || strings.Contains(p, "company") || strings.Contains(p, "house")
+	action := strings.Contains(p, "change") || strings.Contains(p, "update") ||
+		strings.Contains(p, "rewrite") || strings.Contains(p, "edit") ||
+		strings.Contains(p, "according") || strings.Contains(p, "still") ||
+		strings.Contains(p, "fix") || strings.Contains(p, "from")
+	return topic && action
+}
+
+// namedPageThemeRegenCue is "regenerate this page for software company theme"
+// including Roman Urdu ("mutabiq"/"mutibq") and common typos.
+func namedPageThemeRegenCue(p string) bool {
+	regen := strings.Contains(p, "regen") || strings.Contains(p, "redesign") ||
+		strings.Contains(p, "restyle") || strings.Contains(p, "rewrite") ||
+		strings.Contains(p, "recreate") || strings.Contains(p, "overhaul")
+	themeSoft := strings.Contains(p, "theme") ||
+		strings.Contains(p, "software") ||
+		strings.Contains(p, "saas") ||
+		strings.Contains(p, "mutabi") || strings.Contains(p, "mutibq")
+	return regen && themeSoft ||
+		(strings.Contains(p, "software") && (strings.Contains(p, "compan") || strings.Contains(p, "house") || strings.Contains(p, "theme")) &&
+			(regen || strings.Contains(p, "kr") || strings.Contains(p, "kar") || strings.Contains(p, "update") || strings.Contains(p, "change")))
+}
+
+// isNamedPageStillWrongPrompt is a follow-up that the named page still shows
+// old brand/copy ("shop page pe abi b jpro", "tm kuch b change ni kye").
+func isNamedPageStillWrongPrompt(prompt string) bool {
+	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	if promptNamedPageSlug(p) == "" {
+		return false
+	}
+	still := strings.Contains(p, "abi") || strings.Contains(p, "abhi") ||
+		strings.Contains(p, "still") || strings.Contains(p, "again") ||
+		strings.Contains(p, "arha") || strings.Contains(p, "aa rha") ||
+		strings.Contains(p, "showing")
+	wrong := strings.Contains(p, "jpro") || strings.Contains(p, "j pro") ||
+		strings.Contains(p, "change ni") || strings.Contains(p, "ni kye") ||
+		strings.Contains(p, "nahi") || strings.Contains(p, "nothing") ||
+		strings.Contains(p, "same") || strings.Contains(p, "wasy")
+	return still && wrong
 }
 
 // isSectionRedesignPrompt is a full header/footer rebuild OR a follow-up that
@@ -298,6 +576,85 @@ func isSectionCSSBrokenPrompt(p string) bool {
 	return strings.Contains(p, "css") || strings.Contains(p, "style") ||
 		strings.Contains(p, "design") || strings.Contains(p, "desgin") ||
 		strings.Contains(p, "apply")
+}
+
+// isNamedPageCSSBrokenPrompt is "shop/services/… page CSS not applying" —
+// liquid+css resync for the named page, never simple_edit explore thrash.
+func isNamedPageCSSBrokenPrompt(prompt string) bool {
+	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
+	slug := promptNamedPageSlug(p)
+	if slug == "" && !strings.Contains(p, "page") {
+		return false
+	}
+	if !sectionCSSBrokenRe.MatchString(p) &&
+		!(strings.Contains(p, "css") && (strings.Contains(p, "proper") || strings.Contains(p, "fix") || strings.Contains(p, "ni") || strings.Contains(p, "nahi"))) {
+		return false
+	}
+	return slug != "" || strings.Contains(p, "page")
+}
+
+// isHomeCSSBrokenPrompt is "homepage looks like plain HTML / CSS not applied" —
+// the liquid/CSS class-mismatch failure mode. Must use complex_page full-home
+// packaging so both pages/home.liquid and pages/css/home.css are rewritten together.
+func isHomeCSSBrokenPrompt(p string) bool {
+	p = strings.ToLower(strings.Join(strings.Fields(p), " "))
+	hasHome := strings.Contains(p, "homepage") || strings.Contains(p, "home page") ||
+		(strings.Contains(p, "home") && (strings.Contains(p, "page") || strings.Contains(p, "design") ||
+			strings.Contains(p, "desgin") || strings.Contains(p, "css") || strings.Contains(p, "html")))
+	if !hasHome {
+		return false
+	}
+	if strings.Contains(p, "like html") || strings.Contains(p, "only html") ||
+		strings.Contains(p, "plain html") || strings.Contains(p, "only like html") ||
+		strings.Contains(p, "not any css") || strings.Contains(p, "no css") ||
+		strings.Contains(p, "without css") || strings.Contains(p, "not correct") {
+		return true
+	}
+	return sectionCSSBrokenRe.MatchString(p)
+}
+
+// homeCloneCueRe: merchant wants homepage to match a reference site / look
+// "the same" / Roman Urdu "asa chy" / "same kro" / "proper dikhao".
+var homeCloneCueRe = regexp.MustCompile(`(?i)(?:` +
+	`\b(?:same\s+kro|same\s+karo|same\s+site|same\s+page|same\s+as|just\s+like|look\s+like|make\s+it\s+like|copy\s+this|clone|match\s+this|inspired\s+by)\b` +
+	`|` +
+	`\basa\s+chy\b|\basi\s+(?:chy|chahiye|ready)\b|\baisy\s+chy\b|\baisi\s+chy\b` +
+	`|` +
+	`\bproper\s+(?:diko|dikhao|dikha|show)\b` +
+	`|` +
+	`\b(?:home\s*page|homepage)\b[\s\S]{0,48}\b(?:same|like|asa|aisi|aisy|clone|match|copy)\b` +
+	`|` +
+	`\b(?:same|like|asa|aisi|aisy|clone|match|copy)\b[\s\S]{0,48}\b(?:home\s*page|homepage)\b` +
+	`)`)
+
+func promptMentionsHome(p string) bool {
+	p = strings.ToLower(p)
+	return strings.Contains(p, "homepage") || strings.Contains(p, "home page") ||
+		(strings.Contains(p, "home") && strings.Contains(p, "page"))
+}
+
+func promptHasHTTPURL(p string) bool {
+	low := strings.ToLower(p)
+	return strings.Contains(low, "http://") || strings.Contains(low, "https://") ||
+		strings.Contains(low, "www.")
+}
+
+// isHomeReferenceClonePrompt is "make my homepage like this URL / same as
+// that site" — must rebuild the whole homepage from the reference, never a
+// spelling fix or single card-essentials edit (observed in production).
+func isHomeReferenceClonePrompt(p string) bool {
+	p = strings.ToLower(strings.Join(strings.Fields(p), " "))
+	if !promptMentionsHome(p) {
+		return false
+	}
+	if homeCloneCueRe.MatchString(p) {
+		return true
+	}
+	// URL in the same message as "home page" is almost always "make it like this".
+	if promptHasHTTPURL(p) {
+		return true
+	}
+	return false
 }
 
 // isSliderFeaturePrompt is multi-image / autoplay / broken-slider / image-swap

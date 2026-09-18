@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/themecheck"
@@ -57,7 +58,7 @@ func (s *Service) buildToolExecutor(store themefs.ThemeStore, storeAuth themefs.
 		case "read_theme_file":
 			return s.execReadThemeFile(ctx, store, storeAuth, input)
 		case "grep_theme":
-			return s.execGrepTheme(ctx, store, storeAuth, input)
+			return s.execGrepTheme(ctx, store, storeAuth, input, tc.Metrics)
 		case "validate_changes":
 			return s.execValidateChanges(ctx, store, storeAuth, tc, snapBase, &validateCallCount, input)
 		default:
@@ -221,9 +222,18 @@ type grepFileHit struct {
 // expression (RE2 — Go's regexp package, not a plain substring; see
 // grepThemeTool's description) matched line-by-line, optionally restricted
 // to paths matching path_glob (path.Match — one wildcard segment, no "**").
-// Candidate file reads run concurrently (errgroup, loadThemeFilesConcurrency);
-// match assembly walks candidates in sorted order and stops at maxGrepMatches.
-func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
+//
+// I/O model (Phase 2 + Phase 3):
+//   - Reads go through the generation-scoped store (Overlay → CachingStore →
+//     FlowPOS/workspace), so cache hits never leave the process.
+//   - Independent candidate ReadFile calls run with bounded concurrency
+//     (errgroup.SetLimit(loadThemeFilesConcurrency)); never one goroutine
+//     per file without a cap.
+//   - Match assembly walks candidates in sorted path order so parallel
+//     completion order never changes the model-facing result.
+// Unreadable / empty files are skipped (same as before concurrent reads).
+func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, input json.RawMessage, metrics *ai.TurnMetrics) (string, error) {
+	grepStart := time.Now()
 	var args grepThemeInput
 	if err := json.Unmarshal(input, &args); err != nil {
 		return "", fmt.Errorf("invalid grep_theme input: %w", err)
@@ -234,6 +244,17 @@ func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, s
 	re, err := regexp.Compile(args.Pattern)
 	if err != nil {
 		return "", fmt.Errorf("invalid pattern: %w", err)
+	}
+
+	var flowPOSBeforeList, flowPOSBeforeRead, flowPOSBeforeElapsed int64
+	if c := themefs.FlowPOSCountersFromContext(ctx); c != nil {
+		flowPOSBeforeList = c.ListFiles.Load()
+		flowPOSBeforeRead = c.ReadFile.Load()
+		flowPOSBeforeElapsed = c.ElapsedMs.Load()
+	}
+	var cacheBefore themefs.CacheStats
+	if cs := themefs.AsCachingStore(store); cs != nil {
+		cacheBefore = cs.Stats()
 	}
 
 	tree, err := store.ListFiles(ctx, storeAuth)
@@ -264,10 +285,16 @@ func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, s
 		candidates = candidates[:maxGrepFilesScanned]
 	}
 
+	maxConcurrency := loadThemeFilesConcurrency
+	if n := len(candidates); n > 0 && n < maxConcurrency {
+		maxConcurrency = n
+	}
+
 	perFile := make([][]grepFileHit, len(candidates))
 	scanCtx, cancelScan := context.WithCancel(ctx)
 	defer cancelScan()
 	var matchTotal atomic.Int32
+	var inFlight, peakConcurrent atomic.Int32
 	g, gctx := errgroup.WithContext(scanCtx)
 	g.SetLimit(loadThemeFilesConcurrency)
 	for i, p := range candidates {
@@ -281,7 +308,15 @@ func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, s
 				return nil
 			default:
 			}
+			cur := inFlight.Add(1)
+			for {
+				old := peakConcurrent.Load()
+				if cur <= old || peakConcurrent.CompareAndSwap(old, cur) {
+					break
+				}
+			}
 			content, err := store.ReadFile(gctx, storeAuth, p)
+			inFlight.Add(-1)
 			if err != nil || content == "" {
 				return nil
 			}
@@ -306,22 +341,67 @@ func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, s
 	}
 	_ = g.Wait() // cancellation is expected when max matches hit early
 
+	// Count only real FlowPOS HTTP ops (via themefs counters), not cache hits.
+	flowPOSReads := 0
+	var flowPOSElapsedMs int64
+	if c := themefs.FlowPOSCountersFromContext(ctx); c != nil {
+		flowPOSReads = int((c.ListFiles.Load() - flowPOSBeforeList) + (c.ReadFile.Load() - flowPOSBeforeRead))
+		flowPOSElapsedMs = c.ElapsedMs.Load() - flowPOSBeforeElapsed
+	}
+	var cacheHits, cacheMisses int64
+	if cs := themefs.AsCachingStore(store); cs != nil {
+		after := cs.Stats()
+		cacheHits = (after.Hits - cacheBefore.Hits)
+		cacheMisses = (after.Misses - cacheBefore.Misses)
+	}
+	io := ai.GrepIOMetrics{
+		FlowPOSReads:     flowPOSReads,
+		FlowPOSElapsedMs: flowPOSElapsedMs,
+		CacheHits:        cacheHits,
+		CacheMisses:      cacheMisses,
+		PeakConcurrent:   int(peakConcurrent.Load()),
+		MaxConcurrency:   maxConcurrency,
+	}
+
 	var b strings.Builder
 	matches := 0
 	for _, hits := range perFile {
 		for _, h := range hits {
 			if matches >= maxGrepMatches {
 				fmt.Fprintf(&b, "(stopped at %d matches — narrow your pattern/path_glob)\n", maxGrepMatches)
+				io.FilesScanned = len(candidates)
+				io.Matches = matches
+				logGrepMetrics(storeAuth.TenantID, metrics, grepStart, io)
 				return b.String(), nil
 			}
 			fmt.Fprintf(&b, "%s:%d: %s\n", h.path, h.line, h.text)
 			matches++
 		}
 	}
+	io.FilesScanned = len(candidates)
+	io.Matches = matches
 	if matches == 0 {
+		logGrepMetrics(storeAuth.TenantID, metrics, grepStart, io)
 		return "(no matches)", nil
 	}
+	logGrepMetrics(storeAuth.TenantID, metrics, grepStart, io)
 	return b.String(), nil
+}
+
+func logGrepMetrics(tenantID uint64, metrics *ai.TurnMetrics, start time.Time, io ai.GrepIOMetrics) {
+	elapsed := time.Since(start).Milliseconds()
+	metrics.RecordGrep(io)
+	slog.Info("ai: grep_theme metrics",
+		"tenant_id", tenantID,
+		"grep_elapsed_ms", elapsed,
+		"files_scanned", io.FilesScanned,
+		"matches_found", io.Matches,
+		"flowpos_read_count", io.FlowPOSReads,
+		"flowpos_elapsed_ms", io.FlowPOSElapsedMs,
+		"cache_hits", io.CacheHits,
+		"cache_misses", io.CacheMisses,
+		"concurrent_reads", io.PeakConcurrent,
+		"max_concurrency", io.MaxConcurrency)
 }
 
 // maxValidateChangesCalls bounds how many times a model can call

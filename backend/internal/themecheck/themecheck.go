@@ -4,7 +4,11 @@
 // (pathsafety.go, layout.go, pages.go).
 package themecheck
 
-import "ai-chat/internal/themefs"
+import (
+	"strings"
+
+	"ai-chat/internal/themefs"
+)
 
 // Severity is how a Finding should be treated by the caller: an error
 // finding blocks the write and triggers a retry; a warning finding is
@@ -83,13 +87,36 @@ func (s Snapshot) LayoutStart() string { return s.Files[pathLayoutStart] }
 // none exists yet.
 func (s Snapshot) LayoutEnd() string { return s.Files[pathLayoutEnd] }
 
-// ProposedFile is one file the model proposes creating or updating — mirrors
-// ai.GeneratedFile's shape without importing package ai (themecheck must not
-// depend on it; see the brief's phase 1 design notes).
+// ProposedFile is one file the model proposes creating, updating, or
+// deleting — mirrors ai.GeneratedFile's shape without importing package ai.
 type ProposedFile struct {
 	Path    string
-	Action  string // "create" | "update"
+	Action  string // "create" | "update" | "delete"
 	Content string
+}
+
+// isDeleteAction is true for propose_changes action "delete" (and the
+// staged tombstone marker). Content rules must not run on these — empty
+// bodies are intentional.
+func isDeleteAction(f ProposedFile) bool {
+	if strings.EqualFold(strings.TrimSpace(f.Action), "delete") {
+		return true
+	}
+	return f.Content == themefs.DraftDeleteMarker
+}
+
+// withoutDeletes returns a proposal copy with delete files removed so
+// content/boilerplate rules never reject an intentional file removal.
+func withoutDeletes(p Proposal) Proposal {
+	out := p
+	out.Files = nil
+	for _, f := range p.Files {
+		if isDeleteAction(f) {
+			continue
+		}
+		out.Files = append(out.Files, f)
+	}
+	return out
 }
 
 // Proposal is the minimal subset of ai.Result Check needs. The caller
@@ -119,22 +146,25 @@ func (p Proposal) fileByPath(path string) (ProposedFile, bool) {
 // Check runs every rule against proposal given the theme's current snap,
 // returning every Finding across all rules and files. Rules run
 // independently and unconditionally — a failure in one rule never skips
-// another.
+// another. Delete actions are excluded from content rules (empty body is
+// intentional — Apply removes the file).
 func Check(proposal Proposal, snap Snapshot) []Finding {
+	content := withoutDeletes(proposal)
 	var findings []Finding
-	findings = append(findings, checkPageBoilerplate(proposal, snap)...)
-	findings = append(findings, checkPlaceholderBody(proposal, snap)...)
-	findings = append(findings, checkAllowedSyntax(proposal, snap)...)
-	findings = append(findings, checkBalancedTags(proposal, snap)...)
-	findings = append(findings, checkRenderTargetExists(proposal, snap)...)
-	findings = append(findings, checkAssetRegistered(proposal, snap)...)
-	findings = append(findings, checkPageRoute(proposal, snap)...)
-	findings = append(findings, checkPageRequiresAuth(proposal, snap)...)
-	findings = append(findings, checkSEOFilled(proposal, snap)...)
-	findings = append(findings, checkThemeToken(proposal, snap)...)
-	findings = append(findings, checkBoolGuard(proposal, snap)...)
-	findings = append(findings, checkNoFramework(proposal, snap)...)
-	findings = append(findings, checkJSShape(proposal, snap)...)
-	findings = append(findings, checkKnownFields(proposal, snap)...)
+	findings = append(findings, checkPageBoilerplate(content, snap)...)
+	findings = append(findings, checkPlaceholderBody(content, snap)...)
+	findings = append(findings, checkAllowedSyntax(content, snap)...)
+	findings = append(findings, checkBalancedTags(content, snap)...)
+	findings = append(findings, checkRenderTargetExists(content, snap)...)
+	findings = append(findings, checkAssetRegistered(content, snap)...)
+	findings = append(findings, checkPageRoute(content, snap)...)
+	findings = append(findings, checkPageRequiresAuth(content, snap)...)
+	findings = append(findings, checkSEOFilled(content, snap)...)
+	findings = append(findings, checkThemeToken(content, snap)...)
+	findings = append(findings, checkBoolGuard(content, snap)...)
+	findings = append(findings, checkAppendNullSafe(content, snap)...)
+	findings = append(findings, checkNoFramework(content, snap)...)
+	findings = append(findings, checkJSShape(content, snap)...)
+	findings = append(findings, checkKnownFields(content, snap)...)
 	return findings
 }
