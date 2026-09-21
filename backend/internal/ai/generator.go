@@ -988,7 +988,13 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			_ = stream.Close()
 			if streamErr == nil {
 				if err := stream.Err(); err != nil {
-					return nil, fmt.Errorf("claude stream: %w", err)
+					// "provider", not "claude": this same call serves
+					// DeepSeek too, over its Anthropic-compat endpoint (see
+					// New's own doc comment) — the error previously said
+					// "claude stream" here even on a pure-DeepSeek
+					// deployment, which reads as this service having
+					// somehow called the wrong provider when it didn't.
+					return nil, fmt.Errorf("provider stream: %w", err)
 				}
 				break
 			}
