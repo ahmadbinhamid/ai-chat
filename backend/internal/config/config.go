@@ -113,6 +113,45 @@ type Config struct {
 	// DeepSeek (classify / validate / candidate context). Default false —
 	// existing generation pipeline is unchanged until explicitly enabled.
 	BuilderPlanEnabled bool
+	// BuilderLocalLMEnabled turns on optional local prompt-understanding
+	// refinement after the deterministic BuilderPlan (still before DeepSeek).
+	// Default false. Requires BuilderPlanEnabled to have any effect in the
+	// generation path. Never mutates theme files; never replaces DeepSeek.
+	BuilderLocalLMEnabled bool
+	// BuilderLocalLMProvider selects heuristic | http | unavailable.
+	// Empty → heuristic, or http when BuilderLocalLMURL is set.
+	BuilderLocalLMProvider string
+	// BuilderLocalLMURL is an optional OpenAI-compatible base URL
+	// (e.g. http://127.0.0.1:11434/v1 for Ollama). Empty → HeuristicProvider
+	// (CPU-only, no new runtime dependency).
+	BuilderLocalLMURL string
+	// BuilderLocalLMModel is the optional model name for HTTPProvider.
+	BuilderLocalLMModel string
+	// BuilderLocalLMTimeoutMs is the hard budget for local understanding
+	// (default 1500). Must stay far below the generation deadline.
+	BuilderLocalLMTimeoutMs int
+	// BuilderShadowLMEnabled runs a candidate semantic model in SHADOW mode
+	// only (validate + compare + discard). Default false. Never affects the
+	// production plan, DeepSeek, or deterministic ops. No trained candidate
+	// exists yet — without a configured provider/URL this is a no-op.
+	BuilderShadowLMEnabled bool
+	BuilderShadowLMProvider string
+	BuilderShadowLMURL      string
+	BuilderShadowLMModel    string
+	BuilderShadowLMTimeoutMs int
+	BuilderShadowSampleRate  float64
+	// BuilderTrainingDataEnabled turns on ML-9 compact execution example
+	// collection (default false). Never stores raw prompts by default.
+	BuilderTrainingDataEnabled bool
+	// BuilderTrainingSampleRate is 0..1 (default 1.0 when enabled).
+	BuilderTrainingSampleRate float64
+	// BuilderTrainingRetentionDays bounds how long examples are kept (default 30).
+	BuilderTrainingRetentionDays int
+	// BuilderTrainingMaxRecords caps total retained rows globally (default 10000).
+	BuilderTrainingMaxRecords int
+	// BuilderTrainingStoreSanitizedPrompt optionally stores a redacted truncated
+	// prompt. Default false — fingerprint only.
+	BuilderTrainingStoreSanitizedPrompt bool
 	// FakeAIMode, when true, skips the real Claude API entirely — see
 	// ai.NewFake. For debugging the surrounding plumbing (the async
 	// generation lifecycle, the stream WebSocket, the dashboard) without
@@ -237,8 +276,24 @@ func Load() Config {
 		DeepSeekVisionModel: getenv("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
 		DeepSeekBaseURL:     getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
 
-		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
-		BuilderPlanEnabled:          getenvBool("BUILDER_PLAN_ENABLED", false),
+		HistorySummarizationEnabled:         getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
+		BuilderPlanEnabled:                  getenvBool("BUILDER_PLAN_ENABLED", false),
+		BuilderLocalLMEnabled:               getenvBool("BUILDER_LOCAL_LM_ENABLED", false),
+		BuilderLocalLMProvider:              strings.TrimSpace(os.Getenv("BUILDER_LOCAL_LM_PROVIDER")),
+		BuilderLocalLMURL:                   strings.TrimSpace(os.Getenv("BUILDER_LOCAL_LM_URL")),
+		BuilderLocalLMModel:                 getenv("BUILDER_LOCAL_LM_MODEL", "qwen2.5-0.5b-instruct"),
+		BuilderLocalLMTimeoutMs:             getenvInt("BUILDER_LOCAL_LM_TIMEOUT_MS", 1500),
+		BuilderShadowLMEnabled:              getenvBool("BUILDER_SHADOW_LM_ENABLED", false),
+		BuilderShadowLMProvider:             strings.TrimSpace(os.Getenv("BUILDER_SHADOW_LM_PROVIDER")),
+		BuilderShadowLMURL:                  strings.TrimSpace(os.Getenv("BUILDER_SHADOW_LM_URL")),
+		BuilderShadowLMModel:                getenv("BUILDER_SHADOW_LM_MODEL", "qwen2.5-0.5b-instruct"),
+		BuilderShadowLMTimeoutMs:            getenvInt("BUILDER_SHADOW_LM_TIMEOUT_MS", 1500),
+		BuilderShadowSampleRate:             getenvFloat("BUILDER_SHADOW_SAMPLE_RATE", 1.0),
+		BuilderTrainingDataEnabled:          getenvBool("BUILDER_TRAINING_DATA_ENABLED", false),
+		BuilderTrainingSampleRate:           getenvFloat("BUILDER_TRAINING_SAMPLE_RATE", 1.0),
+		BuilderTrainingRetentionDays:        getenvInt("BUILDER_TRAINING_RETENTION_DAYS", 30),
+		BuilderTrainingMaxRecords:           getenvInt("BUILDER_TRAINING_MAX_RECORDS", 10000),
+		BuilderTrainingStoreSanitizedPrompt: getenvBool("BUILDER_TRAINING_STORE_SANITIZED_PROMPT", false),
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 
@@ -350,6 +405,19 @@ func getenvInt(key string, fallback int) int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
 		log.Printf("WARNING: invalid %s=%q, using default %d", key, v, fallback)
+		return fallback
+	}
+	return n
+}
+
+func getenvFloat(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseFloat(v, 64)
+	if err != nil || n < 0 {
+		log.Printf("WARNING: invalid %s=%q, using default %v", key, v, fallback)
 		return fallback
 	}
 	return n

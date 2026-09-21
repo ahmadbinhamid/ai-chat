@@ -8,8 +8,6 @@ backend/.gopath/
 *.out
 
 # Env
-.env
-.env.*
 !.env.example
 backend/.env
 backend/.env.*
@@ -19,10 +17,21 @@ backend/.env.*
 node_modules/
 
 # Editor and agent config (executable surface)
-.vscode/
 .idea/
 .claude/settings.json
 .claude/settings.local.json
 
 # OS
 .DS_Store
+
+# Local LM / training artifacts (never commit weights)
+*.gguf
+*.bin
+*.safetensors
+**/lora-adapters/
+**/external/
+backend/artifacts/**/external/
+# Keep JSON reports; ignore any accidental weight dumps under artifacts
+backend/artifacts/**/*.gguf
+backend/artifacts/**/*.safetensors
+config.bat

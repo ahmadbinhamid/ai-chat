@@ -23,6 +23,9 @@ func TestClassify_Table(t *testing.T) {
 		{errors.New("Generation timed out after 10 minutes. Create page 1 of 2 completed successfully; remaining steps were not completed."), genfail.CodeAIGenerationTimeout},
 		{errors.New("provider stream first-token timeout: no content"), genfail.CodeAIProviderFirstTokenTimeout},
 		{errors.New("provider stream idle timeout: no progress"), genfail.CodeStreamIdleTimeout},
+		{errors.New("stage theme changes: pages.json consistency: current registry invalid: parse pages.json: invalid character '\\n' in string literal"), genfail.CodePagesRegistryInvalid},
+		{errors.New("menu operation: current defaults.json invalid: truncated prompt stub is not a merge base"), genfail.CodeMenuOperationInvalid},
+		{errors.New("Add pages to navigation needs another attempt: menu operation: duplicate menu item"), genfail.CodeMenuOperationInvalid},
 	}
 	for _, tc := range cases {
 		got := genfail.Classify(tc.err)

@@ -146,7 +146,27 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 		}
 		seenPath[wantPath] = true
 		if err := attachPageRegistryEntry(&plan, entry); err != nil {
-			return writePlan{}, err
+			// Register-only (existing page already on disk): model often
+			// returns page_registry_entry with empty files[]. Pull the
+			// on-disk liquid into the plan so FlowPOS can upsert PageMeta
+			// without regenerating content.
+			if wantPath == "" {
+				return writePlan{}, err
+			}
+			content, readErr := store.ReadFile(ctx, storeAuth, wantPath)
+			if readErr != nil || strings.TrimSpace(content) == "" {
+				return writePlan{}, err
+			}
+			prev := content
+			plan.files = append(plan.files, planFile{
+				path:     wantPath,
+				action:   FileActionUpdate,
+				content:  content,
+				previous: &prev,
+			})
+			if err2 := attachPageRegistryEntry(&plan, entry); err2 != nil {
+				return writePlan{}, err
+			}
 		}
 	}
 

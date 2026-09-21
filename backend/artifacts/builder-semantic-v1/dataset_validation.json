@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "dataset_version": "builder-semantic-v1",
+  "dataset_hash": "420da0454f33f3af2ffd93ae45c1ca5a0c472fdc55c652c7a186ce46dd00f5f6",
+  "split_hash": "0d39cd37680499b8af3c28eb2feebbb23a2fd6e002b284acf2501257cf8c8437",
+  "train_count": 2,
+  "validation_count": 0,
+  "test_count": 0,
+  "semantic_group_leakage": false,
+  "invalid_jsonl_rows": 0,
+  "missing_required_target_rows": 0,
+  "sensitive_rows": 0
+}

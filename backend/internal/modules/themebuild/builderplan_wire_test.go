@@ -1,11 +1,14 @@
 package themebuild
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
+	"ai-chat/internal/builderintelligence"
 	"ai-chat/internal/builderplan"
+	"ai-chat/internal/buildershadow"
 )
 
 func TestObserveBuilderPlan_RealCases(t *testing.T) {
@@ -53,7 +56,7 @@ func TestObserveBuilderPlan_RealCases(t *testing.T) {
 		{
 			name: "register_blog_if_missing", prompt: "if the blog page is not registered, register it",
 			wantIntent: builderplan.IntentNavigationRegistry, wantMinOps: 1,
-			wantOp: builderplan.OpRegisterPage, wantDeepSeek: true,
+			wantOp: builderplan.OpRegisterExistingPage, wantDeepSeek: false,
 		},
 	}
 	for _, tc := range cases {
@@ -192,5 +195,118 @@ func TestBuilderPlanDisabledByDefault(t *testing.T) {
 	s.SetBuilderPlanEnabled(true)
 	if !s.builderPlanEnabled {
 		t.Fatal("SetBuilderPlanEnabled failed")
+	}
+}
+
+func TestBuilderIntelligenceDisabledByDefault(t *testing.T) {
+	t.Parallel()
+	s := &Service{}
+	if s.builderIntelligence != nil && s.builderIntelligence.Enabled() {
+		t.Fatal("builder intelligence must default OFF")
+	}
+	svc := builderintelligence.New(builderintelligence.Config{Enabled: true})
+	s.SetBuilderIntelligence(svc)
+	if !s.builderIntelligence.Enabled() {
+		t.Fatal("SetBuilderIntelligence enable failed")
+	}
+	if s.builderIntelligence.ProviderName() != "heuristic" {
+		t.Fatalf("provider=%s", s.builderIntelligence.ProviderName())
+	}
+}
+
+func TestObserveBuilderPlanWith_LocalLMSkipAndRefine(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	intel := builderintelligence.New(builderintelligence.Config{
+		Enabled: true, Provider: builderintelligence.ProviderHeuristic, Timeout: time.Second,
+	})
+
+	skipObs := observeBuilderPlanWith(ctx, "change button color to blue", observeBuilderPlanOptions{
+		Intelligence: intel,
+	})
+	if !skipObs.Valid || !skipObs.LocalLM.Skipped || skipObs.LocalLM.Called {
+		t.Fatalf("simple edit must skip LM: %+v", skipObs.LocalLM)
+	}
+
+	refineObs := observeBuilderPlanWith(ctx, "change blogs for a software house but keep JPRO meta titles", observeBuilderPlanOptions{
+		Intelligence: intel,
+	})
+	if !refineObs.Valid || refineObs.LocalLM.Skipped {
+		t.Fatalf("nl constraint should call LM: %+v", refineObs.LocalLM)
+	}
+	if !refineObs.LocalLM.Success {
+		t.Fatalf("heuristic should succeed: %+v", refineObs.LocalLM)
+	}
+	blob := strings.Join(refineObs.Plan.Constraints, " ")
+	low := strings.ToLower(blob)
+	if !strings.Contains(low, "jpro") && !strings.Contains(low, "protect_field:meta_title") {
+		t.Fatalf("constraints=%v", refineObs.Plan.Constraints)
+	}
+}
+
+func TestObserveBuilderPlanWith_LocalLMUnavailableFallback(t *testing.T) {
+	t.Parallel()
+	base, err := builderplan.BuildPlan("change blogs for a software house but keep JPRO meta titles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intel := builderintelligence.New(builderintelligence.Config{
+		Enabled: true, Provider: builderintelligence.ProviderHTTP, // empty URL → unavailable
+		Timeout: 5 * time.Millisecond,
+	})
+	obs := observeBuilderPlanWith(context.Background(), base.OriginalPrompt, observeBuilderPlanOptions{
+		Intelligence: intel,
+	})
+	if !obs.Valid || !obs.LocalLM.Failure || obs.LocalLM.Reason != "unavailable" {
+		t.Fatalf("want unavailable fallback valid=%v meta=%+v", obs.Valid, obs.LocalLM)
+	}
+	if obs.Plan.Intent != base.Intent {
+		t.Fatalf("deterministic plan must survive: got %s want %s", obs.Plan.Intent, base.Intent)
+	}
+}
+
+func TestObserveBuilderPlanWith_Create2SkipsLocalLM(t *testing.T) {
+	t.Parallel()
+	intel := builderintelligence.New(builderintelligence.Config{
+		Enabled: true, Provider: builderintelligence.ProviderHeuristic,
+	})
+	obs := observeBuilderPlanWith(context.Background(), "create 2 blog pages", observeBuilderPlanOptions{
+		Intelligence: intel,
+	})
+	if !obs.Valid || !obs.LocalLM.Skipped || obs.LocalLM.Called {
+		t.Fatalf("create 2 must skip local LM: %+v", obs.LocalLM)
+	}
+}
+
+func TestObserveBuilderPlanWith_ShadowDiscarded(t *testing.T) {
+	t.Parallel()
+	shadow := buildershadow.New(buildershadow.Config{
+		Enabled:  true,
+		Provider: "heuristic",
+		Blocking: true,
+		Timeout:  time.Second,
+	})
+	prompt := "change the blogs according to software house but keep JPRO meta titles"
+	base, err := builderplan.BuildPlan(prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obs := observeBuilderPlanWith(context.Background(), prompt, observeBuilderPlanOptions{
+		Shadow: shadow,
+	})
+	if !obs.Valid {
+		t.Fatal(obs.FallbackReason)
+	}
+	if obs.LocalLM.Called {
+		t.Fatalf("production LM should not run: %+v", obs.LocalLM)
+	}
+	if obs.Shadow.Skipped {
+		t.Fatalf("shadow should run: %+v", obs.Shadow)
+	}
+	if obs.Shadow.Status != buildershadow.StatusDiscarded {
+		t.Fatalf("status=%s", obs.Shadow.Status)
+	}
+	if len(obs.Plan.Operations) != len(base.Operations) {
+		t.Fatalf("ops mutated prod=%v base=%v", obs.Plan.Operations, base.Operations)
 	}
 }

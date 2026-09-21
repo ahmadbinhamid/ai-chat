@@ -13,6 +13,9 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/auth"
+	"ai-chat/internal/builderexamples"
+	"ai-chat/internal/builderintelligence"
+	"ai-chat/internal/buildershadow"
 	"ai-chat/internal/config"
 	"ai-chat/internal/logging"
 	"ai-chat/internal/modules/chat"
@@ -93,6 +96,57 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	buildSvc.SetBuilderPlanEnabled(cfg.BuilderPlanEnabled)
 	if cfg.BuilderPlanEnabled {
 		logger.Info("builderplan observation enabled")
+	}
+	biSvc := builderintelligence.New(builderintelligence.Config{
+		Enabled:  cfg.BuilderLocalLMEnabled,
+		Provider: cfg.BuilderLocalLMProvider,
+		URL:      cfg.BuilderLocalLMURL,
+		Model:    cfg.BuilderLocalLMModel,
+		Timeout:  time.Duration(cfg.BuilderLocalLMTimeoutMs) * time.Millisecond,
+	})
+	buildSvc.SetBuilderIntelligence(biSvc)
+	if cfg.BuilderLocalLMEnabled {
+		logger.Info("builder intelligence enabled",
+			"provider", biSvc.ProviderName(),
+			"timeout_ms", cfg.BuilderLocalLMTimeoutMs,
+			"url_set", cfg.BuilderLocalLMURL != "",
+		)
+	}
+	shadow := buildershadow.New(buildershadow.Config{
+		Enabled:    cfg.BuilderShadowLMEnabled,
+		Provider:   cfg.BuilderShadowLMProvider,
+		URL:        cfg.BuilderShadowLMURL,
+		Model:      cfg.BuilderShadowLMModel,
+		Timeout:    time.Duration(cfg.BuilderShadowLMTimeoutMs) * time.Millisecond,
+		SampleRate: cfg.BuilderShadowSampleRate,
+		Blocking:   false, // never block production generation
+	})
+	buildSvc.SetBuilderShadow(shadow)
+	if cfg.BuilderShadowLMEnabled {
+		logger.Info("builder shadow candidate enabled",
+			"provider", shadow.CandidateName(),
+			"timeout_ms", cfg.BuilderShadowLMTimeoutMs,
+			"url_set", cfg.BuilderShadowLMURL != "",
+			"sample_rate", cfg.BuilderShadowSampleRate,
+			"affects_production", false,
+		)
+	}
+	if cfg.BuilderTrainingDataEnabled {
+		exStore := builderexamples.NewSQLStore(conn)
+		exCollector := builderexamples.NewCollector(builderexamples.Config{
+			Enabled:              true,
+			SampleRate:           cfg.BuilderTrainingSampleRate,
+			RetentionDays:        cfg.BuilderTrainingRetentionDays,
+			MaxRecords:           cfg.BuilderTrainingMaxRecords,
+			StoreSanitizedPrompt: cfg.BuilderTrainingStoreSanitizedPrompt,
+		}, exStore)
+		buildSvc.SetBuilderExampleCollector(exCollector)
+		logger.Info("builder training data collection enabled",
+			"sample_rate", cfg.BuilderTrainingSampleRate,
+			"retention_days", cfg.BuilderTrainingRetentionDays,
+			"max_records", cfg.BuilderTrainingMaxRecords,
+			"store_sanitized_prompt", cfg.BuilderTrainingStoreSanitizedPrompt,
+		)
 	}
 	if cfg.ThemeWorkspaceDir != "" {
 		buildSvc.SetThemeWorkspaceRoot(cfg.ThemeWorkspaceDir)

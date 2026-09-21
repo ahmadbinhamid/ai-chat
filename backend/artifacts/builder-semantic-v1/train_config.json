@@ -1,0 +1,29 @@
+{
+  "dataset_version": "builder-semantic-v1",
+  "dataset_hash": "420da0454f33f3af2ffd93ae45c1ca5a0c472fdc55c652c7a186ce46dd00f5f6",
+  "split_hash": "0d39cd37680499b8af3c28eb2feebbb23a2fd6e002b284acf2501257cf8c8437",
+  "seed": 42,
+  "base_model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+  "inference_gguf_note": "qwen2.5-0.5b-instruct-q4_k_m.gguf is for llama.cpp inference only — do not LoRA-tune the GGUF",
+  "trainable_artifact": "Qwen2.5-0.5B-Instruct (HF safetensors / fp16)",
+  "method": "lora",
+  "do_not_train_quantized_gguf": true,
+  "max_sequence_length": 512,
+  "batch_size": 1,
+  "gradient_accumulation": 8,
+  "learning_rate": 0.0002,
+  "epochs": 3,
+  "max_steps": 500,
+  "lora_rank": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.05,
+  "lora_target_modules": [
+    "q_proj",
+    "v_proj",
+    "k_proj",
+    "o_proj"
+  ],
+  "output_dir_outside_git": "/Users/q/.cache/builder-lm/lora-runs/builder-semantic-v1",
+  "target_schema": "{\"constraints\":[],\"protected_fields\":[],\"preferences\":[],\"clarification\":\"\",\"needs_clarification\":false}",
+  "task_description": "User prompt + deterministic BuilderPlan summary → semantic refinement only. Never files, tools, pages.json, or blog generation."
+}

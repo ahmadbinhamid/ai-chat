@@ -1,0 +1,9 @@
+{
+  "status": "NO_CANDIDATE_MODEL",
+  "candidate_configured": false,
+  "measured": false,
+  "discarded": true,
+  "notes": [
+    "No shadow candidate URL/provider — valid ML-16 outcome"
+  ]
+}

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/themefs"
 )
 
 // validatePageFileRegistryConsistency checks staged create/update/delete
@@ -183,23 +184,11 @@ func removePageRegistryIdentities(current string, removeIDs []string) (string, e
 		}
 		kept = append(kept, raw)
 	}
-	indent := pagesJSONIndent(current)
-	var b strings.Builder
-	b.WriteByte('[')
-	if len(kept) > 0 {
-		b.WriteByte('\n')
-		for i, raw := range kept {
-			b.WriteString(indent)
-			b.Write(raw)
-			if i < len(kept)-1 {
-				b.WriteByte(',')
-			}
-			b.WriteByte('\n')
-		}
+	out := serializePagesJSON(kept, current)
+	if !json.Valid([]byte(strings.TrimSpace(out))) {
+		return "", fmt.Errorf("serialize pages.json: produced invalid JSON")
 	}
-	b.WriteByte(']')
-	b.WriteByte('\n')
-	return b.String(), nil
+	return out, nil
 }
 
 // ensureCreateHasRegistry rejects page-file creates that omit registration.
@@ -241,6 +230,12 @@ func ensureProposedCreatesRegistered(result *ai.Result) error {
 	if len(creates) == 0 {
 		return nil
 	}
+	// page_registry_entry can only cover ONE create. Multiple creates without
+	// pages.json is the N05 failure mode (pair of service pages → thrash).
+	if len(creates) > 1 && !hasPagesJSON {
+		return fmt.Errorf("incomplete page create: %d new pages (%s) need a pages.json update or compound atomic steps — page_registry_entry only registers one page",
+			len(creates), strings.Join(creates, ", "))
+	}
 	if !hasPagesJSON && result.PageRegistryEntry == nil {
 		return fmt.Errorf("incomplete page create: %s need page_registry_entry (or pages.json merge) — file without registry is not allowed",
 			strings.Join(creates, ", "))
@@ -252,4 +247,66 @@ func ensureProposedCreatesRegistered(result *ai.Result) error {
 		}
 	}
 	return nil
+}
+
+// synthesizeMissingPageRegistry fills page_registry_entry when the model
+// created exactly one pages/<slug>.liquid and forgot registration. Avoids
+// burning repair budget on a deterministic omit. Multi-create is left to
+// compound / pages.json (see ensureProposedCreatesRegistered).
+func synthesizeMissingPageRegistry(result *ai.Result) bool {
+	if result == nil || result.PageRegistryEntry != nil {
+		return false
+	}
+	hasPagesJSON := false
+	var createPath, createID string
+	createCount := 0
+	for _, f := range result.Files {
+		low := strings.ToLower(strings.TrimSpace(f.Path))
+		act := strings.ToLower(strings.TrimSpace(f.Action))
+		if low == "pages.json" && (act == "update" || act == "create") {
+			hasPagesJSON = true
+		}
+		if act != "create" {
+			continue
+		}
+		id := pageIDFromLiquidPath(f.Path)
+		if id == "" || id == "home" {
+			continue
+		}
+		createCount++
+		createPath = strings.TrimSpace(f.Path)
+		createID = id
+	}
+	if hasPagesJSON || createCount != 1 || createID == "" {
+		return false
+	}
+	title := humanizePageSlug(createID)
+	pathPrefix := "/pages"
+	if strings.Contains(strings.ToLower(createPath), "/auth/") {
+		pathPrefix = "/pages/auth"
+	}
+	result.PageRegistryEntry = &themefs.PageEntry{
+		Title:  title,
+		Slug:   createID,
+		Page:   createID,
+		Path:   pathPrefix,
+		Type:   "custom",
+		Status: "published",
+	}
+	return true
+}
+
+func humanizePageSlug(slug string) string {
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		return "Page"
+	}
+	parts := strings.Split(slug, "-")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	return strings.Join(parts, " ")
 }

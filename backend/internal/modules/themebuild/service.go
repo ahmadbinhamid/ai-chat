@@ -14,6 +14,12 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/builderexamples"
+	"ai-chat/internal/buildercontext"
+	"ai-chat/internal/builderintelligence"
+	"ai-chat/internal/builderoperations"
+	"ai-chat/internal/builderplan"
+	"ai-chat/internal/buildershadow"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/prodhardening"
 	"ai-chat/internal/safego"
@@ -259,10 +265,20 @@ type Service struct {
 	// before DeepSeek (see observeBuilderPlan). Default OFF — existing
 	// pipeline unchanged until BUILDER_PLAN_ENABLED=true.
 	builderPlanEnabled bool
+	// builderIntelligence is the optional local prompt-understanding service
+	// (heuristic / HTTP local LM). themebuild never talks to providers directly.
+	builderIntelligence *builderintelligence.Service
+	// builderShadow optionally evaluates a candidate LM without affecting production.
+	builderShadow *buildershadow.Runner
+	// exampleCollector optionally records compact ML-9 training examples.
+	exampleCollector *builderexamples.Collector
 	// workspaceRoot, when non-empty, enables local-first theme mirrors for
 	// generation reads/greps (see themeworkspace). Set once via
 	// SetThemeWorkspaceRoot from server wiring.
 	workspaceRoot string
+	// activeTargets holds bounded per-chat page targets for follow-up
+	// troubleshooting ("now it is not working" → last blog).
+	activeTargets *activeTargetCache
 }
 
 // SetHistorySummarizationEnabled overrides the default (enabled) — see the
@@ -277,6 +293,18 @@ func (s *Service) SetHistorySummarizationEnabled(enabled bool) {
 // DeepSeek. Default false — production behavior unchanged until enabled.
 func (s *Service) SetBuilderPlanEnabled(enabled bool) {
 	s.builderPlanEnabled = enabled
+}
+
+// SetBuilderIntelligence attaches the local prompt-understanding service.
+// nil or a disabled service means observation uses deterministic BuilderPlan only.
+func (s *Service) SetBuilderIntelligence(svc *builderintelligence.Service) {
+	s.builderIntelligence = svc
+}
+
+// SetBuilderShadow attaches optional shadow-candidate evaluation.
+// Shadow output is never applied to the production plan.
+func (s *Service) SetBuilderShadow(r *buildershadow.Runner) {
+	s.builderShadow = r
 }
 
 // SetThemeWorkspaceRoot enables local-first on-disk theme mirrors under
@@ -323,6 +351,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		historySummarizationEnabled: true,
 		historySummaries:            newHistorySummaryCache(),
 		historySummaryLocks:         newStripedMutex(historySummaryLockStripes),
+		activeTargets:               newActiveTargetCache(),
 	}
 }
 
@@ -1304,6 +1333,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		historyMs       int64
 		builderPlanMs   int64
 	)
+	exCap := exampleCapture{prompt: in.Prompt}
 	defer func() {
 		route := RouteLocalFirst
 		if routedIntent == IntentConversation {
@@ -1410,6 +1440,10 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			summaryAttrs = append(summaryAttrs, "cache_creation_input_tokens_available", false)
 		}
 		slog.Info("ai: generation performance summary", summaryAttrs...)
+
+		exCap.routedIntent = routedIntent
+		cancelled := cancelledByUser != nil && cancelledByUser.Load()
+		s.recordBuilderExample(context.Background(), in, c, genID, exCap, snap, provider, model, status, totalMs, preModelMs, deepseekCalled, retErr, cancelled, hasChanges)
 	}()
 	defer func() {
 		// A deliberately fresh, short-lived context for this defer's own
@@ -1566,8 +1600,13 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// files, pages.json, or generation state. Soft-escalate intent only.
 	var planObs planObservation
 	if s.builderPlanEnabled {
-		planObs = observeBuilderPlan(in.Prompt)
-		builderPlanMs = planObs.PlannerElapsedMs + planObs.ContextElapsedMs
+		planObs = observeBuilderPlanWith(ctx, in.Prompt, observeBuilderPlanOptions{
+			Intelligence: s.builderIntelligence,
+			Shadow:       s.builderShadow,
+			GenerationID: genID,
+			TenantID:     in.TenantID,
+		})
+		builderPlanMs = planObs.PlannerElapsedMs + planObs.ContextElapsedMs + planObs.LocalLM.ElapsedMs
 		priorIntent := intent
 		if escalated, applied := escalateIntentFromPlan(intent, planObs); applied {
 			intent = escalated
@@ -1580,6 +1619,39 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				"plan_intent", string(planObs.Plan.Intent))
 		}
 		logBuilderPlanObservation(genID, in.TenantID, c.ID, planObs, priorIntent)
+		exCap.planObs = planObs
+
+		// Ambiguous BuilderPlan → clarification only. Never load draft,
+		// sync workspace, call DeepSeek, or mutate files (E2E Test H).
+		if shouldShortCircuitClarification(planObs) {
+			summary = ambiguousClarificationReply(in.Prompt)
+			if _, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
+				return fmt.Errorf("record clarification reply: %w", err)
+			}
+			skipDraftRefresh = true
+			exCap.needsClarify = true
+			slog.Info("ai: clarification short-circuit",
+				"generation_id", genID,
+				"tenant_id", in.TenantID,
+				"chat_id", c.ID,
+				"clarification_short_circuit", true,
+				"clarification_deepseek_calls", 0,
+				"local_lm_called", planObs.LocalLM.Called,
+				"plan_intent", string(planObs.Plan.Intent),
+				"needs_deepseek", planObs.NeedsDeepSeek,
+				"deepseek_called", false,
+				"file_mutations", 0,
+				"duration_ms", time.Since(doGenerateStart).Milliseconds())
+			slog.Info("ai: intent route",
+				"generation_id", genID,
+				"intent", "ambiguous_clarification",
+				"route", RouteFastConversation,
+				"workspace_loaded", false,
+				"deepseek_called", false,
+				"draft_refresh", false,
+				"duration_ms", time.Since(doGenerateStart).Milliseconds())
+			return nil
+		}
 	}
 
 	// The draft overlay this whole feature exists for: every prior turn's
@@ -1676,31 +1748,65 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return nil
 	}
 
-	// Deterministic register-existing-page: file on disk, missing from
-	// pages.json → merge page_registry_entry. Never regenerates content.
-	if isRegisterExistingPagePrompt(in.Prompt) {
-		regResult, handled, regErr := buildDeterministicRegisterExisting(ctx, store, storeAuth, in.Prompt)
+	// Deterministic register_existing_page via builderoperations — no DeepSeek,
+	// local ML, repair, or retry.
+	var planForLocalOp *builderplan.BuilderPlan
+	if planObs.Valid {
+		planForLocalOp = &planObs.Plan
+	}
+	if opName, localOK := builderoperations.Resolve(in.Prompt, planForLocalOp); localOK &&
+		opName == builderoperations.NameRegisterExistingPage {
+		regResult, opOut, handled, regErr := runLocalRegisterExisting(
+			ctx, store, storeAuth, in.Prompt, planForLocalOp)
+		localElapsed := opOut.Metrics.ElapsedMs
 		if regErr != nil {
-			return fmt.Errorf("register existing page: %w", regErr)
+			slog.Warn("ai: local operation failed",
+				"generation_id", genID,
+				"local_operation_called", true,
+				"local_operation_name", opName,
+				"local_operation_success", false,
+				"local_operation_elapsed_ms", localElapsed,
+				"local_operation_deepseek_calls", 0,
+				"error", regErr.Error())
+			summary = "I couldn't complete that registration."
+			if _, recErr := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusNotApplicable); recErr != nil {
+				return fmt.Errorf("record register-existing reply: %w", recErr)
+			}
+			skipDraftRefresh = true
+			return nil
 		}
 		if handled {
 			routedIntent = IntentComplexPage
+			logLocalOp := func(success bool) {
+				slog.Info("ai: local operation",
+					"generation_id", genID,
+					"chat_id", c.ID,
+					"intent", string(IntentComplexPage),
+					"route", "register_existing_local",
+					"workspace_loaded", workspaceLoaded,
+					"local_operation_called", true,
+					"local_operation_name", opName,
+					"local_operation_success", success && opOut.Metrics.Success,
+					"local_operation_already_done", opOut.Metrics.AlreadyDone,
+					"local_operation_not_found", opOut.Metrics.NotFound,
+					"local_operation_ambiguous", opOut.Metrics.Ambiguous,
+					"local_operation_elapsed_ms", localElapsed,
+					"local_operation_deepseek_calls", 0,
+					"deepseek_called", false,
+					"duration_ms", time.Since(doGenerateStart).Milliseconds())
+			}
 			if !proposalHasChanges(regResult) {
 				summary = regResult.Summary
 				if summary == "" {
 					summary = "Done."
 				}
-				status := chat.ApplyStatusNotApplicable
-				if regResult.NeedsClarification {
-					// Clarification replies are not drafts.
-					status = chat.ApplyStatusNotApplicable
-				}
-				if _, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, status); err != nil {
+				if _, err := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
 					return fmt.Errorf("record register-existing reply: %w", err)
 				}
 				skipDraftRefresh = true
-				slog.Info("ai: register-existing fast path (no draft)",
-					"generation_id", genID, "chat_id", c.ID, "route", "register_existing_local")
+				exCap.localOpName = opName
+				exCap.needsClarify = regResult.NeedsClarification || opOut.Metrics.Ambiguous
+				logLocalOp(true)
 				return nil
 			}
 			unlock, lockErr := s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
@@ -1711,7 +1817,20 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 			plan, planErr := s.buildWritePlan(ctx, store, storeAuth, regResult)
 			if planErr != nil {
-				return fmt.Errorf("stage register existing: %w", planErr)
+				slog.Warn("ai: local operation stage failed",
+					"generation_id", genID,
+					"local_operation_name", opName,
+					"local_operation_success", false,
+					"local_operation_elapsed_ms", localElapsed,
+					"local_operation_deepseek_calls", 0,
+					"error", planErr.Error())
+				summary = "I couldn't complete that registration."
+				if _, recErr := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusNotApplicable); recErr != nil {
+					return fmt.Errorf("record register-existing reply: %w", recErr)
+				}
+				skipDraftRefresh = true
+				exCap.localOpName = opName
+				return nil
 			}
 			stagedFiles := planToStaged(plan)
 			hasChanges = true
@@ -1731,18 +1850,63 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			if _, err := s.persistFileRecords(commitCtx, c, assistantMsg.ID, stagedFiles); err != nil {
 				return fmt.Errorf("persist register-existing draft: %w", err)
 			}
-			slog.Info("ai: register-existing fast path",
+			exCap.localOpName = opName
+			slog.Info("ai: local operation",
 				"generation_id", genID,
 				"chat_id", c.ID,
 				"intent", string(IntentComplexPage),
 				"route", "register_existing_local",
 				"workspace_loaded", workspaceLoaded,
+				"local_operation_called", true,
+				"local_operation_name", opName,
+				"local_operation_success", true,
+				"local_operation_already_done", false,
+				"local_operation_not_found", false,
+				"local_operation_ambiguous", false,
+				"local_operation_elapsed_ms", localElapsed,
+				"local_operation_deepseek_calls", 0,
 				"deepseek_called", false,
 				"file_count", len(regResult.Files),
 				"paths", proposalPaths(regResult),
 				"duration_ms", time.Since(doGenerateStart).Milliseconds())
 			return nil
 		}
+	}
+
+	// Deterministic page troubleshoot / diagnose (broken/not opening) —
+	// no DeepSeek, no local LM. Resolves active chat target when needed.
+	if handledTS, tsSummary, tsChanges, tsStaged, tsErr := s.tryPageTroubleshootLocal(
+		ctx, in, c, genID, store, storeAuth, planObs, doGenerateStart, workspaceLoaded, &exCap,
+	); tsErr != nil {
+		return tsErr
+	} else if handledTS {
+		routedIntent = IntentRepair
+		summary = tsSummary
+		if !tsChanges {
+			if _, recErr := s.chats.RecordAssistantMessage(ctx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusNotApplicable); recErr != nil {
+				return fmt.Errorf("record troubleshoot reply: %w", recErr)
+			}
+			skipDraftRefresh = true
+			return nil
+		}
+		hasChanges = true
+		stagedFiles := tsStaged
+		emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(stagedFiles)})
+		paths := make([]string, 0, len(stagedFiles))
+		for _, f := range stagedFiles {
+			paths = append(paths, f.generated.Path)
+		}
+		emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": paths})
+		commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer commitCancel()
+		assistantMsg, recErr := s.chats.RecordAssistantMessage(commitCtx, c, summary, chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusPending)
+		if recErr != nil {
+			return fmt.Errorf("record troubleshoot reply: %w", recErr)
+		}
+		if _, err := s.persistFileRecords(commitCtx, c, assistantMsg.ID, stagedFiles); err != nil {
+			return fmt.Errorf("persist troubleshoot draft: %w", err)
+		}
+		return nil
 	}
 
 	// Deterministic page/file deletes: orphans not in pages.json, blog rows,
@@ -2000,11 +2164,22 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	emitter.emit(ctx, EventTypeLoadingTheme, struct{}{})
 	phaseMark = time.Now()
-	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)
+	ctxPlan, ctxPlanMeta := buildContextPlan(in.Prompt, planObs)
+	bytesBeforeEstimate := 0
+	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug, ctxPlan.Valid && ctxPlan.OmitManifest)
 	if err != nil {
 		return fmt.Errorf("load theme context: %w", err)
 	}
 	themeContextMs = time.Since(phaseMark).Milliseconds()
+	bytesBeforeEstimate = estimateThemeContextBytes(tc)
+	themeReadsSaved := 0
+	if ctxPlan.Valid && ctxPlan.OmitManifest {
+		themeReadsSaved = 1
+	}
+	exCap.ctxPlan = ctxPlan
+	exCap.ctxMeta = ctxPlanMeta
+	exCap.bytesBefore = bytesBeforeEstimate
+	_ = themeReadsSaved
 	provider, model := s.generatorIdentity()
 	tc.TenantID = in.TenantID
 	tc.ChatID = c.ID
@@ -2013,7 +2188,9 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	tc.GenerationMode = in.Mode
 	prompt := in.Prompt
 	var simpleEditCtx SimpleEditContext
+	var preparedPaths []string
 	intentContextStart := time.Now()
+	preferPaths := preferPathsFromPlan(ctxPlan, planObs)
 	switch intent {
 	case IntentSimpleEdit:
 		if !intentUsesSimpleEditOneShot(intent) {
@@ -2028,6 +2205,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		} else {
 			simpleEditCtx = sec
 		}
+		if len(preferPaths) > 0 {
+			if narrowed, used := buildercontext.NarrowExisting(simpleEditCtx.Paths, preferPaths); used {
+				simpleEditCtx.Paths = narrowed
+			}
+		}
 		if s.builderPlanEnabled && planObs.Valid {
 			narrowed, used := narrowPathsWithCandidates(simpleEditCtx.Paths, planObs.CandidateContext)
 			slog.Info("ai: builderplan context compare",
@@ -2041,13 +2223,18 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				simpleEditCtx.Paths = narrowed
 			}
 		}
+		preparedPaths = simpleEditCtx.Paths
 		tc.SimpleEditOneShot = true
 		// Targeted read fallback stays OFF when local context is sufficient;
 		// only enabled when the planner found no usable excerpts.
 		tc.SimpleEditAllowRead = !simpleEditCtx.Sufficient
 		tc.MaxToolIterations = maxSimpleEditModelCalls
 		tc.MaxTokensOverride = simpleEditMaxTokens
-		tc.DisableExplorationBrake = true
+		// Bound exploration: at most one read, then force propose_changes.
+		// DisableExplorationBrake=true previously allowed read-only thrash
+		// until TOOL_THRASH (live: "change the header button color to blue").
+		tc.DisableExplorationBrake = false
+		tc.MaxExplorationToolCalls = 1
 		tc.FirstTokenTimeoutOverride = ai.FirstTokenTimeoutForMode(ai.FirstTokenModeSimple)
 		tc.FileTree = filterFileTreeToPaths(tc.FileTree, simpleEditCtx.Paths)
 		tc.Manifest = nil
@@ -2113,6 +2300,16 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		if cpcErr != nil {
 			slog.Warn("ai: complex-page context planner failed", "chat_id", c.ID, "error", cpcErr)
 		} else {
+			if len(preferPaths) > 0 {
+				if narrowed, used := buildercontext.NarrowExisting(cpc.Paths, preferPaths); used {
+					cpc.Paths = narrowed
+					cpc.Package = filterPreparedPackageToPaths(cpc.Package, narrowed)
+					slog.Info("ai: context plan narrowed complex paths",
+						"generation_id", genID,
+						"paths", cpc.Paths,
+						"prefer", preferPaths)
+				}
+			}
 			tc.PageCreatePrepared = true
 			// Sufficient local package → propose-only; otherwise one narrow read.
 			tc.PageCreateAllowRead = !cpc.Sufficient
@@ -2123,6 +2320,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			tc.PagesJSON = truncateForSimpleEditPrompt(tc.PagesJSON, 2500)
 			tc.DefaultsJSON = truncateForSimpleEditPrompt(tc.DefaultsJSON, 800)
 			prompt = complexPagePreparedPrompt(in.Prompt, cpc)
+			preparedPaths = cpc.Paths
 		}
 		if s.builderPlanEnabled && planObs.Valid {
 			existingPaths := []string(nil)
@@ -2136,7 +2334,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				"existing_paths", existingPaths,
 				"candidate_paths", planObs.CandidateContext,
 				"narrowed", used,
-				"applied_narrow", false, // complex path keeps existing ranking; candidates are observational
+				"applied_narrow", len(preferPaths) > 0,
 				"builder_plan_ms", builderPlanMs)
 		}
 		tc.MaxToolIterations = maxComplexPageModelCalls
@@ -2199,6 +2397,13 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	}
 	intentContextMs = time.Since(intentContextStart).Milliseconds()
 
+	// Apply ContextPlan reductions (dedupe stubs, omit tree/manifest leftovers).
+	dupRemoved := applyContextPlanToThemeContext(&tc, ctxPlan, preparedPaths)
+	bytesAfterEstimate := estimateThemeContextBytes(tc)
+	exCap.bytesAfter = bytesAfterEstimate
+	exCap.dupRemoved = dupRemoved
+	exCap.historyBefore = len(toTurns(priorMessages))
+
 	emitter.emit(ctx, EventTypePreparingContext, struct{}{})
 	phaseMark = time.Now()
 	snapBase, err := s.buildSnapshotBase(ctx, store, storeAuth)
@@ -2212,13 +2417,16 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	phaseMark = time.Now()
 	var turns []ai.Turn
+	historyMsgs := 0
 	if intentUsesSimpleEditOneShot(intent) {
 		turns = nil
+		historyMsgs = 0
 	} else if intent == IntentComplexPage && tc.PageCreatePrepared {
 		// Prepared theme package already carries structural state — replay a
 		// short recent window only; skip Summarize's multi-second API cost.
 		raw := toTurns(priorMessages)
 		turns = recentChatTurns(raw, complexPageRecentTurns)
+		historyMsgs = len(turns)
 		slog.Info("ai: history summarization",
 			"chat_id", c.ID,
 			"ran", false,
@@ -2227,9 +2435,23 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			"prior_turns", len(raw),
 			"cache_hit", false,
 			"elapsed_ms", 0)
+	} else if t, n, ok := selectTurnsForContextPlan(toTurns(priorMessages), ctxPlan); ok {
+		turns = t
+		historyMsgs = n
+		slog.Info("ai: history summarization",
+			"chat_id", c.ID,
+			"ran", false,
+			"skipped_reason", "context_plan_focused",
+			"recent_turns", len(turns),
+			"prior_turns", len(priorMessages),
+			"cache_hit", false,
+			"elapsed_ms", 0)
 	} else {
 		turns = s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
+		historyMsgs = len(turns)
 	}
+	exCap.historyAfter = historyMsgs
+	logContextPlan(genID, in.TenantID, c.ID, ctxPlan, ctxPlanMeta, historyMsgs, bytesBeforeEstimate, bytesAfterEstimate, dupRemoved, themeReadsSaved)
 	historyMs = time.Since(phaseMark).Milliseconds()
 	preModelMs = time.Since(doGenerateStart).Milliseconds()
 	slog.Info("ai: pre-model phase finished",
@@ -2247,6 +2469,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		"history_ms", historyMs,
 		"builder_plan_ms", builderPlanMs,
 		"builder_plan_enabled", s.builderPlanEnabled,
+		"context_plan_elapsed_ms", ctxPlanMeta.ElapsedMs,
 		"pre_model_ms", preModelMs)
 	emitter.emit(ctx, EventTypePreparingAI, struct{}{})
 	deepseekCalled = true
@@ -2269,6 +2492,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				if len(compoundPartial.Registries) > 0 {
 					compoundRegistries = compoundPartial.Registries
 				}
+				exCap.partial = true
 				// Clear err so staging runs; re-apply compoundPartial after stage.
 				err = nil
 			} else {
@@ -2343,9 +2567,19 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				"propose_changes_parsed", false,
 				"error", err.Error())
 		}
+		if intentUsesSimpleEditOneShot(intent) && !simpleEditEscalated {
+			thrash := strings.Contains(strings.ToLower(err.Error()), "did not call propose_changes")
+			slog.Info("ai: simple-edit metrics",
+				"chat_id", c.ID,
+				"generation_id", genID,
+				"simple_edit_propose_reached", false,
+				"simple_edit_tool_thrash", thrash,
+				"error", err.Error())
+		}
 		return err
 	}
 	if intentUsesSimpleEditOneShot(intent) && !simpleEditEscalated && !usedCompound {
+		proposeReached := result != nil && (proposalHasChanges(result) || result.NeedsClarification || result.AnsweredQuestion)
 		slog.Info("ai: simple-edit metrics",
 			"chat_id", c.ID,
 			"generation_id", genID,
@@ -2356,7 +2590,15 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			"simple_edit_patch_size", simpleEditPatchSize(result),
 			"simple_edit_context_chars", len([]rune(simpleEditCtx.Package)),
 			"simple_edit_model_ms", modelMS,
+			"simple_edit_propose_reached", proposeReached,
+			"simple_edit_tool_thrash", false,
 			"paths", simpleEditCtx.Paths)
+	}
+
+	if s.builderPlanEnabled && planObs.Valid {
+		if matchErr := checkPlanExecutionMatch(planObs, result); matchErr != nil {
+			return matchErr
+		}
 	}
 
 	var warnings []themecheck.Finding
@@ -2411,11 +2653,15 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		extras := compoundExtraRegistryEntries(result, compoundRegistries)
 		// File ↔ registry consistency before anything is staged. On failure,
 		// do not persist partial deletes/creates that would orphan pages.json.
-		currentPagesJSON := tc.PagesJSON
-		if strings.TrimSpace(currentPagesJSON) == "" {
-			if raw, readErr := store.ReadFile(ctx, storeAuth, pathPagesJSON); readErr == nil {
-				currentPagesJSON = raw
-			}
+		// Always prefer the workspace/store pages.json — ThemeContext.PagesJSON
+		// may be a context-plan truncated prompt stub (invalid JSON).
+		storePagesJSON := ""
+		if raw, readErr := store.ReadFile(ctx, storeAuth, pathPagesJSON); readErr == nil {
+			storePagesJSON = raw
+		}
+		currentPagesJSON, resolveErr := resolveCanonicalPagesJSON(storePagesJSON, "")
+		if resolveErr != nil {
+			return fmt.Errorf("stage theme changes: %w", resolveErr)
 		}
 		expectedNew := make([]string, 0, 1+len(extras))
 		if result.PageRegistryEntry != nil {
@@ -2444,6 +2690,9 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		// to audit, including the layout splices (see GeneratedFileKind)
 		// that used to be silently un-audited when writes were immediate.
 		staged = planToStaged(plan)
+		if at, ok := activeTargetFromResult(result, ""); ok {
+			s.activeTargets.put(in.TenantID, c.ID, at)
+		}
 	}
 
 	applyStatus := chat.ApplyStatusNotApplicable
@@ -2614,7 +2863,7 @@ func (s *Service) prepareSimpleEditEscalation(
 	in GenerateInput,
 	priorMessages []chat.Message,
 ) (ai.ThemeContext, string, []ai.Turn, error) {
-	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)
+	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug, false)
 	if err != nil {
 		return ai.ThemeContext{}, "", nil, err
 	}
@@ -2701,7 +2950,7 @@ func (s *Service) ReadThemeAssetBytes(ctx context.Context, storeAuth themefs.Req
 // exactly four goroutines). Each goroutine assigns its own dedicated
 // variable rather than a shared map, so — unlike those two — no mutex is
 // needed: g.Wait() establishes happens-before for every read below it.
-func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
+func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, themeSlug string, omitManifest bool) (ai.ThemeContext, error) {
 	var pagesJSON, defaultsJSON string
 	var tree []themefs.FileTreeEntry
 	var manifest themefs.Manifest
@@ -2710,27 +2959,32 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 	g.Go(func() (err error) { pagesJSON, err = store.ReadFile(gctx, storeAuth, pathPagesJSON); return })
 	g.Go(func() (err error) { defaultsJSON, err = store.ReadFile(gctx, storeAuth, pathDefaultsJSON); return })
 	g.Go(func() (err error) { tree, err = store.ListFiles(gctx, storeAuth); return })
-	g.Go(func() error {
-		// Build through the generation-scoped store (overlay + cache) so
-		// component reads reuse FlowPOS work already paid for this turn.
-		m, err := themefs.GenerateManifestFrom(gctx, storeAuth, store)
-		if err != nil {
-			return fmt.Errorf("build manifest: %w", err)
-		}
-		manifest = m
-		return nil
-	})
+	if !omitManifest {
+		g.Go(func() error {
+			// Build through the generation-scoped store (overlay + cache) so
+			// component reads reuse FlowPOS work already paid for this turn.
+			m, err := themefs.GenerateManifestFrom(gctx, storeAuth, store)
+			if err != nil {
+				return fmt.Errorf("build manifest: %w", err)
+			}
+			manifest = m
+			return nil
+		})
+	}
 	if err := g.Wait(); err != nil {
 		return ai.ThemeContext{}, err
 	}
 
-	return ai.ThemeContext{
+	tc := ai.ThemeContext{
 		ThemeSlug:    themeSlug,
 		PagesJSON:    pagesJSON,
 		DefaultsJSON: defaultsJSON,
 		FileTree:     tree,
-		Manifest:     &manifest,
-	}, nil
+	}
+	if !omitManifest {
+		tc.Manifest = &manifest
+	}
+	return tc, nil
 }
 
 // buildSnapshotBase fetches the part of a themecheck.Snapshot that's

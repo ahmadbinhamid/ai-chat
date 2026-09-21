@@ -597,3 +597,93 @@ func TestGenerate_BrandModeOnlyOffersProposeChanges(t *testing.T) {
 		t.Fatalf("unexpected files: %+v", result.Files)
 	}
 }
+
+// TestGenerate_SimpleEditForcesProposeAfterOneRead proves simple-edit cannot
+// stay in read-only exploration until TOOL_THRASH: after at most one read,
+// the next turn forces propose_changes-only tools + named tool_choice.
+func TestGenerate_SimpleEditForcesProposeAfterOneRead(t *testing.T) {
+	calls := 0
+	sawForcePropose := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		s := string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls == 1 {
+			// First turn: model explores with a read (allowed once).
+			fmt.Fprint(w, toolUseSSEResponse("msg_1", "toolu_1", "read_theme_file", map[string]any{
+				"path": "components/css/header.css",
+			}, 10, 5))
+			return
+		}
+		// Second turn must force propose — tools payload is propose-only
+		// (schema bytes drop; read_theme_file must not appear as a tool entry).
+		if strings.Contains(s, `"name":"read_theme_file","description"`) ||
+			strings.Contains(s, `"name":"read_theme_file","input_schema"`) {
+			t.Errorf("call %d still offered read_theme_file tool; body=%s", calls, truncate(s, 500))
+		}
+		forcedNamed := strings.Contains(s, `"tool_choice":{"name":"propose_changes","type":"tool"}`) ||
+			strings.Contains(s, `"type":"tool","name":"propose_changes"`)
+		if !forcedNamed {
+			t.Errorf("call %d must force propose_changes tool_choice; body=%s", calls, truncate(s, 400))
+		}
+		if !strings.Contains(s, `"forcing`) && !forcedNamed {
+			t.Errorf("call %d expected forced propose", calls)
+		}
+		sawForcePropose = true
+		fmt.Fprint(w, toolUseSSEResponse("msg_2", "toolu_2", "propose_changes", map[string]any{
+			"summary":               "Header button is now blue.",
+			"needs_clarification":   false,
+			"answered_question":     false,
+			"files":                 []map[string]any{{"path": "components/css/header.css", "action": "update", "content": ".btn{color:blue}"}},
+			"page_registry_entry":   nil,
+			"layout_links_to_add":   []string{},
+			"layout_scripts_to_add": []string{},
+		}, 20, 10))
+	}))
+	defer ts.Close()
+
+	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
+	g := newTestGenerator(client)
+	g.provider = "deepseek"
+	g.model = "deepseek-v4-pro"
+	g.modelName = "deepseek-v4-pro"
+
+	toolExec := func(_ context.Context, name string, _ json.RawMessage) (string, error) {
+		if name == "read_theme_file" {
+			return `{"path":"components/css/header.css","content":".btn{color:red}"}`, nil
+		}
+		return "", fmt.Errorf("unexpected tool %s", name)
+	}
+
+	result, err := g.Generate(context.Background(), ThemeContext{
+		ThemeSlug:               "demo",
+		SimpleEditOneShot:       true,
+		SimpleEditAllowRead:     true,
+		MaxToolIterations:       2,
+		MaxExplorationToolCalls: 1,
+		DisableExplorationBrake: false,
+	}, nil, "change the header button color to blue", nil, nil, nil, toolExec, nil)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("expected >=2 model calls (read then forced propose), got %d", calls)
+	}
+	if !sawForcePropose {
+		t.Fatal("never observed forced propose_changes turn")
+	}
+	if result == nil || len(result.Files) == 0 {
+		t.Fatal("expected propose_changes result with files")
+	}
+	if result.ExplorationToolCalls != 1 {
+		t.Fatalf("exploration_tool_calls=%d want 1", result.ExplorationToolCalls)
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}

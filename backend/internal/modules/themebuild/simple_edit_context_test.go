@@ -22,9 +22,21 @@ func TestDetectSimpleEditTargets(t *testing.T) {
 	if len(got) < 2 {
 		t.Fatalf("expected homepage+hero, got %v", got)
 	}
-	got = detectSimpleEditTargets("change the slider color")
-	if len(got) == 0 || got[0] != "slider" {
-		t.Fatalf("expected slider target, got %v", got)
+	got = detectSimpleEditTargets("pls make hdr btn blue")
+	if len(got) == 0 {
+		t.Fatal("expected hdr/btn targets")
+	}
+	hasHeader, hasBtn := false, false
+	for _, tname := range got {
+		if tname == "header" {
+			hasHeader = true
+		}
+		if tname == "button" {
+			hasBtn = true
+		}
+	}
+	if !hasHeader || !hasBtn {
+		t.Fatalf("expected header+button from hdr/btn shorthand, got %v", got)
 	}
 }
 

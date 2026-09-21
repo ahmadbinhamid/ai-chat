@@ -31,6 +31,8 @@ const (
 	CodeToolThrash               Code = "TOOL_THRASH"
 	CodeQueueFull                Code = "QUEUE_FULL"
 	CodeSessionExpired           Code = "SESSION_EXPIRED"
+	CodePagesRegistryInvalid     Code = "PAGES_REGISTRY_INVALID"
+	CodeMenuOperationInvalid     Code = "MENU_OPERATION_INVALID"
 	CodeUnknown                  Code = "UNKNOWN"
 )
 
@@ -131,6 +133,25 @@ func Classify(err error) Classification {
 		return Classification{
 			Code: CodeValidationFailed, Stage: "repair", Retryable: true,
 			Message: "The generated changes couldn't be validated after multiple attempts — please try again.",
+		}
+	case strings.Contains(lower, "pages.json consistency") ||
+		strings.Contains(lower, "current registry invalid") ||
+		(strings.Contains(lower, "truncated prompt stub is not a merge base") && strings.Contains(lower, "pages.json")) ||
+		(strings.Contains(lower, "parse pages.json") && strings.Contains(lower, "invalid character")):
+		// Internal code for registry lifecycle failures. Merchant message stays
+		// generic — never expose pages.json / parser details to the UI.
+		return Classification{
+			Code: CodePagesRegistryInvalid, Stage: "registry", Retryable: true,
+			Message: "We couldn't complete this request. Please try again.",
+		}
+	case strings.Contains(lower, "menu operation") ||
+		strings.Contains(lower, "current defaults.json invalid") ||
+		(strings.Contains(lower, "truncated prompt stub is not a merge base") && strings.Contains(lower, "defaults.json")):
+		// Internal code for structured add_to_menu failures. Merchant message
+		// stays generic — never expose defaults.json / schema / DeepSeek details.
+		return Classification{
+			Code: CodeMenuOperationInvalid, Stage: "menu", Retryable: true,
+			Message: "We couldn't complete this request. Please try again.",
 		}
 	case strings.Contains(lower, "did not call propose_changes"):
 		return Classification{

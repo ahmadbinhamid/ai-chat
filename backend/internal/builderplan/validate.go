@@ -3,6 +3,8 @@ package builderplan
 import (
 	"fmt"
 	"strings"
+
+	"ai-chat/internal/buildercontract"
 )
 
 // Validate checks a BuilderPlan before it may reach expensive generation.
@@ -25,6 +27,13 @@ func Validate(plan BuilderPlan) error {
 	for i, op := range plan.Operations {
 		if op.Kind == "" {
 			return fmt.Errorf("builderplan: operation %d missing kind", i)
+		}
+		rule, ok := ContractRule(op.Kind)
+		if !ok {
+			return fmt.Errorf("builderplan: operation %d unknown kind %q (not in buildercontract v%s)", i, op.Kind, buildercontract.ContractVersion)
+		}
+		if rule.Status == buildercontract.StatusContractDefinedNotImplemented {
+			return fmt.Errorf("builderplan: operation %d kind %q is CONTRACT_DEFINED_NOT_IMPLEMENTED", i, op.Kind)
 		}
 		if !op.ProtectExisting && op.Kind != OpClarify {
 			return fmt.Errorf("builderplan: operation %d must protect existing pages", i)

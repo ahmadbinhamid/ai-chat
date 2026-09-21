@@ -1,0 +1,23 @@
+{
+  "dataset_version": "builder-semantic-v1",
+  "train_count": 2,
+  "validation_count": 0,
+  "test_count": 0,
+  "usable_total": 2,
+  "positive_semantic": 2,
+  "positive_routing": 0,
+  "negative_eval": 0,
+  "ambiguous_eval": 0,
+  "distinct_semantic_groups": 2,
+  "with_protected_fields": 2,
+  "with_preferences": 1,
+  "with_clarification": 0,
+  "seo_related": 1,
+  "compound": 1,
+  "intent_distribution": {
+    "compound": 1,
+    "simple_edit": 1
+  },
+  "dataset_hash": "420da0454f33f3af2ffd93ae45c1ca5a0c472fdc55c652c7a186ce46dd00f5f6",
+  "split_hash": "0d39cd37680499b8af3c28eb2feebbb23a2fd6e002b284acf2501257cf8c8437"
+}

@@ -1,0 +1,25 @@
+{
+  "attempted": false,
+  "skipped_reason": "NOT_READY_FOR_TRAINING: Collect more REAL sanitized builder executions via BUILDER_TRAINING_DATA_ENABLED=true. Do not fabricate data. Re-export builder-semantic-v1 after collection, then re-run the gate.",
+  "hardware": {
+    "goos": "darwin",
+    "goarch": "arm64",
+    "num_cpu": 10,
+    "has_cuda": false,
+    "notes": "CPU/Apple-Silicon laptop assumed. Full LoRA/QLoRA training of Qwen2.5-0.5B is not automated in-repo without an explicit external training toolchain. Inference via llama.cpp remains supported; training artifacts can be prepared for external runs.",
+    "cpu_lora_practical": false
+  },
+  "config": {
+    "dataset_version": "builder-semantic-v1",
+    "dataset_hash": "",
+    "split_hash": "",
+    "base_model": "Qwen2.5-0.5B-Instruct",
+    "quantization": "Q4_K_M",
+    "method": "lora",
+    "seed": 42,
+    "max_steps": 500,
+    "learning_rate": 0.0002,
+    "artifact_dir": "artifacts/builder-semantic-v1/external"
+  },
+  "external_train_ready": false
+}

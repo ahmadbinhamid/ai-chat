@@ -1,0 +1,222 @@
+[
+  {
+    "id": "A_simple_deterministic",
+    "prompt": "change the header button color to blue",
+    "passed": true,
+    "intent": "simple_edit",
+    "ambiguous": false,
+    "compound": false,
+    "needs_deepseek": true,
+    "local_lm_should_call": false,
+    "local_lm_skip_reason": "deterministic_simple_edit",
+    "operation_kinds": [
+      "simple_style_edit"
+    ],
+    "context_file_count": 2,
+    "context_files": [
+      "components/button.liquid",
+      "css/theme.css"
+    ],
+    "planner_ms": 0
+  },
+  {
+    "id": "B_register_existing",
+    "prompt": "can you register the blog page",
+    "passed": true,
+    "intent": "navigation_registry",
+    "ambiguous": false,
+    "compound": false,
+    "needs_deepseek": false,
+    "local_lm_should_call": false,
+    "local_lm_skip_reason": "deterministic_register",
+    "operation_kinds": [
+      "register_existing_page"
+    ],
+    "context_file_count": 1,
+    "context_files": [
+      "pages.json"
+    ],
+    "planner_ms": 0
+  },
+  {
+    "id": "C_semantic_jpro",
+    "prompt": "change the blogs according to software house but keep the JPRO meta titles",
+    "passed": true,
+    "intent": "compound",
+    "ambiguous": false,
+    "compound": true,
+    "needs_deepseek": true,
+    "local_lm_should_call": true,
+    "local_lm_skip_reason": "semantic_extraction",
+    "operation_kinds": [
+      "update_page_content",
+      "update_seo_meta"
+    ],
+    "context_file_count": 3,
+    "context_files": [
+      "pages/blog.liquid",
+      "pages/css/blog.css",
+      "pages.json"
+    ],
+    "protected_field_signals": [
+      "meta_title"
+    ],
+    "planner_ms": 0,
+    "heuristic_protected_fields": [
+      "meta_title"
+    ],
+    "heuristic_preferences": [
+      "software house"
+    ]
+  },
+  {
+    "id": "D_saas_slug",
+    "prompt": "make the blog more professional for SaaS customers but don't change the slug",
+    "passed": true,
+    "intent": "page_create",
+    "ambiguous": false,
+    "compound": false,
+    "needs_deepseek": true,
+    "local_lm_should_call": true,
+    "local_lm_skip_reason": "semantic_extraction",
+    "operation_kinds": [
+      "create_page",
+      "register_page"
+    ],
+    "context_file_count": 1,
+    "context_files": [
+      "pages.json"
+    ],
+    "protected_field_signals": [
+      "slug"
+    ],
+    "planner_ms": 0,
+    "heuristic_protected_fields": [
+      "slug"
+    ],
+    "heuristic_preferences": [
+      "saas audience",
+      "professional"
+    ]
+  },
+  {
+    "id": "E_compound_create2",
+    "prompt": "create 2 blog pages",
+    "passed": true,
+    "intent": "compound",
+    "ambiguous": false,
+    "compound": true,
+    "needs_deepseek": true,
+    "local_lm_should_call": false,
+    "local_lm_skip_reason": "deterministic_page_create",
+    "operation_kinds": [
+      "create_page",
+      "create_page",
+      "register_page"
+    ],
+    "context_file_count": 1,
+    "context_files": [
+      "pages.json"
+    ],
+    "planner_ms": 0
+  },
+  {
+    "id": "F_create_nav",
+    "prompt": "create a page and add it to navigation",
+    "passed": true,
+    "intent": "compound",
+    "ambiguous": false,
+    "compound": true,
+    "needs_deepseek": true,
+    "local_lm_should_call": false,
+    "local_lm_skip_reason": "deterministic_page_create",
+    "operation_kinds": [
+      "create_page",
+      "register_page",
+      "add_to_navigation"
+    ],
+    "context_file_count": 2,
+    "context_files": [
+      "pages.json",
+      "defaults.json"
+    ],
+    "planner_ms": 0
+  },
+  {
+    "id": "G_ambiguous",
+    "prompt": "make the site better",
+    "passed": true,
+    "intent": "ambiguous",
+    "ambiguous": true,
+    "compound": false,
+    "needs_deepseek": false,
+    "local_lm_should_call": true,
+    "local_lm_skip_reason": "ambiguous",
+    "operation_kinds": [
+      "clarify"
+    ],
+    "context_file_count": 0,
+    "planner_ms": 0
+  },
+  {
+    "id": "H_seo_protected",
+    "prompt": "change the blog meta title but leave meta description and slug unchanged",
+    "passed": true,
+    "intent": "compound",
+    "ambiguous": false,
+    "compound": true,
+    "needs_deepseek": true,
+    "local_lm_should_call": true,
+    "local_lm_skip_reason": "semantic_extraction",
+    "operation_kinds": [
+      "update_page_content",
+      "update_seo_meta"
+    ],
+    "context_file_count": 3,
+    "context_files": [
+      "pages/blog.liquid",
+      "pages/css/blog.css",
+      "pages.json"
+    ],
+    "protected_field_signals": [
+      "slug",
+      "meta_description"
+    ],
+    "planner_ms": 0,
+    "heuristic_protected_fields": [
+      "slug",
+      "meta_description"
+    ]
+  },
+  {
+    "id": "I_timeout_policy",
+    "prompt": "change blogs for software house keep JPRO meta titles",
+    "passed": true,
+    "intent": "compound",
+    "ambiguous": false,
+    "compound": true,
+    "needs_deepseek": true,
+    "local_lm_should_call": true,
+    "local_lm_skip_reason": "semantic_extraction",
+    "operation_kinds": [
+      "update_page_content",
+      "update_seo_meta"
+    ],
+    "context_file_count": 3,
+    "context_files": [
+      "pages/blog.liquid",
+      "pages/css/blog.css",
+      "pages.json"
+    ],
+    "protected_field_signals": [
+      "meta_title"
+    ],
+    "planner_ms": 0,
+    "heuristic_protected_fields": [
+      "meta_title"
+    ],
+    "heuristic_preferences": [
+      "software house"
+    ]
+  }
+]

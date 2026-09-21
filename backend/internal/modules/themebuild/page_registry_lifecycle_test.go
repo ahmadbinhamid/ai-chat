@@ -135,6 +135,7 @@ func TestIsRegisterExistingPagePrompt(t *testing.T) {
 	}{
 		{"if not register then please register it", true},
 		{"please register the blog page", true},
+		{"can you register the blog page", true},
 		{"register it", true},
 		{"create a contact page", false},
 		{"delete extra pages", false},
@@ -206,7 +207,7 @@ func TestBuildDeterministicRegisterExisting_RejectsMissingFile(t *testing.T) {
 	if !ok || proposalHasChanges(result) {
 		t.Fatalf("expected no-draft missing-file reply, got %+v", result)
 	}
-	if !strings.Contains(strings.ToLower(result.Summary), "not on disk") {
+	if !strings.Contains(strings.ToLower(result.Summary), "couldn't find") {
 		t.Fatalf("summary=%q", result.Summary)
 	}
 }

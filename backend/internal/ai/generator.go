@@ -852,6 +852,15 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				forcingPropose = true
 			}
 		}
+		// Simple-edit mirrors page-create: when local excerpts are enough,
+		// force propose on the first iteration. When one read is allowed,
+		// force propose after that single inspection — never read→read→…
+		// until TOOL_THRASH (live failure: header button color).
+		if tc.SimpleEditOneShot {
+			if !tc.SimpleEditAllowRead || iteration >= 1 {
+				forcingPropose = true
+			}
+		}
 		forceProposeNext = false
 		callTools := tools
 		if forcingPropose && (tc.PageCreatePrepared || tc.SimpleEditOneShot) {
@@ -908,7 +917,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				"complete, verified proposal, call propose_changes with needs_clarification: true, " +
 				"files: [], and a summary explaining that the request needs to be split into a " +
 				"smaller step or retried, instead of guessing."
-			if tc.PageCreatePrepared {
+			if tc.SimpleEditOneShot {
+				nudge = "SIMPLE_EDIT: local context was pre-selected. Call propose_changes NOW with a minimal " +
+					"action \"edit\" changeset for the merchant request. Do not read more files. " +
+					"Do not explore. Prefer old_string/new_string patches. summary must be one short sentence. " +
+					"Only use needs_clarification: true with files: [] if you truly cannot act safely."
+			} else if tc.PageCreatePrepared {
 				nudge = "Local page/homepage context was pre-selected — call propose_changes now with a compact changeset " +
 					"(only changed files, one short summary, no unchanged full-file dumps). " +
 					"Do not list or grep the theme. If a critical detail is missing and read_theme_file is available, " +

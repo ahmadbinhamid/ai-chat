@@ -1,0 +1,31 @@
+{
+  "status": "NOT_READY_FOR_TRAINING",
+  "promotion_allowed": false,
+  "reasons": [
+    "Training dataset below ML-11/ML-14 thresholds — NOT_READY_FOR_TRAINING.",
+    "usable_total=2 need\u003e=500",
+    "usable_total: 2/500 missing 498",
+    "positive_semantic: 2/200 missing 198",
+    "distinct_semantic_groups: 2/100 missing 98",
+    "with_protected_fields: 2/50 missing 48",
+    "with_preferences: 1/50 missing 49",
+    "with_clarification: 0/30 missing 30",
+    "seo_related: 1/40 missing 39",
+    "compound: 1/40 missing 39",
+    "No trained/shadow candidate model configured."
+  ],
+  "criteria_checklist": [
+    "candidate exists",
+    "dataset quality sufficient (usable\u003e=500, …)",
+    "candidate beats baseline where relevant",
+    "unsafe output ~0",
+    "protected-field handling correct",
+    "clarification acceptable",
+    "latency/RAM/CPU acceptable",
+    "real-world scenarios pass",
+    "no critical reliability regressions",
+    "BUILDER_LOCAL_LM_ENABLED remains false until separate rollout"
+  ],
+  "requires_trained_model": true,
+  "shadow_only_ok": false
+}
