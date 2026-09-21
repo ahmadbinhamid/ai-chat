@@ -1,0 +1,15 @@
+{
+  "measured": true,
+  "status": "MEASURED",
+  "cold_latency_ms": 249.403,
+  "warm_p50_ms": 220.947,
+  "warm_p95_ms": 299.63429999999977,
+  "valid_json_percent": 100,
+  "unsafe_output_percent": 5.555555555555555,
+  "protected_field_f1": 0.6153846153846153,
+  "samples": 18,
+  "notes": [
+    "Qwen2.5-0.5B via llama.cpp — measured only if endpoint reachable",
+    "Do not auto-promote; reference baseline ~0.48 accuracy / ~340ms p50 preserved separately"
+  ]
+}

@@ -2,7 +2,6 @@ package themebuild
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -42,6 +41,13 @@ type CompoundProgress struct {
 	Failed     *CompoundStep
 	Accum      *ai.Result
 	Registries []*themefs.PageEntry // page_registry_entry from each create step
+	// RegistryJSON is the last validated pages.json checkpoint after
+	// structured merges. Never holds a truncated ThemeContext prompt stub.
+	RegistryJSON string
+	// MenuJSON is the last validated defaults.json checkpoint after
+	// structured add_to_menu merges. Never holds a truncated prompt stub
+	// or a model-authored full defaults.json rewrite.
+	MenuJSON string
 }
 
 // PlanCompoundWorkflow returns a multi-step plan for compound builder
@@ -95,11 +101,11 @@ func PlanCompoundWorkflow(prompt string) (CompoundPlan, bool) {
 			ID:    len(plan.Steps) + 1,
 			Kind:  CompoundStepAddToMenu,
 			Label: "Add pages to navigation",
+			// Deterministic store-backed merge — DeepSeek is not called for this
+			// step. FocusedPrompt is retained for plan/debug visibility only.
 			FocusedPrompt: fmt.Sprintf(
 				"Atomic menu step for merchant request %q.\n"+
-					"Add a storefront menu item for %s via defaults.json only.\n"+
-					"action \"update\" on defaults.json FULL body — keep every existing menu.items entry, APPEND the new item.\n"+
-					"FORBIDDEN: rewriting header.liquid/CSS instead of defaults.json.",
+					"Platform adds structured menu items for %s into defaults.json menu.items (no model rewrite).",
 				p, hint,
 			),
 			ValidatorPrompt: p,
@@ -311,62 +317,19 @@ func compoundExtraRegistryEntries(result *ai.Result, regs []*themefs.PageEntry) 
 	return out
 }
 
-// upsertPagesJSONWithRegistry merges one page_registry_entry into a pages.json
-// excerpt for the next compound step's context — does not force the model to
-// rewrite pages.json; staging still uses PageMeta via buildWritePlan.
+// upsertPagesJSONWithRegistry merges one page_registry_entry into a validated
+// pages.json checkpoint via structured merge + canonical serialize. On parse
+// or merge failure it returns the previous checkpoint unchanged (never wipes
+// the registry or concatenates model JSON text).
 func upsertPagesJSONWithRegistry(pagesJSON string, entry *themefs.PageEntry) string {
 	if entry == nil {
 		return pagesJSON
 	}
-	var entries []themefs.PageEntry
-	if strings.TrimSpace(pagesJSON) != "" {
-		if err := json.Unmarshal([]byte(pagesJSON), &entries); err != nil {
-			entries = nil
-		}
-	}
-	page := strings.TrimSpace(entry.Page)
-	if page == "" {
-		page = strings.TrimSpace(entry.Slug)
-	}
-	merged := false
-	for i := range entries {
-		key := strings.TrimSpace(entries[i].Page)
-		if key == "" {
-			key = strings.TrimSpace(entries[i].Slug)
-		}
-		if key == page {
-			entries[i] = *entry
-			if entries[i].Page == "" {
-				entries[i].Page = page
-			}
-			if entries[i].Status == "" {
-				entries[i].Status = "published"
-			}
-			merged = true
-			break
-		}
-	}
-	if !merged {
-		cp := *entry
-		if cp.Page == "" {
-			cp.Page = page
-		}
-		if cp.Status == "" {
-			cp.Status = "published"
-		}
-		if cp.Type == "" {
-			cp.Type = "custom"
-		}
-		if cp.Path == "" {
-			cp.Path = "/pages"
-		}
-		entries = append(entries, cp)
-	}
-	raw, err := json.Marshal(entries)
+	next, _, err := applyRegistryEntryCheckpoint(pagesJSON, entry)
 	if err != nil {
 		return pagesJSON
 	}
-	return string(raw)
+	return next
 }
 
 // pageIdentitiesFromJSON lists page/slug identities for compound prompts
@@ -426,6 +389,8 @@ func CompoundPartialFailureMessage(progress CompoundProgress, cause error) strin
 				b.WriteString(" because validation failed")
 			case strings.Contains(low, "incomplete atomic"), strings.Contains(low, "incomplete multi-page"):
 				b.WriteString(" because the page was not fully created/registered")
+			case strings.Contains(low, "menu operation"), strings.Contains(low, "defaults.json invalid"):
+				b.WriteString(" because the navigation update could not be completed")
 			case strings.Contains(low, "timeout"), strings.Contains(low, "deadline"):
 				b.WriteString(" because the provider timed out")
 			case strings.Contains(low, "cancel"):

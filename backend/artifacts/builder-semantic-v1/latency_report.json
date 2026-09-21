@@ -1,0 +1,24 @@
+{
+  "scenario_planner_p50_ms": 0,
+  "scenario_planner_p95_ms": 0,
+  "local_op_elapsed_ms": [
+    0
+  ],
+  "local_lm_p50_ms": 220.947,
+  "local_lm_p95_ms": 299.63429999999977,
+  "notes": [
+    "Planner timings from controlled BuilderPlan builds (CPU).",
+    "DeepSeek TTFT not claimed without live measurement."
+  ],
+  "by_scenario_planner_ms": {
+    "A_simple_deterministic": 0,
+    "B_register_existing": 0,
+    "C_semantic_jpro": 0,
+    "D_saas_slug": 0,
+    "E_compound_create2": 0,
+    "F_create_nav": 0,
+    "G_ambiguous": 0,
+    "H_seo_protected": 0,
+    "I_timeout_policy": 0
+  }
+}

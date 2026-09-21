@@ -4,6 +4,10 @@
 //
 // DeepSeek / existing generation remains responsible for complex language
 // and content reasoning. This package never mutates theme files.
+//
+// Page lifecycle operation vocabulary and mutation rules are authoritative in
+// package buildercontract (contract_version=1). OperationKind strings here
+// must match that vocabulary for implemented ops.
 package builderplan
 
 // IntentKind is the top-level classification of a merchant prompt.
@@ -17,6 +21,7 @@ const (
 	IntentSEOMeta            IntentKind = "seo_meta"
 	IntentPageCreate         IntentKind = "page_create"
 	IntentNavigationRegistry IntentKind = "navigation_registry"
+	IntentPageTroubleshoot   IntentKind = "page_troubleshoot"
 	IntentAmbiguous          IntentKind = "ambiguous"
 )
 
@@ -33,15 +38,18 @@ const (
 type OperationKind string
 
 const (
-	OpSimpleStyleEdit   OperationKind = "simple_style_edit"
-	OpSectionEdit       OperationKind = "section_edit"
-	OpFullPageEdit      OperationKind = "full_page_edit"
-	OpCreatePage        OperationKind = "create_page"
-	OpRegisterPage      OperationKind = "register_page"
-	OpUpdateSEOMeta     OperationKind = "update_seo_meta"
-	OpUpdatePageContent OperationKind = "update_page_content"
-	OpAddToNavigation   OperationKind = "add_to_navigation"
-	OpClarify           OperationKind = "clarify"
+	OpSimpleStyleEdit        OperationKind = "simple_style_edit"
+	OpSectionEdit            OperationKind = "section_edit"
+	OpFullPageEdit           OperationKind = "full_page_edit"
+	OpCreatePage             OperationKind = "create_page"
+	OpRegisterPage           OperationKind = "register_page"
+	OpRegisterExistingPage   OperationKind = "register_existing_page"
+	OpUpdateSEOMeta          OperationKind = "update_seo_meta"
+	OpUpdatePageContent      OperationKind = "update_page_content"
+	OpAddToNavigation        OperationKind = "add_to_navigation"
+	OpDiagnoseExistingPage   OperationKind = "diagnose_existing_page"
+	OpFixExistingPage        OperationKind = "fix_existing_page"
+	OpClarify                OperationKind = "clarify"
 )
 
 // Operation is one validated, non-destructive work item.

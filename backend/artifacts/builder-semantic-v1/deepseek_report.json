@@ -1,0 +1,11 @@
+{
+  "measured": false,
+  "status": "NOT_MEASURED",
+  "notes": [
+    "ML-8 did not measure live DeepSeek before/after context optimization.",
+    "ML-16 does not fabricate TTFT/context reduction claims without a live generation harness.",
+    "Run a controlled staging generation with BUILDER_PLAN_ENABLED=true and capture TurnMetricsSnapshot to populate this report.",
+    "Schema for future measurement is defined in PathMetrics."
+  ],
+  "improvement_claimed": false
+}

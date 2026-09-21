@@ -1,30 +1,49 @@
 package themebuild
 
 import (
+	"context"
 	"log/slog"
 	"time"
 
+	"ai-chat/internal/builderintelligence"
 	"ai-chat/internal/builderplan"
+	"ai-chat/internal/buildershadow"
 )
 
 // planObservation is the non-mutating BuilderPlan snapshot used when
 // BUILDER_PLAN_ENABLED=true. It never writes theme files or calls DeepSeek.
 type planObservation struct {
-	Plan              builderplan.BuilderPlan
-	Valid             bool
-	FallbackReason    string
-	PlannerElapsedMs  int64
-	ContextElapsedMs  int64
-	NeedsDeepSeek     bool
-	MappedIntent      Intent // empty when no safe mapping
-	MappedGeneration  string // existing generation-mode label for logs
-	CandidateContext  []string
-	AppliedEscalate   bool
+	Plan             builderplan.BuilderPlan
+	Valid            bool
+	FallbackReason   string
+	PlannerElapsedMs int64
+	ContextElapsedMs int64
+	NeedsDeepSeek    bool
+	MappedIntent     Intent // empty when no safe mapping
+	MappedGeneration string // existing generation-mode label for logs
+	CandidateContext []string
+	AppliedEscalate  bool
+	LocalLM          builderintelligence.Meta
+	Shadow           buildershadow.Comparison
+}
+
+// observeBuilderPlanOptions configures optional local understanding + shadow.
+type observeBuilderPlanOptions struct {
+	Intelligence *builderintelligence.Service
+	Shadow       *buildershadow.Runner
+	GenerationID string
+	TenantID     uint64
 }
 
 // observeBuilderPlan runs CPU-only plan build+validate. On any failure it
 // returns Valid=false and FallbackReason so callers keep the existing path.
 func observeBuilderPlan(prompt string) planObservation {
+	return observeBuilderPlanWith(context.Background(), prompt, observeBuilderPlanOptions{})
+}
+
+// observeBuilderPlanWith optionally refines via builderintelligence.Service.
+// themebuild does not know provider/URL/model details — only the service.
+func observeBuilderPlanWith(ctx context.Context, prompt string, opts observeBuilderPlanOptions) planObservation {
 	start := time.Now()
 	plan, err := builderplan.BuildPlan(prompt)
 	plannerMs := time.Since(start).Milliseconds()
@@ -39,10 +58,40 @@ func observeBuilderPlan(prompt string) planObservation {
 	ctxStart := time.Now()
 	candidates := builderplan.SelectContextFiles(plan)
 	contextMs := time.Since(ctxStart).Milliseconds()
-	// BuildPlan already populated RequiredFiles; keep an explicit measurement
-	// of the pure selection helper for pre-model timing logs.
 	if len(plan.RequiredFiles) == 0 {
 		plan.RequiredFiles = candidates
+	}
+
+	var lmMeta builderintelligence.Meta
+	deterministic := plan
+	// Ambiguous/clarify plans must not call local LM or DeepSeek — short-circuit
+	// happens in doGenerate. Skip Understand so local_lm_called stays false.
+	if !plan.Ambiguous && plan.Intent != builderplan.IntentAmbiguous &&
+		plan.Intent != builderplan.IntentPageTroubleshoot &&
+		!(len(plan.Operations) == 1 && plan.Operations[0].Kind == builderplan.OpClarify) &&
+		!(len(plan.Operations) == 1 && plan.Operations[0].Kind == builderplan.OpDiagnoseExistingPage) &&
+		opts.Intelligence != nil && opts.Intelligence.Enabled() {
+		res := opts.Intelligence.Understand(ctx, builderintelligence.Input{
+			Prompt:            prompt,
+			DeterministicPlan: plan,
+		})
+		plan = res.Plan
+		lmMeta = res.Meta
+		if len(plan.RequiredFiles) == 0 {
+			plan.RequiredFiles = builderplan.SelectContextFiles(plan)
+		}
+	}
+
+	var shadowCmp buildershadow.Comparison
+	if opts.Shadow != nil && opts.Shadow.Enabled() {
+		shadowCmp = opts.Shadow.Observe(ctx, buildershadow.Input{
+			Prompt:            prompt,
+			DeterministicPlan: deterministic,
+			ProductionPlan:    plan,
+			ProductionMeta:    lmMeta,
+			GenerationID:      opts.GenerationID,
+			TenantID:          opts.TenantID,
+		})
 	}
 
 	obs := planObservation{
@@ -52,6 +101,8 @@ func observeBuilderPlan(prompt string) planObservation {
 		ContextElapsedMs: contextMs,
 		NeedsDeepSeek:    builderplan.NeedsDeepSeek(plan),
 		CandidateContext: plan.RequiredFiles,
+		LocalLM:          lmMeta,
+		Shadow:           shadowCmp,
 	}
 	if mapped, mode, ok := mapBuilderPlanToExistingIntent(plan); ok {
 		obs.MappedIntent = mapped
@@ -81,6 +132,8 @@ func mapBuilderPlanToExistingIntent(plan builderplan.BuilderPlan) (Intent, strin
 		builderplan.IntentPageCreate, builderplan.IntentSEOMeta,
 		builderplan.IntentNavigationRegistry:
 		return IntentComplexPage, "complex_page", true
+	case builderplan.IntentPageTroubleshoot:
+		return IntentRepair, "page_troubleshoot", true
 	default:
 		return "", "", false
 	}
@@ -97,8 +150,6 @@ func escalateIntentFromPlan(existing Intent, obs planObservation) (Intent, bool)
 	case IntentComplexPage, IntentRepair, IntentMultiFileEdit:
 		return existing, false
 	case IntentConversation, IntentThemeQuery:
-		// Theme-query / conversation already decided by ClassifyIntent;
-		// do not override those special routes from the planner.
 		return existing, false
 	}
 	if obs.MappedIntent == IntentComplexPage &&
@@ -161,6 +212,7 @@ func logBuilderPlanObservation(genID string, tenantID uint64, chatID string, obs
 		"classifier_source", p.ClassifierSource,
 		"operation_count", len(p.Operations),
 		"operation_kinds", opKinds,
+		"planned_operation", primaryPlannedOperation(p),
 		"selected_context_file_count", len(obs.CandidateContext),
 		"selected_context_files", obs.CandidateContext,
 		"ambiguous", p.Ambiguous,
@@ -168,6 +220,38 @@ func logBuilderPlanObservation(genID string, tenantID uint64, chatID string, obs
 		"mapped_intent", string(obs.MappedIntent),
 		"mapped_generation_mode", obs.MappedGeneration,
 		"applied_escalate", obs.AppliedEscalate,
+		"local_lm_called", obs.LocalLM.Called,
+		"local_lm_skipped", obs.LocalLM.Skipped,
+		"local_lm_reason", obs.LocalLM.Reason,
+		"local_lm_elapsed_ms", obs.LocalLM.ElapsedMs,
+		"local_lm_timeout", obs.LocalLM.Timeout,
+		"local_lm_success", obs.LocalLM.Success,
+		"local_lm_failure", obs.LocalLM.Failure,
+		"local_lm_fallback", obs.LocalLM.Fallback,
+		"local_lm_provider", obs.LocalLM.Provider,
+		"local_lm_model", obs.LocalLM.Model,
+		"local_lm_input_bytes", obs.LocalLM.InputBytes,
+		"local_lm_output_bytes", obs.LocalLM.OutputBytes,
+		"deterministic_confidence", obs.LocalLM.DeterministicConfidence,
+		"refined_confidence", obs.LocalLM.RefinedConfidence,
+		"plan_changed", obs.LocalLM.PlanChanged,
+		"operation_count_before", obs.LocalLM.OperationCountBefore,
+		"operation_count_after", obs.LocalLM.OperationCountAfter,
+		"refinement_applied", obs.LocalLM.RefinementApplied,
+		"refinement_rejected", obs.LocalLM.RefinementRejected,
+		"refinement_fields_count", obs.LocalLM.RefinementFieldsCount,
+		"plan_intent_before", obs.LocalLM.PlanIntentBefore,
+		"plan_intent_after", obs.LocalLM.PlanIntentAfter,
+		"plan_op_count_before", obs.LocalLM.PlanOpCountBefore,
+		"plan_op_count_after", obs.LocalLM.PlanOpCountAfter,
+		"shadow_status", obs.Shadow.Status,
+		"shadow_skipped", obs.Shadow.Skipped,
+		"shadow_skip_reason", obs.Shadow.SkipReason,
+		"shadow_candidate_valid", obs.Shadow.CandidateValid,
+		"shadow_candidate_unsafe", obs.Shadow.CandidateUnsafe,
+		"shadow_candidate_latency_ms", obs.Shadow.CandidateLatencyMS,
+		"shadow_exact_match", obs.Shadow.ExactMatch,
+		"shadow_affects_production", false,
 	)
 	slog.Info("ai: builderplan observation", attrs...)
 }

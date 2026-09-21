@@ -426,6 +426,11 @@ func (s *Service) generateValidProposal(
 		// N-page / pages.json gate — that is the tool-contract mismatch
 		// that rejected valid Step 1 registry proposals.
 		if !tc.CompoundAtomicCreate {
+			if synthesizeMissingPageRegistry(result) {
+				slog.Info("ai: synthesized missing page_registry_entry",
+					"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,
+					"page", pageEntryIdentity(normalizeRegistryEntry(result.PageRegistryEntry)))
+			}
 			if err := incompleteMultiPageCreateProposal(merchantPrompt, result); err != nil {
 				if attempt >= maxThemeCheckRetries+1 {
 					// Never stage a fake "Generated N pages" stub (blog.liquid /

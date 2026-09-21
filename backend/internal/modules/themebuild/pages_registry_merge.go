@@ -86,10 +86,135 @@ func pagesJSONIndent(pagesJSON string) string {
 	return "  "
 }
 
+// looksLikeTruncatedPagesJSON detects prompt-only stubs produced by
+// truncateForSimpleEditPrompt / context-plan OmitFullPagesJSON. Those must
+// never be used as the merge or staging base (mid-string cuts leave raw
+// newlines inside unterminated JSON strings).
+func looksLikeTruncatedPagesJSON(s string) bool {
+	low := strings.ToLower(s)
+	return strings.Contains(s, "…(truncated") ||
+		strings.Contains(low, "...(truncated") ||
+		strings.Contains(low, "(truncated for simple-edit)")
+}
+
+// isValidPagesJSON reports whether s is empty or parseable pages.json.
+func isValidPagesJSON(s string) bool {
+	_, err := parsePagesJSONRaw(s)
+	return err == nil
+}
+
+// serializePagesJSON is the canonical pages.json writer: structured raw
+// entries in, properly escaped JSON out. Never concatenates model text.
+func serializePagesJSON(raws []json.RawMessage, indentHint string) string {
+	indent := pagesJSONIndent(indentHint)
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	if len(raws) > 0 {
+		buf.WriteByte('\n')
+		for i, raw := range raws {
+			buf.WriteString(indent)
+			buf.Write(raw)
+			if i < len(raws)-1 {
+				buf.WriteByte(',')
+			}
+			buf.WriteByte('\n')
+		}
+	}
+	buf.WriteByte(']')
+	buf.WriteByte('\n')
+	return buf.String()
+}
+
+// resolveCanonicalPagesJSON picks a merge/staging base. Prefer a valid
+// store/workspace body; never trust a truncated ThemeContext prompt stub.
+// promptHint is only used when it is complete valid JSON (not truncated).
+func resolveCanonicalPagesJSON(storePagesJSON, promptHint string) (string, error) {
+	var candidates []string
+	if !looksLikeTruncatedPagesJSON(storePagesJSON) {
+		candidates = append(candidates, storePagesJSON)
+	}
+	if strings.TrimSpace(promptHint) != "" && !looksLikeTruncatedPagesJSON(promptHint) {
+		candidates = append(candidates, promptHint)
+	}
+	for _, c := range candidates {
+		if _, err := parsePagesJSONRaw(c); err == nil {
+			return c, nil
+		}
+	}
+	if strings.TrimSpace(storePagesJSON) != "" && !looksLikeTruncatedPagesJSON(storePagesJSON) {
+		_, err := parsePagesJSONRaw(storePagesJSON)
+		return "", fmt.Errorf("pages.json consistency: current registry invalid: %w", err)
+	}
+	if looksLikeTruncatedPagesJSON(storePagesJSON) || looksLikeTruncatedPagesJSON(promptHint) {
+		return "", fmt.Errorf("pages.json consistency: current registry invalid: parse pages.json: truncated prompt stub is not a merge base")
+	}
+	// Truly empty theme registry.
+	return "", nil
+}
+
+// validateRegistryMergeInvariants checks merge output before checkpoint/stage.
+func validateRegistryMergeInvariants(before, after string, expectedNew []string) error {
+	if !json.Valid([]byte(strings.TrimSpace(after))) {
+		return fmt.Errorf("pages.json consistency: proposed pages.json is not valid JSON")
+	}
+	if err := validatePagesJSONNonDestructive(before, after, expectedNew, true); err != nil {
+		return err
+	}
+	afterRaws, err := parsePagesJSONRaw(after)
+	if err != nil {
+		return fmt.Errorf("pages.json consistency: proposed pages.json is not valid JSON: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, raw := range afterRaws {
+		id := identityFromRawPage(raw)
+		if id == "" {
+			continue
+		}
+		if seen[id] {
+			return fmt.Errorf("pages.json consistency: duplicate identity %q in proposed registry", id)
+		}
+		seen[id] = true
+	}
+	for _, id := range expectedNew {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if !seen[id] {
+			return fmt.Errorf("pages.json consistency: created page %q has no registry entry (use page_registry_entry)", id)
+		}
+	}
+	return nil
+}
+
+// applyRegistryEntryCheckpoint merges one structured entry onto a validated
+// checkpoint. On failure the previous checkpoint is unchanged (caller keeps it).
+func applyRegistryEntryCheckpoint(checkpoint string, entry *themefs.PageEntry) (next string, added []string, err error) {
+	if entry == nil {
+		return checkpoint, nil, nil
+	}
+	next, added, err = mergePageRegistryEntries(checkpoint, []*themefs.PageEntry{entry})
+	if err != nil {
+		return checkpoint, nil, err
+	}
+	want := []string{}
+	if id := pageEntryIdentity(normalizeRegistryEntry(entry)); id != "" {
+		// Only require identity in after; added may be empty on upsert.
+		want = []string{id}
+	}
+	if err := validateRegistryMergeInvariants(checkpoint, next, want); err != nil {
+		return checkpoint, nil, err
+	}
+	return next, added, nil
+}
+
 // mergePageRegistryEntries upserts entries into current pages.json.
 // Existing entry bytes are preserved; new entries are appended. Duplicate
 // identities update in place (no second row).
 func mergePageRegistryEntries(current string, entries []*themefs.PageEntry) (string, []string, error) {
+	if looksLikeTruncatedPagesJSON(current) {
+		return "", nil, fmt.Errorf("parse pages.json: truncated prompt stub is not a merge base")
+	}
 	raws, err := parsePagesJSONRaw(current)
 	if err != nil {
 		return "", nil, err
@@ -113,9 +238,13 @@ func mergePageRegistryEntries(current string, entries []*themefs.PageEntry) (str
 		if id == "" {
 			return "", nil, fmt.Errorf("page_registry_entry missing page/slug identity")
 		}
+		// Structured encode — json.Marshal escapes newlines/quotes/control chars.
 		encoded, err := json.Marshal(norm)
 		if err != nil {
 			return "", nil, fmt.Errorf("encode page_registry_entry %q: %w", id, err)
+		}
+		if !json.Valid(encoded) {
+			return "", nil, fmt.Errorf("encode page_registry_entry %q: produced invalid JSON", id)
 		}
 		if idx, ok := byID[id]; ok {
 			raws[idx] = json.RawMessage(encoded)
@@ -126,23 +255,11 @@ func mergePageRegistryEntries(current string, entries []*themefs.PageEntry) (str
 		added = append(added, id)
 	}
 
-	indent := pagesJSONIndent(current)
-	var buf bytes.Buffer
-	buf.WriteByte('[')
-	if len(raws) > 0 {
-		buf.WriteByte('\n')
-		for i, raw := range raws {
-			buf.WriteString(indent)
-			buf.Write(raw)
-			if i < len(raws)-1 {
-				buf.WriteByte(',')
-			}
-			buf.WriteByte('\n')
-		}
+	out := serializePagesJSON(raws, current)
+	if !json.Valid([]byte(strings.TrimSpace(out))) {
+		return "", nil, fmt.Errorf("serialize pages.json: produced invalid JSON")
 	}
-	buf.WriteByte(']')
-	buf.WriteByte('\n')
-	return buf.String(), added, nil
+	return out, added, nil
 }
 
 // validatePagesJSONNonDestructive ensures every pre-merge identity still
@@ -281,11 +398,24 @@ func injectMergedPagesJSON(result *ai.Result, current string, registries []*them
 	if len(registries) == 0 {
 		return nil
 	}
+	if looksLikeTruncatedPagesJSON(current) {
+		return fmt.Errorf("parse pages.json: truncated prompt stub is not a merge base")
+	}
 	merged, added, err := mergePageRegistryEntries(current, registries)
 	if err != nil {
 		return err
 	}
-	if err := validatePagesJSONNonDestructive(current, merged, added, true); err != nil {
+	expected := make([]string, 0, len(registries))
+	for _, e := range registries {
+		if id := pageEntryIdentity(normalizeRegistryEntry(e)); id != "" {
+			expected = append(expected, id)
+		}
+	}
+	// Prefer full expected set (includes upserts) over only newly-added.
+	if len(expected) == 0 {
+		expected = added
+	}
+	if err := validateRegistryMergeInvariants(current, merged, expected); err != nil {
 		return err
 	}
 	replaced := false

@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "checks": [
+    "local LM timeout falls back (builderintelligence Understand Meta.Timeout/Fallback)",
+    "local provider unavailable falls back (providers.Unavailable)",
+    "invalid JSON falls back without mutating deterministic plan",
+    "deterministic register_existing_page does not invoke DeepSeek (NeedsDeepSeek=false, Metrics.DeepSeekCalls=0)",
+    "compound partial failure preserves completed work (existing themebuild checkpoints — unchanged)",
+    "parent ~10-minute generation deadline intact (not modified in ML-16)",
+    "first-token timeout intact (AI_STREAM_FIRST_TOKEN_TIMEOUT_MS — not modified)",
+    "retries remain bounded (not modified)",
+    "repair remains bounded (not modified)",
+    "WebSocket terminal lifecycle intact (not modified)"
+  ],
+  "notes": [
+    "Inventory-only verification — ML-16 does not mutate these controls"
+  ]
+}

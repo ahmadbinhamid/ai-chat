@@ -1,0 +1,182 @@
+{
+  "status": "NOT_READY_FOR_TRAINING",
+  "dataset_version": "builder-semantic-v1",
+  "generated_at": "2026-09-18T12:16:53Z",
+  "gate": {
+    "ready": false,
+    "status": "NOT_READY_FOR_TRAINING",
+    "config": {
+      "min_usable_total": 500,
+      "min_positive_semantic": 200,
+      "min_distinct_semantic_groups": 100,
+      "min_with_protected_fields": 50,
+      "min_with_preferences": 50,
+      "min_clarification": 30,
+      "min_seo_related": 40,
+      "min_compound": 40
+    },
+    "stats": {
+      "dataset_version": "builder-semantic-v1",
+      "train_count": 2,
+      "validation_count": 0,
+      "test_count": 0,
+      "usable_total": 2,
+      "positive_semantic": 2,
+      "positive_routing": 0,
+      "negative_eval": 0,
+      "ambiguous_eval": 0,
+      "distinct_semantic_groups": 2,
+      "with_protected_fields": 2,
+      "with_preferences": 1,
+      "with_clarification": 0,
+      "seo_related": 1,
+      "compound": 1,
+      "intent_distribution": {
+        "compound": 1,
+        "simple_edit": 1
+      },
+      "dataset_hash": "420da0454f33f3af2ffd93ae45c1ca5a0c472fdc55c652c7a186ce46dd00f5f6",
+      "split_hash": "0d39cd37680499b8af3c28eb2feebbb23a2fd6e002b284acf2501257cf8c8437"
+    },
+    "failures": [
+      {
+        "metric": "usable_total",
+        "have": 2,
+        "required": 500,
+        "missing": 498
+      },
+      {
+        "metric": "positive_semantic",
+        "have": 2,
+        "required": 200,
+        "missing": 198
+      },
+      {
+        "metric": "distinct_semantic_groups",
+        "have": 2,
+        "required": 100,
+        "missing": 98
+      },
+      {
+        "metric": "with_protected_fields",
+        "have": 2,
+        "required": 50,
+        "missing": 48
+      },
+      {
+        "metric": "with_preferences",
+        "have": 1,
+        "required": 50,
+        "missing": 49
+      },
+      {
+        "metric": "with_clarification",
+        "have": 0,
+        "required": 30,
+        "missing": 30
+      },
+      {
+        "metric": "seo_related",
+        "have": 1,
+        "required": 40,
+        "missing": 39
+      },
+      {
+        "metric": "compound",
+        "have": 1,
+        "required": 40,
+        "missing": 39
+      }
+    ],
+    "recommendation": "Collect more REAL sanitized builder executions via BUILDER_TRAINING_DATA_ENABLED=true. Do not fabricate data. Re-export builder-semantic-v1 after collection, then re-run the gate.",
+    "additional_examples_needed": {
+      "compound": 39,
+      "distinct_semantic_groups": 98,
+      "positive_semantic": 198,
+      "seo_related": 39,
+      "usable_total": 498,
+      "with_clarification": 30,
+      "with_preferences": 49,
+      "with_protected_fields": 48
+    }
+  },
+  "hardware": {
+    "goos": "darwin",
+    "goarch": "arm64",
+    "num_cpu": 10,
+    "has_cuda": false,
+    "notes": "CPU/Apple-Silicon laptop assumed. Full LoRA/QLoRA training of Qwen2.5-0.5B is not automated in-repo without an explicit external training toolchain. Inference via llama.cpp remains supported; training artifacts can be prepared for external runs.",
+    "cpu_lora_practical": false
+  },
+  "training": {
+    "attempted": false,
+    "hardware": {
+      "goos": "",
+      "goarch": "",
+      "num_cpu": 0,
+      "has_cuda": false,
+      "notes": "",
+      "cpu_lora_practical": false
+    },
+    "config": {
+      "dataset_version": "",
+      "dataset_hash": "",
+      "split_hash": "",
+      "base_model": "",
+      "quantization": "",
+      "method": "",
+      "seed": 0,
+      "artifact_dir": ""
+    },
+    "external_train_ready": false
+  },
+  "criteria": {
+    "require_better_semantic_accuracy": false,
+    "require_safety_equal_or_better": false,
+    "max_invalid_json_rate": 0,
+    "max_p95_ms": 0,
+    "max_ram_mb": 0,
+    "no_clarification_regression": false,
+    "no_protected_field_regression": false
+  },
+  "benchmark": [
+    {
+      "model": "heuristic (ML-11 reference)",
+      "accuracy": 0.82,
+      "protected_field_accuracy": 0.77,
+      "clarification_accuracy": 1,
+      "valid_json_percent": 100,
+      "unsafe_output_percent": 0,
+      "p50_ms": 0,
+      "p95_ms": 0.004,
+      "evaluated": true,
+      "notes": "ML-11 reference measurement on labeled eval-only set; preserved, not re-interpreted"
+    },
+    {
+      "model": "qwen2.5-0.5b-base (ML-11 reference)",
+      "accuracy": 0.48,
+      "protected_field_accuracy": 0.67,
+      "clarification_accuracy": 1,
+      "valid_json_percent": 100,
+      "unsafe_output_percent": 7.14,
+      "p50_ms": 340,
+      "p95_ms": 453,
+      "evaluated": true,
+      "notes": "ML-11 reference measurement on labeled eval-only set; preserved, not re-interpreted"
+    }
+  ],
+  "decision_reasons": [
+    "Training dataset below ML-11/ML-14 thresholds — NOT_READY_FOR_TRAINING.",
+    "usable_total=2 need\u003e=500",
+    "usable_total: 2/500 missing 498",
+    "positive_semantic: 2/200 missing 198",
+    "distinct_semantic_groups: 2/100 missing 98",
+    "with_protected_fields: 2/50 missing 48",
+    "with_preferences: 1/50 missing 49",
+    "with_clarification: 0/30 missing 30",
+    "seo_related: 1/40 missing 39",
+    "compound: 1/40 missing 39",
+    "No trained/shadow candidate model configured."
+  ],
+  "production_note": "BUILDER_LOCAL_LM_ENABLED must remain false. Shadow is separate. Do not switch production models."
+}

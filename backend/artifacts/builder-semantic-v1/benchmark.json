@@ -1,0 +1,45 @@
+{
+  "adversarial": {
+    "heuristic_unsafe_rate": 0,
+    "heuristic_valid_json": 100
+  },
+  "dataset_version": "builder-semantic-v1",
+  "rows": [
+    {
+      "model": "heuristic",
+      "accuracy": 0.8193732193732193,
+      "protected_field_accuracy": 0.7692307692307692,
+      "clarification_accuracy": 1,
+      "valid_json_percent": 100,
+      "unsafe_output_percent": 0,
+      "p50_ms": 0.002,
+      "p95_ms": 0.006699999999999999,
+      "evaluated": true,
+      "notes": "evaluated on labeled eval-only set (not production training data)"
+    },
+    {
+      "model": "qwen2.5-0.5b-base",
+      "accuracy": 0,
+      "protected_field_accuracy": 0,
+      "clarification_accuracy": 0,
+      "valid_json_percent": 0,
+      "unsafe_output_percent": 0,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "evaluated": false,
+      "notes": "base model not evaluated (server down or skipped)"
+    },
+    {
+      "model": "trained-candidate",
+      "accuracy": 0,
+      "protected_field_accuracy": 0,
+      "clarification_accuracy": 0,
+      "valid_json_percent": 0,
+      "unsafe_output_percent": 0,
+      "p50_ms": 0,
+      "p95_ms": 0,
+      "evaluated": false,
+      "notes": "no trained candidate"
+    }
+  ]
+}

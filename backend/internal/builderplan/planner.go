@@ -63,7 +63,7 @@ func BuildPlanWith(c Classifier, prompt string) (BuilderPlan, error) {
 				target = "pages/blog.liquid"
 			}
 			plan.Operations = []Operation{{
-				Kind: OpRegisterPage, Target: target, Label: "Register existing " + slug,
+				Kind: OpRegisterExistingPage, Target: target, Label: "Register existing " + slug,
 				ProtectExisting: true,
 			}}
 		} else {
@@ -88,13 +88,16 @@ func BuildPlanWith(c Classifier, prompt string) (BuilderPlan, error) {
 			target = "pages/home.liquid"
 		}
 		kind := OpUpdatePageContent
-		if fullPageRe.MatchString(p) && !contentRewriteRe.MatchString(p) {
+		if fullPageRe.MatchString(p) && !contentRewriteRe.MatchString(p) && !existingPageContentRe.MatchString(p) {
 			kind = OpFullPageEdit
 		}
 		plan.Operations = []Operation{{
 			Kind: kind, Target: target, Label: "Update page content",
 			ProtectExisting: true,
 		}}
+		if protectSlugRe.MatchString(p) {
+			plan.Constraints = append(plan.Constraints, "protect_field:slug")
+		}
 		if seoMetaRe.MatchString(p) {
 			plan.Compound = true
 			plan.Operations = append(plan.Operations, Operation{
@@ -122,6 +125,18 @@ func BuildPlanWith(c Classifier, prompt string) (BuilderPlan, error) {
 			Kind: OpSimpleStyleEdit, Target: target, Label: "Simple style edit",
 			ProtectExisting: true,
 		}}
+	case IntentPageTroubleshoot:
+		plan.Complexity = ComplexityLow
+		target := troubleshootTarget(p)
+		plan.Operations = []Operation{{
+			Kind: OpDiagnoseExistingPage, Target: target, Label: "Diagnose existing page",
+			ProtectExisting: true,
+		}}
+		plan.AcceptanceCriteria = []string{
+			"diagnose_before_deepseek",
+			"prefer_deterministic_registry_fix",
+			"never_create_page_for_existing_troubleshoot",
+		}
 	default: // ambiguous
 		plan.Complexity = ComplexityLow
 		plan.Operations = []Operation{{
@@ -210,6 +225,29 @@ func sectionTarget(p string) string {
 	}
 }
 
+// troubleshootTarget returns a logical pages/*.liquid path when the prompt
+// names a page; empty when the caller must resolve via active chat target.
+func troubleshootTarget(p string) string {
+	switch {
+	case strings.Contains(p, "blog"):
+		return "pages/blog.liquid"
+	case strings.Contains(p, "pricing"):
+		return "pages/pricing.liquid"
+	case strings.Contains(p, "about"):
+		return "pages/about-us.liquid"
+	case strings.Contains(p, "contact"):
+		return "pages/contact-us.liquid"
+	case strings.Contains(p, "faq"):
+		return "pages/faq.liquid"
+	case strings.Contains(p, "home"):
+		return "pages/home.liquid"
+	case strings.Contains(p, "service"):
+		return "pages/services.liquid"
+	default:
+		return ""
+	}
+}
+
 func uniqueTargets(ops []Operation) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(ops))
@@ -238,7 +276,7 @@ func defaultAcceptance(plan BuilderPlan) []string {
 		switch op.Kind {
 		case OpCreatePage:
 			out = append(out, "new_page_uses_page_registry_entry")
-		case OpRegisterPage, OpUpdateSEOMeta:
+		case OpRegisterPage, OpRegisterExistingPage, OpUpdateSEOMeta:
 			out = append(out, "pages_json_merge_preserves_existing_entries")
 		case OpAddToNavigation:
 			out = append(out, "defaults_json_appends_menu_items")

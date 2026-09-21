@@ -1,0 +1,16 @@
+{
+  "cases": [
+    {
+      "name": "register_existing_page",
+      "prompt": "can you register the blog page",
+      "passed": true,
+      "elapsed_ms": 0,
+      "deepseek_calls": 0,
+      "local_lm_calls": 0,
+      "retries": 0,
+      "repairs": 0,
+      "outcome": "success",
+      "pages_json_diff_bytes": 0
+    }
+  ]
+}

@@ -110,7 +110,9 @@ var (
 		`)`)
 
 	// multiPageCreateCountRe extracts how many new pages the merchant wants.
+	// Digits: "2 pages" / "3 blogs". Words: "pair of … pages" / "two pages".
 	multiPageCreateCountRe = regexp.MustCompile(`(?i)\b(\d{1,2})\s+(?:blog\s*)?pages?\b|\b(\d{1,2})\s+blogs?\b`)
+	multiPageCreateWordCountRe = regexp.MustCompile(`(?i)\b(pair|couple|both|two|three|four|five|six|seven|eight|nine|ten)\b[\s\S]{0,24}\b(?:blog\s*)?pages?\b|\b(pair|couple|both|two|three|four|five|six|seven|eight|nine|ten)\b\s+blogs?\b`)
 
 	// pageAndMenuRe: page + menu/nav together with a create/add/new action —
 	// structural multi-file work (register page + wire navigation).
@@ -247,6 +249,11 @@ func ClassifyIntent(prompt, mode string, hasAttachments bool) Intent {
 		return IntentThemeQuery
 	}
 	if isBulkPageDeletePrompt(p) {
+		return IntentComplexPage
+	}
+	// Register existing on-disk page into pages.json — never simple_edit
+	// (model tends to emit page_registry_entry with empty files[]).
+	if isRegisterExistingPagePrompt(p) {
 		return IntentComplexPage
 	}
 	if complexRe.MatchString(p) {
@@ -411,27 +418,60 @@ func isMultiPageCreatePrompt(prompt string) bool {
 func requestedNewPageCount(prompt string) int {
 	p := strings.ToLower(strings.Join(strings.Fields(prompt), " "))
 	m := multiPageCreateCountRe.FindStringSubmatch(p)
-	if len(m) == 0 {
-		return 0
-	}
-	raw := m[1]
-	if raw == "" {
-		raw = m[2]
-	}
-	n := 0
-	for _, ch := range raw {
-		if ch < '0' || ch > '9' {
-			return 0
+	if len(m) > 0 {
+		raw := m[1]
+		if raw == "" {
+			raw = m[2]
 		}
-		n = n*10 + int(ch-'0')
+		n := 0
+		for _, ch := range raw {
+			if ch < '0' || ch > '9' {
+				n = 0
+				break
+			}
+			n = n*10 + int(ch-'0')
+		}
+		if n >= 2 {
+			if n > 10 {
+				return 10
+			}
+			return n
+		}
 	}
-	if n < 2 {
+	wm := multiPageCreateWordCountRe.FindStringSubmatch(p)
+	if len(wm) == 0 {
 		return 0
 	}
-	if n > 10 {
-		return 10
+	raw := wm[1]
+	if raw == "" {
+		raw = wm[2]
 	}
-	return n
+	return wordPageCount(raw)
+}
+
+func wordPageCount(word string) int {
+	switch strings.ToLower(strings.TrimSpace(word)) {
+	case "pair", "couple", "both", "two":
+		return 2
+	case "three":
+		return 3
+	case "four":
+		return 4
+	case "five":
+		return 5
+	case "six":
+		return 6
+	case "seven":
+		return 7
+	case "eight":
+		return 8
+	case "nine":
+		return 9
+	case "ten":
+		return 10
+	default:
+		return 0
+	}
 }
 
 // multiPageCreateBatchSize is how many pages the AI must create THIS turn.

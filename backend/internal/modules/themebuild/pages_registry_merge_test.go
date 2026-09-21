@@ -209,11 +209,16 @@ func TestCompoundPartial_KeepsPage1RegistryMerge(t *testing.T) {
 		{Path: "pages/one.liquid", Action: "create", Content: "a"},
 		{Path: "pages.json", Action: "update", Content: `[{"slug":"one"}]`}, // destructive model body
 	}, PageRegistryEntry: &themefs.PageEntry{Slug: "one", Page: "one", Type: "custom", Status: "published", Path: "/pages"}}
+	checkpoint, _, err := applyRegistryEntryCheckpoint(base, page1.PageRegistryEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
 	progress := CompoundProgress{
-		Completed:  []CompoundStep{{Label: "Create page 1 of 2", Kind: CompoundStepCreatePage}},
-		Failed:     &CompoundStep{Label: "Create page 2 of 2"},
-		Accum:      page1,
-		Registries: []*themefs.PageEntry{page1.PageRegistryEntry},
+		Completed:    []CompoundStep{{Label: "Create page 1 of 2", Kind: CompoundStepCreatePage}},
+		Failed:       &CompoundStep{Label: "Create page 2 of 2"},
+		Accum:        page1,
+		Registries:   []*themefs.PageEntry{page1.PageRegistryEntry},
+		RegistryJSON: checkpoint,
 	}
 	accum, _, regs, err := compoundPartialOrErr(progress, nil, base, fmt.Errorf("step 2 failed"))
 	if err == nil {

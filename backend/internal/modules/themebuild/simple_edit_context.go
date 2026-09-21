@@ -93,13 +93,13 @@ func detectSimpleEditTargets(prompt string) []string {
 		keys   []string
 		target string
 	}{
-		{[]string{"header", "navbar", "nav bar", "top bar"}, "header"},
+		{[]string{"header", "hdr", "navbar", "nav bar", "top bar"}, "header"},
 		{[]string{"footer"}, "footer"},
 		{[]string{"hero", "banner"}, "hero"},
 		{[]string{"slider", "carousel"}, "slider"},
 		{[]string{"product card", "product-card", "cards"}, "product_card"},
 		{[]string{"homepage", "home page", "landing"}, "homepage"},
-		{[]string{"button", "cta"}, "button"},
+		{[]string{"button", "btn", "cta"}, "button"},
 		{[]string{"logo"}, "logo"},
 		{[]string{"cart"}, "cart"},
 		{[]string{"menu"}, "menu"},
@@ -165,7 +165,7 @@ func rankPathsForTargets(paths, targets []string, prompt string) []string {
 		for _, t := range targets {
 			switch t {
 			case "header":
-				if strings.Contains(low, "header") || strings.Contains(low, "nav") {
+				if strings.Contains(low, "header") || strings.Contains(low, "hdr") || strings.Contains(low, "nav") {
 					score += 100
 				}
 			case "footer":
@@ -198,9 +198,13 @@ func rankPathsForTargets(paths, targets []string, prompt string) []string {
 				if strings.Contains(low, "button") || strings.Contains(low, "btn") || strings.Contains(low, "cta") {
 					score += 80
 				}
-				// Buttons often live in header — soft boost.
+				// Buttons often live in header — soft boost. Prefer header.css
+				// when the merchant names both header + button (color edits).
 				if strings.Contains(low, "header") {
 					score += 30
+					if strings.HasSuffix(low, ".css") {
+						score += 40
+					}
 				}
 			case "logo", "cart", "menu", "sidebar", "section":
 				if strings.Contains(low, t) {

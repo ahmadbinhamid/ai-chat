@@ -184,7 +184,7 @@ func TestBuildThemeContext_SecondCallSeesFirstTurnsDraftOutput(t *testing.T) {
 	}
 	overlay := themefs.NewOverlayStore(svc.store, draft)
 
-	tc, err := svc.buildThemeContext(ctx, overlay, testStoreAuth(), "demo-theme")
+	tc, err := svc.buildThemeContext(ctx, overlay, testStoreAuth(), "demo-theme", false)
 	if err != nil {
 		t.Fatalf("buildThemeContext failed: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestBuildThemeContext_ConcurrentCallsMatchSequentialShape(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	tc, err := svc.buildThemeContext(context.Background(), svc.store, testStoreAuth(), "demo-theme")
+	tc, err := svc.buildThemeContext(context.Background(), svc.store, testStoreAuth(), "demo-theme", false)
 	if err != nil {
 		t.Fatalf("buildThemeContext failed: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestBuildThemeContext_FailsOnASingleReadError(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	if _, err := svc.buildThemeContext(context.Background(), svc.store, testStoreAuth(), "demo-theme"); err == nil {
+	if _, err := svc.buildThemeContext(context.Background(), svc.store, testStoreAuth(), "demo-theme", false); err == nil {
 		t.Error("expected an error when the file-listing call fails")
 	}
 }
