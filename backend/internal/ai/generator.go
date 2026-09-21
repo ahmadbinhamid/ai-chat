@@ -21,6 +21,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
 )
 
 // themeEngineSpec is THEME_ENGINE_SPEC.md, embedded at build time so this
@@ -191,6 +192,104 @@ type Generator struct {
 	// config.Config.MaxTokens (AI_MAX_TOKENS env var, falling back to the
 	// deprecated ANTHROPIC_MAX_TOKENS).
 	maxTokens int64
+	// streamTimeouts configures consumeStream's idle/first-token budgets —
+	// see StreamTimeouts' own doc comment. Zero-valued fields (e.g. a
+	// Generator built directly in a test, bypassing New) fall back to the
+	// package defaults via (*Generator).idleTimeout /
+	// (*Generator).firstTokenTimeoutFor, never to an instant/zero timeout.
+	streamTimeouts StreamTimeouts
+}
+
+// StreamTimeouts configures Generate's per-attempt idle and first-token
+// budgets — see consumeStream's own doc comment for what each one guards
+// against. Grouped into its own struct rather than more positional
+// parameters on New: it's one cohesive unit of config that config.Load
+// either supplies in full or a caller (tests, NewFake) leaves zero-valued,
+// which the getters above treat as "use the default," not "time out
+// instantly."
+//
+// FirstToken* is split by ai.GenerationMode rather than one flat value:
+// FirstTokenBrand/FirstTokenCopy are shorter because those modes are
+// contractually narrow (brand: defaults.json only; copy: hardcoded text
+// only — see GenerationModeBrand/GenerationModeCopy), FirstTokenPages is
+// longer because creating a new registered page is typically the most work
+// a single turn does, and FirstTokenEdit is the default/fallback most
+// ordinary chat traffic actually hits — GenerationMode is normally empty
+// ("edit") outside the explicit guided-onboarding flow that sets Mode
+// itself (see themebuild.GenerateInput.Mode's own doc comment), so most
+// generations get FirstTokenEdit's budget regardless of how simple or
+// complex the actual prompt is.
+type StreamTimeouts struct {
+	Idle            time.Duration
+	FirstTokenEdit  time.Duration
+	FirstTokenBrand time.Duration
+	FirstTokenCopy  time.Duration
+	FirstTokenPages time.Duration
+}
+
+// Default stream timeouts — see StreamTimeouts' own doc comment. Used
+// whenever a Generator's corresponding StreamTimeouts field is zero, not
+// just when StreamTimeouts itself is entirely zero-valued.
+const (
+	defaultStreamIdleTimeout       = 12 * time.Second
+	defaultFirstTokenTimeoutEdit   = 120 * time.Second
+	defaultFirstTokenTimeoutNarrow = 45 * time.Second
+	defaultFirstTokenTimeoutPages  = 150 * time.Second
+)
+
+func (g *Generator) idleTimeout() time.Duration {
+	if g.streamTimeouts.Idle > 0 {
+		return g.streamTimeouts.Idle
+	}
+	return defaultStreamIdleTimeout
+}
+
+// firstTokenTimeoutFor picks the first-token budget for mode (an
+// ai.GenerationMode value) — see StreamTimeouts' own doc comment on why
+// this is split by mode and why "edit" (the default/empty value) is the one
+// most real traffic hits.
+func (g *Generator) firstTokenTimeoutFor(mode string) time.Duration {
+	switch mode {
+	case GenerationModeBrand:
+		if g.streamTimeouts.FirstTokenBrand > 0 {
+			return g.streamTimeouts.FirstTokenBrand
+		}
+		return defaultFirstTokenTimeoutNarrow
+	case GenerationModeCopy:
+		if g.streamTimeouts.FirstTokenCopy > 0 {
+			return g.streamTimeouts.FirstTokenCopy
+		}
+		return defaultFirstTokenTimeoutNarrow
+	case GenerationModePages:
+		if g.streamTimeouts.FirstTokenPages > 0 {
+			return g.streamTimeouts.FirstTokenPages
+		}
+		return defaultFirstTokenTimeoutPages
+	default: // GenerationModeEdit, or unset/empty — the common case.
+		if g.streamTimeouts.FirstTokenEdit > 0 {
+			return g.streamTimeouts.FirstTokenEdit
+		}
+		return defaultFirstTokenTimeoutEdit
+	}
+}
+
+// clampToContextDeadline shortens d to whatever's left on ctx's deadline
+// (the generation's own parent timeout — see themebuild's generateTimeout)
+// when that's sooner than d, so a first-token budget can never itself
+// outlive the generation it's part of. A ctx with no deadline (e.g. a bare
+// context.Background() in a test) leaves d unchanged.
+func clampToContextDeadline(ctx context.Context, d time.Duration) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return d
+	}
+	if remaining := time.Until(deadline); remaining < d {
+		if remaining < 0 {
+			return 0
+		}
+		return remaining
+	}
+	return d
 }
 
 // New constructs the client. apiKey empty is a configuration error the
@@ -214,7 +313,7 @@ type Generator struct {
 // OfAny; DeepSeek's model will still reason its way to skipping one anyway.
 // See Generate's "len(toolUses) == 0" handling, which nudges rather than
 // fails outright specifically to route around this.
-func New(apiKey, baseURL, model, effort, visionModel string, maxTokens int64) (*Generator, error) {
+func New(apiKey, baseURL, model, effort, visionModel string, maxTokens int64, streamTimeouts StreamTimeouts) (*Generator, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("API key is not set")
 	}
@@ -237,11 +336,12 @@ func New(apiKey, baseURL, model, effort, visionModel string, maxTokens int64) (*
 		"adaptive_thinking_supported", modelSupportsAdaptiveThinking(model),
 		"vision_model", visionModel)
 	return &Generator{
-		client:      anthropic.NewClient(opts...),
-		model:       model,
-		effort:      anthropic.OutputConfigEffort(effort),
-		maxTokens:   maxTokens,
-		visionModel: visionModel,
+		client:         anthropic.NewClient(opts...),
+		model:          model,
+		effort:         anthropic.OutputConfigEffort(effort),
+		streamTimeouts: streamTimeouts,
+		maxTokens:      maxTokens,
+		visionModel:    visionModel,
 	}, nil
 }
 
@@ -495,6 +595,138 @@ func isRetryableAccumulateErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "accumulate stream")
 }
 
+// errStreamIdle and errStreamFirstToken are consumeStream's two timeout
+// classes — see its own doc comment. Both are retried exactly like a
+// truncated/garbled stream chunk (isRetryableAccumulateErr) via
+// isRetryableStreamErr: a hung provider connection is exactly as
+// recoverable by a fresh attempt as a garbled one, not a reason to fail the
+// whole generation outright.
+var (
+	errStreamIdle       = errors.New("provider stream idle timeout")
+	errStreamFirstToken = errors.New("provider stream first-token timeout")
+)
+
+// isRetryableStreamErr reports whether err is one this Generate call's
+// attempt loop should retry rather than fail outright — either class of
+// consumeStream timeout, or a truncated/garbled accumulate error. A plain
+// ctx cancellation/deadline (context.Canceled/DeadlineExceeded) is
+// deliberately NOT included: that's the caller's own budget running out,
+// not a transient provider hiccup, and retrying it would just spend the
+// retry delay on a context that's already dead.
+func isRetryableStreamErr(err error) bool {
+	return isRetryableAccumulateErr(err) || errors.Is(err, errStreamIdle) || errors.Is(err, errStreamFirstToken)
+}
+
+// streamRetryReason labels err for the retry warning log below — purely
+// diagnostic, never used for control flow.
+func streamRetryReason(err error) string {
+	switch {
+	case errors.Is(err, errStreamIdle):
+		return "idle_timeout"
+	case errors.Is(err, errStreamFirstToken):
+		return "first_token_timeout"
+	case isRetryableAccumulateErr(err):
+		return "truncated_stream"
+	default:
+		return "unknown"
+	}
+}
+
+// streamProgressBytes approximates how much real output a streamed message
+// carries so far — text, thinking narration, and tool_use content (name +
+// arguments) all count. tool_use counts because a forced propose_changes
+// call — or any call with adaptive thinking unsupported/disabled — can
+// stream nothing but tool_use deltas with zero narration text; counting
+// text alone made a model that was actively streaming a large
+// propose_changes payload look like it had made no progress at all,
+// tripping the first-token timeout on a call that was working correctly.
+func streamProgressBytes(message anthropic.Message) int {
+	n := 0
+	for _, block := range message.Content {
+		switch b := block.AsAny().(type) {
+		case anthropic.TextBlock:
+			n += len(b.Text)
+		case anthropic.ThinkingBlock:
+			n += len(b.Thinking)
+		case anthropic.ToolUseBlock:
+			n += len(b.Name) + len(b.Input)
+		}
+	}
+	return n
+}
+
+// consumeStream drains one streaming attempt into message via coalescer,
+// enforcing an idle timeout (idleTimeout, reset on every event the stream
+// produces) and a first-token timeout (firstTokenTimeout, only until the
+// first byte of real progress per streamProgressBytes). Returns nil on a
+// clean end of stream (caller still checks stream.Err() itself, same as
+// before this existed), the wrapped accumulate error on a garbled chunk, or
+// errStreamIdle/errStreamFirstToken on a timeout — see isRetryableStreamErr
+// for how Generate's attempt loop treats each of those.
+//
+// stream.Next() has no timeout of its own and can block indefinitely on a
+// stalled connection, so each read runs in its own goroutine and this
+// function selects between that read completing, ctx ending, and the two
+// timers above — the same reason a plain "read with a deadline" isn't
+// possible directly against the SDK's stream type.
+func consumeStream(
+	ctx context.Context,
+	stream *ssestream.Stream[anthropic.MessageStreamEventUnion],
+	message *anthropic.Message,
+	coalescer *deltaCoalescer,
+	idleTimeout, firstTokenTimeout time.Duration,
+) error {
+	emitted := 0
+	sawProgress := false
+
+	idleTimer := time.NewTimer(idleTimeout)
+	defer idleTimer.Stop()
+	firstTokenTimer := time.NewTimer(firstTokenTimeout)
+	defer firstTokenTimer.Stop()
+
+	type nextResult struct{ ok bool }
+	nextCh := make(chan nextResult, 1)
+	readNext := func() { nextCh <- nextResult{ok: stream.Next()} }
+	go readNext()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-idleTimer.C:
+			return errStreamIdle
+		case <-firstTokenTimer.C:
+			if !sawProgress {
+				return errStreamFirstToken
+			}
+			// Stale fire racing against the Stop() call below (Stop
+			// returning false without us draining the channel, since at
+			// that point nothing was reading it) — sawProgress already
+			// true means this is a no-op, not a real timeout.
+		case r := <-nextCh:
+			if !r.ok {
+				return nil
+			}
+			if err := message.Accumulate(stream.Current()); err != nil {
+				return fmt.Errorf("accumulate stream: %w", err)
+			}
+			if !sawProgress && streamProgressBytes(*message) > 0 {
+				sawProgress = true
+				firstTokenTimer.Stop()
+			}
+			if full := currentText(*message); len(full) > emitted {
+				coalescer.add(full[emitted:])
+				emitted = len(full)
+			}
+			if !idleTimer.Stop() {
+				<-idleTimer.C
+			}
+			idleTimer.Reset(idleTimeout)
+			go readNext()
+		}
+	}
+}
+
 // defaultMaxTokens is used when AI_MAX_TOKENS (or the deprecated
 // ANTHROPIC_MAX_TOKENS) is unset — comfortably
 // below Opus-tier's real ceiling (per Anthropic's docs, 64000 is nowhere
@@ -604,6 +836,13 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}
 
 	tools := toolsForMode(tc.GenerationMode)
+	// Computed once for the whole call, not per iteration/attempt: mode
+	// doesn't change mid-Generate, and clamping to ctx's deadline here
+	// (rather than inside consumeStream) means a slow first several
+	// iterations naturally tighten the budget left for a later one, instead
+	// of every iteration getting the same fixed budget regardless of how
+	// much of the parent generation timeout is already spent.
+	firstTokenTimeout := clampToContextDeadline(ctx, g.firstTokenTimeoutFor(tc.GenerationMode))
 	// The dynamic block (pages.json, defaults.json, file tree, manifest —
 	// often several thousand tokens on a theme with many pages) is
 	// byte-identical across every iteration of THIS call's tool loop and
@@ -718,48 +957,53 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			attemptsUsed = attempt
 			stream := g.client.Messages.NewStreaming(ctx, params)
 			message = anthropic.Message{}
-			emitted := 0
-			var accumulateErr error
-			// Fresh per attempt, same as message/emitted above: a retried
-			// attempt is its own streaming API call with its own text run,
-			// and coalescer.flush() below already empties it before the next
+			// Fresh per attempt, same as message above: a retried attempt is
+			// its own streaming API call with its own text run, and
+			// coalescer.flush() below already empties it before the next
 			// attempt/iteration could otherwise reuse a stale buffer. Note
 			// this does mean a retry re-emits onDelta from the start of this
-			// iteration's text — acceptable since the failure this retries
-			// (see isRetryableAccumulateErr) happens while parsing a
-			// tool_use block's arguments, which iterations that narrate
+			// iteration's text — acceptable since every failure this retries
+			// (see isRetryableStreamErr) happens either before any text has
+			// streamed (a timeout) or while parsing a tool_use block's
+			// arguments (a garbled chunk), which iterations that narrate
 			// meaningful text rarely reach before it would have failed.
 			coalescer := newDeltaCoalescer(onDelta)
-			for stream.Next() {
-				if err := message.Accumulate(stream.Current()); err != nil {
-					accumulateErr = fmt.Errorf("accumulate stream: %w", err)
-					break
-				}
-				if full := currentText(message); len(full) > emitted {
-					coalescer.add(full[emitted:])
-					emitted = len(full)
-				}
-			}
+			streamErr := consumeStream(ctx, stream, &message, coalescer, g.idleTimeout(), firstTokenTimeout)
 			// Whatever's still buffered when this attempt ends must go out
 			// now — otherwise the last <80-char, <200ms fragment of a turn's
 			// narration (very often the tail end, since a stream just ending
 			// is exactly when there's no more input to trigger the next
 			// add() call that would have flushed it) is silently lost.
 			coalescer.flush()
-			if accumulateErr == nil {
+			// consumeStream can return before the stream reaches a natural
+			// EOF (an idle/first-token timeout abandons it mid-read, unlike
+			// every other exit path, which already drained it to
+			// completion) — close explicitly, right here rather than via a
+			// deferred call, so an abandoned connection and the background
+			// goroutine consumeStream leaves behind still blocked in
+			// stream.Next() are released the moment this attempt is done
+			// with it, not piled up until this whole Generate call returns
+			// (which, across many iterations/attempts, could be minutes
+			// away and dozens of connections deep).
+			_ = stream.Close()
+			if streamErr == nil {
 				if err := stream.Err(); err != nil {
 					return nil, fmt.Errorf("claude stream: %w", err)
 				}
 				break
 			}
-			if !isRetryableAccumulateErr(accumulateErr) || attempt == streamAccumulateMaxAttempts {
-				return nil, accumulateErr
+			if !isRetryableStreamErr(streamErr) || attempt == streamAccumulateMaxAttempts {
+				return nil, streamErr
 			}
-			// The provider's stream arrived truncated/garbled mid-chunk — a
-			// transport-level hiccup, not anything about this request — so a
-			// short pause and a fresh attempt resolves it in practice.
-			slog.Warn("ai: provider stream truncated/garbled, retrying", "attempt", attempt,
-				"max_attempts", streamAccumulateMaxAttempts, "error", accumulateErr.Error())
+			// A garbled/truncated chunk, a stalled connection (idle timeout),
+			// or a model that never produced a first token in budget — all
+			// three are transport/provider-side hiccups unrelated to this
+			// specific request, so a short pause and a fresh attempt
+			// resolves them in practice the same way the original
+			// garbled-chunk retry already did.
+			slog.Warn("ai: provider stream disrupted, retrying", "attempt", attempt,
+				"max_attempts", streamAccumulateMaxAttempts, "reason", streamRetryReason(streamErr),
+				"error", streamErr.Error())
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()

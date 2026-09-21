@@ -235,7 +235,7 @@ func TestNew_BaseURLReachesFakeServer(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g, err := New("test-key", ts.URL, "claude-test", "", "", 0)
+	g, err := New("test-key", ts.URL, "claude-test", "", "", 0, StreamTimeouts{})
 	if err != nil {
 		t.Fatalf("New returned an error: %v", err)
 	}

@@ -78,6 +78,25 @@ type Config struct {
 	// occasionally on complex prompts.
 	MaxTokens int64
 
+	// StreamIdleTimeout bounds how long a single streaming attempt can go
+	// with no new event at all before it's treated as hung and retried, the
+	// same way a truncated/garbled stream chunk already is (see
+	// ai.isRetryableAccumulateErr) — resets on every event the stream
+	// produces, so a slow-but-alive stream is never cut off by this alone.
+	StreamIdleTimeout time.Duration
+	// FirstTokenTimeout* bound how long a streaming attempt can go with NO
+	// real output at all (no text, thinking, or tool_use content) before
+	// its first byte — separate from StreamIdleTimeout because a model can
+	// legitimately spend far longer thinking before its first token than it
+	// ever should between two already-flowing chunks. Split by
+	// ai.GenerationMode — see ai.StreamTimeouts' own doc comment for why
+	// FirstTokenTimeoutEdit (the default/empty mode) is the one almost all
+	// ordinary chat traffic actually uses.
+	FirstTokenTimeoutEdit  time.Duration
+	FirstTokenTimeoutBrand time.Duration
+	FirstTokenTimeoutCopy  time.Duration
+	FirstTokenTimeoutPages time.Duration
+
 	// DeepSeek — only read/required when AIProvider == "deepseek".
 	DeepSeekAPIKey  string
 	DeepSeekModel   string
@@ -194,6 +213,12 @@ func Load() Config {
 		MaxTokens:            int64(getenvIntDeprecated("AI_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS", 64000)),
 		FakeAIMode:           getenvBool("AI_CHAT_FAKE_MODE", false),
 		FakeAIDelay:          time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
+
+		StreamIdleTimeout:      time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_SECONDS", 12)) * time.Second,
+		FirstTokenTimeoutEdit:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_SECONDS", 120)) * time.Second,
+		FirstTokenTimeoutBrand: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
+		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
+		FirstTokenTimeoutPages: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_PAGES_SECONDS", 150)) * time.Second,
 
 		DeepSeekAPIKey:      os.Getenv("DEEPSEEK_API_KEY"),
 		DeepSeekModel:       getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),

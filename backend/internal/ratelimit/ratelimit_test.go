@@ -38,6 +38,25 @@ func TestPerTenantLimiter_PerTenantIsolation(t *testing.T) {
 	}
 }
 
+// TestPerTenantLimiter_BoundedByMaxTenants covers ratelimitMaxTenants' own
+// claim: the map behind PerTenantLimiter never grows past that cap no
+// matter how many distinct tenants make requests over the life of the
+// process.
+func TestPerTenantLimiter_BoundedByMaxTenants(t *testing.T) {
+	l := NewPerTenantLimiter(5)
+
+	for i := range uint64(ratelimitMaxTenants + 100) {
+		l.Allow(i)
+		if len(l.limiters) > ratelimitMaxTenants {
+			t.Fatalf("limiters map grew to %d entries after tenant %d, want at most %d", len(l.limiters), i, ratelimitMaxTenants)
+		}
+	}
+
+	if len(l.limiters) != ratelimitMaxTenants {
+		t.Fatalf("expected the map to sit exactly at its cap of %d once more than that many tenants have been seen, got %d", ratelimitMaxTenants, len(l.limiters))
+	}
+}
+
 // TestNewPerTenantLimiter_ClampsNonPositiveRate covers the constructor's
 // own guard: a caller passing 0 or a negative GENERATION_RATE_LIMIT_PER_MINUTE
 // must still get a usable (if maximally strict) limiter, not one that

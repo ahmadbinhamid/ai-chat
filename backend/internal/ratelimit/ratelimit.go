@@ -18,6 +18,15 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// ratelimitMaxTenants bounds PerTenantLimiter's map size — one entry per
+// tenant that has ever made a request, otherwise unbounded for the life of
+// the process. Eviction (see limiterFor) is arbitrary, not LRU: cheap to
+// implement, and a wrongly-evicted tenant only costs one fresh burst
+// allowance on their next request, never a correctness problem — the same
+// tradeoff historySummaryCache makes for the same reason (see
+// themebuild/history_summary.go).
+const ratelimitMaxTenants = 4096
+
 // PerTenantLimiter hands out one token-bucket limiter per tenant, created on
 // first use and reused after that.
 type PerTenantLimiter struct {
@@ -54,6 +63,16 @@ func (l *PerTenantLimiter) limiterFor(tenantID uint64) *rate.Limiter {
 
 	if lim, ok := l.limiters[tenantID]; ok {
 		return lim
+	}
+	if len(l.limiters) >= ratelimitMaxTenants {
+		// Evict one arbitrary entry — Go map iteration order is randomized,
+		// so this is effectively a random eviction, not LRU. See
+		// ratelimitMaxTenants' doc comment for why that's an acceptable
+		// tradeoff here.
+		for k := range l.limiters {
+			delete(l.limiters, k)
+			break
+		}
 	}
 	// ratePerMin requests per minute == ratePerMin/60 requests per second.
 	lim := rate.NewLimiter(rate.Limit(float64(l.ratePerMin)/60.0), l.burst)

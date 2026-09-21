@@ -81,11 +81,19 @@ func main() {
 	}
 	defer func() { _ = conn.Close() }()
 
+	streamTimeouts := ai.StreamTimeouts{
+		Idle:            cfg.StreamIdleTimeout,
+		FirstTokenEdit:  cfg.FirstTokenTimeoutEdit,
+		FirstTokenBrand: cfg.FirstTokenTimeoutBrand,
+		FirstTokenCopy:  cfg.FirstTokenTimeoutCopy,
+		FirstTokenPages: cfg.FirstTokenTimeoutPages,
+	}
+
 	var generator *ai.Generator
 	if cfg.AIProvider == "deepseek" {
-		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens)
+		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens, streamTimeouts)
 	} else {
-		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens)
+		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens, streamTimeouts)
 	}
 	if err != nil {
 		// One-shot CLI command exiting the whole process — the OS reclaims

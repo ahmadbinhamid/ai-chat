@@ -40,6 +40,14 @@ type Server struct {
 func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) {
 	useJSONFieldNames()
 
+	streamTimeouts := ai.StreamTimeouts{
+		Idle:            cfg.StreamIdleTimeout,
+		FirstTokenEdit:  cfg.FirstTokenTimeoutEdit,
+		FirstTokenBrand: cfg.FirstTokenTimeoutBrand,
+		FirstTokenCopy:  cfg.FirstTokenTimeoutCopy,
+		FirstTokenPages: cfg.FirstTokenTimeoutPages,
+	}
+
 	var generator *ai.Generator
 	switch {
 	case cfg.FakeAIMode:
@@ -48,13 +56,13 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 		generator = ai.NewFake(cfg.FakeAIDelay)
 	case cfg.AIProvider == "deepseek":
 		var err error
-		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens)
+		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens, streamTimeouts)
 		if err != nil {
 			return nil, err
 		}
 	default:
 		var err error
-		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens)
+		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens, streamTimeouts)
 		if err != nil {
 			return nil, err
 		}

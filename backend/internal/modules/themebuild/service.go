@@ -1284,11 +1284,20 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	// all read from, so a second/third prompt in this chat always sees
 	// what earlier turns in the SAME draft already changed, never the
 	// stale saved theme. See doGenerate's package-level doc comment.
+	//
+	// Wrapped in a CachingStore scoped to this one generation call — see its
+	// own doc comment. grep_theme and read_theme_file can each re-read the
+	// same paths many times over one generation, and buildThemeContext /
+	// buildSnapshotBase independently re-fetch pages.json, defaults.json,
+	// and the file tree; without this, every one of those reads is its own
+	// flowpos-backend HTTP round trip. A fresh CachingStore per call means a
+	// theme change between turns is never served stale — nothing here
+	// outlives this doGenerate call.
 	draft, err := s.repo.DraftFiles(ctx, c.ID)
 	if err != nil {
 		return fmt.Errorf("load draft overlay: %w", err)
 	}
-	store := themefs.NewOverlayStore(s.store, draft)
+	store := themefs.NewCachingStore(themefs.NewOverlayStore(s.store, draft))
 
 	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
@@ -1508,13 +1517,41 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	readFile := s.buildFileReader(store, storeAuth)
 
 	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
-	result, turns, err := s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
-	if err != nil {
-		return err
+
+	// Checked before ever calling the model: a small set of explicit,
+	// narrow page-lifecycle requests (register an existing page, diagnose
+	// why one isn't working) that this service can answer deterministically
+	// — see tryDeterministicPageOp's own doc comment. ok is false for every
+	// other prompt, including a detector match this function couldn't
+	// confirm safely, and falls straight through to normal generation
+	// exactly as if this check didn't exist.
+	result, deterministic := s.tryDeterministicPageOp(ctx, store, storeAuth, in.Prompt)
+	if !deterministic {
+		var err error
+		result, turns, err = s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
+		if err != nil {
+			return err
+		}
 	}
 
+	// Fills a create-without-registry gap deterministically (see its own
+	// doc comment) before themecheck's page-route rule would otherwise
+	// reject it as an error and force a full paid repair generation for
+	// what's almost always a simple omission, not a genuine ambiguity.
+	synthesizeMissingPageRegistry(result)
+
 	var warnings []themecheck.Finding
-	if proposalHasChanges(result) {
+	// !deterministic guards the whole check/repair pass, not just the model
+	// call inside it: a deterministic register proposes the target file's
+	// EXISTING content completely unchanged (see tryRegisterExistingPage),
+	// so there is nothing new for themecheck to validate — whatever was
+	// already true about that file's validity is unaffected by adding a
+	// registry entry. Running it through checkAndRepair anyway would mean
+	// a merchant's one hand-edited or pre-existing themecheck violation on
+	// an otherwise-untouched file silently escalates a "zero model calls"
+	// operation into a full paid repair generation — exactly the cost this
+	// deterministic path exists to avoid.
+	if !deterministic && proposalHasChanges(result) {
 		// Emitted for the model's first accepted propose_changes call, not
 		// whatever checkAndRepair's retries eventually settle on below — by
 		// the time a repair retry replaces result, the merchant watching
@@ -1530,6 +1567,14 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			return err
 		}
 	}
+
+	// Last gate before anything is staged, checked against the FINAL
+	// result (after any repair retry above may have changed it): never let
+	// a protected page (see protectPages' own doc comment — currently
+	// "blog" and "home") get silently deleted or unregistered as a side
+	// effect of a turn that wasn't explicitly asking to remove it.
+	var blockedPages []string
+	result, blockedPages = protectPages(result, in.Prompt, tc.PagesJSON)
 
 	hasChanges = proposalHasChanges(result)
 
@@ -1588,6 +1633,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		summary = "Done."
 	}
 	summary = appendWarningsNote(summary, warnings)
+	summary = protectedPagesNote(summary, blockedPages)
 
 	// A cancel request landing in this exact window — after the model's
 	// output has already been decided and is only being committed — must
