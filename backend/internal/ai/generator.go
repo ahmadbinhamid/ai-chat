@@ -551,6 +551,15 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	// failing needs to fall back to requesting full content rather than
 	// retrying forever.
 	editFailureCounts := make(map[string]int)
+	// knownPaths backs warnReadBeforeWriteViolations — every path the model
+	// has SOME grounding for in this Generate call: requested via
+	// read_theme_file (registerReadPaths), or proposed as action "create" in
+	// any propose_changes attempt this call has seen, including one that
+	// later failed materialization (an "edit" against a path created
+	// earlier in this same loop is legitimate — see this map's two write
+	// sites below). Persists across every iteration, same as
+	// editFailureCounts above.
+	knownPaths := make(map[string]bool)
 	// Anthropic rejects any empty text content block outright ("text content
 	// blocks must be non-empty") — not just for the cache_control
 	// breakpoint below, for any message anywhere in the request — so an
@@ -858,8 +867,19 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			if err := json.Unmarshal(proposeInput, &result); err != nil {
 				return nil, fmt.Errorf("could not parse propose_changes input: %w", err)
 			}
+			// Registered even if this attempt goes on to fail materialization
+			// below — a "create" the model proposed earlier in this same loop
+			// is real grounding for editing that path in a later attempt,
+			// same as an actual read_theme_file call (see knownPaths' own
+			// doc comment).
+			for _, f := range result.Files {
+				if f.Action == "create" {
+					knownPaths[f.Path] = true
+				}
+			}
 			ok, retryMsg := materializeEdits(ctx, &result, readFile, editFailureCounts)
 			if ok {
+				warnReadBeforeWriteViolations(result.Files, knownPaths)
 				result.InputTokens = totalInputTokens
 				result.OutputTokens = totalOutputTokens
 				result.ExplorationToolCalls = explorationToolCalls
@@ -915,6 +935,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, materializeFailureMsg, true))
 				continue
 			}
+			if tu.Name == toolNameReadThemeFile {
+				registerReadPaths(tu.Input, knownPaths)
+			}
 			explorationToolCalls++
 			if progress != nil {
 				progress.ToolStarted(tu.Name, tu.Input)
@@ -944,6 +967,109 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}
 
 	return nil, fmt.Errorf("model did not call propose_changes within %d tool-loop iterations", maxToolIterations)
+}
+
+// readThemeFileToolInput mirrors the "paths" field of read_theme_file's own
+// input schema (see readThemeFileTool) — a second, independent definition
+// rather than sharing themebuild's identically-shaped readThemeFileInput,
+// since this package doesn't import themebuild (see ToolExecutor's own doc
+// comment on that boundary) and only needs to know WHICH paths the model
+// asked for, never to execute the read itself.
+type readThemeFileToolInput struct {
+	Paths []string `json:"paths"`
+}
+
+// registerReadPaths records every path a read_theme_file tool_use requested
+// into knownPaths — called for the call's raw input regardless of what
+// toolExec's result later says about it. That's deliberate, not an
+// oversight: execReadThemeFile (themebuild) reports a per-path miss (a 404,
+// a rejected extension) INSIDE its single opaque output string, not as a Go
+// error this package ever sees or parses — package ai has no visibility
+// into that per-path outcome, only into which paths were asked for. So a
+// path the model requested but which actually 404'd still counts as
+// "known" here; warnReadBeforeWriteViolations' false-negative rate is the
+// disclosed cost of that, not a bug — see this function's own callers.
+// Malformed input is ignored rather than erroring: execReadThemeFile is
+// about to reject the same malformed JSON moments later with a real,
+// model-facing error; this bookkeeping isn't the place to duplicate that.
+func registerReadPaths(input json.RawMessage, knownPaths map[string]bool) {
+	var args readThemeFileToolInput
+	if err := json.Unmarshal(input, &args); err != nil {
+		return
+	}
+	for _, p := range args.Paths {
+		knownPaths[p] = true
+	}
+}
+
+// warnReadBeforeWriteViolations logs, at Warn, every action:"update" file in
+// files whose path never appeared in knownPaths — this covers every
+// materialized "edit" too, since a file that arrives here already failed
+// materialization once already returns early elsewhere (see this
+// function's call site): by the time this runs, "edit" never survives as a
+// value (see GeneratedFile.OriginalAction's own doc comment). action:
+// "create" files are never checked — a new file can't have been read.
+//
+// Detection only. This never changes what Generate returns, rejects, or
+// retries — see the spec's own §12 rule 12 and the "Rules for every
+// request" list in staticSystemPromptBlock for the rule this is measuring
+// compliance with, not enforcing.
+//
+// Scoped to THIS Generate call alone, deliberately — a path read or created
+// in an earlier turn of the same conversation is NOT carried forward, and
+// that's correct, not a gap to close later: a persisted chat_messages row
+// for an assistant turn is that turn's prose summary plus its warnings note
+// (see appendWarningsNote), never a file's raw content, confirmed by
+// comparing a real message's stored length against its own "done" event
+// payload. A file this call didn't read has no content grounding anywhere
+// else to fall back on, including across turns.
+// preSuppliedFiles are the two writable files spec §0 says are already in
+// every request's context: "Already in your context — never call a tool to
+// fetch these: pages.json, defaults.json, the theme's file tree, and the
+// component library in §8." dynamicSystemPrompt embeds pages.json's and
+// defaults.json's full current content on every call (verified against §0's
+// own claim, not assumed), so a write to either without a prior
+// read_theme_file call in this loop is the model doing exactly what §0
+// instructs, not a violation warnReadBeforeWriteViolations should flag.
+//
+// §0's other two names — "the theme's file tree" and "the component
+// library in §8" — aren't excluded here because they were never eligible
+// to warn in the first place: neither is a real file path a propose_changes
+// files[] entry can name. The file tree is a listing, and §8's manifest
+// (formatManifest) only carries component PARAM SIGNATURES inferred from
+// each file, never a component's actual content — so a component file
+// itself still needs a genuine read before it can be edited; being named
+// in the manifest doesn't supply its content the way pages.json/
+// defaults.json's own text is supplied whole.
+//
+// liquid/layout-start.liquid and liquid/layout-end.liquid are deliberately
+// NOT here: they aren't on §0's pre-supplied list, and §0 says the opposite
+// for them — a direct edit to either must "read the whole file first, same
+// as any other edit." §3's fixed boilerplate snippet (the layout-start/
+// layout-end render calls copied into a new page) is a constant for a
+// DIFFERENT file, not these two files' own content, so it doesn't pre-
+// supply them either. A write to either without a read still warns.
+//
+// Keep this in sync with §0's own list if it ever changes.
+var preSuppliedFiles = map[string]bool{
+	"pages.json":    true,
+	"defaults.json": true,
+}
+
+func warnReadBeforeWriteViolations(files []GeneratedFile, knownPaths map[string]bool) {
+	for _, f := range files {
+		if f.Action != "update" {
+			continue
+		}
+		if preSuppliedFiles[f.Path] {
+			continue
+		}
+		if knownPaths[f.Path] {
+			continue
+		}
+		slog.Warn("ai: proposal writes to a file never read this generation",
+			"path", f.Path, "action", f.Action, "file_count", len(files))
+	}
 }
 
 // summarizeMaxTokens caps the summary completion — this is a cheap plain-
@@ -1032,9 +1158,13 @@ Rules for every request:
 8. Before you modify any existing file, read it with read_theme_file — never write a file you
    have not read, and never guess at its current content. Emit only files whose content actually
    changes as a result of this request.
-9. Use list_theme_files/read_theme_file/grep_theme as needed to explore the theme before you
-   finalize anything. Call propose_changes exactly once, when you're done, with the complete,
-   final set of changes for this request — not a partial draft.`, themeEngineSpec),
+9. Once you've read an existing file, action: "edit" is the default way to change it —
+   old_string/new_string pairs materialize into the same complete corrected file, just cheaper to
+   express. Use action: "update" only for a specific reason: the change is broad enough that a
+   full rewrite is genuinely smaller than expressing it as edits.
+10. Use list_theme_files/read_theme_file/grep_theme as needed to explore the theme before you
+    finalize anything. Call propose_changes exactly once, when you're done, with the complete,
+    final set of changes for this request — not a partial draft.`, themeEngineSpec),
 		CacheControl: cacheControl,
 	}
 }
