@@ -8,21 +8,9 @@ import (
 	"time"
 )
 
-// These exercise fetchReferenceURL directly (bare *Service, no database) —
-// the cache itself is pure in-process logic, so a real DB/network stack
-// adds nothing to what these prove; the end-to-end path (a real doGenerate
-// call actually consulting it) is covered separately in
-// attachment_doGenerate_test.go.
+// Tests fetchReferenceURL directly (cache is pure logic, no DB/network).
 
-// fetchReferenceURLTestHTML is real enough markup (a title, a heading, and
-// a paragraph) to build a NON-empty digest — the cache only ever stores a
-// non-empty digest (see fetchReferenceURL's own doc comment), so any test
-// below that needs an entry to actually get cached uses this rather than a
-// bare fragment that might digest to nothing. The <title> lets
-// TestFetchReferenceURL_CachesWithinTTLForSameTenant also confirm the
-// title round-trips through a cache hit end to end (not just via a
-// manually seeded entry — see TestFetchReferenceURL_CacheHitSkipsRebuildingDigest
-// for that).
+// Real markup to build non-empty digest (cache never stores empty).
 const fetchReferenceURLTestHTML = `<html><head><title>Cached Reference Page</title></head>` +
 	`<body><h1>cached</h1><p>Some real body copy so the digest isn't empty.</p></body></html>`
 
@@ -55,15 +43,7 @@ func TestFetchReferenceURL_CachesWithinTTLForSameTenant(t *testing.T) {
 	}
 }
 
-// TestFetchReferenceURL_CacheHitSkipsRebuildingDigest proves a cache hit
-// returns the ALREADY-built digest (and title) straight from the cache
-// rather than re-fetching stylesheets and re-running BuildDigest on it —
-// the latency point of caching the finished digest in the first place (see
-// fetchReferenceURL's own doc comment). Seeds the cache directly with text
-// BuildDigest would never itself produce from fl's configured HTML, and
-// confirms a hit returns that text (and title) completely unchanged while
-// making zero calls to Fetch (and, transitively, FetchStylesheets/
-// BuildDigest).
+// Cache hit returns built digest straight, skipping fetch/BuildDigest.
 func TestFetchReferenceURL_CacheHitSkipsRebuildingDigest(t *testing.T) {
 	const tenantID = uint64(1)
 	const url = "https://example.com"
@@ -150,13 +130,7 @@ func TestFetchReferenceURL_NilCacheFallsBackToUncached(t *testing.T) {
 	}
 }
 
-// TestReferenceURLCache_TotalBytesCountsTitle confirms title bytes are
-// included in totalBytes (both on insert and on release), not just
-// content's — an accounting gap here wouldn't cause a real memory problem
-// on its own (a title is a handful of bytes next to a ~16KB digest), but
-// it would make totalBytes silently drift from what the cache actually
-// holds, which is worth catching directly rather than only as a side
-// effect of some other test.
+// Verify title bytes included in totalBytes (accounting gap check).
 func TestReferenceURLCache_TotalBytesCountsTitle(t *testing.T) {
 	c := newReferenceURLCache()
 	const content = "PAGE\n"
@@ -173,10 +147,7 @@ func TestReferenceURLCache_TotalBytesCountsTitle(t *testing.T) {
 	}
 }
 
-// TestReferenceURLCache_ExpiresAfterTTL exercises the cache type directly
-// (not through fetchReferenceURL) to prove an entry past its TTL is a miss —
-// see set's own doc comment for why the entry is stamped with
-// referenceURLCacheTTL, not tested by waiting referenceURLCacheTTL for real.
+// Tests cache expiry directly (not via fetchReferenceURL).
 func TestReferenceURLCache_ExpiresAfterTTL(t *testing.T) {
 	c := newReferenceURLCache()
 	c.entries[referenceURLCacheKey(1, "https://example.com")] = cachedReference{
@@ -192,13 +163,7 @@ func TestReferenceURLCache_ExpiresAfterTTL(t *testing.T) {
 	}
 }
 
-// TestReferenceURLCache_EvictsByTotalBytesNotEntryCount proves the cache
-// bounds its memory by the total BYTES of cached content, not a count of
-// entries — the whole point of moving off the old entry-count cap (2048
-// entries of up to 5MB raw body each was a ~10GB worst case; see
-// referenceURLCacheMaxBytes' own doc comment). Inserts enough entries to
-// exceed referenceURLCacheMaxBytes several times over and asserts the
-// running total never exceeds the cap and the earliest entries are gone.
+// Cache bounds by total bytes, not entry count; verifies eviction.
 func TestReferenceURLCache_EvictsByTotalBytesNotEntryCount(t *testing.T) {
 	c := newReferenceURLCache()
 	const entrySize = 1024 * 1024 // 1MB
@@ -219,7 +184,5 @@ func TestReferenceURLCache_EvictsByTotalBytesNotEntryCount(t *testing.T) {
 	if len(c.entries) >= entryCount {
 		t.Errorf("expected older entries to have been evicted, but all %d entries are still present", len(c.entries))
 	}
-	// Eviction is arbitrary (Go map iteration order), not LRU — see
-	// referenceURLCache.set's own doc comment — so which specific entries
-	// survive isn't asserted, only that the cap held and something gave way.
+	// Eviction is arbitrary (not LRU); only cap and survival matter.
 }

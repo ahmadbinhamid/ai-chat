@@ -139,11 +139,7 @@ func TestRecapAssistantTurn_NeverEmpty(t *testing.T) {
 	}
 }
 
-// TestRecapAssistantTurn_ShowsOriginalActionForMaterializedEdit is the case
-// this field exists for: a file the model submitted as "edit" (materialized
-// to "update" by the time it reaches here — see ai.MaterializeEdits) must
-// recap as "(edit)", not "(update)", or the model's own replayed history
-// contradicts the guidance repairPrompt gives it.
+// Shows original action (edit) even after materialization to (update).
 func TestRecapAssistantTurn_ShowsOriginalActionForMaterializedEdit(t *testing.T) {
 	result := &ai.Result{
 		Files: []ai.GeneratedFile{
@@ -159,11 +155,7 @@ func TestRecapAssistantTurn_ShowsOriginalActionForMaterializedEdit(t *testing.T)
 	}
 }
 
-// TestRecapAssistantTurn_CreateAndUpdateByteIdenticalToBeforeOriginalAction
-// confirms a file that was never an "edit" (OriginalAction unset) recaps
-// exactly as it did before this field existed — the required back-compat
-// case for every existing caller, including a fake generator/eval fixture
-// built directly in Go that never sets OriginalAction.
+// Back-compat: files without OriginalAction recap exactly as before.
 func TestRecapAssistantTurn_CreateAndUpdateByteIdenticalToBeforeOriginalAction(t *testing.T) {
 	result := &ai.Result{
 		Files: []ai.GeneratedFile{
@@ -178,12 +170,7 @@ func TestRecapAssistantTurn_CreateAndUpdateByteIdenticalToBeforeOriginalAction(t
 	}
 }
 
-// TestRecapAssistantTurn_FailedMaterializationRecapsAsUpdate documents the
-// decision for the edge case where an edit failed materialization and the
-// model's retry, within the same Generate call, resubmitted the file
-// directly as a full "update" — that file never enters the OriginalAction
-// branch (see materializeEdits), so its recap shows exactly what the model
-// ultimately supplied: "update", not a stale "edit" it abandoned.
+// Failed materialization resubmitted as update recaps as (update).
 func TestRecapAssistantTurn_FailedMaterializationRecapsAsUpdate(t *testing.T) {
 	result := &ai.Result{
 		Files: []ai.GeneratedFile{

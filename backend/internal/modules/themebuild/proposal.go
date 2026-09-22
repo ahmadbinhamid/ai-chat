@@ -392,31 +392,9 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 	for _, f := range errorFindings {
 		fmt.Fprintf(&b, "- %s\n", formatFindingLine(f))
 	}
-	// A themecheck rejection is exactly the case action "edit" is for: the
-	// findings above already say precisely which line(s) are wrong, so a
-	// targeted old_string/new_string fix against the content you already
-	// have (see the paragraph below) is normally both correct and far
-	// smaller than resubmitting the whole file — action "edit"'s
-	// server-side materialization always produces that same complete,
-	// corrected file; it's just a cheaper way to submit it, not a partial
-	// one. Said plainly here, in place of a bare "not a diff" prohibition,
-	// so the instruction explains what materialization does instead of just
-	// forbidding the syntax that triggers it.
-	//
-	// The second fallback condition (an edit already failed once this turn)
-	// is what closes a real gap: materializeEdits' own retry escalation
-	// (maxEditMaterializationFailures) is scoped to ONE Generate call, so
-	// it never fires across repair ROUNDS — each fresh checkAndRepair
-	// attempt starts that counter back at zero, even though the model's own
-	// conversation history (its prior tool_result) already shows the exact
-	// same file rejecting an edit. Observed in production: the identical
-	// file failing edit materialization on the first attempt of two
-	// separate repair rounds in the same turn, each self-correcting only
-	// after burning a whole extra model call retrying with the same
-	// (already-in-context) content. Naming the earlier failure explicitly,
-	// as its own condition rather than folded into the first with "OR",
-	// gives the model a clear, separate reason to reach for "update"
-	// instead of repeating the same old_string guess a second time.
+	// "edit" is for targeted old_string/new_string fixes (materialized server-side).
+	// Use "update" if: (1) broad rewrite is simpler, or (2) edit already failed this turn.
+	// Note: retry escalation is per-Generate call, not per-repair round.
 	b.WriteString("\nFix each of these with action \"edit\" against the file you already have (a precise " +
 		"old_string/new_string pair per finding) — materialized server-side, an \"edit\" produces the exact same " +
 		"complete, corrected file a full \"update\" would; it's just a cheaper way to express the same change, " +

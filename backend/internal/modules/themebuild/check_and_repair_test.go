@@ -103,9 +103,7 @@ func TestCheckAndRepair_RetriesOnceThenSucceeds(t *testing.T) {
 	if got.Summary != "good" {
 		t.Fatalf("expected the retried (good) result to be returned, got %+v", got)
 	}
-	// Token usage from the rejected first attempt (100/50) must still be
-	// folded into the accepted result's totals — otherwise the first
-	// attempt's cost silently vanishes from what gets billed/recorded.
+	// Token usage from first attempt must be folded into totals.
 	if got.InputTokens != 120 || got.OutputTokens != 60 {
 		t.Errorf("expected accumulated tokens 120/60, got %d/%d", got.InputTokens, got.OutputTokens)
 	}
@@ -125,12 +123,7 @@ func TestCheckAndRepair_ExhaustsRetriesAndFails(t *testing.T) {
 	}
 }
 
-// invalidResult mimics a garbled/corrupted repair reply — e.g. the model's
-// proposed path field coming back mangled — which validateProposal rejects
-// outright (see service.go's checkAndRepair: a validateProposal failure
-// during a retry must not immediately kill the whole generation, it should
-// consume one of the same maxThemeCheckRetries slots as a themecheck
-// rejection does).
+// Garbled repair reply; rejection consumes retry slot, doesn't kill generation.
 func invalidResult() *ai.Result {
 	return &ai.Result{
 		Summary:      "garbled",

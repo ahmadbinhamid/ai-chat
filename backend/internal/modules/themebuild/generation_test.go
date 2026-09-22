@@ -81,9 +81,7 @@ func TestGenerationRepository_StartEndGetLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGeneration failed: %v", err)
 	}
-	// EndGeneration sanitizes genErr before storing it (see ai.SanitizeError)
-	// — the raw "boom" never reaches this column, only its generic fallback
-	// wrapping, since "boom" matches no recognized category.
+	// EndGeneration sanitizes error messages via ai.SanitizeError.
 	wantErr := "Error from AI agent: something went wrong while generating a response — please try again in a moment"
 	if g.Status != GenerationStatusFailed || g.Error == nil || *g.Error != wantErr || g.FinishedAt == nil {
 		t.Fatalf("unexpected generation state after end: %+v", g)

@@ -139,11 +139,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		locks = newRedisThemeLock(rdb)
 	} else {
 		bus = newInProcessEventBus()
-		// In-process locking only serializes staging/apply/revert within
-		// THIS replica — two replicas can still race the same theme_slug.
-		// Same degradation this service already accepts for the event bus
-		// when REDIS_URL is unset (see the warning above it in server.go):
-		// tolerable for a single-replica deployment, not for more than one.
+		// In-process lock doesn't prevent replica races; see REDIS_URL requirement in server.go.
 		slog.Warn("REDIS_URL is not set — theme write locking falls back to a single-replica, in-process lock, " +
 			"which does not prevent two replicas from staging/applying/reverting the same theme concurrently")
 		locks = newKeyedMutex()
@@ -164,9 +160,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 	}
 }
 
-// In-memory only by generation ID, never DB (credential-at-rest risk).
-// Keyed by gen ID not promoting goroutine: two races can promote either request's row.
-// On pod restart, empty map; take reports missing tokens like expired ones.
+// In-memory only (security); keyed by gen ID to allow either race winner to promote.
 type pendingTokens struct {
 	mu     sync.Mutex
 	tokens map[string]string
@@ -255,9 +249,7 @@ type GenerateOutcome struct {
 	GenerationID string
 }
 
-// Returns immediately; AI call/validation/staging happen in background.
-// Prompts queue and run one-at-a-time in order, never parallel.
-// Failures recorded as failed chat turns (visible in transcript).
+// Background execution; queued one-at-a-time.
 func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutcome, error) {
 	if in.ThemeSlug == "" {
 		return GenerateOutcome{}, errors.New("theme_slug is required")
@@ -266,16 +258,11 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if len(in.Images) > imageLimit.MaxCount {
 		return GenerateOutcome{}, fmt.Errorf("%w: at most %d images per message", ErrTooManyImages, imageLimit.MaxCount)
 	}
-	// Reject before ever persisting an image nothing downstream can
-	// process — cheaper and clearer than letting it fail deep inside
-	// doGenerate once this turn is dequeued.
+	// Reject before persisting (fails cheaper than dequeued).
 	if len(in.Images) > 0 && !s.gen.SupportsVision() {
 		return GenerateOutcome{}, ErrVisionNotConfigured
 	}
-	// DecodedLen is pure arithmetic on the base64 string's own length — no
-	// need to actually decode just to measure size (the HTTP handler
-	// already validated each Base64 field really is valid base64 at bind
-	// time; this only needs the size).
+	// DecodedLen is cheap arithmetic; HTTP handler already validated base64.
 	for i, img := range in.Images {
 		if int64(base64.StdEncoding.DecodedLen(len(img.Base64))) > imageLimit.MaxBytes {
 			return GenerateOutcome{}, fmt.Errorf("%w: image %d", ErrImageTooLarge, i)

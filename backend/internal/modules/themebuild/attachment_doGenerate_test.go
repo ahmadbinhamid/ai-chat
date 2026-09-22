@@ -574,9 +574,7 @@ func TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward(t *testi
 		t.Fatalf("expected exactly 2 Generate calls (one per turn), got %d: %+v", len(prompts), prompts)
 	}
 	first, second := prompts[0], prompts[1]
-	// Turn 1's OWN fetch — not carry-forward — produces a prompt with the
-	// digest, not raw markup: the heading's TEXT ("Reference Site")
-	// survives extraction, but the literal "<h1>" tag does not.
+	// Turn 1's fetch produces digest, not raw markup.
 	if !strings.Contains(first, "Reference Site") {
 		t.Errorf("expected turn 1 to contain the fetched page's extracted content, got: %s", first)
 	}

@@ -8,24 +8,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// TestRunOneQueuedGeneration_TickerUpdatesHeartbeatWithNoEvents is Bug 2's
-// layer-2 test: eventEmitter.emitLive (layer 1) only fires on a thinking
-// delta, but ToolChoiceAny is forced on every tool-loop iteration (see
-// ai.Generate), so a turn that goes straight to a tool call — or, as here,
-// a generator that emits nothing at all — produces no delta and no durable
-// event for the whole length of one model call. Before this fix, a call
-// that ran longer than generationHeartbeatTimeout with zero events would
-// leave last_heartbeat_at stale despite the generation being perfectly
-// healthy, and ReapStaleGenerations would wrongly reap it. This drives
-// runOneQueuedGeneration with a generator that ignores onDelta/progress
-// entirely and just sleeps, and asserts the ticker alone still keeps the
-// heartbeat fresh.
+// Bug 2: ticker must keep heartbeat fresh even with zero events from the model.
 func TestRunOneQueuedGeneration_TickerUpdatesHeartbeatWithNoEvents(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 
-	// Real-world heartbeatThrottle/ticker interval is 30s — shrunk here so
-	// the test doesn't have to wait that long for a tick. Restored via
-	// t.Cleanup so other tests in this package keep seeing the real value.
+	// Shrink heartbeat ticker interval for faster testing.
 	originalTicker := heartbeatTickerNanos.Load()
 	heartbeatTickerNanos.Store(int64(30 * time.Millisecond))
 	t.Cleanup(func() { heartbeatTickerNanos.Store(originalTicker) })
@@ -59,10 +46,7 @@ func TestRunOneQueuedGeneration_TickerUpdatesHeartbeatWithNoEvents(t *testing.T)
 		t.Errorf("expected last_heartbeat_at to have been updated during this call, got %v (before test started: %v)", hb.Time, before)
 	}
 
-	// The ticker must stop once the generation ends — not keep firing
-	// against a `generations` row for a generation that's already done.
-	// Confirmed by checking last_heartbeat_at doesn't keep advancing after
-	// runOneQueuedGeneration has already returned.
+	// Ticker must stop once generation ends; verify heartbeat stops advancing.
 	stopped := getHeartbeat(t, svc.repo.db, genID)
 	time.Sleep(150 * time.Millisecond) // several ticker intervals
 	stillStopped := getHeartbeat(t, svc.repo.db, genID)

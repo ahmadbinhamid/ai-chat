@@ -13,9 +13,7 @@ import (
 	"ai-chat/internal/themefs"
 )
 
-// Item 13: LoadThemeFiles returns CSS and JS (when includeAssets is true),
-// and issues its reads concurrently rather than one HTTP round trip at a
-// time.
+// Returns CSS/JS (when includeAssets) and reads concurrently.
 func TestLoadThemeFiles_ReturnsAssetsAndReadsConcurrently(t *testing.T) {
 	files := map[string]string{
 		"pages/home.liquid":        "<html/>",
@@ -48,9 +46,7 @@ func TestLoadThemeFiles_ReturnsAssetsAndReadsConcurrently(t *testing.T) {
 				break
 			}
 		}
-		// Held open just long enough that overlapping reads are reliably
-		// observable — too short and a slow-but-still-sequential
-		// implementation could coincidentally pass.
+		// Delay ensures overlapping reads are observable.
 		time.Sleep(75 * time.Millisecond)
 
 		reqPath := strings.TrimPrefix(r.URL.Path, "/store/themes/active/files/")
@@ -90,10 +86,7 @@ func TestLoadThemeFiles_ReturnsAssetsAndReadsConcurrently(t *testing.T) {
 	}
 }
 
-// TestLoadThemeFiles_LiquidOnlyByDefault confirms includeAssets: false
-// keeps the original .liquid-only behavior existing callers relied on for
-// CSS/JS, while pages.json is still included regardless — see
-// LoadThemeFiles's doc comment on why that one's unconditional.
+// includeAssets: false keeps .liquid-only behavior; pages.json always included.
 func TestLoadThemeFiles_LiquidOnlyByDefault(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{
 		"pages/home.liquid": "<html/>",

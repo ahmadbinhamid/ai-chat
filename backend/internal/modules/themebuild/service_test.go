@@ -10,10 +10,7 @@ import (
 	"ai-chat/internal/themefs"
 )
 
-// newTestStoreServer returns an httptest.Server standing in for
-// flowpos-backend's theme-file API — every GET reports the file as not
-// existing yet (404), which is the normal "new page" case buildWritePlan
-// needs to read through cleanly.
+// Test server: returns 404 for all requests (new page case).
 func newTestStoreServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -95,17 +92,7 @@ func TestBuildWritePlan_PageRegistryEntryWithNoMatchingFileErrors(t *testing.T) 
 	}
 }
 
-// TestBuildWritePlan_DirectLayoutStartEditSkipsSplice is the regression
-// test for the safety net that replaced validateProposal's old outright
-// rejection of a direct layout-start.liquid/layout-end.liquid edit (see
-// pathsafety.go/writeplan.go's own doc comments): a turn that edits
-// liquid/layout-start.liquid directly via files[] AND also sets
-// LayoutLinksToAdd in the same turn must NOT also get a computed
-// plan.layoutStart splice — that would either duplicate the audit row for
-// the same (message_id, file_path) or, worse, silently overwrite the
-// direct edit with stale pre-edit content when commitWritePlan writes the
-// splice after plan.files. The direct edit's own content must be exactly
-// what was proposed, untouched by the splice logic.
+// Direct layout edit with LayoutLinksToAdd must skip splice (safety net).
 func TestBuildWritePlan_DirectLayoutStartEditSkipsSplice(t *testing.T) {
 	ts := newTestStoreServer(t)
 	defer ts.Close()
