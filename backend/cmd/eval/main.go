@@ -1,6 +1,4 @@
 // Command eval runs the real theme-builder pipeline against internal/evals' task list,
-// using a real logged-in tenant's bearer token since this service has no service-to-service auth.
-// Safe to re-run: each task's mode is explicit (evals.Task.Mode), not inferred from turn count.
 package main
 
 import (

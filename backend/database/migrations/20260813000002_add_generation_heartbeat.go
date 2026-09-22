@@ -15,10 +15,6 @@ func init() {
 }
 
 // last_heartbeat_at decouples ReapStaleGenerations' staleness check from the 65-minute
-// generateTimeout, so a stuck generation isn't left "running" for the full budget before being reaped.
-//
-// Stamped on every progress event (tool calls, deltas, retries); NULL for existing/never-updated
-// rows is deliberate — the reaper falls back to started_at.
 func Up_20260813000002(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE generations

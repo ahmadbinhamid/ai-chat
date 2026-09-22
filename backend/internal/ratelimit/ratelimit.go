@@ -1,6 +1,4 @@
 // Package ratelimit provides a per-tenant token-bucket limiter, mainly for the LLM-backed
-// generation endpoint. In-process only (map behind a mutex) — limits one instance, not a
-// horizontally scaled fleet; swap for a shared store (Redis) if that changes.
 package ratelimit
 
 import (

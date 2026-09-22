@@ -393,8 +393,6 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 		fmt.Fprintf(&b, "- %s\n", formatFindingLine(f))
 	}
 	// "edit" is for targeted old_string/new_string fixes (materialized server-side).
-	// Use "update" if: (1) broad rewrite is simpler, or (2) edit already failed this turn.
-	// Note: retry escalation is per-Generate call, not per-repair round.
 	b.WriteString("\nFix each of these with action \"edit\" against the file you already have (a precise " +
 		"old_string/new_string pair per finding) — materialized server-side, an \"edit\" produces the exact same " +
 		"complete, corrected file a full \"update\" would; it's just a cheaper way to express the same change, " +

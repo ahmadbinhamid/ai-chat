@@ -29,7 +29,6 @@ func NewService(repo *Repository) *Service {
 
 // GetOrCreateChat returns the tenant's one, ongoing chat of the given type,
 // creating it on first use. chatType comes from the caller (themebuild
-// passes "builder"), keeping this package reusable for other chat types.
 func (s *Service) GetOrCreateChat(ctx context.Context, tenantID uint64, chatType string) (Chat, error) {
 	c, err := s.repo.GetChatByTenantAndType(ctx, tenantID, chatType)
 	if err == nil {
@@ -69,7 +68,6 @@ func (s *Service) createChat(ctx context.Context, tenantID uint64, chatType stri
 
 // GetChatForTenant returns the tenant's one chat of the given type, or
 // ErrNotFound if they haven't sent a first message yet — read-only, unlike
-// GetOrCreateChat.
 func (s *Service) GetChatForTenant(ctx context.Context, tenantID uint64, chatType string) (Chat, error) {
 	return s.repo.GetChatByTenantAndType(ctx, tenantID, chatType)
 }
@@ -89,7 +87,6 @@ func (s *Service) GetChat(ctx context.Context, tenantID uint64, chatID string) (
 
 // ListMessages returns a chat's full turn history after verifying
 // ownership. Prefer ListMessagesForVerifiedChat if the caller already
-// tenant-verified this chat earlier in the same request.
 func (s *Service) ListMessages(ctx context.Context, tenantID uint64, chatID string) ([]Message, error) {
 	if _, err := s.GetChat(ctx, tenantID, chatID); err != nil {
 		return nil, err

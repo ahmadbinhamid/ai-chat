@@ -136,8 +136,6 @@ func invalidResult() *ai.Result {
 func TestCheckAndRepair_RetriesPastAnInvalidRepairReply(t *testing.T) {
 	// First repair attempt comes back malformed (rejected by validateProposal,
 	// not themecheck); the second repair attempt is clean. With
-	// maxThemeCheckRetries == 2, this must still succeed — the malformed
-	// reply consumes a retry slot rather than hard-failing the generation.
 	fg := &fakeGenerator{results: []*ai.Result{invalidResult(), goodResult()}}
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
@@ -181,7 +179,6 @@ func TestCheckAndRepair_WarningsPassThroughOnAccept(t *testing.T) {
 
 	// Use a snapshot missing the theme-token var fallback to produce a
 	// harmless warning-severity finding instead: add a CSS file with a
-	// component-local custom property baking in a literal hex color.
 	result.Files = append(result.Files, ai.GeneratedFile{
 		Path: "components/css/testimonials.css", Action: "create", Content: ".x { --testimonials-accent: #ff6600; }",
 	})
@@ -204,17 +201,10 @@ func TestCheckAndRepair_WarningsPassThroughOnAccept(t *testing.T) {
 
 // footerTrustpilotScript mirrors the incident this feature exists to
 // prevent: a merchant's theme already carries a third-party <script src>
-// (Trustpilot, Meta pixel, GA, Intercom, ...) before the model ever touches
-// the file.
 const footerTrustpilotScript = `  <script src="https://widget.trustpilot.com/tp-widget.min.js"></script>`
 
 // TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair is the
 // footer/"Powered By FlowPOS" incident end to end: the model's proposal
-// re-emits the whole file (proposals are always complete files, never
-// diffs) with the merchant's pre-existing script intact plus its own new
-// line. Without pre-existing-violation filtering this used to cost a full
-// repair round-trip whose only way to "fix" an error it didn't cause was to
-// delete the merchant's script.
 func TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair(t *testing.T) {
 	baselineFooter := "<footer>\n" + footerTrustpilotScript + "\n</footer>"
 	proposedFooter := "<footer>\n  <p>Powered by FlowPOS</p>\n" + footerTrustpilotScript + "\n</footer>"
@@ -248,8 +238,6 @@ func TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair(t *testing.T) {
 
 // TestCheckAndRepair_SameViolationInNewFileStillRepairs confirms the same
 // off-theme script, when it's the model's OWN new file rather than an edit
-// to an existing one, still triggers a real repair — a brand-new file has
-// no baseline, so the model owns every line of it.
 func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
 	badNewFooter := "<footer>\n" + footerTrustpilotScript + "\n</footer>"
 	fixedNewFooter := "<footer></footer>"
@@ -283,9 +271,6 @@ func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
 
 // TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip is the case
 // that motivates AutoFixThemeTokens: six hardcoded colors the model could
-// have reached for real defaults.json tokens for, all mechanically
-// resolvable — the repair round-trip (a real Generate call, minutes of
-// wall-clock in production) must never happen at all.
 func TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip(t *testing.T) {
 	defaultsJSON := `{"colors": {
 		"primary": "#1e3a8a", "secondary": "#111111", "accent": "#3d5bbf",

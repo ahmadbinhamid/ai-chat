@@ -92,8 +92,6 @@ func createAttachments(ctx context.Context, e execer, attachments []MessageAttac
 }
 
 // UpsertHTMLAttachment replaces any existing row at the same (message_id, kind, position).
-// Must be an upsert, not a plain insert: a reaper-restarted generation retrying this must
-// not fail on a duplicate key, just replace the row with this attempt's content.
 func (r *Repository) UpsertHTMLAttachment(ctx context.Context, a MessageAttachment) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO chat_message_attachments (id, message_id, tenant_id, kind, filename, media_type, size_bytes, checksum, position, content, created_at, updated_at)
@@ -127,8 +125,6 @@ func (r *Repository) CreateMessageAndTouchUsage(ctx context.Context, m Message, 
 }
 
 // ListMessagesByChat returns full turn history with attachment METADATA only — this backs
-// GET /chat on every page load, so it must never carry attached bytes. Attachment metadata
-// loads via a separate IN-list query, not a JOIN, to avoid row fan-out and NULL-dedup logic.
 func (r *Repository) ListMessagesByChat(ctx context.Context, chatID string) ([]Message, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, apply_status, applied_at, created_at

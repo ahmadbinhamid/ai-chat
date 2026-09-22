@@ -16,8 +16,6 @@ func init() {
 
 // Adds a write-time constraint so a (message_id, kind, position) duplicate fails at insert
 // instead of causing ambiguous read ordering downstream.
-//
-// Verified against the dev database before adding this: zero existing rows violated it.
 func Up_20260909000003(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE chat_message_attachments

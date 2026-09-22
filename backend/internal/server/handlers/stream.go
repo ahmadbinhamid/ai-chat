@@ -65,9 +65,7 @@ type streamReadyMessage struct {
 	LastSeq int64  `json:"last_seq"`
 }
 
-// Stream verifies chat ownership, upgrades to a WebSocket, replays generation_events after last_seq, then relays live events
-// until disconnect or a genuine internal error. Auth is verified before the upgrade since a 401 can't be sent on an already-upgraded
-// connection; last_seq is a query param (not a post-upgrade message) since coder/websocket can't safely await an optional message with a bounded wait.
+// Stream verifies chat ownership, upgrades to a WebSocket, replays generation_events after last_seq...
 func (h *StreamHandler) Stream(c *gin.Context) {
 	identity, matchedSubprotocol, ok := auth.WebSocketAuth(c, h.authClient, h.authCache, h.authCacheTTL, h.authNegativeCacheTTL)
 	if !ok {
@@ -152,11 +150,7 @@ func (h *StreamHandler) Stream(c *gin.Context) {
 	h.waitForLiveEvents(ctx, conn, live, &watermark)
 }
 
-// waitForLiveEvents is the steady state after replay: pings periodically, writes live events newer than *watermark, and
-// returns only on disconnect or a write/ping failure — never on EventTypeDone/EventTypeFailed.
-//
-// Seq == 0 (ephemeral events) is never compared against *watermark: those are never durably stored, so comparing against a
-// watermark that only grows would make every Seq-0 event wrongly look already-delivered and drop it.
+// waitForLiveEvents is the steady state after replay: pings periodically, writes live events newer ...
 func (h *StreamHandler) waitForLiveEvents(ctx context.Context, conn *websocket.Conn, live <-chan themebuild.GenerationEvent, watermark *int64) {
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()

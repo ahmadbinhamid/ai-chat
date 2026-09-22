@@ -15,31 +15,8 @@ func init() {
 	})
 }
 
-// chat_message_attachments replaces chat_messages' per-type attachment columns (images,
-// html_attachment_filename/content) with one polymorphic table — a new type costs no migration.
-//
-// Transcript reads (every GET /chat) no longer pull attachment bytes; only doGenerate reads content.
-//
-// Bytes stay in MySQL, not external storage — multi-replica with no shared volume, and not
-// justified at current volume; see chat.MessageAttachment's doc comment for the read split.
-//
-// content is LONGBLOB (not LONGTEXT, even for kind='html') to keep the table polymorphic;
-// stored as raw decoded bytes, not base64 — base64 is used only on the wire/request path.
-//
-// storage_key is reserved for future external storage (always NULL today); exactly one of
-// content/storage_key is meaningful per row.
-//
-// checksum is sha256 of the raw bytes, tenant-scoped and indexed — recorded for future dedupe,
-// not enforced; two rows may share one and each still owns its own bytes independently.
-//
-// No updated_at: rows are insert-only, removed via ON DELETE CASCADE when the message's chat
-// is deleted — no orphan-blob sweeper needed.
-//
-// Old columns (images, html_attachment_filename/content) are intentionally left in place here
-// — dropped separately in 20260909000004.
-//
-// No backfill: this feature has never run against real data (dev-only, never deployed), so
-// there's nothing to preserve. If that's no longer true, write a fresh backfill migration first.
+// Polymorphic attachments table, insert-only. Old columns dropped separately in 20260909000004.
+// No updated_at, no backfill (feature dev-only, never deployed).
 func Up_20260909000002(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chat_message_attachments (

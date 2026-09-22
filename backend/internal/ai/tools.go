@@ -13,9 +13,6 @@ import (
 type ToolExecutor func(ctx context.Context, name string, input json.RawMessage) (string, error)
 
 // ToolProgress is called just before a tool executes (ToolStarted) and just after it returns
-// (ToolFinished), synchronously inside Generate's tool loop — an implementation must not block.
-// input is raw, unparsed model arguments; summary in ToolFinished is computed by Generate,
-// which already knows each tool's shape, so callers don't duplicate that logic.
 type ToolProgress interface {
 	ToolStarted(name string, input json.RawMessage)
 	ToolFinished(name string, summary string, err error)

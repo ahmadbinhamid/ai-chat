@@ -15,11 +15,6 @@ func init() {
 }
 
 // generation_events is the durable event log a WebSocket client replays on reconnect.
-//
-// seq is monotonic per chat_id, assigned by the single goroutine owning that chat's generation,
-// so no cross-process coordination is needed to keep it gap-free.
-//
-// chat_id is denormalized from generations so retention trims (keep last 200/chat) need no join.
 func Up_20260730000002(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS generation_events (

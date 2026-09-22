@@ -64,8 +64,6 @@ func TestWarnReadBeforeWriteViolations_CreateNeverWarns(t *testing.T) {
 }
 
 // TestWarnReadBeforeWriteViolations_PreSuppliedFilesNeverWarn checks pages.json/defaults.json
-// (already in every request's context; the model is told never to read_theme_file them)
-// don't warn when written unread.
 func TestWarnReadBeforeWriteViolations_PreSuppliedFilesNeverWarn(t *testing.T) {
 	files := []GeneratedFile{
 		{Path: "defaults.json", Action: "update"},

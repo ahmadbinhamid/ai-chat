@@ -158,9 +158,6 @@ func TestFindCarryForwardSourceMessageID_ExcludesCurrentMessage(t *testing.T) {
 }
 
 // Boundary: m0 stays in the window while total replayed turns <= summarizeHistoryThreshold;
-// one more filler turn pushes it out. The next two tests sit on either side of that cutoff.
-
-// Replayed count lands exactly on summarizeHistoryThreshold, so nothing is trimmed and m0 is still found.
 func TestFindCarryForwardSourceMessageID_JustInsideWindow(t *testing.T) {
 	priorMessages := []chat.Message{htmlAttachedUserMsg("m0")}
 	for i := 0; i < summarizeHistoryThreshold-2; i++ {

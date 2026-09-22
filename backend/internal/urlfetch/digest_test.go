@@ -11,7 +11,6 @@ import (
 
 // loadDigestFixture reads testdata/<name>.html (required) and
 // testdata/<name>.css (optional — some fixtures have none), combining inline
-// + external CSS the same way Fetcher.FetchStylesheets does in production.
 func loadDigestFixture(t *testing.T, name string) (htmlSrc, css string) {
 	t.Helper()
 	htmlBytes, err := os.ReadFile(filepath.Join("testdata", name+".html"))
@@ -135,7 +134,6 @@ func TestBuildDigest_OverHardCapIsTruncated(t *testing.T) {
 
 // TestCSSPropertyPattern_DoesNotMatchAsASuffixOfALongerProperty guards
 // against "color" naively matching inside "background-color" (CSS's "-" is
-// a regex word-boundary character).
 func TestCSSPropertyPattern_DoesNotMatchAsASuffixOfALongerProperty(t *testing.T) {
 	css := ".btn { background-color: #6E9A3A; }"
 	if m := cssPropertyPatterns["color"].FindStringSubmatch(css); m != nil {

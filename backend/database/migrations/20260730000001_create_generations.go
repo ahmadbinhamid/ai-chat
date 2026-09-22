@@ -15,10 +15,6 @@ func init() {
 }
 
 // generations is a durable, multi-replica-safe replacement for the old in-memory
-// generation tracker, so state survives a pod restart and a reaper can find dead runs.
-//
-// running_chat_id is a virtual column (NULL unless status='running') since MySQL lacks a
-// partial unique index — the UNIQUE key on it enforces one running generation per chat.
 func Up_20260730000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS generations (

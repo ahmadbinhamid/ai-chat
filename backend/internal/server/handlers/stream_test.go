@@ -244,9 +244,7 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	readEvent(t, wsConn, themebuild.EventTypeStarted, 5)
 }
 
-// TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark confirms a live ephemeral (seq:0) event still arrives
-// after watermark has advanced (otherwise seq:0<=watermark always looks like an already-delivered duplicate and gets dropped),
-// and that delivering it doesn't corrupt the watermark — a genuine seq-2 duplicate after it is still skipped, and the real seq-3 event arrives next.
+// TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark confirms a live ephemeral (se...
 func TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark(t *testing.T) {
 	conn := openStreamTestDB(t)
 	rdb, err := themebuild.NewRedisClient(getenvOr("REDIS_URL", "redis://127.0.0.1:6379"))

@@ -16,16 +16,6 @@ func init() {
 }
 
 // chat_messages, generation_events and chat_message_attachments get updated_at for schema
-// consistency, even though rows stay immutable — set once at insert, equal to created_at.
-//
-// generations gets real created_at/updated_at (it had neither) — unlike the other three it's
-// genuinely mutated many times, so updated_at is actively bumped, not write-once.
-//
-// created_at is backfilled from the earliest existing timestamp per row (queued_at, then
-// started_at, then finished_at, then now as a last resort).
-//
-// Each ALTER runs as add-nullable, backfill, then make-NOT-NULL: a NOT NULL column with no
-// default can't be added directly to a table that already has rows.
 func Up_20260909000005(db *sql.DB) error {
 	simple := []string{"chat_messages", "generation_events", "chat_message_attachments"}
 	for _, table := range simple {

@@ -15,10 +15,6 @@ func init() {
 }
 
 // html_attachment_filename/content let a user turn carry one reference HTML file — plain
-// columns (not a JSON array like images) since this is capped at one file per message.
-//
-// content is capped at themebuild.MaxHTMLAttachmentBytes and sanitized
-// (SanitizeHTMLAttachment strips scripts/base64 assets) before it reaches this column.
 func Up_20260909000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE chat_messages

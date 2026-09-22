@@ -15,15 +15,6 @@ func init() {
 }
 
 // Turns generations into a queue: any number of "queued" rows may wait behind at most one
-// "running" row (still enforced by uniq_generations_running_chat, unchanged here).
-//
-// prompt/theme_slug/mode/queued_at let DequeueNext replay the original request later, since it
-// may be long gone by then; started_at becomes nullable since a queued row hasn't started.
-//
-// Bearer token is deliberately NOT stored here (credential-at-rest risk) — see themebuild.pendingTokens.
-//
-// prompt has no DEFAULT: MySQL rejects a literal default on TEXT columns (error 1101); every
-// INSERT sets it explicitly instead.
 func Up_20260812000001(db *sql.DB) error {
 	if _, err := db.Exec(`
 		ALTER TABLE generations

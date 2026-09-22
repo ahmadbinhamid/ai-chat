@@ -169,8 +169,6 @@ func TestCombineCSS_EnforcesTheRealByteCap(t *testing.T) {
 
 // TestFetchStylesheets_CapsEachFileAtItsOwnShare confirms a SINGLE
 // stylesheet larger than maxStylesheetBytesPerFile is cut to its own share,
-// not read in full — needed so maxStylesheets racing concurrently can't
-// together exceed maxStylesheetBytes off the wire.
 func TestFetchStylesheets_CapsEachFileAtItsOwnShare(t *testing.T) {
 	over := strings.Repeat("a", maxStylesheetBytesPerFile+1000)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -198,9 +196,6 @@ func TestFetchStylesheets_CapsEachFileAtItsOwnShare(t *testing.T) {
 
 // TestFetchStylesheets_RunsConcurrently proves the fetches happen at once,
 // not serially, via a channel-based rendezvous rather than a wall-clock
-// threshold: every request blocks until all n requests have arrived, which
-// a serial fetcher could never satisfy — it would stall until
-// stylesheetPhaseTimeout, failing this test's count assertion structurally.
 func TestFetchStylesheets_RunsConcurrently(t *testing.T) {
 	const n = 3
 	var mu sync.Mutex
@@ -247,8 +242,6 @@ func TestFetchStylesheets_RunsConcurrently(t *testing.T) {
 
 // TestFetchStylesheets_DoesNotCountAStylesheetThatDidNotSurviveTheBudget: a
 // stylesheet whose fetch succeeds can still contribute zero bytes if the
-// budget was already spent by earlier chunks (inline CSS goes first) —
-// count must reflect that, not just that the HTTP request succeeded.
 func TestFetchStylesheets_DoesNotCountAStylesheetThatDidNotSurviveTheBudget(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css")
@@ -278,7 +271,6 @@ func TestFetchStylesheets_DoesNotCountAStylesheetThatDidNotSurviveTheBudget(t *t
 
 // TestFetchStylesheets_InlineCSSDoesNotCountTowardStylesheetCount confirms
 // inline <style> content is collected but never counted as a "stylesheet
-// fetched" — it wasn't fetched, it was already in the document.
 func TestFetchStylesheets_InlineCSSDoesNotCountTowardStylesheetCount(t *testing.T) {
 	htmlSrc := `<style>.a{color:red}</style>`
 	finalURL, err := url.Parse("https://example.com/")
@@ -299,7 +291,6 @@ func TestFetchStylesheets_InlineCSSDoesNotCountTowardStylesheetCount(t *testing.
 
 // TestFetchStylesheets_SkipsFailingStylesheetWithoutFailingOthers confirms
 // a 500 from one stylesheet host costs nothing but that stylesheet's own
-// content — CSS is an enhancement, never a reason to lose the others.
 func TestFetchStylesheets_SkipsFailingStylesheetWithoutFailingOthers(t *testing.T) {
 	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -333,7 +324,6 @@ func TestFetchStylesheets_SkipsFailingStylesheetWithoutFailingOthers(t *testing.
 
 // TestFetchStylesheets_SkipsBlockedHost confirms the SSRF guard applies to
 // stylesheet hrefs too — uses the REAL NewFetcher(), since httptest.Server
-// addresses are always loopback and so always rejected by the real guard.
 func TestFetchStylesheets_SkipsBlockedHost(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css")
@@ -359,8 +349,6 @@ func TestFetchStylesheets_SkipsBlockedHost(t *testing.T) {
 
 // TestFetchStylesheets_BoundedByPhaseTimeout confirms the phase gives up at
 // stylesheetPhaseTimeout. Unlike the concurrency test, proving a TIMEOUT
-// value is honored genuinely requires measuring elapsed time, with a
-// generous margin to avoid flaking on a loaded CI box.
 func TestFetchStylesheets_BoundedByPhaseTimeout(t *testing.T) {
 	block := make(chan struct{}) // never closed
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

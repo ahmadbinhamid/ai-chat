@@ -22,9 +22,7 @@ import (
 // Keeps a PreviewHandler built without that call (e.g. tests) from inheriting themefs.Store's much longer 60s timeout.
 const defaultProductsFetchTimeout = 2 * time.Second
 
-// buildPreviewContext overlays real store name/menu/products on the fixture; category/basket/customer/product stay fixture since
-// there's no single real value (or it needs auth). Shared by Preview and Context so both render identical data — otherwise
-// PreviewPane's accuracy-check would falsely report differences on every page. Each overlay fails open to the fixture value.
+// buildPreviewContext overlays real store name/menu/products on the fixture; category/basket/custom...
 func buildPreviewContext(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, productsFetchTimeout time.Duration) map[string]any {
 	fixture := themefs.FixtureContext()
 
@@ -55,9 +53,7 @@ func buildPreviewContext(ctx context.Context, builder *themebuild.Service, store
 	return fixture
 }
 
-// previewProductItems maps the real products-list response into theme_engine_spec.md §7's shape. choices[]/variants[] stay
-// empty/false (not omitted, to match the fixture's key set) since the list endpoint doesn't eager-load them — only the
-// single-product endpoint does, which is also why buildPreviewContext keeps the detail-page `product` singular on the fixture.
+// previewProductItems maps the real products-list response into theme_engine_spec.md §7's shape. ch...
 func previewProductItems(products []themefs.Product) []any {
 	items := make([]any, len(products))
 	for i, p := range products {

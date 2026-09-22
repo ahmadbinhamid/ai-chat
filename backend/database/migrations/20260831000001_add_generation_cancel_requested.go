@@ -15,10 +15,6 @@ func init() {
 }
 
 // cancel_requested_at is the durable half of cancelling a running generation — the live
-// EventTypeCancelRequested signal is best-effort and can be missed or dropped under load.
-//
-// runOneQueuedGeneration checks this column on subscribe and on every heartbeat tick as a
-// backstop, so a cancel request is never silently lost.
 func Up_20260831000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE generations

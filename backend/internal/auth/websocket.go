@@ -60,8 +60,6 @@ func WebSocketAuth(c *gin.Context, client *Client, cache Cache, positiveTTL, neg
 }
 
 // parseWebSocketSubprotocols extracts the bearer token and tenant ID from the comma-separated
-// Sec-WebSocket-Protocol header; matchedSubprotocol must be echoed back in the 101 response —
-// a real browser fails the handshake if it's omitted, though Go's own client tolerates that.
 func parseWebSocketSubprotocols(header string) (token string, tenantID string, matchedSubprotocol string, err error) {
 	if header == "" {
 		return "", "", "", errors.New("missing Sec-WebSocket-Protocol header")

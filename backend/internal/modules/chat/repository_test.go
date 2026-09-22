@@ -136,8 +136,6 @@ func TestRepository_CreateMessageAndTouchUsage_RollsBackOnFailure(t *testing.T) 
 }
 
 // TestRepository_TouchChatUsage_ZeroDeltaSameSecond checks a zero-delta UPDATE that changes
-// nothing byte-for-byte doesn't get misreported as ErrNotFound by checkAffected — only
-// surfaces with clientFoundRows=true against real MySQL, not a mock driver.
 func TestRepository_TouchChatUsage_ZeroDeltaSameSecond(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -359,7 +357,6 @@ func TestRepository_ListMessagesByChat_SkipsUnknownAttachmentKind(t *testing.T) 
 
 // TestRepository_AttachmentUniqueKey_RejectsDuplicateMessageKindPosition checks
 // uq_cma_message_kind_position enforces at write time that two rows can't share
-// (message_id, kind, position). Requires `make migrate` to have run.
 func TestRepository_AttachmentUniqueKey_RejectsDuplicateMessageKindPosition(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)

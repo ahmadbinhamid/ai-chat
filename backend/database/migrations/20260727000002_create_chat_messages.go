@@ -16,11 +16,6 @@ func init() {
 
 // chat_messages is append-only (no updated_at); tenant_id is denormalized from chats for
 // tenant-scoped checks without a join.
-//
-// role/status/apply_status are VARCHAR not ENUM — the Go types are the actual constraint, so
-// new values (e.g. apply_status's "pending"/"discarded") need no schema change.
-//
-// No error_message column: a failed generation's error text goes in content with status='failed'.
 func Up_20260727000002(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chat_messages (

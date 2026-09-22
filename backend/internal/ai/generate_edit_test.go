@@ -188,7 +188,6 @@ func TestGenerate_TwoFailedEditsFallBackToFullContentRequest(t *testing.T) {
 		case 3:
 			// Body is JSON, so a literal `"` inside the message text is
 			// escaped to `\"` on the wire — match on a quote-free substring
-			// instead of fighting that escaping.
 			body, _ := io.ReadAll(r.Body)
 			if !strings.Contains(string(body), "resubmit this file with action") {
 				t.Errorf("expected the 3rd call's request to carry the fall-back-to-update advice after 2 failures, body: %s", body)

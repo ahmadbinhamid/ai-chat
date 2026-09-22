@@ -26,8 +26,6 @@ func SanitizeError(err error) string {
 }
 
 // categorizeError maps err to a short, actionable, provider-neutral reason. A typed
-// *anthropic.Error is checked first; the string-matching fallback covers errors this
-// codebase generates itself, or DeepSeek not always surfacing a typed error.
 func categorizeError(err error) string {
 	var apiErr *anthropic.Error
 	if errors.As(err, &apiErr) {

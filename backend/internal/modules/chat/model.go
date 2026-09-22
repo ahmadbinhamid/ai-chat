@@ -79,9 +79,6 @@ const (
 )
 
 // MessageAttachment is one file attached to a user-role turn's prompt (an image or one
-// reference HTML file). Content holds raw decoded bytes and is populated ONLY by
-// Repository.GetAttachmentsContent — normal transcript reads leave it nil, so a page load
-// never pays for attached bytes. StorageKey is reserved for future external storage; unused today.
 type MessageAttachment struct {
 	ID         string         `json:"id"`
 	MessageID  string         `json:"-"`

@@ -19,6 +19,7 @@ import (
 )
 
 // themeEngineSpec is THEME_ENGINE_SPEC.md embedded at build time.
+//
 //go:embed prompts/theme_engine_spec.md
 var themeEngineSpec string
 
@@ -68,37 +69,35 @@ type Result struct {
 
 // GenerationMode restricts what a turn is allowed to touch.
 const (
-	GenerationModeEdit  = "edit"   // default: any tool, any file; empty string means edit
-	GenerationModeBrand = "brand"  // only defaults.json, only propose_changes
-	GenerationModeCopy  = "copy"   // hardcoded component/page text only
-	GenerationModePages = "pages"  // adding new pages.json-registered pages
+	GenerationModeEdit  = "edit"  // default: any tool, any file; empty string means edit
+	GenerationModeBrand = "brand" // only defaults.json, only propose_changes
+	GenerationModeCopy  = "copy"  // hardcoded component/page text only
+	GenerationModePages = "pages" // adding new pages.json-registered pages
 )
 
 // ThemeContext is current theme state for Claude; model fetches file content via read_theme_file.
 type ThemeContext struct {
-	ThemeSlug    string
-	PagesJSON    string                 // current pages.json or ""
-	DefaultsJSON string                 // current defaults.json
-	FileTree     []themefs.FileTreeEntry // supplied up front to avoid initial list_theme_files cost
-	Manifest     *themefs.Manifest       // component param signatures; nil if unavailable
-	GenerationMode string               // restricts what this turn may touch; empty = GenerationModeEdit
+	ThemeSlug      string
+	PagesJSON      string                  // current pages.json or ""
+	DefaultsJSON   string                  // current defaults.json
+	FileTree       []themefs.FileTreeEntry // supplied up front to avoid initial list_theme_files cost
+	Manifest       *themefs.Manifest       // component param signatures; nil if unavailable
+	GenerationMode string                  // restricts what this turn may touch; empty = GenerationModeEdit
 }
 
 // Generator calls Claude to produce theme file changes.
 type Generator struct {
-	client anthropic.Client
-	model  anthropic.Model
-	effort anthropic.OutputConfigEffort
-	visionModel anthropic.Model  // separate model for image calls; text-only turns use model for proven quality
-	fake      bool
-	fakeDelay time.Duration
-	maxTokens int64               // Claude call's max_tokens; see AI_MAX_TOKENS env var
+	client         anthropic.Client
+	model          anthropic.Model
+	effort         anthropic.OutputConfigEffort
+	visionModel    anthropic.Model // separate model for image calls; text-only turns use model for proven quality
+	fake           bool
+	fakeDelay      time.Duration
+	maxTokens      int64          // Claude call's max_tokens; see AI_MAX_TOKENS env var
 	streamTimeouts StreamTimeouts // zero-valued fields fall back to defaults, never to instant timeout
 }
 
 // StreamTimeouts configures idle and first-token budgets for consumeStream.
-// Zero-valued fields fall back to defaults via (*Generator).idleTimeout/firstTokenTimeoutFor.
-// FirstToken* is split by GenerationMode: Brand/Copy are shorter (narrow scope), Pages is longer (most work).
 type StreamTimeouts struct {
 	Idle            time.Duration
 	FirstTokenEdit  time.Duration
@@ -195,7 +194,6 @@ func New(apiKey, baseURL, model, effort, visionModel string, maxTokens int64, st
 
 // SupportsVision reports whether this Generator was configured with a
 // vision-capable model — Generate rejects an Image when this is false
-// rather than silently sending it to a model that can't use it.
 func (g *Generator) SupportsVision() bool {
 	return g.visionModel != ""
 }
@@ -244,15 +242,7 @@ var resultSchema = map[string]any{
 				"the same as needs_clarification. Mutually exclusive with needs_clarification and with actually proposing " +
 				"changes.",
 		},
-		// Strict: true + additionalProperties: false (see proposeChangesTool)
-		// means every property here must be present on every files[] item —
-		// content and edits are both always required, their meaning set by
-		// action rather than by which one is present. Deliberately not an
-		// anyOf/oneOf split keyed on action: DeepSeek's Anthropic-compat
-		// endpoint (the actual target for this schema) has unverified
-		// support for conditional subschemas, so the contract is documented
-		// in each field's description instead and enforced server-side by
-		// materializeEdits, not by the schema itself.
+		// Strict + additionalProperties: false requires all properties present; documented in field descriptions, enforced server-side (DeepSeek endpoint has unverified conditional-subschema support).
 		"files": map[string]any{
 			"type": "array",
 			"items": map[string]any{
@@ -296,18 +286,7 @@ var resultSchema = map[string]any{
 				},
 			},
 		},
-		// page_registry_entry deliberately has no requires_auth property.
-		// Per theme_engine_spec.md §5, requires_auth: true only applies to
-		// my_account/my_orders/change_password — fixed system route types this
-		// service is forbidden from ever (re-)registering. Every page ai-chat
-		// can legitimately create is type "custom", which never needs it.
-		// Asking the model for a value that's always false, and on top of that
-		// silently discarded by flowpos-backend's StoreThemeFileRequest /
-		// ThemeFileController today, just invites the model (and future
-		// readers) to believe gating works through this path. If a merchant
-		// ever needs a gated custom page, that's a spec change plus a
-		// flowpos-backend change, decided then — not a field carried
-		// speculatively now.
+		// No requires_auth: spec allows only on fixed system routes (my_account, etc); ai-chat creates only "custom" pages. Field omitted to avoid confusing model.
 		"page_registry_entry": map[string]any{
 			"anyOf": []any{
 				map[string]any{
@@ -421,8 +400,6 @@ func streamProgressBytes(message anthropic.Message) int {
 }
 
 // consumeStream drains one streaming attempt into message. Enforces idle timeout (reset per event) and
-// first-token timeout (until first progress per streamProgressBytes). stream.Next() has no timeout and
-// blocks indefinitely on stalled connections, so each read runs in a goroutine with timers in a select.
 func consumeStream(
 	ctx context.Context,
 	stream *ssestream.Stream[anthropic.MessageStreamEventUnion],
@@ -489,9 +466,7 @@ const defaultMaxTokens = 64000
 // errMaxTokensTruncated: returned when StopReason==max_tokens to prevent parsing partial JSON.
 var errMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
 
-// Generate orchestrates tool loop: execute tools until propose_changes; materialize edits before returning.
-// onDelta: called per text chunk streamed. progress: notified per toolExec call.
-// Materialization failure fed back as tool_result; loop continues, giving model chance to correct.
+// Generate orchestrates tool loop: execute tools until propose_changes; materialize edits before re...
 func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, images []Image, onDelta func(string), progress ToolProgress, toolExec ToolExecutor, readFile FileReader) (*Result, error) {
 	if g.fake {
 		return g.fakeGenerate(ctx, prompt)
@@ -799,9 +774,7 @@ func registerReadPaths(input json.RawMessage, knownPaths map[string]bool) {
 	}
 }
 
-// warnReadBeforeWriteViolations: logs every action:"update" not in knownPaths (detection only, no behavior change).
-// Scoped to THIS Generate call; files not read here have no grounding across turns.
-// preSuppliedFiles: pages.json, defaults.json (spec §0 pre-supplied); edits to layout-start/layout-end still require reads.
+// warnReadBeforeWriteViolations: logs every action:"update" not in knownPaths (detection only, no b...
 var preSuppliedFiles = map[string]bool{
 	"pages.json":    true,
 	"defaults.json": true,
@@ -825,7 +798,6 @@ func warnReadBeforeWriteViolations(files []GeneratedFile, knownPaths map[string]
 
 // summarizeMaxTokens caps the summary completion — this is a cheap plain-
 // text call (no tools, no thinking), so it needs nowhere near g.maxTokens;
-// a few paragraphs of prose fits comfortably within this.
 const summarizeMaxTokens = 1024
 
 // Summarize: concise prose summary of turns as prior context (plain completion, no tools/thinking/system prompt).

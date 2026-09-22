@@ -16,8 +16,6 @@ func init() {
 
 // chats is one row per (tenant_id, type) — deliberately generic (no theme_slug/per-user
 // ownership) so it isn't coupled to the theme-builder use case.
-//
-// No local FK to tenant/user: identity is resolved by internal/auth from the bearer token.
 func Up_20260727000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (

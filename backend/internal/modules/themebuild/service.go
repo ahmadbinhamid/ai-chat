@@ -196,6 +196,7 @@ var ErrVisionNotConfigured = errors.New("image attachments aren't enabled on thi
 var ErrTooManyImages = errors.New("too many images attached")
 var ErrImageTooLarge = errors.New("an attached image is too large")
 var ErrHTMLAttachmentTooLarge = errors.New("attached HTML file is too large")
+
 // Wraps urlfetch error; already merchant-readable on its own.
 var ErrLinkFetchFailed = errors.New("could not use the link in your message as a reference")
 

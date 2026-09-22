@@ -41,7 +41,6 @@ const maxRedirects = 5
 
 // Sentinel errors, wrapped with more detail via fmt.Errorf's %w in Fetch.
 // Deliberately merchant-readable: themebuild.Service.Generate surfaces this
-// text straight into its own error.
 var (
 	ErrInvalidURL  = errors.New("invalid reference url")
 	ErrBlockedHost = errors.New("that url points at a private or internal address and can't be used as a reference")
@@ -49,7 +48,6 @@ var (
 	ErrNotHTML     = errors.New("that url did not return a webpage")
 	// ErrBlocked (401/403/429 after retry) is distinct from ErrFetchFailed: the
 	// site is actively refusing automation, not unreachable — the merchant
-	// can work around it by pasting HTML directly instead of a link.
 	ErrBlocked = errors.New("that site refused an automated request — try pasting the page's HTML as a file instead")
 )
 
@@ -67,7 +65,6 @@ func NewFetcher() *Fetcher {
 
 // newFetcherWithDialContext is NewFetcher with the dial function swapped —
 // lets tests hit an httptest.Server (always loopback) without the real guard
-// rejecting it; TestFetcher_BlocksLoopback covers the real guard separately.
 func newFetcherWithDialContext(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *Fetcher {
 	return &Fetcher{
 		client: &http.Client{
@@ -91,13 +88,7 @@ func newFetcherWithDialContext(dial func(ctx context.Context, network, addr stri
 	}
 }
 
-// guardedDialer builds the *net.Dialer every fetch (and every redirect hop)
-// connects through. The guard runs in Control, not a pre-flight check
-// against the URL's hostname: Control fires after resolution, on the exact
-// IP about to be dialed, closing the DNS-rebinding gap a hostname-only check
-// would leave open. Letting the standard dialer resolve (rather than dialing
-// only the first address ourselves) also preserves Go's normal multi-address
-// fallback/Happy Eyeballs — Control still vets every address tried.
+// Guard in Control hook, not pre-flight: runs after resolution on actual IP, closing DNS-rebinding gap. Preserves Happy Eyeballs.
 func guardedDialer() *net.Dialer {
 	return &net.Dialer{
 		Timeout: dialTimeout,
@@ -110,7 +101,6 @@ func guardedDialer() *net.Dialer {
 			if ip == nil || IsBlockedIP(ip) {
 				// host (the resolved internal address) is never surfaced to a
 				// merchant — callers only errors.Is-match this against ErrBlocked
-				// and log it server-side; re-verify that if a new call site is added.
 				return fmt.Errorf("%w: %s", ErrBlockedHost, host)
 			}
 			return nil
@@ -125,18 +115,10 @@ type Result struct {
 	Truncated bool
 	// FinalURL is the response's URL AFTER redirects, not rawURL as passed in —
 	// needed to correctly resolve relative hrefs found in the fetched HTML.
-	// Never nil on a successful Fetch.
 	FinalURL *url.URL
 }
 
-// Fetch validates rawURL, does an SSRF-guarded GET with one retry on a
-// transient failure, and returns at most maxBytes of the body. Going over
-// maxBytes truncates (at a tag boundary) rather than failing — a merchant
-// doesn't control a link's size the way they control an upload's. No
-// separate hard ceiling above maxBytes: reading past it just to fail fast
-// would be slower and more memory-hungry than truncating. A successful
-// result still needs the same sanitization an uploaded HTML file gets
-// (themebuild.SanitizeHTMLAttachment) — this cap only bounds what Fetch itself reads.
+// SSRF-guarded GET, truncates at tag boundary (not an error), still needs sanitization even on success.
 func (f *Fetcher) Fetch(ctx context.Context, rawURL string, maxBytes int64) (Result, error) {
 	u, err := ValidateURL(rawURL)
 	if err != nil {
@@ -185,7 +167,6 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string, maxBytes int64) (Res
 
 // doWithRetry retries exactly once on the SAME ctx as the first attempt
 // (already bounded to fetchTimeout) — a failing endpoint can't double its
-// time budget just by being retryable.
 func (f *Fetcher) doWithRetry(ctx context.Context, url string) (*http.Response, error) {
 	resp, err := f.do(ctx, url)
 	if !shouldRetry(resp, err) {
@@ -218,7 +199,6 @@ func isRetryableStatus(statusCode int) bool {
 
 // isBlockedStatus is checked after the retry has run its course: still-429,
 // or a never-retried 401/403, means the site is actively refusing
-// automation, not merely unreachable — hence the distinct ErrBlocked sentinel.
 func isBlockedStatus(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusTooManyRequests
 }
@@ -240,8 +220,6 @@ func (f *Fetcher) do(ctx context.Context, url string) (*http.Response, error) {
 
 // TruncateAtTagBoundary cuts html to at most maxBytes, backing up to the
 // last '<' only when the cut genuinely lands inside an unfinished tag —
-// handing the model/sanitizer a half-written tag reads as broken markup,
-// not as "the page continues past here."
 func TruncateAtTagBoundary(html string, maxBytes int64) string {
 	if maxBytes <= 0 || int64(len(html)) <= maxBytes {
 		return html
@@ -261,7 +239,6 @@ func TruncateAtTagBoundary(html string, maxBytes int64) string {
 
 // trimIncompleteTrailingRune backs s up to the last valid UTF-8 boundary when
 // a byte-index cut landed mid-character — independent of tag-boundary
-// truncation above. O(1): checks only the last few bytes (UTF-8's max width).
 func trimIncompleteTrailingRune(s string) string {
 	for i := 0; i < utf8.UTFMax && i < len(s); i++ {
 		start := len(s) - 1 - i
@@ -277,8 +254,6 @@ func trimIncompleteTrailingRune(s string) string {
 
 // looksLikeHTML trusts contentType only when it explicitly says html/xml —
 // text/plain is deliberately NOT trusted on the header alone, since hostile
-// or misconfigured endpoints commonly serve arbitrary content as text/plain.
-// Anything else falls through to sniffing the body's opening bytes.
 func looksLikeHTML(contentType string, body []byte) bool {
 	ct := strings.ToLower(contentType)
 	if strings.Contains(ct, "html") || strings.Contains(ct, "xml") {
@@ -289,7 +264,6 @@ func looksLikeHTML(contentType string, body []byte) bool {
 
 // sniffsAsHTML checks the first sniffBytes for a real markup opening
 // ("<!doctype html"/"<html"/"<!--", or '<' followed by a letter) — a stray
-// '<' elsewhere in a non-markup body doesn't count.
 func sniffsAsHTML(body []byte) bool {
 	if len(body) > sniffBytes {
 		body = body[:sniffBytes]

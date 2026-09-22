@@ -9,7 +9,6 @@ import (
 )
 
 // Tests fetchReferenceURL directly (cache is pure logic, no DB/network).
-
 // Real markup to build non-empty digest (cache never stores empty).
 const fetchReferenceURLTestHTML = `<html><head><title>Cached Reference Page</title></head>` +
 	`<body><h1>cached</h1><p>Some real body copy so the digest isn't empty.</p></body></html>`
@@ -70,7 +69,6 @@ func TestFetchReferenceURL_CacheHitSkipsRebuildingDigest(t *testing.T) {
 	}
 	// title DOES ride along on a cache hit (Phase 3.1) — see
 	// cachedReference's own doc comment for why. styleCount does not: a
-	// hit fetches nothing new this turn, so 0 is the accurate count.
 	if title != cachedTitle {
 		t.Errorf("expected a cache hit to return the cached title, got %q, want %q", title, cachedTitle)
 	}

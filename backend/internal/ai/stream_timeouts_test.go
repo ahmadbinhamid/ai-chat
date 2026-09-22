@@ -98,8 +98,6 @@ func TestConsumeStream_FirstTokenTimeoutFiresWhenNothingEverArrives(t *testing.T
 }
 
 // TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress checks tool_use-only streaming
-// (no narration text) still counts as first-token progress — only the idle timeout should
-// fire here, not the first-token one, since a text/thinking-only check would false-trip it.
 func TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress(t *testing.T) {
 	var b strings.Builder
 	sseEvent(&b, "message_start", map[string]any{
@@ -179,8 +177,6 @@ func TestGenerate_RetriesOnIdleTimeout(t *testing.T) {
 }
 
 // TestStreamProgressBytes_CountsTextThinkingAndToolUse covers every branch streamProgressBytes
-// counts. Built via real json.Unmarshal, not a struct literal: the As* accessors re-decode
-// from an internal raw-JSON field that only json.Unmarshal populates.
 func TestStreamProgressBytes_CountsTextThinkingAndToolUse(t *testing.T) {
 	var blocks []anthropic.ContentBlockUnion
 	raw := `[

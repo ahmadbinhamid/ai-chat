@@ -16,9 +16,6 @@ func init() {
 
 // chat_generated_files records every file an assistant message changed; file_path is
 // required since it's the only record of where content was written.
-//
-// chat_id is denormalized from message_id to avoid a join; pending/applied/discarded
-// tracking is added by the 20260813000001 migration.
 func Up_20260727000003(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chat_generated_files (

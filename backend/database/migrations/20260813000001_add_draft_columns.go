@@ -16,12 +16,6 @@ func init() {
 
 // Prevents two data-loss bugs that only exist now that writes are deferred to a draft
 // instead of applied immediately (see themebuild's package doc comment).
-//
-// kind ('proposed' vs 'layout') keeps layout-splice audit rows distinguishable from the
-// model's own files, so a deferred splice isn't silently lost before Apply runs.
-//
-// page_meta persists PageMeta (title/slug/SEO), previously consumed immediately at write
-// time — without it, a page in an applied draft would register with no title/slug/SEO.
 func Up_20260813000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE chat_generated_files

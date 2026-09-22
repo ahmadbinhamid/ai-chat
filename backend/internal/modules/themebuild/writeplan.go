@@ -115,8 +115,6 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 	}
 
 	// A turn that directly edits layout-start/end.liquid has taken full ownership of its content;
-	// skip the splice for that path or commitWritePlan would overwrite the direct edit with stale
-	// content (it writes plan.files first, then a splice computed against pre-edit content).
 	if len(result.LayoutLinksToAdd) > 0 && !hasDirectEdit(plan.files, pathLayoutStart) {
 		current, err := store.ReadFile(ctx, storeAuth, pathLayoutStart)
 		if err != nil {

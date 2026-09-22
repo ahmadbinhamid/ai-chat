@@ -22,9 +22,6 @@ const maxEditMaterializationFailures = 2
 const duplicatePathsFailureKey = "<duplicate-paths>"
 
 // materializeEdits turns every "edit"-action file into "update" with real content, in place.
-// ok is false when a file failed to materialize; retryMessage lets the model self-correct
-// rather than failing a generation that can cost minutes of streaming. failureCounts must
-// persist across the whole Generate call, not reset per attempt.
 func materializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
 	if dupes := duplicateFilePaths(result.Files); len(dupes) > 0 {
 		failureCounts[duplicatePathsFailureKey]++
@@ -121,8 +118,6 @@ const noMatchContentCap = 8_000
 const noMatchWindowBytes = 4_000
 
 // noMatchProblem builds the retry message for one no_match failure: full content if it fits,
-// a bounded near-miss window if not, or a "re-read this file" instruction otherwise — avoids
-// driving the model to expensively re-read/re-grep the file itself.
 func noMatchProblem(path, content string, edits []Edit, applyErr error) string {
 	base := fmt.Sprintf("%s: %s", path, applyErr)
 	if len(content) <= noMatchContentCap {
@@ -189,8 +184,6 @@ func (t matchTier) String() string {
 }
 
 // applyEdits applies edits in order, each old_string located against content AS IT STANDS
-// after every prior edit — so overlapping edits naturally fail uniqueness with no special
-// handling. worstTier is the loosest tier any edit needed, for materializeEdits to log.
 func applyEdits(content string, edits []Edit) (result string, worstTier matchTier, matchCount int, err error) {
 	worstTier = tierExact
 	for i, e := range edits {
@@ -213,12 +206,7 @@ func applyEdits(content string, edits []Edit) (result string, worstTier matchTie
 	return content, worstTier, 0, nil
 }
 
-// findMatch locates old_string in content, trying tiers in order and stopping at the first
-// that resolves to exactly one location: 1) exact byte-for-byte, 2) per-line trimmed,
-// 3) whitespace-collapsed (catches `class="a  b"` vs `class="a b"`).
-// A tier with zero matches falls through; a tier with more than one is an immediate failure,
-// never falling through to a looser tier that could pick blind. start/end are always byte
-// offsets into the ORIGINAL content, never the whitespace-normalized comparison copies.
+// Tries tiers: exact, per-line trimmed, whitespace-collapsed. Zero matches falls through; >1 is failure (never blind pick). Offsets are byte positions in original.
 func findMatch(content, oldString string) (start, end int, tier matchTier, matchCount int, err error) {
 	switch count := strings.Count(content, oldString); count {
 	case 1:
@@ -273,8 +261,6 @@ func collapseTrimmed(s string) string {
 }
 
 // lineOffset is one line with byte offsets back into the ORIGINAL content string. [start, end)
-// excludes both the line's '\n' and any trailing '\r' — a CRLF's '\r' belongs to the line
-// ending, not the content, since end is also the splice boundary for a matched region.
 type lineOffset struct {
 	text       string
 	start, end int
@@ -333,14 +319,6 @@ func findLineWindows(contentLines []lineOffset, oldLines []string, normal func(s
 const reindentTabWidth = 4
 
 // reindentToMatch re-indents inserted (new_string) to sit at matched's leading indentation
-// (tier 2/3 only), since the replacement entirely discards matched's own leading whitespace.
-//
-// Applies a signed DELTA (target width minus inserted's first-line width) to every line's
-// existing indentation, clamped at zero — so a shallower line (e.g. a closing-tag cascade
-// dedenting back out) keeps its own smaller depth instead of being flattened to one uniform
-// indentation. Blank lines stay blank. Output indentation is always plain spaces, never tabs —
-// a tab only counts as reindentTabWidth columns for the delta arithmetic; emitting that many
-// literal tab characters back out would be a 4x blowup on a tab-indented target.
 func reindentToMatch(matched, inserted string) string {
 	targetWidth := indentWidth(leadingWhitespace(firstLine(matched)))
 	insertedLines := strings.Split(inserted, "\n")

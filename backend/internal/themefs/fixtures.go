@@ -1,9 +1,6 @@
 package themefs
 
-// This file provides canned §7-shaped data for previewing a page without a real storefront request behind it.
-// Everything is map[string]any, not a Go struct, so the renderer can resolve dotted paths via plain map traversal.
-
-// FixtureProduct returns a representative product detail context covering every §7 field, including choices/variants.
+// This file provides canned §7-shaped data for previewing a page without a real storefront request ...
 func FixtureProduct() map[string]any {
 	return map[string]any{
 		"name": "Sample Product", "id": "1", "slug": "sample-product",

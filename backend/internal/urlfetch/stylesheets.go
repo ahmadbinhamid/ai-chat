@@ -14,45 +14,22 @@ import (
 
 // maxStylesheets bounds how many <link rel="stylesheet"> hrefs
 // FetchStylesheets follows, in document order — enough for a typical
-// base+framework+theme split without a long fan-out.
 const maxStylesheets = 3
 
 // maxStylesheetBytes bounds the TOTAL combined CSS (inline + external).
 // Once spent, FetchStylesheets stops accumulating rather than failing.
-// Each individual fetch only reads its own even share (see
-// maxStylesheetBytesPerFile); this cap is enforced by combineCSS afterward.
 const maxStylesheetBytes = 150 * 1024
 
 // maxStylesheetBytesPerFile is maxStylesheetBytes split evenly across
 // maxStylesheets concurrent fetches, so they can't pull more than the
-// combined budget off the wire before combineCSS even runs.
 const maxStylesheetBytesPerFile = maxStylesheetBytes / maxStylesheets
 
 // stylesheetPhaseTimeout bounds the WHOLE stylesheet phase, not per file.
 // CSS is an enhancement, never a reason to make a merchant wait, so this
-// stays small next to fetchTimeout's 10s.
 const stylesheetPhaseTimeout = 3 * time.Second
 
 // FetchStylesheets extracts stylesheet <link> hrefs and inline <style>
 // content from htmlSrc, fetches the external ones CONCURRENTLY through this
-// SAME Fetcher (so every SSRF guarantee — guardedDialer, sub-timeouts,
-// one-retry — applies unchanged, with no second HTTP client), and returns
-// combined CSS up to maxStylesheetBytes. finalURL is the base for resolving
-// relative hrefs when the document has no <base> of its own.
-//
-// Deliberately not restricted to finalURL's own origin — real sites serve
-// CSS from CDNs/other domains — because IsBlockedIP at dial time (not an
-// origin check) is what makes following an arbitrary href safe here.
-//
-// A stylesheet that fails, times out, or is SSRF-blocked is skipped
-// silently: CSS is an enhancement, never a reason to fail an already-
-// successful HTML fetch.
-//
-// count is the number of EXTERNAL stylesheets that actually contributed
-// bytes to the combined text (not inline CSS, which was never "fetched") —
-// a stylesheet can succeed over the wire yet contribute zero bytes if the
-// budget was already spent by earlier chunks (see combineCSS), so count
-// must reflect what's in the result, not how many requests returned 2xx.
 func (f *Fetcher) FetchStylesheets(ctx context.Context, htmlSrc string, finalURL *url.URL) (css string, count int) {
 	hrefs, inlineCSS := extractStylesheetSources(htmlSrc, finalURL)
 
@@ -65,8 +42,6 @@ func (f *Fetcher) FetchStylesheets(ctx context.Context, htmlSrc string, finalURL
 		g.Go(func() error {
 			// Reads only its even share (maxStylesheetBytesPerFile), not the
 			// full budget — keeps maxStylesheets concurrent fetches bounded
-			// to maxStylesheetBytes total. Errors are swallowed, not returned
-			// to the group: one stylesheet's failure must never affect the others.
 			body, err := f.fetchRaw(ctx, href, maxStylesheetBytesPerFile)
 			if err != nil {
 				return nil
@@ -94,8 +69,6 @@ func (f *Fetcher) FetchStylesheets(ctx context.Context, htmlSrc string, finalURL
 
 // combineCSS concatenates chunks up to budget bytes, truncating the chunk
 // that overflows at a valid UTF-8 boundary. contributed counts chunks that
-// donated at least one byte — a chunk arriving after the budget's already
-// spent contributes zero, letting FetchStylesheets' count exclude it.
 func combineCSS(budget int, chunks []string) (text string, contributed int) {
 	var b strings.Builder
 	for _, chunk := range chunks {
@@ -116,9 +89,6 @@ func combineCSS(budget int, chunks []string) (text string, contributed int) {
 
 // fetchRaw is Fetch's shared plumbing (SSRF-guarded dial, one-retry rule,
 // status classification) minus the HTML-specific parts — a stylesheet isn't
-// HTML, so no content-type sniffing or tag-boundary truncation. Silently
-// drops anything past maxBytes. No fetchTimeout sub-context: the caller
-// already bounds ctx to the tighter stylesheetPhaseTimeout.
 func (f *Fetcher) fetchRaw(ctx context.Context, rawURL string, maxBytes int64) ([]byte, error) {
 	u, err := ValidateURL(rawURL)
 	if err != nil {
@@ -140,8 +110,6 @@ func (f *Fetcher) fetchRaw(ctx context.Context, rawURL string, maxBytes int64) (
 
 // mediaAllowsScreen reports whether a media attribute still applies to
 // ordinary screen rendering — absent/empty always does (per the HTML spec,
-// both mean "all"). Substring check, not real media-query parsing: enough
-// to filter out media="print" without a full parser.
 func mediaAllowsScreen(media string) bool {
 	if media == "" {
 		return true
@@ -152,10 +120,6 @@ func mediaAllowsScreen(media string) bool {
 
 // extractStylesheetSources collects stylesheet <link> hrefs (resolved,
 // deduped, capped, in document order) and inline <style> text, skipping
-// print-only media and <style> nested in an inline <svg> (icon-scoped, not
-// page design). Two tokenizer passes: findBaseHref runs first since a
-// <base href> affects how every relative href resolves regardless of its
-// position in the document. Pure function — no network, per CLAUDE.md rule 2.
 func extractStylesheetSources(htmlSrc string, finalURL *url.URL) (hrefs []string, inlineCSS string) {
 	base := finalURL
 	if href, ok := findBaseHref(htmlSrc); ok {
@@ -257,7 +221,6 @@ func attrVal(t html.Token, key string) string {
 
 // hasRelToken checks token against each space-separated entry in rel
 // (e.g. rel="preload stylesheet"), case-insensitively — matching the whole
-// attribute would miss multi-token values.
 func hasRelToken(rel, token string) bool {
 	for _, part := range strings.Fields(rel) {
 		if strings.EqualFold(part, token) {
@@ -269,7 +232,6 @@ func hasRelToken(rel, token string) bool {
 
 // resolveHref resolves href (absolute, protocol-relative, or relative)
 // against base per RFC 3986 §5. Returns ok=false for an unparseable href,
-// which a caller simply skips.
 func resolveHref(href string, base *url.URL) (*url.URL, bool) {
 	ref, err := url.Parse(href)
 	if err != nil {

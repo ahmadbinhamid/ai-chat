@@ -15,7 +15,6 @@ import (
 
 // unguardedDialContext skips the IsBlockedIP check so tests can hit an
 // httptest.Server (always loopback) and exercise Fetch's own logic — the
-// guard itself is covered separately in guard_test.go and TestFetcher_BlocksLoopback.
 func unguardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	return (&net.Dialer{}).DialContext(ctx, network, addr)
 }
@@ -35,7 +34,6 @@ func TestFetcher_BlocksLoopback(t *testing.T) {
 
 // TestFetcher_BlocksResolvedHostname covers a HOSTNAME ("localhost") rather
 // than an IP literal, proving the guard catches a blocked address reached
-// via DNS resolution, not just one already spelled out as an IP.
 func TestFetcher_BlocksResolvedHostname(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("<html>should never be reached</html>"))
@@ -140,7 +138,6 @@ func TestFetcher_Fetch_AllowsMissingContentType(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set(..., "") not Del: Del would leave the key absent, triggering
 		// net/http's own auto-sniffing, which would send a real "text/html"
-		// header and silently skip the no-header/sniff branch this test targets.
 		w.Header().Set("Content-Type", "")
 		w.Write([]byte("<html></html>"))
 	}))
@@ -176,7 +173,6 @@ func TestFetcher_Fetch_TruncatesOverMaxBytes(t *testing.T) {
 
 // TestFetcher_Fetch_TruncatesAtTagBoundary confirms the truncated HTML
 // never ends mid-tag — the cut point lands inside a long attribute value
-// with no earlier tag close, so it must back up to the unfinished tag's own '<'.
 func TestFetcher_Fetch_TruncatesAtTagBoundary(t *testing.T) {
 	prefix := "<html><body><p>hello</p><div data-x=\""
 	// Pad well past 1000 bytes so the cut point genuinely lands mid-attribute.
@@ -204,7 +200,6 @@ func TestFetcher_Fetch_TruncatesAtTagBoundary(t *testing.T) {
 
 // TestFetcher_Fetch_TruncatesEvenWayOverMaxBytes: a body 20x over the cap
 // still only costs maxBytes+1 bytes read and truncates like one barely over —
-// there's no separate "too big to truncate" case.
 func TestFetcher_Fetch_TruncatesEvenWayOverMaxBytes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -408,7 +403,6 @@ func TestFetcher_Fetch_ErrBlockedFor429AfterRetry(t *testing.T) {
 
 // TestFetcher_Fetch_SniffsEmptyContentTypeAsHTML confirms an empty/missing
 // Content-Type with a body that genuinely opens like markup is still
-// accepted, via body sniffing.
 func TestFetcher_Fetch_SniffsEmptyContentTypeAsHTML(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set(..., "") not Del — see TestFetcher_Fetch_AllowsMissingContentType.
@@ -425,7 +419,6 @@ func TestFetcher_Fetch_SniffsEmptyContentTypeAsHTML(t *testing.T) {
 
 // TestFetcher_Fetch_RejectsEmptyContentTypeNonHTMLBody is
 // SniffsEmptyContentTypeAsHTML's negative counterpart: an empty
-// Content-Type on a non-markup body must still be rejected.
 func TestFetcher_Fetch_RejectsEmptyContentTypeNonHTMLBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Set(..., "") kept consistent with the other Content-Type tests in this file.
@@ -443,9 +436,6 @@ func TestFetcher_Fetch_RejectsEmptyContentTypeNonHTMLBody(t *testing.T) {
 
 // TestFetcher_Fetch_RejectsNonHTMLWithoutReadingWholeBody confirms a large
 // mislabeled body is rejected after ~sniffBytes, not after full download.
-// Proven via a handler blocked on a channel released only after Fetch
-// returns, not a byte count or wall-clock bound — TCP send buffers make
-// byte counts unreliable, and timing assertions are flaky/slow.
 func TestFetcher_Fetch_RejectsNonHTMLWithoutReadingWholeBody(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

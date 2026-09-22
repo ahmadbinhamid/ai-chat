@@ -16,7 +16,6 @@ const maxCustomProperties = 30
 
 // maxRankedValuesPerProperty bounds how many of each ranked property's
 // most-frequent values are kept — frequency is the real signal (a color
-// used 40 times is the brand color), so this caps the long tail only.
 const maxRankedValuesPerProperty = 8
 
 // maxFontFaceFamilies and maxFontCDNHrefs bound the typefaces section —
@@ -28,7 +27,6 @@ const (
 
 // maxCSSValueChars caps one declared CSS value so a pathological value
 // (a box-shadow with many layers) can't dominate the budget before
-// DigestHardCapBytes' truncation runs.
 const maxCSSValueChars = 200
 
 // rankedCSSProperties are the properties ranked by occurrence count — each
@@ -40,8 +38,6 @@ var rankedCSSProperties = []string{
 
 // cssPropertyPatterns is built once at package init. Each pattern requires
 // its property preceded only by "{"/";" + whitespace, not bare \b: CSS's "-"
-// is a regex word-boundary character, so bare \bcolor\b would also match
-// inside "background-color".
 var cssPropertyPatterns = func() map[string]*regexp.Regexp {
 	m := make(map[string]*regexp.Regexp, len(rankedCSSProperties))
 	for _, p := range rankedCSSProperties {
@@ -63,7 +59,6 @@ var (
 
 // fontCDNHosts are matched by exact host or subdomain (see isFontCDNHost),
 // so "fonts.googleapis.com" also matches "www.fonts.googleapis.com" but not
-// a lookalike like "notfonts.googleapis.com.evil.example".
 var fontCDNHosts = []string{
 	"fonts.googleapis.com", "fonts.gstatic.com", "use.typekit.net",
 	"use.fontawesome.com", "fonts.adobe.com", "fast.fonts.net", "p.typekit.net",

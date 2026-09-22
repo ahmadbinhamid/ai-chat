@@ -12,8 +12,6 @@ import (
 )
 
 // TestVisionModelSmokeTest is a throwaway go/no-go check for whether the vision model can
-// drive this project's real tool-loop with an image attached. Skipped unless
-// DEEPSEEK_VISION_SMOKE_TEST=1 — hits a real, billed API, no place in normal `make test`/CI.
 func TestVisionModelSmokeTest(t *testing.T) {
 	if os.Getenv("DEEPSEEK_VISION_SMOKE_TEST") != "1" {
 		t.Skip("set DEEPSEEK_VISION_SMOKE_TEST=1 to run this against the real DeepSeek API")
@@ -154,8 +152,6 @@ func TestVisionModel_ImageTokenDelta(t *testing.T) {
 	}
 
 	// Order matters: DeepSeek caches on request-prefix match, so whichever call runs SECOND
-	// can get a discounted reading regardless of the image. Order is reversed here to check
-	// for that confound: if "second call is cheaper" flips with the order, it's a caching artifact.
 	withImage := call(t, true)
 	withoutImage := call(t, false)
 	t.Logf("GO/NO-GO (reversed order): image's own marginal input-token cost = %d tokens", withImage-withoutImage)

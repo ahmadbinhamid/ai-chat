@@ -23,8 +23,6 @@ func TestCurrentText_SkipsUnrecognizedBlockType(t *testing.T) {
 }
 
 // TestCurrentText_MixedKnownAndUnrecognizedBlocks checks skipping one unrecognized block
-// doesn't disturb real text/thinking blocks. Built via json.Unmarshal, not struct literals,
-// since AsText()/AsThinking() decode from captured raw JSON — the real streaming path.
 func TestCurrentText_MixedKnownAndUnrecognizedBlocks(t *testing.T) {
 	raw := `[
 		{"type": "text", "text": "hello "},

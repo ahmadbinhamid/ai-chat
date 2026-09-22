@@ -26,9 +26,6 @@ func sseEvent(b *strings.Builder, eventType string, data any) {
 
 // toolUseSSEResponse renders a complete one-turn SSE stream where the model
 // calls exactly one tool with the given input (marshaled whole, not as
-// incremental deltas — Accumulate treats the first input_json_delta on an
-// empty "{}" input as a full replace, so one delta carrying the whole
-// object is a faithful, simpler stand-in for real incremental streaming).
 func toolUseSSEResponse(msgID, toolID, toolName string, input any, inputTokens, outputTokens int64) string {
 	inputJSON, err := json.Marshal(input)
 	if err != nil {
@@ -63,9 +60,6 @@ func toolUseSSEResponse(msgID, toolID, toolName string, input any, inputTokens, 
 
 // TestGenerate_ToolLoopReadsThenProposes is phase 2's "Done when" scenario:
 // given a fake Anthropic server that first calls read_theme_file and then
-// propose_changes, Generate executes the read tool via toolExec, feeds its
-// result back, and returns the final Result from propose_changes — without
-// ai ever touching themefs itself (toolExec is the only bridge).
 func TestGenerate_ToolLoopReadsThenProposes(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -130,10 +124,6 @@ func TestGenerate_ToolLoopReadsThenProposes(t *testing.T) {
 
 // textOnlySSEResponse renders a complete one-turn SSE stream where the model
 // replies with plain text and stop_reason "end_turn" — no tool_use block at
-// all, despite tool_choice being forced. This is DeepSeek's actual observed
-// behavior for a prompt it judges doesn't need a tool (confirmed live
-// against DeepSeek's compat endpoint for a bare "hello"), which real
-// Anthropic's ToolChoice: OfAny is supposed to make impossible.
 func textOnlySSEResponse(msgID, text string, inputTokens, outputTokens int64) string {
 	var b strings.Builder
 	sseEvent(&b, "message_start", map[string]any{
@@ -164,11 +154,6 @@ func textOnlySSEResponse(msgID, text string, inputTokens, outputTokens int64) st
 
 // TestGenerate_NudgesRatherThanFailsOnToollessTurn is the regression test
 // for the DeepSeek "hello" bug: a turn that comes back with no tool call at
-// all (see textOnlySSEResponse) must not fail the whole generation — it
-// must be nudged (its own toolless turn replayed, plus a user message
-// insisting on a tool call) and given another iteration, exactly like a
-// real tool_use turn would get its result replayed. Two toolless turns in a
-// row before propose_changes proves this isn't a one-shot special case.
 func TestGenerate_NudgesRatherThanFailsOnToollessTurn(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -217,11 +202,6 @@ func TestGenerate_NudgesRatherThanFailsOnToollessTurn(t *testing.T) {
 
 // TestNew_BaseURLReachesFakeServer confirms New's baseURL param actually
 // wires the SDK client at the target endpoint — this is the whole
-// DeepSeek-compatibility story (New(apiKey, baseURL, ...) pointed at
-// DeepSeek's documented Anthropic-compat endpoint instead of a fake server
-// here): if this test passes, the same tool loop already exercised above
-// works unmodified against any Anthropic Messages-API-compatible endpoint,
-// not just the real Anthropic API.
 func TestNew_BaseURLReachesFakeServer(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -281,11 +261,6 @@ func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {
 
 // TestGenerate_ForcesProposeChangesNearIterationCeiling verifies the
 // budget-aware forcing added alongside the 20->28 maxToolIterations raise:
-// once the loop is within forceProposeWithinLastN iterations of the cap, the
-// request sent to the model forces the specific propose_changes tool (not the
-// generic "any tool" choice) — so a model that's spent its budget reading
-// still gets pushed to commit to a proposal rather than reading indefinitely
-// and running out the clock with nothing produced.
 func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 	calls := 0
 	forceBoundary := maxToolIterations - forceProposeWithinLastN // 0-indexed iteration where forcing begins
@@ -334,7 +309,6 @@ func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 	}
 	// It should have taken exactly forceBoundary "list" calls before the
 	// first forced call finally proposes — confirms forcing kicked in at the
-	// expected iteration rather than earlier or never.
 	if calls != forceBoundary+1 {
 		t.Errorf("expected %d calls before the model proposed, got %d", forceBoundary+1, calls)
 	}
@@ -342,14 +316,11 @@ func TestGenerate_ForcesProposeChangesNearIterationCeiling(t *testing.T) {
 
 // TestGenerate_BrandModeOnlyOffersProposeChanges confirms brand mode's tool
 // restriction: even though the fake server would happily answer a
-// read_theme_file call, the model is never offered anything but
-// propose_changes, so it must call that immediately.
 func TestGenerate_BrandModeOnlyOffersProposeChanges(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		// The static system prompt's own narration mentions "read_theme_file"
 		// by name (rule 8), so check the tools array's JSON shape
-		// specifically, not a bare substring of the whole request.
 		if !strings.Contains(string(body), `"name":"propose_changes"`) || strings.Contains(string(body), `"name":"read_theme_file"`) {
 			t.Errorf("expected only propose_changes to be offered in brand mode, request body: %s", body)
 		}

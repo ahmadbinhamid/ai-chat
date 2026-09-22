@@ -16,8 +16,6 @@ func init() {
 
 // Widens queued_at/created_at columns to DATETIME(6) so same-second writes sort by real
 // insertion order instead of an id/row-visit tiebreak.
-//
-// time.Now().UTC() already carries microsecond precision, so no Go write-path changes are needed.
 func Up_20260922000001(db *sql.DB) error {
 	if _, err := db.Exec(`ALTER TABLE generations MODIFY COLUMN queued_at DATETIME(6) NULL`); err != nil {
 		return err

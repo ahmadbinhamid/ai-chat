@@ -20,7 +20,6 @@ var whitespaceRunPattern = regexp.MustCompile(`\s+`)
 
 // excludedTextTags never contribute to a text-derived section. "title" is
 // excluded too since it's surfaced separately via pageIdentity, and leaving
-// it in could wrongly mark a client-rendered shell as non-Empty.
 var excludedTextTags = map[string]bool{
 	"script": true, "style": true, "noscript": true, "template": true, "title": true,
 }
@@ -38,21 +37,7 @@ type Digest struct {
 	Truncated bool
 }
 
-// BuildDigest is a pure (html, css) -> compact text digest transformation.
-// Raw fetched markup is the wrong payload for a model writing Liquid — most
-// of a real page's DOM is framework wrapper divs and hashed class names, no
-// design signal, and it crowds the merchant's own theme files out of the
-// model's attention. The digest surfaces design tokens, a structural
-// outline, and real copy instead, ranked so the most design-relevant
-// material survives truncation first (see each section's own ordering).
-//
-// The digest is exactly as untrusted as the raw HTML it's built from —
-// extraction does not sanitize against a page author injecting model-
-// directed instructions into a heading or alt text. Callers must still
-// apply the same injection-guard framing they'd apply to raw markup.
-//
-// finalURL may be nil in a test with no real fetch behind it (the identity
-// section then omits the URL line); css may be empty (no design-tokens section, not an error).
+// BuildDigest extracts design tokens, structure, and copy from raw HTML/CSS, ranked for truncation robustness. Not sanitized; caller must inject-guard as with raw markup. finalURL/css may be nil/empty.
 func BuildDigest(finalURL *url.URL, htmlSrc, css string) Digest {
 	page := extractPage(htmlSrc)
 	tokens := extractDesignTokens(css, htmlSrc)
@@ -67,7 +52,6 @@ func BuildDigest(finalURL *url.URL, htmlSrc, css string) Digest {
 	writeCopySection(&b, body)
 	// IMAGES is lowest-priority: dropped outright once the soft budget is
 	// spent, rather than letting the hard-cap truncation below cut whatever
-	// section happens to land on the boundary.
 	if b.Len() < digestSoftBudgetBytes {
 		writeImagesSection(&b, images)
 	}
