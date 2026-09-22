@@ -42,7 +42,7 @@ type Config struct {
 	FirstTokenTimeoutCopy  time.Duration
 	FirstTokenTimeoutPages time.Duration
 
-	// APIKey/Model/BaseURL talk to DeepSeek over its Anthropic Messages API compat endpoint.
+	// APIKey/Model/BaseURL talk to the AI provider over its Anthropic Messages API compat endpoint.
 	APIKey  string
 	Model   string
 	BaseURL string
@@ -106,10 +106,10 @@ func Load() Config {
 		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
 		FirstTokenTimeoutPages: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_PAGES_SECONDS", 150)) * time.Second,
 
-		APIKey:      os.Getenv("DEEPSEEK_API_KEY"),
-		Model:       getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
-		VisionModel: getenv("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
-		BaseURL:     getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
+		APIKey:      os.Getenv("AI_API_KEY"),
+		Model:       getenv("AI_MODEL", "deepseek-v4-pro"),
+		VisionModel: getenv("AI_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
+		BaseURL:     getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
 
 		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
 

@@ -9,7 +9,7 @@ func TestLoad_DeepSeekFields(t *testing.T) {
 	t.Setenv("FLOWPOS_API_BASE", "http://flowpos.test")
 
 	t.Run("populates its own fields with defaults", func(t *testing.T) {
-		t.Setenv("DEEPSEEK_API_KEY", "sk-test")
+		t.Setenv("AI_API_KEY", "sk-test")
 		cfg := Load()
 		if cfg.APIKey != "sk-test" {
 			t.Errorf("APIKey = %q, want %q", cfg.APIKey, "sk-test")
@@ -23,8 +23,8 @@ func TestLoad_DeepSeekFields(t *testing.T) {
 	})
 
 	t.Run("env vars override defaults", func(t *testing.T) {
-		t.Setenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-		t.Setenv("DEEPSEEK_BASE_URL", "https://mock.test/anthropic")
+		t.Setenv("AI_MODEL", "deepseek-v4-flash")
+		t.Setenv("AI_BASE_URL", "https://mock.test/anthropic")
 		cfg := Load()
 		if cfg.Model != "deepseek-v4-flash" {
 			t.Errorf("Model = %q, want %q", cfg.Model, "deepseek-v4-flash")

@@ -16,15 +16,15 @@ func TestVisionModelSmokeTest(t *testing.T) {
 	if os.Getenv("DEEPSEEK_VISION_SMOKE_TEST") != "1" {
 		t.Skip("set DEEPSEEK_VISION_SMOKE_TEST=1 to run this against the real DeepSeek API")
 	}
-	apiKey := os.Getenv("DEEPSEEK_API_KEY")
+	apiKey := os.Getenv("AI_API_KEY")
 	if apiKey == "" {
-		t.Fatal("DEEPSEEK_API_KEY not set")
+		t.Fatal("AI_API_KEY not set")
 	}
-	baseURL := os.Getenv("DEEPSEEK_BASE_URL")
+	baseURL := os.Getenv("AI_BASE_URL")
 	if baseURL == "" {
 		baseURL = "https://api.deepseek.com/anthropic"
 	}
-	visionModel := os.Getenv("DEEPSEEK_VISION_MODEL")
+	visionModel := os.Getenv("AI_VISION_MODEL")
 	if visionModel == "" {
 		visionModel = "deepseek-v4-flash-vision-exp"
 	}
@@ -112,15 +112,15 @@ func TestVisionModel_ImageTokenDelta(t *testing.T) {
 	if os.Getenv("DEEPSEEK_VISION_SMOKE_TEST") != "1" {
 		t.Skip("set DEEPSEEK_VISION_SMOKE_TEST=1 to run this against the real DeepSeek API")
 	}
-	apiKey := os.Getenv("DEEPSEEK_API_KEY")
+	apiKey := os.Getenv("AI_API_KEY")
 	if apiKey == "" {
-		t.Fatal("DEEPSEEK_API_KEY not set")
+		t.Fatal("AI_API_KEY not set")
 	}
-	baseURL := os.Getenv("DEEPSEEK_BASE_URL")
+	baseURL := os.Getenv("AI_BASE_URL")
 	if baseURL == "" {
 		baseURL = "https://api.deepseek.com/anthropic"
 	}
-	visionModel := os.Getenv("DEEPSEEK_VISION_MODEL")
+	visionModel := os.Getenv("AI_VISION_MODEL")
 	if visionModel == "" {
 		visionModel = "deepseek-v4-flash-vision-exp"
 	}
