@@ -9,11 +9,8 @@ import (
 
 const ruleIDNoFramework = "no-framework"
 
-// frameworkSignal is one narrow, high-precision pattern for a specific
-// framework/library — narrow on purpose: rule 10 is a blocking error, and
-// this theme's own approved vocabulary already includes generic-sounding
-// names (btn-primary, container, grid) that a broad keyword match would
-// false-positive on.
+// frameworkSignal is a narrow, high-precision pattern for one framework — a broad keyword match would false-positive
+// on this theme's own vocabulary (btn-primary, container, grid).
 type frameworkSignal struct {
 	name string
 	re   *regexp.Regexp
@@ -31,19 +28,13 @@ var frameworkSignals = []frameworkSignal{
 	{"jQuery", regexp.MustCompile(`\bjQuery\(|\$\(document\)\.ready\(|\$\(function\s*\(`)},
 }
 
-// buildToolConfigBasenames are build-tool config files that have no reason
-// to exist as a theme .js file — the extension whitelist elsewhere only
-// blocks non-.liquid/.css/.js files, so a config file smuggled in as "x.js"
-// still needs its own check.
+// buildToolConfigBasenames catches a build-tool config smuggled in as "x.js" — the extension whitelist alone wouldn't block it.
 var buildToolConfigBasenames = map[string]bool{
 	"tailwind.config": true, "webpack.config": true, "vite.config": true,
 	"postcss.config": true, "babel.config": true, "rollup.config": true,
 }
 
-// externalScriptSrcRe matches a <script src="..."> whose value is an
-// absolute or protocol-relative URL — Go's RE2 engine has no negative
-// lookahead, so this deliberately only catches the unambiguous "definitely
-// off-theme" case rather than trying to also flag "doesn't use asset_url".
+// externalScriptSrcRe matches an absolute/protocol-relative <script src>; RE2 has no negative lookahead, so it only catches the unambiguous off-theme case.
 var externalScriptSrcRe = regexp.MustCompile(`<script[^>]*\ssrc="(https?://[^"]*|//[^"]*)"`)
 
 // checkNoFramework enforces rule 10: no CSS/JS framework or library, no

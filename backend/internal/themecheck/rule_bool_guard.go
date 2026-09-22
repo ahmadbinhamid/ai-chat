@@ -7,11 +7,8 @@ import (
 
 const ruleIDBoolGuard = "bool-guard"
 
-// boolIshLastSegments are the trailing field names spec §1/§7 mark as
-// bool-ish (values arrive inconsistently as true/false/1/0/"1"/"0") — keyed
-// on the reference's final dotted segment so both "product.on_sale" and,
-// after one-hop loop aliasing, "item.active" (from menu.items[].active) match
-// the same way.
+// boolIshLastSegments are trailing field names whose values arrive inconsistently as true/false/1/0/"1"/"0".
+// Keyed on the final dotted segment so both "product.on_sale" and aliased "item.active" match.
 var boolIshLastSegments = map[string]bool{
 	"active": true, "on_sale": true, "has_choices": true, "has_variants": true, "is_available": true,
 }

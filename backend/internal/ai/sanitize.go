@@ -16,14 +16,8 @@ import (
 // match a recognized, safe-to-summarize category below.
 const genericGenerationError = "something went wrong while generating a response — please try again in a moment"
 
-// SanitizeError turns any error from Generate/Summarize into a short,
-// vendor-neutral message safe to show a merchant or store as chat history.
-// The raw error can contain the backing AI provider's name (config.AIProvider
-// is an internal implementation detail, never something a merchant should
-// see referenced), request IDs, and a raw JSON error body — none of that is
-// merchant-appropriate regardless of which provider is configured. Callers
-// should still log the original error server-side (slog.Error et al.) for
-// debugging; this is only for anything a merchant can see.
+// SanitizeError turns any error into a short, vendor-neutral message safe to show a merchant.
+// Callers should still log the original server-side.
 func SanitizeError(err error) string {
 	if err == nil {
 		return ""
@@ -31,20 +25,9 @@ func SanitizeError(err error) string {
 	return fmt.Sprintf("Error from AI agent: %s", categorizeError(err))
 }
 
-// categorizeError maps err to a short, actionable, provider-neutral reason.
-// Anthropic's own SDK wraps every HTTP-level API failure in a typed
-// *anthropic.Error carrying a real StatusCode and a Type() (rate_limit_error,
-// overloaded_error, billing_error, ...) — checked first, since it's exact by
-// construction, unlike matching on err.Error()'s text. strings.Contains on
-// "502"/"521" et al. used to be the only check here, and could false-match a
-// request ID or file size that happened to contain the same digits; that
-// string-matching fallback still exists below, but now only runs when
-// there's no typed error to classify from — which covers two real cases:
-// errors this codebase generates itself (never wrapped in *anthropic.Error
-// to begin with), and the DeepSeek compat endpoint (config.AIProvider ==
-// "deepseek" — see ai.New's doc comment), which speaks the same wire
-// protocol but isn't guaranteed to always surface a typed error the SDK
-// recognizes.
+// categorizeError maps err to a short, actionable, provider-neutral reason. A typed
+// *anthropic.Error is checked first; the string-matching fallback covers errors this
+// codebase generates itself, or DeepSeek not always surfacing a typed error.
 func categorizeError(err error) string {
 	var apiErr *anthropic.Error
 	if errors.As(err, &apiErr) {
@@ -57,11 +40,8 @@ func categorizeError(err error) string {
 			return "the request timed out — please try again"
 		case apiErr.Type() == shared.ErrorTypeOverloadedError || apiErr.StatusCode == http.StatusBadGateway ||
 			apiErr.StatusCode == http.StatusServiceUnavailable || (apiErr.StatusCode >= 520 && apiErr.StatusCode <= 524):
-			// 521-524 are Cloudflare's own origin-unreachable/timeout codes
-			// (see developers.cloudflare.com/support/troubleshooting/http-status-codes)
-			// — seen in practice when buildSnapshot's read of a theme file
-			// hits a momentarily-down origin behind Cloudflare, not an AI
-			// provider issue.
+			// 521-524: Cloudflare's own origin-unreachable/timeout codes, seen
+			// when buildSnapshot hits a momentarily-down origin, not the AI provider.
 			return "temporarily unavailable — please try again shortly"
 		}
 	}
@@ -78,21 +58,13 @@ func categorizeError(err error) string {
 	lower := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(lower, "accumulate stream") || strings.Contains(lower, "error converting content block to json"):
-		// The provider's streamed response was cut off or garbled mid-chunk
-		// before the SDK could reassemble it into valid JSON (seen in
-		// production as both "unexpected end of JSON input" and "invalid
-		// character '}' after top-level value" — a dropped connection or
-		// truncated response, not anything about the request itself).
-		// Checked before the generic "timeout"/"unavailable" matches below
-		// since those substrings don't otherwise appear here.
+		// A dropped connection or truncated response cut the stream off mid-chunk
+		// before the SDK could reassemble valid JSON.
 		return "the connection to the AI provider was interrupted mid-response — please try again"
 	case strings.Contains(lower, "credit balance") || strings.Contains(lower, "insufficient balance") ||
 		strings.Contains(lower, "payment required") || (strings.Contains(lower, "insufficient") && strings.Contains(lower, "credit")):
-		// "insufficient balance"/"payment required" cover DeepSeek's own
-		// wording for the same condition (its compat endpoint's 402 body is
-		// {"error":{"message":"Insufficient Balance",...}} — no "credit" in
-		// it at all, so the original credit-only check silently missed it
-		// and fell through to the generic message). Observed in production.
+		// "insufficient balance"/"payment required" cover DeepSeek's own wording
+		// for this (its 402 body has no "credit" in it at all).
 		return "the account is out of credits — please contact support"
 	case strings.Contains(lower, "did not call propose_changes within"):
 		return "the task was too complex to finish in one attempt — please try breaking it into smaller requests"

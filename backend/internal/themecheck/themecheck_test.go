@@ -2,11 +2,7 @@ package themecheck
 
 import "testing"
 
-// TestCheck_BadProposalProducesExactlyThreeErrors is phase 1's "Done when"
-// acceptance scenario: a hand-written bad proposal with an invented field, a
-// missing CSS link, and a bare bool guard produces exactly three error
-// findings — and (by construction, since Check never touches disk) nothing
-// is ever written for a proposal Check rejects.
+// TestCheck_BadProposalProducesExactlyThreeErrors: an invented field, missing CSS link, and bare bool guard produce exactly three error findings.
 func TestCheck_BadProposalProducesExactlyThreeErrors(t *testing.T) {
 	pageContent := `{% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
 <section class="page-section">

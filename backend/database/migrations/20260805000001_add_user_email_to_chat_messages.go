@@ -14,9 +14,8 @@ func init() {
 	})
 }
 
-// user_email mirrors user_name — same nullable-for-non-user-turns shape (see
-// chk_chat_messages_user_role), sourced from auth.Identity.Email so the
-// transcript can attribute a turn beyond just a display name.
+// user_email mirrors user_name's nullable-for-non-user-turns shape (see chk_chat_messages_user_role),
+// sourced from auth.Identity.Email for turn attribution beyond just a display name.
 func Up_20260805000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE chat_messages

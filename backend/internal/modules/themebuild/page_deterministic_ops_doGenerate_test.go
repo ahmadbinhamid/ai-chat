@@ -14,11 +14,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// neverCalledGenerator fails the test outright if Generate is ever
-// invoked — the whole point of tryDeterministicPageOp is answering a
-// register/diagnose request with zero model calls, so a test using this
-// generator that still passes is itself proof of that, not just an
-// assertion about the returned *ai.Result.
+// neverCalledGenerator fails the test if Generate is ever invoked — proves the deterministic
+// path makes zero model calls, not just that the returned *ai.Result looks right.
 type neverCalledGenerator struct{ t *testing.T }
 
 func (g neverCalledGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, string, []ai.Image, func(string), ai.ToolProgress, ai.ToolExecutor, ai.FileReader) (*ai.Result, error) {
@@ -30,13 +27,8 @@ func (g neverCalledGenerator) Summarize(context.Context, []ai.Turn) (string, err
 
 func (g neverCalledGenerator) SupportsVision() bool { return false }
 
-// TestDoGenerate_RegisterExistingPage_MatchesNormalGenerationShape is the
-// "same event stream and chat message shape as a normal generation, or the
-// frontend breaks" check the deterministic register path is required to
-// pass: driven through the real doGenerate (not tryRegisterExistingPage
-// directly), asserting the same event/message/apply-status shape a model-
-// driven turn with one changed file would produce, using a generator that
-// fails the test if it's ever called.
+// Driven through the real doGenerate, asserting the same event/message/apply-status shape a
+// model-driven turn would produce — the deterministic path must not break the frontend's expectations.
 func TestDoGenerate_RegisterExistingPage_MatchesNormalGenerationShape(t *testing.T) {
 	conn := openTestDB(t)
 	chatRepo := chat.NewRepository(conn)
@@ -123,10 +115,8 @@ func TestDoGenerate_RegisterExistingPage_MatchesNormalGenerationShape(t *testing
 	}
 }
 
-// TestDoGenerate_DiagnoseExistingPage_NoChangesButStillCompletes covers the
-// other deterministic op's shape: no files staged, but still a completed
-// message with ApplyStatusNotApplicable — matching a normal "just answered
-// a question" turn.
+// No files staged, but still a completed message with ApplyStatusNotApplicable, like a normal
+// "just answered a question" turn.
 func TestDoGenerate_DiagnoseExistingPage_NoChangesButStillCompletes(t *testing.T) {
 	conn := openTestDB(t)
 	chatRepo := chat.NewRepository(conn)

@@ -33,10 +33,8 @@ type Server struct {
 	reaperCancel context.CancelFunc
 }
 
-// New builds the router and mounts every route. AI generation being
-// unavailable (no ANTHROPIC_API_KEY) is a startup error, not something this
-// service degrades around — generation is the entire product here, unlike
-// a marketplace mini-app where AI is one optional feature among many.
+// New builds the router and mounts every route. AI generation being unavailable is a
+// startup error, not something this service degrades around — generation is the whole product.
 func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) {
 	useJSONFieldNames()
 
@@ -49,20 +47,13 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	}
 
 	var generator *ai.Generator
-	switch {
-	case cfg.FakeAIMode:
+	if cfg.FakeAIMode {
 		logger.Warn("AI_CHAT_FAKE_MODE is enabled — every generation returns a canned no-op result, " +
 			"the AI provider is never called, and nothing is ever written to a theme. Do not leave this on.")
 		generator = ai.NewFake(cfg.FakeAIDelay)
-	case cfg.AIProvider == "deepseek":
+	} else {
 		var err error
-		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens, streamTimeouts)
-		if err != nil {
-			return nil, err
-		}
-	default:
-		var err error
-		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens, streamTimeouts)
+		generator, err = ai.New(cfg.APIKey, cfg.BaseURL, cfg.Model, cfg.Effort, cfg.VisionModel, cfg.MaxTokens, streamTimeouts)
 		if err != nil {
 			return nil, err
 		}
@@ -105,23 +96,14 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	r := gin.New()
 	r.Use(gin.Recovery(), logging.Middleware(logger), maxBodySize(cfg.MaxRequestBodyBytes))
 
-	// The tenant dashboard calls this API directly from the browser (it is
-	// a native React page, not an iframed mini-app), so it needs real CORS
-	// — not just a permissive "*", since that combined with a future
-	// cookie-based auth mode would be a real hole. Origins are explicitly
-	// allow-listed rather than wildcarded; no origins configured => no
-	// cross-origin browser calls succeed (fails closed, not open).
+	// The tenant dashboard calls this API directly from the browser, so it
+	// needs real CORS — origins are explicitly allow-listed, never "*".
 	if len(cfg.CORSAllowedOrigins) > 0 {
 		r.Use(cors.New(cors.Config{
 			AllowOrigins: cfg.CORSAllowedOrigins,
-			// DELETE is needed for DELETE /chats/:chatId/queue/:generationId
-			// (cancelling a queued prompt) — without it here, the browser's
-			// CORS preflight for that route fails before the request itself
-			// is even sent.
+			// DELETE is needed for the queue-cancel routes' preflight.
 			AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPatch, http.MethodDelete},
-			// Authorization carries the FlowPOS bearer token internal/auth
-			// forwards upstream; X-Tenant-Id is the optional tenant-switch
-			// header (see internal/auth's Middleware).
+			// X-Tenant-Id is the optional tenant-switch header (see auth.Middleware).
 			AllowHeaders:     []string{"Content-Type", "Authorization", "X-Tenant-Id"},
 			ExposeHeaders:    []string{"X-Request-Id"},
 			AllowCredentials: false,
@@ -161,34 +143,26 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	identified.GET("/theme-assets/*path", assetHandler.Get)
 	identified.POST("/themes/:slug/preview", previewHandler.Preview)
 
-	// Not in the `identified` group: a browser WebSocket can't set an
-	// Authorization header, so this route authenticates itself via
-	// auth.WebSocketAuth (Sec-WebSocket-Protocol subprotocols) instead — see
-	// StreamHandler's doc comment. GET /chat (above) stays as the polling
-	// fallback for a client whose WebSocket can't connect (corporate proxy,
-	// etc.) — this doesn't replace it.
+	// Not in `identified`: a browser WebSocket can't set an Authorization header, so this
+	// route authenticates via Sec-WebSocket-Protocol subprotocols instead.
 	api.GET("/chats/:chatId/stream", streamHandler.Stream)
 
-	// Runs immediately and then every minute until Close cancels it (see
-	// themebuild.Service.RunReaper) — independent of any single request's
-	// lifecycle, so it needs its own long-lived context.
+	// Runs immediately and then every minute until Close cancels it — independent of any
+	// single request's lifecycle, so it needs its own long-lived context.
 	reaperCtx, reaperCancel := context.WithCancel(context.Background())
 	go buildSvc.RunReaper(reaperCtx)
 
 	return &Server{cfg: cfg, engine: r, authCache: authCache, reaperCancel: reaperCancel}, nil
 }
 
-// Close releases resources the server started that outlive a single
-// request — the auth cache's background sweep goroutine and the stale-
-// generation reaper. Called during graceful shutdown (see cmd/server/main.go).
+// Close releases resources the server started that outlive a single request — the auth
+// cache's sweep goroutine and the stale-generation reaper.
 func (s *Server) Close() {
 	s.authCache.Close()
 	s.reaperCancel()
 }
 
-// Handler exposes the underlying http.Handler — used both by Run (wrapped
-// in an *http.Server for graceful shutdown, see cmd/server/main.go) and by
-// in-process HTTP tests via httptest.
+// Handler exposes the underlying http.Handler, used both by Run and by in-process HTTP tests.
 func (s *Server) Handler() http.Handler {
 	return s.engine
 }
@@ -198,13 +172,8 @@ func (s *Server) Addr() string {
 	return ":" + s.cfg.Port
 }
 
-// maxBodySize caps every request body this API accepts at limit bytes — see
-// config.Config.MaxRequestBodyBytes's doc comment for why. http.MaxBytesReader
-// makes any read past limit fail with a *http.MaxBytesError instead of
-// silently allowing unbounded in-memory allocation; every handler already
-// surfaces a body-read/decode failure as a normal 400 through its existing
-// c.ShouldBindJSON + respondBindErr path (see handlers/errors.go), so a
-// request that hits this limit gets a clear error, not a crash or a hang.
+// maxBodySize caps every request body at limit bytes; a read past it fails with
+// *http.MaxBytesError, surfaced as an ordinary 400 by each handler's bind path.
 func maxBodySize(limit int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Body != nil {

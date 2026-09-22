@@ -14,11 +14,8 @@ import (
 	"ai-chat/internal/themefs"
 )
 
-// newFakeThemeServer stands in for flowpos-backend's theme-file API,
-// serving ListFiles (a flat tree — each map key becomes one top-level
-// "file" entry; the tool-exec methods under test only care whether an
-// entry is a file, never its nesting) and ReadFile from a fixed in-memory
-// file set.
+// newFakeThemeServer stands in for flowpos-backend's theme-file API, serving ListFiles (flat
+// tree, one entry per map key) and ReadFile from a fixed in-memory file set.
 func newFakeThemeServer(t *testing.T, files map[string]string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -65,13 +62,8 @@ func TestExecListThemeFiles(t *testing.T) {
 	}
 }
 
-// TestBuildFileReader_ReadsThroughDraftOverlay confirms the ai.FileReader
-// backing edit materialization (see materializeEdits in package ai) reads
-// through the SAME draft overlay the model's own read_theme_file tool
-// reads through — an edit targeting a file an earlier turn already staged
-// must see that staged content, never the stale saved-theme version
-// underneath it (same property execReadThemeFile's own test/doc comment
-// already establishes for the model-facing read tool).
+// Confirms buildFileReader reads through the SAME draft overlay read_theme_file does — an edit
+// targeting an earlier-staged file must see that staged content, never the stale saved version.
 func TestBuildFileReader_ReadsThroughDraftOverlay(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{"components/footer.liquid": "saved theme content"})
 	defer ts.Close()
@@ -127,14 +119,8 @@ func TestExecReadThemeFile_RejectsDisallowedExtension(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	// pages.json is a real, readable (and now writable) theme file, but
-	// read_theme_file still rejects it — not because of any extension
-	// restriction (pages.json is a legitimate .json file, same as any
-	// other now — see themefs.allowedGeneratedExtensions), but because
-	// it's already supplied directly in context (THEME_ENGINE_SPEC.md
-	// §0), so fetching it again through this tool is always a wasted
-	// round trip. See execReadThemeFile's own explicit pathPagesJSON/
-	// pathDefaultsJSON check.
+	// pages.json is readable/writable but read_theme_file rejects it anyway: it's already
+	// supplied in context, so fetching it here is always a wasted round trip.
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"pages.json"}})
 	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
@@ -282,8 +268,7 @@ func TestRepairFileReader_FallsBackToStoreForUnknownPath(t *testing.T) {
 	}
 }
 
-// TestRepairFileReader_PropagatesStoreErrorUnchanged is the edge case:
-// a real store read error must not be swallowed by the overlay.
+// A real store read error must not be swallowed by the overlay.
 func TestRepairFileReader_PropagatesStoreErrorUnchanged(t *testing.T) {
 	wantErr := errors.New("boom")
 	base := func(context.Context, string) (string, error) { return "", wantErr }
@@ -294,4 +279,3 @@ func TestRepairFileReader_PropagatesStoreErrorUnchanged(t *testing.T) {
 		t.Errorf("expected the store's own error to propagate unchanged, got %v", err)
 	}
 }
-

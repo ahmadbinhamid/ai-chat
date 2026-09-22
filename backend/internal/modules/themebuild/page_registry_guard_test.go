@@ -30,8 +30,7 @@ func TestSlugFromPageFilePath(t *testing.T) {
 	}
 }
 
-// TestSynthesizeMissingPageRegistry_FillsSingleCreate covers the core
-// case: one new page file, no registry entry proposed at all.
+// One new page file, no registry entry proposed at all.
 func TestSynthesizeMissingPageRegistry_FillsSingleCreate(t *testing.T) {
 	result := &ai.Result{Files: []ai.GeneratedFile{
 		{Path: "pages/pricing.liquid", Action: "create", Content: "..."},
@@ -47,8 +46,7 @@ func TestSynthesizeMissingPageRegistry_FillsSingleCreate(t *testing.T) {
 	}
 }
 
-// TestSynthesizeMissingPageRegistry_AuthScoped covers the pages/auth/*
-// route-prefix case.
+// Covers the pages/auth/* route-prefix case.
 func TestSynthesizeMissingPageRegistry_AuthScoped(t *testing.T) {
 	result := &ai.Result{Files: []ai.GeneratedFile{
 		{Path: "pages/auth/loyalty.liquid", Action: "create"},
@@ -60,9 +58,7 @@ func TestSynthesizeMissingPageRegistry_AuthScoped(t *testing.T) {
 	}
 }
 
-// TestSynthesizeMissingPageRegistry_NeverOverwritesExisting covers the
-// "never second-guess a real answer" contract — even an entry that looks
-// wrong (mismatched slug) must be left alone.
+// Even an entry that looks wrong (mismatched slug) must be left alone.
 func TestSynthesizeMissingPageRegistry_NeverOverwritesExisting(t *testing.T) {
 	original := &themefs.PageEntry{Slug: "something-else", Page: "something-else"}
 	result := &ai.Result{
@@ -76,8 +72,7 @@ func TestSynthesizeMissingPageRegistry_NeverOverwritesExisting(t *testing.T) {
 	}
 }
 
-// TestSynthesizeMissingPageRegistry_SkipsMultiCreate covers the
-// "compound create has no single obvious identity" exclusion.
+// A compound multi-page create has no single obvious identity to guess at.
 func TestSynthesizeMissingPageRegistry_SkipsMultiCreate(t *testing.T) {
 	result := &ai.Result{Files: []ai.GeneratedFile{
 		{Path: "pages/pricing.liquid", Action: "create"},
@@ -90,9 +85,7 @@ func TestSynthesizeMissingPageRegistry_SkipsMultiCreate(t *testing.T) {
 	}
 }
 
-// TestSynthesizeMissingPageRegistry_SkipsNonPageFiles covers a create that
-// isn't a page at all (a new component) — must never be mistaken for a
-// page identity.
+// A created component file must never be mistaken for a page identity.
 func TestSynthesizeMissingPageRegistry_SkipsNonPageFiles(t *testing.T) {
 	result := &ai.Result{Files: []ai.GeneratedFile{
 		{Path: "components/widget.liquid", Action: "create"},
@@ -138,9 +131,7 @@ func TestDroppedProtectedSlugs(t *testing.T) {
 	}
 }
 
-// TestProtectPages_BlocksDeleteWithoutExplicitRequest covers the main
-// guard: a proposal deleting pages/blog.liquid as a side effect of some
-// other request must have that action stripped.
+// A proposal deleting pages/blog.liquid as a side effect must have that action stripped.
 func TestProtectPages_BlocksDeleteWithoutExplicitRequest(t *testing.T) {
 	result := &ai.Result{Files: []ai.GeneratedFile{
 		{Path: "pages/blog.liquid", Action: "delete"},
@@ -157,9 +148,7 @@ func TestProtectPages_BlocksDeleteWithoutExplicitRequest(t *testing.T) {
 	}
 }
 
-// TestProtectPages_AllowsExplicitDeletion covers the escape hatch — a
-// merchant who genuinely wants the blog page gone must still be able to
-// delete it.
+// A merchant who genuinely wants the blog page gone must still be able to delete it.
 func TestProtectPages_AllowsExplicitDeletion(t *testing.T) {
 	result := &ai.Result{Files: []ai.GeneratedFile{
 		{Path: "pages/blog.liquid", Action: "delete"},
@@ -175,9 +164,7 @@ func TestProtectPages_AllowsExplicitDeletion(t *testing.T) {
 	}
 }
 
-// TestProtectPages_RevertsPagesJSONRewriteThatDropsProtectedSlug covers
-// the second vector: a direct pages.json rewrite (not a delete action)
-// that silently drops a protected slug's row.
+// Covers the second vector: a direct pages.json rewrite that silently drops a protected slug's row.
 func TestProtectPages_RevertsPagesJSONRewriteThatDropsProtectedSlug(t *testing.T) {
 	current := `[{"slug":"blog","page":"blog","status":"published"},{"slug":"pricing","page":"pricing","status":"published"}]`
 	rewritten := `[{"slug":"pricing","page":"pricing","status":"published"}]` // blog silently dropped
@@ -196,9 +183,7 @@ func TestProtectPages_RevertsPagesJSONRewriteThatDropsProtectedSlug(t *testing.T
 	}
 }
 
-// TestProtectPages_LeavesUnrelatedFilesAlone is the negative control — a
-// normal proposal touching neither a protected page nor pages.json must
-// pass through completely unchanged.
+// A proposal touching neither a protected page nor pages.json must pass through unchanged.
 func TestProtectPages_LeavesUnrelatedFilesAlone(t *testing.T) {
 	result := &ai.Result{Files: []ai.GeneratedFile{
 		{Path: "pages/pricing.liquid", Action: "update", Content: "new content"},

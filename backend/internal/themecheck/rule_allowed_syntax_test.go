@@ -41,9 +41,7 @@ func TestCheckAllowedSyntax_UnknownTag(t *testing.T) {
 }
 
 func TestCheckAllowedSyntax_UnknownFilter(t *testing.T) {
-	// "replace" is a real php-liquid filter (so ScanOutputExpressions parses
-	// it fine) but not one §1 documents — genuinely disallowed, unlike
-	// truncate below.
+	// "replace" parses fine but isn't §1-documented — genuinely disallowed, unlike truncate below.
 	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Content: "{{ product.name | replace: 'a', 'b' }}"}}}
 	got := checkAllowedSyntax(p, Snapshot{})
 	if len(got) != 1 {
@@ -51,11 +49,7 @@ func TestCheckAllowedSyntax_UnknownFilter(t *testing.T) {
 	}
 }
 
-// TestCheckAllowedSyntax_SpecDocumentedFiltersAreAllowed covers the five
-// filters §1 has always documented (money, get_products, escape,
-// strip_html, truncate) but allowedFilters didn't actually accept until
-// this fix — see allowedFilters' own doc comment. A regression here means
-// the whitelist has drifted from §1 again.
+// TestCheckAllowedSyntax_SpecDocumentedFiltersAreAllowed covers the five §1-documented filters allowedFilters must accept.
 func TestCheckAllowedSyntax_SpecDocumentedFiltersAreAllowed(t *testing.T) {
 	content := `{{ price | money }}
 {{ "slug-a,slug-b" | split: ',' | get_products }}

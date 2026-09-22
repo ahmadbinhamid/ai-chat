@@ -8,9 +8,7 @@ import (
 	"ai-chat/internal/ai"
 )
 
-// fakeGeneratorErr wraps fakeGenerator to additionally support returning a
-// hard error from Generate on a given call — fakeGenerator (see
-// check_and_repair_test.go) only ever returns results, never an error.
+// fakeGeneratorErr supports hard errors in addition to results.
 type fakeGeneratorErr struct {
 	fakeGenerator
 	errOnCall int // 1-indexed call number to fail on; 0 means never
@@ -102,9 +100,7 @@ func TestGenerateValidProposal_HardGenerateErrorIsNotRetried(t *testing.T) {
 	}
 }
 
-// hallucinatedEmptyResult mimics the production bug this task exists to
-// fix: needs_clarification false, an empty files array, and zero
-// exploration tool calls — the model describing work it never did.
+// hallucinatedEmptyResult: the production bug (false + no files + no exploration).
 func hallucinatedEmptyResult(summary string) *ai.Result {
 	return &ai.Result{Summary: summary, NeedsClarification: false, ExplorationToolCalls: 0}
 }
@@ -119,11 +115,7 @@ func clarificationResult(summary string) *ai.Result {
 	return &ai.Result{Summary: summary, NeedsClarification: true, ExplorationToolCalls: 0}
 }
 
-// answeredQuestionResult mimics a genuine Q&A reply per theme_engine_spec.md
-// §0's third case — a question or read-only request, answered directly,
-// legitimately needing zero exploration and zero proposed changes. This is
-// exactly the shape that used to be indistinguishable from
-// hallucinatedEmptyResult and got retried into unwanted exploration.
+// answeredQuestionResult: genuine Q&A reply (was indistinguishable from hallucination).
 func answeredQuestionResult(summary string) *ai.Result {
 	return &ai.Result{Summary: summary, AnsweredQuestion: true, NeedsClarification: false, ExplorationToolCalls: 0}
 }

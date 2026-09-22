@@ -15,20 +15,14 @@ const (
 	landmarkPreviewChars = 120
 )
 
-// maxHeadingChars caps a single heading's text — every other per-item field
-// in this file is already length-capped one way or another; without this,
-// one pathological heading (a merchant's own copy dumped into an <h1>)
-// could dominate the whole budget on its own before DigestHardCapBytes'
-// final truncation ever gets a say in which section loses ground. See
-// maxCSSValueChars in digest_tokens.go for the same reasoning applied to a
-// declared CSS value.
+// maxHeadingChars caps one heading's text so a pathological <h1> can't
+// dominate the whole budget before DigestHardCapBytes' truncation runs.
 const maxHeadingChars = 200
 
 // headingTags maps a heading tag name to its outline depth/level.
 var headingTags = map[string]int{"h1": 1, "h2": 2, "h3": 3}
 
-// landmarkTags are the elements STRUCTURE's outline previews — the HTML
-// landmark roles a merchant's own section rhythm is usually built from.
+// landmarkTags are the HTML landmark roles STRUCTURE's outline previews.
 var landmarkTags = map[string]bool{
 	"header": true, "nav": true, "main": true, "section": true,
 	"article": true, "aside": true, "footer": true,
@@ -49,14 +43,12 @@ type structureInfo struct {
 	landmarks []landmark
 }
 
-// landmarkFrame tracks one currently-open landmark element's accumulating
-// preview text — a stack of these, not a single variable, since landmarks
-// nest constantly in real markup (a <nav> inside a <header>, a <section>
-// inside <main>).
+// landmarkFrame tracks one open landmark's accumulating preview text — a
+// stack since landmarks nest constantly (a <nav> inside a <header>).
 type landmarkFrame struct {
 	tag  string
 	buf  strings.Builder
-	done bool // stop appending once buf has enough for a preview, but the frame stays open so close-tag bookkeeping (matching by tag name) stays correct
+	done bool // stop appending once buf is full; frame stays open for close-tag bookkeeping
 }
 
 func extractStructure(htmlSrc string) structureInfo {

@@ -11,15 +11,9 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
-// TestVisionModelSmokeTest is a throwaway go/no-go check for the image-
-// attachment feature plan (see the plan doc): can deepseek-v4-flash-vision-
-// exp actually drive THIS project's real tool-loop (list/read/grep/
-// propose_changes, the exact defs from tools.go) with an image attached,
-// or does the "just swap the model string" premise break down?
-//
-// Skipped unless DEEPSEEK_VISION_SMOKE_TEST=1 is set — this hits a real,
-// experimental, billed API and has no place running in normal `make test`/
-// CI. Delete this file once the go/no-go question is answered either way.
+// TestVisionModelSmokeTest is a throwaway go/no-go check for whether the vision model can
+// drive this project's real tool-loop with an image attached. Skipped unless
+// DEEPSEEK_VISION_SMOKE_TEST=1 — hits a real, billed API, no place in normal `make test`/CI.
 func TestVisionModelSmokeTest(t *testing.T) {
 	if os.Getenv("DEEPSEEK_VISION_SMOKE_TEST") != "1" {
 		t.Skip("set DEEPSEEK_VISION_SMOKE_TEST=1 to run this against the real DeepSeek API")
@@ -39,10 +33,7 @@ func TestVisionModelSmokeTest(t *testing.T) {
 
 	client := anthropic.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseURL))
 
-	// A real, valid, minimal 1x1 PNG — this smoke test is about PIPELINE
-	// compatibility (does the endpoint accept an image block at all, still
-	// call tools, still parse structured output), not vision quality, so a
-	// trivial image is sufficient.
+	// A real, valid, minimal 1x1 PNG — this is about pipeline compatibility, not vision quality.
 	const onePixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
 	tools := []anthropic.ToolUnionParam{
@@ -117,12 +108,8 @@ func TestVisionModelSmokeTest(t *testing.T) {
 	run(t, "with_thinking_and_effort", true)
 }
 
-// TestVisionModel_ImageTokenDelta isolates the image's own marginal input-
-// token cost — same model, same tools, same prompt text, same (empty)
-// history, differing ONLY in whether an image block is attached. Comparing
-// across different real chats/tenants would confound the comparison (their
-// theme context sizes differ) — this holds everything else fixed instead.
-// Same skip/env-var gating as TestVisionModelSmokeTest.
+// TestVisionModel_ImageTokenDelta isolates the image's marginal input-token cost — same
+// model/tools/prompt, differing only in whether an image block is attached.
 func TestVisionModel_ImageTokenDelta(t *testing.T) {
 	if os.Getenv("DEEPSEEK_VISION_SMOKE_TEST") != "1" {
 		t.Skip("set DEEPSEEK_VISION_SMOKE_TEST=1 to run this against the real DeepSeek API")
@@ -166,13 +153,9 @@ func TestVisionModel_ImageTokenDelta(t *testing.T) {
 		return msg.Usage.InputTokens
 	}
 
-	// Order matters here: DeepSeek's compat endpoint caches on request-
-	// prefix match (see ai.New's own doc comment), so whichever call runs
-	// SECOND can get a cache-discounted input_tokens reading regardless of
-	// the image — reversed from TestVisionModel_ImageTokenDelta's first
-	// run (image second) specifically to check for that confound: if the
-	// "second call is cheaper" pattern flips when the order flips, that
-	// confirms it's a caching artifact, not the image's real cost.
+	// Order matters: DeepSeek caches on request-prefix match, so whichever call runs SECOND
+	// can get a discounted reading regardless of the image. Order is reversed here to check
+	// for that confound: if "second call is cheaper" flips with the order, it's a caching artifact.
 	withImage := call(t, true)
 	withoutImage := call(t, false)
 	t.Logf("GO/NO-GO (reversed order): image's own marginal input-token cost = %d tokens", withImage-withoutImage)

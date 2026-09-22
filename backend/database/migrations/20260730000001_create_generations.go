@@ -14,18 +14,11 @@ func init() {
 	})
 }
 
-// generations is the durable replacement for themebuild's in-memory
-// generationTracker (phase 3a) — a row per background Generate call, so
-// GET /chat's generating/generation_error fields survive a pod restart and
-// work correctly with more than one replica, and so a reaper can find and
-// fail generations whose process died mid-run.
+// generations is a durable, multi-replica-safe replacement for the old in-memory
+// generation tracker, so state survives a pod restart and a reaper can find dead runs.
 //
-// MySQL has no native "unique index only when a condition holds", unlike
-// Postgres' partial unique index — running_chat_id is the standard
-// workaround: a virtual column that's NULL except while status='running',
-// with a plain UNIQUE key on it. MySQL unique indexes allow any number of
-// NULLs, so only the "one running generation per chat" case is actually
-// constrained; a chat's many succeeded/failed rows never collide.
+// running_chat_id is a virtual column (NULL unless status='running') since MySQL lacks a
+// partial unique index — the UNIQUE key on it enforces one running generation per chat.
 func Up_20260730000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS generations (

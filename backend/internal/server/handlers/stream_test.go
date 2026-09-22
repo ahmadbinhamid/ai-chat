@@ -49,13 +49,7 @@ func openStreamTestDB(t *testing.T) *sql.DB {
 	return conn
 }
 
-// fakeAuthMiddleware stands in for auth.Middleware: it sets the same
-// context key auth.Middleware sets (auth.Identity, under Gin key
-// "auth_identity" — see internal/auth/middleware.go's ctxIdentityKey),
-// without a real FlowPOS server to introspect a token against. Every
-// request in this test is "authenticated" as tenantID. Used by handlers
-// still behind auth.Middleware (see preview_test.go) — the Stream handler
-// itself no longer is, see fakeFlowposServer below.
+// fakeAuthMiddleware stands in for auth.Middleware: sets auth.Identity under gin key "auth_identity". Every request is authenticated as tenantID.
 func fakeAuthMiddleware(tenantID uint64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Set("auth_identity", auth.Identity{TenantID: tenantID, UserID: 1})
@@ -63,12 +57,7 @@ func fakeAuthMiddleware(tenantID uint64) gin.HandlerFunc {
 	}
 }
 
-// fakeFlowposServer stands in for the real FlowPOS /user endpoint that
-// auth.WebSocketAuth introspects against — the Stream handler now
-// authenticates itself (see auth.WebSocketAuth), unlike the rest of this
-// package's handlers, which sit behind auth.Middleware and can be tested
-// against a fake gin.HandlerFunc instead. Every token this server sees
-// resolves to one active user belonging to exactly one tenant, tenantID.
+// fakeFlowposServer stands in for the real FlowPOS /user endpoint auth.WebSocketAuth introspects against; every token resolves to one active user in tenantID.
 func fakeFlowposServer(t *testing.T, tenantID uint64) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -88,10 +77,7 @@ func fakeFlowposServer(t *testing.T, tenantID uint64) *httptest.Server {
 	return srv
 }
 
-// authSubprotocols builds the Sec-WebSocket-Protocol entries a real browser
-// client sends (see auth.WebSocketAuth / auth.parseWebSocketSubprotocols) —
-// the token is base64url-encoded since it's carried as a subprotocol, not a
-// header.
+// authSubprotocols builds the Sec-WebSocket-Protocol entries a real browser sends; the token is base64url-encoded since it's carried as a subprotocol, not a header.
 func authSubprotocols(token string, tenantID uint64) []string {
 	return []string{
 		"bearer." + base64.RawURLEncoding.EncodeToString([]byte(token)),
@@ -99,8 +85,7 @@ func authSubprotocols(token string, tenantID uint64) []string {
 	}
 }
 
-// readReady reads one frame and asserts it's the {"type":"ready"} frame
-// marking the end of replay (see streamReadyMessage).
+// readReady reads one frame and asserts it's the {"type":"ready"} frame marking the end of replay.
 func readReady(t *testing.T, conn *websocket.Conn, wantLastSeq int64) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -161,11 +146,8 @@ func TestStreamHandler_EchoesOfferedSubprotocolOnAccept(t *testing.T) {
 	}
 	defer func() { _ = wsConn.CloseNow() }()
 
-	// The 101 response must echo back exactly the "bearer.<...>" subprotocol
-	// the client offered — a real browser's WebSocket constructor treats a
-	// missing/mismatched Sec-WebSocket-Protocol response header as a failed
-	// handshake, even though coder/websocket's own client (used everywhere
-	// else in this file) doesn't check for it. See stream.go's Accept call.
+	// The 101 response must echo back exactly the offered subprotocol — a real browser treats a missing/mismatched
+	// Sec-WebSocket-Protocol header as a failed handshake, even though coder/websocket's own client doesn't check for it.
 	got := resp.Header.Get("Sec-WebSocket-Protocol")
 	if got != offered[0] {
 		t.Errorf("expected Sec-WebSocket-Protocol %q echoed back, got %q", offered[0], got)
@@ -188,10 +170,7 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	buildRepo := themebuild.NewRepository(conn)
 	buildSvc := themebuild.NewService(buildRepo, chatSvc, nil, nil, rdb)
 
-	// A fresh tenant ID per run: chats are keyed on (tenant_id, type), so a
-	// fixed constant would reuse the same chat (and its generation rows)
-	// across repeated test runs, tripping the "one running generation per
-	// chat" constraint on a chat a previous run left running.
+	// A fresh tenant ID per run: chats are keyed on (tenant_id, type), so a fixed constant would reuse a previous run's chat/generation rows.
 	tenantID := uint64(time.Now().UnixNano())
 	ctx := context.Background()
 	ch, err := chatSvc.GetOrCreateChat(ctx, tenantID, themebuild.ChatType)
@@ -219,8 +198,7 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/chats/" + ch.ID + "/stream"
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer dialCancel()
-	// Dial's own doc comment: "You never need to close resp.Body yourself" —
-	// it's already closed internally by the time Dial returns.
+	// resp.Body is already closed internally by the time Dial returns.
 	wsConn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{ //nolint:bodyclose
 		Subprotocols: authSubprotocols("test-token", tenantID),
 	})
@@ -229,14 +207,12 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	}
 	defer func() { _ = wsConn.CloseNow() }()
 
-	// Replay: both pre-existing events, in order, followed by the "ready"
-	// frame marking the end of replay (see streamReadyMessage).
+	// Replay: both pre-existing events, in order, followed by the "ready" frame.
 	readEvent(t, wsConn, themebuild.EventTypeStarted, 1)
 	readEvent(t, wsConn, themebuild.EventTypeChecking, 2)
 	readReady(t, wsConn, 2)
 
-	// Live delivery: publish a third event via Redis (as the real
-	// eventEmitter would) and confirm it arrives without a second connect.
+	// Live delivery: publish a third event via Redis and confirm it arrives without a second connect.
 	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 3, themebuild.EventTypeRepairing, map[string]int{"attempt": 1})
 	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
 		GenerationID: genID, ChatID: ch.ID, Seq: 3, Type: themebuild.EventTypeRepairing,
@@ -244,9 +220,7 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	})
 	readEvent(t, wsConn, themebuild.EventTypeRepairing, 3)
 
-	// A "done" event must NOT close the connection — the chat can still
-	// receive another prompt, and the client shouldn't have to reconnect
-	// for it (see Stream's doc comment / waitForLiveEvents).
+	// A "done" event must NOT close the connection — the chat can still receive another prompt without a reconnect.
 	if err := buildRepo.EndGeneration(ctx, ch.ID, nil); err != nil {
 		t.Fatalf("EndGeneration failed: %v", err)
 	}
@@ -257,9 +231,7 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	})
 	readEvent(t, wsConn, themebuild.EventTypeDone, 4)
 
-	// Prove the connection is genuinely still open and subscribed, not just
-	// slow to close: a brand-new generation's event on the same chat must
-	// still arrive on this same connection, no reconnect needed.
+	// Prove the connection is genuinely still open and subscribed: a brand-new generation's event must still arrive here, no reconnect needed.
 	genID2 := uuid.NewString()
 	if err := buildRepo.StartGeneration(ctx, genID2, ch.ID, tenantID); err != nil {
 		t.Fatalf("second StartGeneration failed: %v", err)
@@ -272,17 +244,9 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	readEvent(t, wsConn, themebuild.EventTypeStarted, 5)
 }
 
-// TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark is
-// item 5: a client that's already replayed the durable history (watermark
-// at seq 2) must still receive a live ephemeral (seq: 0) event — the whole
-// reason for waitForLiveEvents' seq==0 carve-out is that Seq: 0 <=
-// watermark is otherwise ALWAYS true once watermark has advanced past 0,
-// which would make every ephemeral event look like an "already delivered
-// during replay" duplicate and get silently dropped forever. It then also
-// confirms the ephemeral event didn't corrupt the watermark itself: a
-// genuine overlap-window duplicate of seq 2 published afterward must still
-// be correctly skipped, and a real seq 3 event must still arrive next, not
-// the stale duplicate.
+// TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark confirms a live ephemeral (seq:0) event still arrives
+// after watermark has advanced (otherwise seq:0<=watermark always looks like an already-delivered duplicate and gets dropped),
+// and that delivering it doesn't corrupt the watermark — a genuine seq-2 duplicate after it is still skipped, and the real seq-3 event arrives next.
 func TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark(t *testing.T) {
 	conn := openStreamTestDB(t)
 	rdb, err := themebuild.NewRedisClient(getenvOr("REDIS_URL", "redis://127.0.0.1:6379"))
@@ -334,8 +298,7 @@ func TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark(t *test
 	}
 	defer func() { _ = wsConn.CloseNow() }()
 
-	// Replay ends with watermark at 2 — the exact state under which the
-	// Seq:0<=watermark bug would always trigger.
+	// Replay ends with watermark at 2 — the exact state the Seq:0<=watermark bug would always trigger.
 	readEvent(t, wsConn, themebuild.EventTypeStarted, 1)
 	readEvent(t, wsConn, themebuild.EventTypeChecking, 2)
 	readReady(t, wsConn, 2)
@@ -347,15 +310,12 @@ func TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark(t *test
 	})
 	readEvent(t, wsConn, themebuild.EventTypeThinking, 0)
 
-	// An overlap-window duplicate of seq 2 (see Stream's own doc comment on
-	// why this can legitimately happen) — must be silently skipped, which
-	// only holds if the ephemeral event above didn't reset the watermark.
+	// An overlap-window duplicate of seq 2 must be silently skipped — only holds if the ephemeral event above didn't reset the watermark.
 	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
 		GenerationID: genID, ChatID: ch.ID, Seq: 2, Type: themebuild.EventTypeChecking,
 		Payload: json.RawMessage(`{"attempt":1}`), CreatedAt: time.Now().UTC(),
 	})
-	// A real seq 3 event published right after — if the duplicate above had
-	// wrongly gotten through, it (not this one) would be what arrives next.
+	// A real seq 3 event right after — if the duplicate above had wrongly gotten through, it would arrive next instead.
 	publishRaw(t, rdb, ch.ID, themebuild.GenerationEvent{
 		GenerationID: genID, ChatID: ch.ID, Seq: 3, Type: themebuild.EventTypeRepairing,
 		Payload: json.RawMessage(`{"attempt":1}`), CreatedAt: time.Now().UTC(),
@@ -363,13 +323,8 @@ func TestStreamHandler_EphemeralEventDeliveredWithoutDisturbingWatermark(t *test
 	readEvent(t, wsConn, themebuild.EventTypeRepairing, 3)
 }
 
-// TestStreamHandler_UnresponsivePeerIsClosedWithinIOTimeout guards against a
-// peer that's alive at the TCP level (no FIN/RST — a sleeping laptop, a
-// dropped WiFi association, a NAT that silently stopped forwarding) but
-// never answers a ping with a pong. Without a bounded context on
-// conn.Ping/conn.Write (see ioTimeout's doc comment in stream.go), the
-// handler's goroutine — and its event-bus subscription — would wedge
-// forever instead of detecting and closing the connection.
+// TestStreamHandler_UnresponsivePeerIsClosedWithinIOTimeout guards against a peer alive at the TCP level that never answers
+// a ping — without ioTimeout bounding conn.Ping/conn.Write, the handler's goroutine and its event-bus subscription would wedge forever.
 func TestStreamHandler_UnresponsivePeerIsClosedWithinIOTimeout(t *testing.T) {
 	origPingInterval, origIOTimeout := pingInterval, ioTimeout
 	pingInterval = 50 * time.Millisecond
@@ -413,30 +368,15 @@ func TestStreamHandler_UnresponsivePeerIsClosedWithinIOTimeout(t *testing.T) {
 	}
 	defer func() { _ = wsConn.CloseNow() }()
 
-	// Drain exactly the one "ready" frame the handshake guarantees, then go
-	// silent: no CloseRead, no further Read/Reader calls of any kind.
-	// Reading again here — even just to poll for closure — would itself
-	// answer any buffered ping with a pong (see coder/websocket Reader's
-	// doc comment: "It will handle ping, pong and close frames as
-	// appropriate"), which is precisely what a genuinely unresponsive peer
-	// would not do. An earlier version of this test called Read to check
-	// for closure and, by doing so, accidentally kept the "unresponsive"
-	// peer responsive — verifying closure must avoid the read side
-	// entirely, hence the Write probe below instead.
+	// Drain the one guaranteed "ready" frame, then go silent — no further Read calls, since coder/websocket's Reader
+	// auto-answers pings with pongs, which would make the "unresponsive" peer responsive again. Verify closure via write probes instead.
 	readReady(t, wsConn, 0)
 
-	// Give the server more than one pingInterval + ioTimeout (150ms here)
-	// to notice and close the connection.
+	// Give the server more than one pingInterval + ioTimeout to notice and close the connection.
 	time.Sleep(pingInterval + ioTimeout + 300*time.Millisecond)
 
-	// Probe for closure with retried writes rather than a single one: raw
-	// TCP semantics mean the very first write after a peer closes can
-	// still succeed locally (the bytes are simply handed to the kernel
-	// send buffer before the resulting RST/FIN has round-tripped back) —
-	// it's typically the *next* write that surfaces the error. Retrying
-	// over a couple seconds makes the assertion robust to that, while
-	// still failing (a fix regression is a permanent, not transient,
-	// "still open") if the server never actually closed the connection.
+	// Retried writes, not one: the first write after a peer closes can still succeed locally (bytes handed to the kernel
+	// before the RST/FIN round-trips back) — retry over a couple seconds so this stays robust without masking a real non-close regression.
 	deadline := time.Now().Add(2 * time.Second)
 	var probeErr error
 	for time.Now().Before(deadline) {
@@ -474,7 +414,7 @@ func TestStreamHandler_UnknownChatRejectedBeforeUpgrade(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/chats/" + uuid.NewString() + "/stream"
 	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// See the other Dial call in this file re: not needing to close resp.Body.
+	// resp.Body is already closed internally by Dial.
 	_, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{ //nolint:bodyclose
 		Subprotocols: authSubprotocols("test-token", tenantID),
 	})
@@ -500,9 +440,7 @@ func mustAppendEvent(t *testing.T, ctx context.Context, repo *themebuild.Reposit
 	}
 }
 
-// publishRaw publishes ev to the same Redis channel the real eventEmitter
-// uses ("gen:{chat_id}" — see themebuild's unexported redisChannelForChat,
-// mirrored here since it isn't exported outside that package).
+// publishRaw publishes ev to the same Redis channel the real eventEmitter uses ("gen:{chat_id}").
 func publishRaw(t *testing.T, rdb *redis.Client, chatID string, ev themebuild.GenerationEvent) {
 	t.Helper()
 	encoded, err := json.Marshal(ev)

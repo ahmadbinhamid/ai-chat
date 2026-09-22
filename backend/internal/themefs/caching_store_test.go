@@ -8,9 +8,7 @@ import (
 	"testing"
 )
 
-// countingStore is a ThemeStore that counts how many times base methods are
-// actually invoked, so tests can assert on cache hits/misses rather than
-// just on returned values.
+// countingStore is a ThemeStore that counts base method invocations, so tests can assert on cache hits/misses.
 type countingStore struct {
 	mu    sync.Mutex
 	files map[string]string
@@ -21,10 +19,7 @@ type countingStore struct {
 	writeCalls  int32
 	deleteCalls int32
 
-	// block, when non-nil, is closed by the test to release a ReadFile call
-	// that's parked waiting for it — used to force two concurrent ReadFile
-	// calls for the same path to overlap in time, so singleflight coalescing
-	// actually has something to coalesce.
+	// block, when non-nil, is closed by the test to release a parked ReadFile call — forces concurrent calls to overlap so singleflight has something to coalesce.
 	block <-chan struct{}
 }
 
@@ -67,9 +62,7 @@ func (c *countingStore) readCount(relPath string) int {
 	return c.readCalls[relPath]
 }
 
-// TestCachingStore_ReadFile_SecondReadIsCacheHit covers the whole point of
-// CachingStore: a second ReadFile for the same path within one store's
-// lifetime must not reach base again.
+// TestCachingStore_ReadFile_SecondReadIsCacheHit: a second ReadFile for the same path must not reach base again.
 func TestCachingStore_ReadFile_SecondReadIsCacheHit(t *testing.T) {
 	base := newCountingStore()
 	base.files["pages.json"] = `{"routes":[]}`
@@ -90,9 +83,7 @@ func TestCachingStore_ReadFile_SecondReadIsCacheHit(t *testing.T) {
 	}
 }
 
-// TestCachingStore_ReadFile_DifferentPathsAreIndependent guards against a
-// cache keyed wrong (e.g. a single-entry cache instead of per-path) — two
-// distinct paths must each be fetched from base exactly once.
+// TestCachingStore_ReadFile_DifferentPathsAreIndependent guards against a cache keyed wrong (e.g. single-entry instead of per-path).
 func TestCachingStore_ReadFile_DifferentPathsAreIndependent(t *testing.T) {
 	base := newCountingStore()
 	base.files["pages.json"] = "A"
@@ -116,10 +107,7 @@ func TestCachingStore_ReadFile_DifferentPathsAreIndependent(t *testing.T) {
 	}
 }
 
-// TestCachingStore_ReadFile_ConcurrentIdenticalReadsCoalesce covers the
-// singleflight half of CachingStore's doc comment: two callers asking for
-// the same not-yet-cached path at the same time must result in exactly one
-// base ReadFile call, with both callers getting that one result.
+// TestCachingStore_ReadFile_ConcurrentIdenticalReadsCoalesce: two callers reading the same uncached path concurrently must produce exactly one base call.
 func TestCachingStore_ReadFile_ConcurrentIdenticalReadsCoalesce(t *testing.T) {
 	base := newCountingStore()
 	base.files["pages/home.liquid"] = "HOME"
@@ -155,11 +143,7 @@ func TestCachingStore_ReadFile_ConcurrentIdenticalReadsCoalesce(t *testing.T) {
 	}
 }
 
-// TestCachingStore_ListFiles_SecondCallIsCacheHit mirrors
-// TestCachingStore_ReadFile_SecondReadIsCacheHit for the tree cache —
-// buildThemeContext and buildSnapshotBase each call ListFiles independently
-// within one generation today, and that duplication is exactly what this
-// cache removes.
+// TestCachingStore_ListFiles_SecondCallIsCacheHit mirrors the ReadFile cache-hit test for the tree cache.
 func TestCachingStore_ListFiles_SecondCallIsCacheHit(t *testing.T) {
 	base := newCountingStore()
 	base.tree = []FileTreeEntry{{Name: "pages.json", Path: "pages.json", Type: "file"}}
@@ -180,10 +164,7 @@ func TestCachingStore_ListFiles_SecondCallIsCacheHit(t *testing.T) {
 	}
 }
 
-// TestCachingStore_WriteFile_InvalidatesThatPathAndTree covers Invalidate:
-// a write through the cache must drop that path's cached content (so a
-// later ReadFile sees the new value, not a stale cached one) and drop the
-// cached tree (a write can add a brand-new path the old tree didn't have).
+// TestCachingStore_WriteFile_InvalidatesThatPathAndTree: a write must drop that path's cached content and the cached tree.
 func TestCachingStore_WriteFile_InvalidatesThatPathAndTree(t *testing.T) {
 	base := newCountingStore()
 	base.files["pages/home.liquid"] = "OLD"
@@ -244,10 +225,7 @@ func TestCachingStore_DeleteFile_Invalidates(t *testing.T) {
 	}
 }
 
-// TestCachingStore_ReadFile_ErrorNotCached covers a correctness edge: a
-// failed base read must not be cached as if it were a successful empty
-// read, or a transient FlowPOS error would poison every later read of that
-// path for the rest of the generation.
+// TestCachingStore_ReadFile_ErrorNotCached: a failed read must not be cached, or a transient error would poison every later read of that path.
 func TestCachingStore_ReadFile_ErrorNotCached(t *testing.T) {
 	base := newCountingStore() // no fixture for "missing.liquid" -> ReadFile errors
 	c := NewCachingStore(base)
@@ -268,10 +246,7 @@ func TestCachingStore_ReadFile_ErrorNotCached(t *testing.T) {
 	}
 }
 
-// TestCachingStore_CacheFile_StopsCachingPastEntryCap covers
-// cachingStoreMaxEntries: once the cache holds that many distinct paths, a
-// new path is served correctly but not retained — proven by a 2nd read of
-// that same new path costing a 2nd base call.
+// TestCachingStore_CacheFile_StopsCachingPastEntryCap: past cachingStoreMaxEntries, a new path is served correctly but not retained.
 func TestCachingStore_CacheFile_StopsCachingPastEntryCap(t *testing.T) {
 	base := newCountingStore()
 	c := NewCachingStore(base)
@@ -299,9 +274,7 @@ func TestCachingStore_CacheFile_StopsCachingPastEntryCap(t *testing.T) {
 	}
 }
 
-// TestCachingStore_SatisfiesThemeStore is a compile-time-ish guard: anything
-// depending on themefs.ThemeStore (doGenerate's store var, buildToolExecutor,
-// etc.) must be able to hold a *CachingStore.
+// TestCachingStore_SatisfiesThemeStore is a compile-time-ish guard that *CachingStore satisfies ThemeStore.
 func TestCachingStore_SatisfiesThemeStore(t *testing.T) {
 	var _ ThemeStore = NewCachingStore(newCountingStore())
 }

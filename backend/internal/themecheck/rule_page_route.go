@@ -26,9 +26,7 @@ type existingPageEntry struct {
 	Type string `json:"type"`
 }
 
-// parseExistingPages parses the theme's current pages.json. A malformed or
-// unexpected shape is treated as "no existing routes known" rather than
-// itself a finding — pages.json's own shape isn't this rule's concern.
+// parseExistingPages parses pages.json; a malformed shape is treated as no known routes, not a finding.
 func parseExistingPages(pagesJSON string) []existingPageEntry {
 	if strings.TrimSpace(pagesJSON) == "" {
 		return nil
@@ -40,9 +38,7 @@ func parseExistingPages(pagesJSON string) []existingPageEntry {
 	return entries
 }
 
-// expectedPageFilePath is the theme-relative .liquid file a pages.json entry
-// must correspond to, per spec §5: path "/pages/auth" ->
-// pages/auth/<page>.liquid, "/pages" (or anything else) -> pages/<page>.liquid.
+// expectedPageFilePath maps a pages.json entry to its .liquid file per spec §5 ("/pages/auth" -> pages/auth/<page>.liquid).
 func expectedPageFilePath(entry *themefs.PageEntry) string {
 	if entry.Path == "/pages/auth" {
 		return "pages/auth/" + entry.Page + ".liquid"
@@ -50,10 +46,8 @@ func expectedPageFilePath(entry *themefs.PageEntry) string {
 	return "pages/" + entry.Page + ".liquid"
 }
 
-// checkPageRoute enforces rule 6: a new pages/<slug>.liquid file must have a
-// matching pages.json registration (page == slug == the file's basename,
-// path matching its subdirectory, slug not already taken, no duplicate
-// system-type entry).
+// checkPageRoute enforces rule 6: a new pages/<slug>.liquid file needs a matching pages.json registration
+// (page == slug == basename, no duplicate slug or system-type entry).
 func checkPageRoute(p Proposal, snap Snapshot) []Finding {
 	var findings []Finding
 	entry := p.PageRegistryEntry

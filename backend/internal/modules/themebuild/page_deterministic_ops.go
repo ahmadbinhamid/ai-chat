@@ -12,22 +12,8 @@ import (
 	"ai-chat/internal/themefs"
 )
 
-// tryDeterministicPageOp checks prompt against pageintent's two narrow
-// detectors — register an existing page, diagnose why an existing page
-// isn't working — and, on a confirmed match, answers without ever calling
-// the model. See pageintent's package doc comment for why each detector is
-// deliberately tight: registering an existing page is a pages.json entry,
-// which currently costs a full generation (a multi-minute, many-thousand-
-// token model call) for what is a structured, zero-ambiguity edit once a
-// matching file is confirmed on disk.
-//
-// ok is false whenever nothing here applies OR a detector matched but this
-// function couldn't confirm enough to act safely (an I/O error, no file on
-// disk matching the guessed slug, an ambiguous "register the page" with no
-// name) — doGenerate falls through to normal generation in every ok=false
-// case, exactly as if this function didn't exist. This is a fast path, not
-// a correctness requirement: it must never be the reason a real request
-// goes unanswered.
+// tryDeterministicPageOp answers register/diagnose-existing-page requests without calling the
+// model, on a confirmed match; ok=false falls through to normal generation, never blocking a request.
 func (s *Service) tryDeterministicPageOp(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, prompt string) (*ai.Result, bool) {
 	if name, ok := pageintent.DetectRegisterExisting(prompt); ok {
 		return s.tryRegisterExistingPage(ctx, store, storeAuth, name)
@@ -38,23 +24,15 @@ func (s *Service) tryDeterministicPageOp(ctx context.Context, store themefs.Them
 	return nil, false
 }
 
-// pageRegistryEntryLite is the subset of a pages.json record the
-// deterministic ops need to check registration/status — deliberately its
-// own small type here rather than reusing themecheck.existingPageEntry
-// (unexported, and this package must not depend on themecheck's internals
-// for something this narrow) or themefs.PageEntry (all 14 fields, most
-// unused for a read-only lookup).
+// pageRegistryEntryLite is the subset of a pages.json record needed for a read-only lookup.
 type pageRegistryEntryLite struct {
 	Slug   string `json:"slug"`
 	Page   string `json:"page"`
 	Status string `json:"status"`
 }
 
-// parsePageRegistryEntries parses the theme's current pages.json (a flat
-// JSON array — see themefs.PageEntry's own doc comment on why this service
-// no longer merges it locally). A malformed or unexpected shape is treated
-// as "no existing routes known," matching themecheck's rule_page_route.go
-// own parseExistingPages behavior for the same file.
+// parsePageRegistryEntries parses pages.json's flat JSON array; a malformed shape is treated as
+// "no existing routes known."
 func parsePageRegistryEntries(pagesJSON string) []pageRegistryEntryLite {
 	if strings.TrimSpace(pagesJSON) == "" {
 		return nil
@@ -66,10 +44,7 @@ func parsePageRegistryEntries(pagesJSON string) []pageRegistryEntryLite {
 	return entries
 }
 
-// findRegistryEntry looks up slug by either its slug or page identity field
-// — spec §5's "page" basename and "slug" are the same value for a custom
-// page, but checking both is cheap and covers a hand-edited or historical
-// entry where they've drifted.
+// findRegistryEntry checks both slug and page fields, covering a hand-edited entry where they've drifted.
 func findRegistryEntry(entries []pageRegistryEntryLite, slug string) (pageRegistryEntryLite, bool) {
 	for _, e := range entries {
 		if e.Slug == slug || e.Page == slug {
@@ -86,11 +61,8 @@ type existingPageFile struct {
 	authScoped bool
 }
 
-// findExistingPageFile confirms a candidate page file actually exists in
-// the theme's file tree — via ListFiles, not ReadFile: Store.ReadFile
-// returns ("", nil) for a missing file (see its own doc comment), which is
-// indistinguishable from a real but empty file by error alone, so ListFiles
-// membership is the only reliable existence check here.
+// findExistingPageFile checks via ListFiles, not ReadFile — ReadFile returns ("", nil) for a
+// missing file, indistinguishable from an empty one.
 func findExistingPageFile(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, nameHint string) (existingPageFile, bool, error) {
 	slug := pageintent.Slugify(nameHint)
 	if slug == "" {
@@ -112,10 +84,7 @@ func findExistingPageFile(ctx context.Context, store themefs.ThemeStore, storeAu
 	return existingPageFile{}, false, nil
 }
 
-// titleFromSlug renders a kebab-case slug as a display title —
-// "about-us" -> "About Us". Only used to fill PageEntry.Title/the reply
-// summary when registering a page the merchant didn't otherwise supply a
-// title for; FlowPOS/the merchant can always rename it afterward.
+// titleFromSlug renders a kebab-case slug as a display title — "about-us" -> "About Us".
 func titleFromSlug(slug string) string {
 	words := strings.Split(slug, "-")
 	for i, w := range words {
@@ -127,21 +96,8 @@ func titleFromSlug(slug string) string {
 	return strings.Join(words, " ")
 }
 
-// tryRegisterExistingPage implements the confirmed half of
-// tryDeterministicPageOp's register path: nameHint has already passed
-// pageintent.DetectRegisterExisting's trigger/edit-cue checks, but that
-// alone is never enough to act — a real file must exist, and it must not
-// already be registered.
-//
-// On success, the returned *ai.Result carries an "update" action on the
-// existing file with its content byte-for-byte UNCHANGED, plus a
-// PageRegistryEntry — buildWritePlan (unmodified, see writeplan.go)
-// attaches that entry as PageMeta on the matching file, and
-// flowpos-backend's own ThemeFileService.save upserts pages.json from it
-// on Apply, exactly as it would for a model-authored proposal. This
-// service never merges pages.json content itself (see themefs.PageEntry's
-// doc comment) — reusing that existing path means this deterministic op
-// needs no pages.json-writing code of its own.
+// tryRegisterExistingPage confirms a real, not-yet-registered file exists before acting. On
+// success the file content is unchanged; PageRegistryEntry rides along so Apply upserts pages.json normally.
 func (s *Service) tryRegisterExistingPage(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, nameHint string) (*ai.Result, bool) {
 	match, found, err := findExistingPageFile(ctx, store, storeAuth, nameHint)
 	if err != nil {
@@ -150,10 +106,7 @@ func (s *Service) tryRegisterExistingPage(ctx context.Context, store themefs.The
 		return nil, false
 	}
 	if !found {
-		// No file matches the guessed slug — most likely the merchant
-		// actually wants a NEW page (create + register), which is a
-		// different operation this deterministic op deliberately doesn't
-		// attempt (see its own doc comment). Let normal generation decide.
+		// No file matches: likely a new-page request, a different op this deterministic path doesn't attempt.
 		return nil, false
 	}
 
@@ -194,24 +147,14 @@ func (s *Service) tryRegisterExistingPage(ctx context.Context, store themefs.The
 			Page:  match.slug,
 			Path:  routePath,
 			Type:  "custom",
-			// Registering an existing page is the merchant explicitly
-			// asking for it to become reachable — an omitted/draft status
-			// would leave it 404ing in prod (spec §5), silently defeating
-			// the entire point of asking to register it.
+			// Draft status would leave the page 404ing in prod, defeating the point of registering it.
 			Status: "published",
 		},
 	}, true
 }
 
-// tryDiagnoseExistingPage implements the confirmed half of
-// tryDeterministicPageOp's diagnose path: nameHint has already passed
-// pageintent.DetectDiagnoseExisting's trigger/edit-cue checks. This only
-// answers the structural questions this service can check without the
-// model — file exists, registered, publish status — never a content/
-// template-logic diagnosis (that's genuinely out of scope: see the
-// contract this mirrors, which explicitly does not implement
-// fix_existing_page). The result never proposes a file change; it only
-// replies.
+// tryDiagnoseExistingPage answers structural questions only (exists, registered, publish
+// status) — never a content/template-logic diagnosis. It never proposes a file change.
 func (s *Service) tryDiagnoseExistingPage(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, nameHint string) (*ai.Result, bool) {
 	slug := pageintent.Slugify(nameHint)
 	if slug == "" {
@@ -244,12 +187,7 @@ func (s *Service) tryDiagnoseExistingPage(ctx context.Context, store themefs.The
 	var summary string
 	switch {
 	case !fileExists && !registered:
-		// Nothing on disk or in the registry matches the guessed slug at
-		// all — this is exactly the case a wrong guess (a synonym, a typo,
-		// the merchant's own informal name for the page) looks identical
-		// to a genuinely missing page. Reporting "it doesn't exist" here
-		// risks being flatly wrong; normal generation can grep_theme for a
-		// closer match instead of this deterministic op guessing.
+		// A wrong slug guess looks identical to a genuinely missing page; let normal generation grep for a closer match.
 		return nil, false
 	case !fileExists && registered:
 		summary = fmt.Sprintf(

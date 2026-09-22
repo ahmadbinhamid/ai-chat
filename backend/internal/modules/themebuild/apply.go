@@ -20,14 +20,12 @@ type ApplyResult struct {
 	AppliedPaths []string `json:"applied_paths"`
 }
 
-// DiscardResult summarizes what DiscardDraft threw away.
 type DiscardResult struct {
 	DiscardedPaths []string `json:"discarded_paths"`
 	DiscardedTurns int      `json:"discarded_turns"`
 }
 
-// DraftSummaryResult is GET /chat's pending_changes field — see
-// Service.DraftSummary.
+// DraftSummaryResult is GET /chat's pending_changes field.
 type DraftSummaryResult struct {
 	HasChanges   bool     `json:"has_changes"`
 	FilePaths    []string `json:"file_paths"`

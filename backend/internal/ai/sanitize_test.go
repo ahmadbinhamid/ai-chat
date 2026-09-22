@@ -10,11 +10,8 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
-// typedAPIError builds a minimal *anthropic.Error carrying only a
-// StatusCode — enough to exercise categorizeError's typed-error path
-// without needing a real HTTP round trip or a JSON error body (Type() stays
-// "" unless UnmarshalJSON populated it, which these tests don't need since
-// they're only checking the StatusCode-based branches).
+// typedAPIError builds a minimal *anthropic.Error carrying only a StatusCode, enough to
+// exercise categorizeError's typed-error path without a real HTTP round trip.
 func typedAPIError(statusCode int) error {
 	return &anthropic.Error{
 		StatusCode: statusCode,
@@ -39,11 +36,7 @@ func TestSanitizeError(t *testing.T) {
 			mustNotHave: []string{"Anthropic", "anthropic", "claude", "api.anthropic.com"},
 		},
 		{
-			// Regression test: observed in production. DeepSeek's compat
-			// endpoint's own wording for "out of money" has no "credit" in
-			// it at all, unlike Anthropic's — the original check (looking
-			// for "credit balance" or "insufficient"+"credit" together)
-			// silently missed this and fell through to the generic message.
+			// DeepSeek's "out of money" wording has no "credit" in it at all, unlike Anthropic's.
 			name: "deepseek insufficient balance",
 			err: errors.New(`claude stream: POST "https://api.deepseek.com/anthropic/v1/messages": 402 Payment Required ` +
 				`{"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}`),
@@ -51,11 +44,8 @@ func TestSanitizeError(t *testing.T) {
 			mustNotHave: []string{"DeepSeek", "deepseek", "api.deepseek.com"},
 		},
 		{
-			// Regression test: observed in production twice, with two
-			// different underlying json.Unmarshal failures — the provider's
-			// stream got cut off/garbled mid-chunk before the SDK could
-			// reassemble a content block's JSON. Neither message matched any
-			// existing case, so both fell through to the generic message.
+			// The provider's stream got cut off/garbled mid-chunk before the SDK could
+			// reassemble a content block's JSON.
 			name:        "provider stream truncated mid-response",
 			err:         errors.New("accumulate stream: error converting content block to JSON: json: error calling MarshalJSON for type json.RawMessage: unexpected end of JSON input"),
 			wantContain: "interrupted",
@@ -107,11 +97,8 @@ func TestSanitizeError(t *testing.T) {
 			wantContain: "temporarily unavailable",
 		},
 		{
-			// The typed path classifies this correctly from StatusCode
-			// alone, without ever inspecting Error()'s own text — unlike
-			// the string-matching fallback, a "521" appearing incidentally
-			// elsewhere in the request (e.g. a request ID) can't influence
-			// this result, because the fallback is never reached.
+			// The typed path classifies this from StatusCode alone, so a "429"-shaped
+			// substring incidentally in the request ID can't influence the result.
 			name: "typed API error: 521 cloudflare origin unreachable, with a request ID that itself contains a misleading status-code-shaped substring",
 			err: &anthropic.Error{
 				StatusCode: 521,

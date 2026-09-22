@@ -5,10 +5,8 @@ import (
 	"testing"
 )
 
-// TestDeltaCoalescer_CoalescesManySmallChunks is item 6: 100 tiny chunks
-// must produce far fewer onDelta calls than 100, and the concatenation of
-// whatever WAS published must exactly equal the concatenation of every
-// chunk fed in — coalescing must never drop or reorder text, only batch it.
+// TestDeltaCoalescer_CoalescesManySmallChunks checks 100 tiny chunks produce far fewer
+// onDelta calls, and published text exactly equals the concatenation of every chunk fed in.
 func TestDeltaCoalescer_CoalescesManySmallChunks(t *testing.T) {
 	var published []string
 	c := newDeltaCoalescer(func(s string) { published = append(published, s) })
@@ -37,11 +35,8 @@ func TestDeltaCoalescer_CoalescesManySmallChunks(t *testing.T) {
 	}
 }
 
-// TestDeltaCoalescer_FlushSendsRemainder confirms flush() delivers a short
-// fragment that never hit either coalescing limit on its own — without
-// this, the tail end of a turn's narration (very often exactly this case:
-// the stream just ended, so nothing else ever triggers another add() call)
-// would be silently dropped.
+// TestDeltaCoalescer_FlushSendsRemainder checks flush() delivers a short fragment that
+// never hit either coalescing limit — otherwise a turn's tail end gets silently dropped.
 func TestDeltaCoalescer_FlushSendsRemainder(t *testing.T) {
 	var published []string
 	c := newDeltaCoalescer(func(s string) { published = append(published, s) })
@@ -55,17 +50,14 @@ func TestDeltaCoalescer_FlushSendsRemainder(t *testing.T) {
 		t.Fatalf("expected flush to deliver the buffered remainder, got %+v", published)
 	}
 
-	// A second flush with nothing buffered must be a no-op, not a spurious
-	// empty-string publish.
+	// A second flush with nothing buffered must be a no-op, not a spurious empty publish.
 	c.flush()
 	if len(published) != 1 {
 		t.Fatalf("expected flushing an empty buffer to be a no-op, got %+v", published)
 	}
 }
 
-// TestDeltaCoalescer_NilOnDeltaIsANoOp mirrors Generate's own contract:
-// onDelta is optional (most callers, e.g. Summarize, never pass one), so
-// add() must tolerate a nil onDelta without panicking.
+// TestDeltaCoalescer_NilOnDeltaIsANoOp checks add() tolerates a nil onDelta without panicking.
 func TestDeltaCoalescer_NilOnDeltaIsANoOp(t *testing.T) {
 	c := newDeltaCoalescer(nil)
 	c.add("anything")

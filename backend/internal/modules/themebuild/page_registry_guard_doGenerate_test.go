@@ -14,16 +14,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// TestDoGenerate_ProtectsBlogPageFromSideEffectPagesJSONRewrite drives
-// protectPages through the real doGenerate. The scenario is a direct
-// pages.json rewrite (Action "update" — a plain, always-valid file edit;
-// see protectPages' own doc comment on why this, not a delete action, is
-// the actually-reachable vector in this codebase: validateProposal only
-// accepts create/update) that silently drops the blog listing's row while
-// ostensibly just updating the pricing page's entry. The prompt never asks
-// for the blog page to go, so pages.json must land unchanged, and the
-// merchant-visible summary must say so rather than silently look like the
-// request was carried out in full.
+// Drives protectPages through the real doGenerate: a pages.json update silently drops the blog
+// row while ostensibly updating pricing; it must land unchanged, with the summary saying so.
 func TestDoGenerate_ProtectsBlogPageFromSideEffectPagesJSONRewrite(t *testing.T) {
 	conn := openTestDB(t)
 	chatRepo := chat.NewRepository(conn)

@@ -1,10 +1,6 @@
 package themecheck
 
-// fieldSpec is one node in the §7 data-model tree. array marks a node whose
-// value is a list — meaningful for resolving `{% for x in <path> %}`: when
-// <path> resolves to an array node, the loop variable becomes an alias for
-// that node's children (see checkKnownFields's one-hop resolution).
-// children is nil for a plain scalar leaf.
+// fieldSpec is one node in the §7 data-model tree; array marks a list node, whose children the `{% for %}` loop variable aliases.
 type fieldSpec struct {
 	array    bool
 	children map[string]*fieldSpec
@@ -18,12 +14,7 @@ func arr(children map[string]*fieldSpec) *fieldSpec {
 	return &fieldSpec{array: true, children: children}
 }
 
-// productFields is shared between "product" (detail page) and
-// "products.items[]" (list contexts) — spec §7 says list contexts get the
-// product shape "minus detail-only fields", but reusing the full shape here
-// deliberately over-permits rather than risk flagging a real field as
-// invented in a list context; rule 12 is a blocking error, so precision
-// matters more than catching this narrower distinction.
+// productFields is shared between "product" and "products.items[]"; deliberately over-permits list-context fields rather than risk a false rule-12 error.
 var productFields = map[string]*fieldSpec{
 	"name": leaf(), "id": leaf(), "slug": leaf(), "sku": leaf(), "barcode": leaf(),
 	"description": leaf(), "image_url": leaf(),
@@ -56,11 +47,7 @@ var paginationFields = map[string]*fieldSpec{
 	"has_prev": leaf(), "has_next": leaf(), "prev_page": leaf(), "next_page": leaf(),
 }
 
-// dataModel encodes theme_engine_spec.md §7's data model, keyed by the root
-// context variable's name. "forloop" isn't a §7 object — it's a Liquid
-// built-in — but it's included here because rule 12 enforces it the exact
-// same way: a known root with only specific children allowed (§1 permits
-// only forloop.first/forloop.last).
+// dataModel encodes theme_engine_spec.md §7's data model; "forloop" is a Liquid built-in, not a §7 object, but rule 12 enforces it the same way.
 var dataModel = map[string]*fieldSpec{
 	"page":  obj(map[string]*fieldSpec{"title": leaf(), "seo_title": leaf(), "seo_description": leaf(), "seo_keywords": leaf()}),
 	"store": obj(map[string]*fieldSpec{"name": leaf()}),

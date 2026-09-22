@@ -7,16 +7,8 @@ import (
 
 const ruleIDKnownFields = "known-fields"
 
-// resolvePathNode resolves a dotted path (e.g. "product.choices" or
-// "choice.label") against lookupRoot — the §7 data model plus whatever
-// for-loop aliases are in scope at this point in the file (see
-// checkKnownFieldsInFile). It returns a non-empty message ONLY when the
-// path's root is known but some field beneath it isn't listed for it — an
-// unrecognized root produces no message at all (nil, ""): §1 says
-// components receive only explicit render params, so names like `variant`
-// or `background` inside a component are never §7 objects, and flagging
-// every one of them would turn this into a blocking error on ordinary,
-// correct code. Precision over recall (see phase 1 design notes).
+// resolvePathNode resolves a dotted path against lookupRoot (the §7 model plus in-scope for-loop aliases).
+// An unrecognized root returns no message — component render params (e.g. "variant") are never §7 objects.
 func resolvePathNode(path string, lookupRoot func(string) (*fieldSpec, bool)) (*fieldSpec, string) {
 	segments := strings.Split(path, ".")
 	cur, known := lookupRoot(segments[0])
@@ -42,10 +34,7 @@ func resolvePathNode(path string, lookupRoot func(string) (*fieldSpec, bool)) (*
 	return cur, ""
 }
 
-// checkKnownFields enforces rule 12: every object.field reference in a
-// proposed .liquid file's output, if/elsif conditions, and for-loop sources
-// must resolve against §7 (or, one hop deep, a for-loop variable bound to a
-// known array field).
+// checkKnownFields enforces rule 12: every object.field reference must resolve against §7, or a for-loop alias one hop deep.
 func checkKnownFields(p Proposal, _ Snapshot) []Finding {
 	var findings []Finding
 	for _, f := range p.Files {
@@ -57,14 +46,8 @@ func checkKnownFields(p Proposal, _ Snapshot) []Finding {
 	return findings
 }
 
-// checkKnownFieldsInFile walks a file's tags and {{ }} outputs together in
-// true document order (not as two independently-scanned lists), maintaining
-// a stack of for-loop alias scopes — pushed on {% for %}, popped on
-// {% endfor %}. This block-scoping matters: two sequential (not nested)
-// loops in the same file reusing a short loop variable name for two
-// different sources (a real pattern — e.g. `for item in menu.items` then
-// later `for item in products.items`) must each resolve `item` against
-// their own source, not whichever binding happened to be seen last.
+// checkKnownFieldsInFile walks tags and outputs in document order, maintaining a stack of for-loop alias scopes.
+// Scoping matters: two sequential (not nested) loops can reuse the same loop var name for different sources.
 func checkKnownFieldsInFile(path, content string) []Finding {
 	var findings []Finding
 	tags := ScanTags(content)

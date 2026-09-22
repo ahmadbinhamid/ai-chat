@@ -14,16 +14,11 @@ import (
 // malformed) — safe to surface to the caller as a real 401.
 var ErrUnauthorized = errors.New("flowpos rejected the token")
 
-// ErrUpstreamUnavailable covers everything else that can go wrong talking to
-// FlowPOS — timeouts, connection failures, 5xx, an unexpected status code, a
-// malformed response body. Deliberately never conflated with ErrUnauthorized:
-// a down identity provider must never look like an expired token, or every
-// user gets logged out during an upstream blip (see Middleware).
+// ErrUpstreamUnavailable covers everything else. Never conflated with ErrUnauthorized: a
+// down provider must not look like an expired token, or an upstream blip logs everyone out.
 var ErrUpstreamUnavailable = errors.New("flowpos identity provider unavailable")
 
-// Tenant is one entry in user.tenants[] from the introspection response —
-// the tenant a request may resolve to, and the role/permissions it carries
-// for that specific tenant.
+// Tenant is one entry in user.tenants[] from the introspection response.
 type Tenant struct {
 	ID           uint64
 	Slug         string
@@ -33,18 +28,14 @@ type Tenant struct {
 	Permissions  []string
 }
 
-// IntrospectResult is the parsed /user response for one token. It is the
-// exact shape cached (see CacheEntry) — tenant resolution happens later,
-// fresh, against Tenants (see package doc comment for why).
+// IntrospectResult is the parsed /user response for one token; the exact shape cached.
 type IntrospectResult struct {
 	UserID   uint64
 	Name     string
 	Email    string
 	IsActive bool
 	Tenants  []Tenant
-	// DefaultTenantID is data.defaultTenant.id, or nil if the response had
-	// no defaultTenant — used as the tenant to resolve to when the caller
-	// sends no X-Tenant-Id.
+	// DefaultTenantID is used when the caller sends no X-Tenant-Id; nil if the response had none.
 	DefaultTenantID *uint64
 }
 
@@ -82,10 +73,8 @@ type Client struct {
 	http    *http.Client
 }
 
-// NewClient builds a Client around one pooled *http.Client, reused across
-// every call — never one client per request. timeout bounds the whole
-// round trip; there is no retry on any status, including 401 (an invalid
-// token doesn't become valid on a second try).
+// NewClient builds a Client around one pooled *http.Client. timeout bounds the round trip;
+// there is no retry on any status, including 401.
 func NewClient(baseURL string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -93,11 +82,8 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 	}
 }
 
-// Introspect verifies token against FlowPOS and returns the identity data it
-// carries. Returns ErrUnauthorized only for an actual 401; every other
-// failure mode (timeout, network error, 5xx, an unexpected status, a
-// malformed body) returns ErrUpstreamUnavailable instead, wrapped with
-// detail via %w/fmt.Errorf so errors.Is still matches.
+// Introspect verifies token against FlowPOS. Returns ErrUnauthorized only for an actual 401;
+// every other failure returns ErrUpstreamUnavailable.
 func (c *Client) Introspect(ctx context.Context, token string) (*IntrospectResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/user", nil)
 	if err != nil {

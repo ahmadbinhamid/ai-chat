@@ -10,13 +10,8 @@ import (
 )
 
 // loadDigestFixture reads testdata/<name>.html (required) and
-// testdata/<name>.css (optional — some fixtures, like inline_style_only
-// and client_rendered_shell, deliberately have none), then combines the
-// external CSS with whatever inline <style> content the HTML itself
-// contains — mirroring how Service.fetchReferenceURL actually assembles
-// BuildDigest's css argument in production (Fetcher.FetchStylesheets
-// combining inline + fetched-external CSS), just without a real network
-// fetch standing in for "external".
+// testdata/<name>.css (optional — some fixtures have none), combining inline
+// + external CSS the same way Fetcher.FetchStylesheets does in production.
 func loadDigestFixture(t *testing.T, name string) (htmlSrc, css string) {
 	t.Helper()
 	htmlBytes, err := os.ReadFile(filepath.Join("testdata", name+".html"))
@@ -52,15 +47,11 @@ func TestBuildDigest_OrdinaryMarketingPage(t *testing.T) {
 	if d.Title != "Acme Outdoors — Gear for the trail" {
 		t.Errorf("Title = %q", d.Title)
 	}
-	// #6E9A3A is background-color in 3 of the fixture CSS's rules — the
-	// single most-repeated background-color, i.e. exactly the "brand
-	// color" signal design tokens ranking exists to surface.
+	// #6E9A3A is the fixture's most-repeated background-color — the brand-color signal.
 	if !strings.Contains(d.Text, "#6E9A3A") {
 		t.Errorf("expected the brand color #6E9A3A to appear in the digest:\n%s", d.Text)
 	}
-	// "Georgia" is the fixture's heading typeface (h1, h2, h3 { font-family:
-	// "Georgia", serif; ... }) — the "names the page's actual typefaces"
-	// half of Phase 3's own "Done when" criterion.
+	// "Georgia" is the fixture's heading typeface.
 	if !strings.Contains(d.Text, "Georgia") {
 		t.Errorf("expected the heading typeface \"Georgia\" to appear in the digest:\n%s", d.Text)
 	}
@@ -111,11 +102,8 @@ func TestBuildDigest_InlineStyleOnlyNoExternalStylesheet(t *testing.T) {
 	if d.Empty {
 		t.Errorf("expected real headings and copy to NOT be classified Empty, got digest:\n%s", d.Text)
 	}
-	// #B5651D is declared only inside the fixture's <style> block — there
-	// is no external stylesheet for this fixture at all (no
-	// testdata/inline_style_only.css) — so this only passes if inline
-	// <style> content actually reaches BuildDigest's design-tokens
-	// extraction.
+	// #B5651D is declared only inside the fixture's inline <style> block (no
+	// external .css fixture exists) — passes only if inline CSS reaches BuildDigest.
 	if !strings.Contains(d.Text, "#B5651D") {
 		t.Errorf("expected a color declared only in an inline <style> block to appear in the digest:\n%s", d.Text)
 	}
@@ -129,10 +117,8 @@ func TestBuildDigest_OverHardCapIsTruncated(t *testing.T) {
 	if len(d.Text) > DigestHardCapBytes {
 		t.Fatalf("expected the digest to be truncated to at most %d bytes, got %d", DigestHardCapBytes, len(d.Text))
 	}
-	// Close to (not just under) the cap — proves truncation actually fired
-	// rather than the content happening to land under the cap on its own,
-	// which per-section caps alone would not achieve for this fixture (see
-	// its own generation comment / size).
+	// Close to (not just under) the cap proves truncation actually fired,
+	// rather than the content happening to land under it on its own.
 	if len(d.Text) < DigestHardCapBytes-10 {
 		t.Errorf("expected the digest to be truncated close to the %d-byte cap, got %d bytes — did the fixture stop being large enough to actually exceed it?", DigestHardCapBytes, len(d.Text))
 	}
@@ -147,13 +133,9 @@ func TestBuildDigest_OverHardCapIsTruncated(t *testing.T) {
 	}
 }
 
-// TestCSSPropertyPattern_DoesNotMatchAsASuffixOfALongerProperty guards the
-// exact bug class cssPropertyPatterns' own doc comment describes: "color"
-// naively matched via \bcolor\b also matches inside "background-color"
-// because CSS's "-" is a regex word-boundary character. This asserts the
-// "color" pattern captures NOTHING from a rule that only declares
-// background-color, and the "background-color" pattern captures correctly
-// from the same input.
+// TestCSSPropertyPattern_DoesNotMatchAsASuffixOfALongerProperty guards
+// against "color" naively matching inside "background-color" (CSS's "-" is
+// a regex word-boundary character).
 func TestCSSPropertyPattern_DoesNotMatchAsASuffixOfALongerProperty(t *testing.T) {
 	css := ".btn { background-color: #6E9A3A; }"
 	if m := cssPropertyPatterns["color"].FindStringSubmatch(css); m != nil {
@@ -165,10 +147,8 @@ func TestCSSPropertyPattern_DoesNotMatchAsASuffixOfALongerProperty(t *testing.T)
 	}
 }
 
-// TestCSSPropertyPattern_MatchesFirstDeclarationInARule confirms the
-// pattern's "preceded by { or ; " requirement still matches a property
-// that's the very first declaration after an opening brace, with no
-// preceding ";" to anchor on.
+// TestCSSPropertyPattern_MatchesFirstDeclarationInARule confirms a property
+// right after "{" (no preceding ";") still matches.
 func TestCSSPropertyPattern_MatchesFirstDeclarationInARule(t *testing.T) {
 	css := ".btn{color:red;background:blue}"
 	m := cssPropertyPatterns["color"].FindStringSubmatch(css)
@@ -201,7 +181,7 @@ func TestFilenameStem(t *testing.T) {
 }
 
 func TestTruncateBytes_PreservesValidUTF8(t *testing.T) {
-	// "é" is 2 bytes (0xC3 0xA9) — cutting at n=1 lands mid-rune.
+	// "é" is 2 bytes — cutting at n=1 lands mid-rune.
 	s := "aé"
 	got := truncateBytes(s, 1)
 	if !utf8.ValidString(got) {

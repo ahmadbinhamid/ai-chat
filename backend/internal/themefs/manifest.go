@@ -11,25 +11,14 @@ import (
 	"time"
 )
 
-// ComponentInfo describes one components/*.liquid or liquid/partials/*.liquid
-// file's inferred call signature — this dialect has no formal parameter
-// declaration syntax (§1: render passes only explicit params, but a
-// component never declares what it expects), so Params is a heuristic:
-// every bare identifier the component's own markup references that isn't
-// one of §7's global context objects and isn't a name the component itself
-// defines (an assign/capture target or a for-loop variable) is assumed to
-// be an incoming param — which is exactly the same "unknown root = a
-// render param, not a data-model object" assumption themecheck's
-// known-fields rule already makes about component markup.
+// ComponentInfo describes a component/partial's inferred call signature. This dialect has no param declaration syntax,
+// so Params is a heuristic: any bare identifier not a §7 global and not self-defined (assign/capture/for-loop var) is assumed to be a param.
 type ComponentInfo struct {
 	Path   string
 	Params []string
 }
 
-// Manifest is a snapshot of the active theme's structure: every file path,
-// plus a component/partial param-signature index — given to the model as
-// grounding (see ai.ThemeContext.Manifest) so it knows what params an
-// existing component actually expects instead of guessing.
+// Manifest is a snapshot of the theme's structure — every file path plus a component param-signature index, given to the model as grounding.
 type Manifest struct {
 	ContentHash string
 	GeneratedAt time.Time
@@ -37,9 +26,7 @@ type Manifest struct {
 	Components  []ComponentInfo
 }
 
-// globalContextRoots are §7's context object names — never an inferred
-// component param, since these are populated globally by the platform, not
-// passed in by whatever renders the component.
+// globalContextRoots are §7's context object names — never inferred as a component param since the platform populates them globally.
 var globalContextRoots = map[string]bool{
 	"page": true, "store": true, "theme": true, "menu": true, "path": true,
 	"customer": true, "customer_authenticated": true, "auth_check": true,
@@ -57,9 +44,7 @@ var (
 	manifestCaptureRe    = regexp.MustCompile(`\{%-?\s*capture\s+(\w+)`)
 )
 
-// inferParams applies the heuristic described on ComponentInfo to one
-// component's source, returning its inferred params sorted for a stable,
-// diffable manifest.
+// inferParams applies ComponentInfo's heuristic to one component's source, returning params sorted for a stable, diffable manifest.
 func inferParams(content string) []string {
 	defined := map[string]bool{}
 	for _, m := range manifestForVarRe.FindAllStringSubmatch(content, -1) {
@@ -90,19 +75,13 @@ func inferParams(content string) []string {
 	return params
 }
 
-// isComponentOrPartial reports whether path is the kind of file
-// GenerateManifest indexes params for — components and liquid/partials
-// only (§8): pages are entry points, not things another file renders with
-// explicit params to introspect.
+// isComponentOrPartial reports whether path is a components/ or liquid/partials/ file (§8) — pages are entry points, not things introspected for params.
 func isComponentOrPartial(path string) bool {
 	return strings.HasSuffix(path, ".liquid") &&
 		(strings.HasPrefix(path, "components/") || strings.HasPrefix(path, "liquid/partials/"))
 }
 
-// GenerateManifest fetches every file in the active theme and builds a
-// fresh Manifest — always does the full work (list + read every .liquid
-// file + infer every component's params); see GetOrGenerateManifest for
-// the cached version most callers want instead.
+// GenerateManifest fetches every theme file and builds a fresh Manifest, always doing the full work — see GetOrGenerateManifest for the cached version most callers want.
 func (s *Store) GenerateManifest(ctx context.Context, auth RequestAuth) (Manifest, error) {
 	tree, err := s.ListFiles(ctx, auth)
 	if err != nil {
@@ -143,11 +122,8 @@ func (s *Store) GenerateManifest(ctx context.Context, auth RequestAuth) (Manifes
 	}, nil
 }
 
-// flattenTree records every FILE path (not directories) from a theme's file
-// tree into paths — a private copy of the same walk themebuild's
-// flattenFileTree does, kept local to this package rather than shared,
-// since themefs must not depend on themebuild (dependencies only ever flow
-// the other way — see themebuild's own doc comment).
+// flattenTree records every file path (not directories) from the tree into paths — a local copy of themebuild's
+// flattenFileTree, kept separate since themefs must not depend on themebuild.
 func flattenTree(entries []FileTreeEntry, paths map[string]bool) {
 	for _, e := range entries {
 		if e.Type == "file" {
@@ -173,16 +149,8 @@ type manifestCache struct {
 	entries map[uint64]manifestCacheEntry
 }
 
-// treeFingerprint hashes just the file tree's paths+types (one ListFiles
-// call, no file content) — a cheap-to-compute signal for "did the set of
-// files change" that GetOrGenerateManifest checks before paying for a full
-// GenerateManifest (which reads every .liquid file's content to build the
-// component param index and the manifest's own ContentHash). This misses a
-// same-paths-different-content edit — a real trade-off, not an oversight:
-// themefs has no local disk to stat an mtime from and no cheaper signal
-// this HTTP API exposes (see the package doc comment on why), so "the file
-// set is unchanged" is the best cheap proxy available for "probably still
-// the same manifest".
+// treeFingerprint hashes just the tree's paths+types — a cheap signal GetOrGenerateManifest checks before paying for a
+// full GenerateManifest. Known trade-off: misses a same-paths-different-content edit; there's no cheaper signal available.
 func treeFingerprint(entries []FileTreeEntry) string {
 	paths := map[string]bool{}
 	flattenTree(entries, paths)
@@ -198,11 +166,8 @@ func treeFingerprint(entries []FileTreeEntry) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// GetOrGenerateManifest returns auth.TenantID's cached manifest if the
-// theme's file tree hasn't changed since it was last computed (a single,
-// cheap ListFiles call to check), or generates — and caches — a fresh one
-// otherwise. Use this instead of GenerateManifest directly unless a
-// guaranteed-fresh manifest matters more than avoiding the extra work.
+// GetOrGenerateManifest returns auth.TenantID's cached manifest if the file tree hasn't changed (one cheap ListFiles
+// check), else generates and caches a fresh one. Prefer this over GenerateManifest unless a guaranteed-fresh manifest matters more.
 func (s *Store) GetOrGenerateManifest(ctx context.Context, auth RequestAuth) (Manifest, error) {
 	tree, err := s.ListFiles(ctx, auth)
 	if err != nil {

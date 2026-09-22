@@ -8,10 +8,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// QueueHandler exposes cancelling a prompt, queued or already running —
-// see themebuild.Service.CancelQueuedGeneration's doc comment for how the
-// two cases differ (a queued prompt stops synchronously here; a running
-// one stops asynchronously, once its own goroutine notices).
+// QueueHandler exposes cancelling a prompt, queued or already running; a queued prompt
+// stops synchronously, a running one stops asynchronously once its goroutine notices.
 type QueueHandler struct {
 	builder *themebuild.Service
 }
@@ -30,9 +28,7 @@ func (h *QueueHandler) Cancel(c *gin.Context) {
 	httpresponse.NoContent(c)
 }
 
-// CancelAll handles DELETE /chats/:chatId/queue — cancels the running
-// generation (if any) and everything still queued behind it, in one call.
-// See themebuild.Service.CancelAllPending's doc comment.
+// CancelAll handles DELETE /chats/:chatId/queue — cancels the running generation (if any) and everything queued behind it.
 func (h *QueueHandler) CancelAll(c *gin.Context) {
 	err := h.builder.CancelAllPending(c.Request.Context(), auth.TenantID(c), c.Param("chatId"))
 	if err != nil {

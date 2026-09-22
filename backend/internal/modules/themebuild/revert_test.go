@@ -18,10 +18,7 @@ import (
 )
 
 // fakeRevertThemeServer is an in-memory stand-in for flowpos-backend's
-// theme-file API, tracking current file content so the test can assert on
-// what RevertToMessage actually wrote/deleted through themefs.Store — the
-// real HTTP boundary this service always goes through (see themefs.Store's
-// own doc comment on why there's no local disk to inspect directly).
+// theme-file API, so the test can assert what RevertToMessage wrote/deleted.
 type fakeRevertThemeServer struct {
 	mu    sync.Mutex
 	files map[string]string
@@ -110,8 +107,6 @@ func TestRevertToMessage_RestoresEditedFileAndDeletesNewerOne(t *testing.T) {
 		t.Fatalf("CreateFile (turn 1) failed: %v", err)
 	}
 
-	time.Sleep(1100 * time.Millisecond) // ensure strictly increasing created_at across turns
-
 	// Turn 2: edit pages/offers.liquid to "v2".
 	fakeServer.mu.Lock()
 	fakeServer.files["pages/offers.liquid"] = "v2"
@@ -128,8 +123,6 @@ func TestRevertToMessage_RestoresEditedFileAndDeletesNewerOne(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateFile (turn 2) failed: %v", err)
 	}
-
-	time.Sleep(1100 * time.Millisecond)
 
 	// Turn 3: create a brand-new file, pages/deals.liquid.
 	fakeServer.mu.Lock()

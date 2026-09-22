@@ -38,7 +38,7 @@ func toolUseSSEResponse(msgID, toolID, toolName string, input any, inputTokens, 
 	sseEvent(&b, "message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id": msgID, "type": "message", "role": "assistant", "model": "claude-test",
+			"id": msgID, "type": "message", "role": "assistant", "model": "test-model",
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
 			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0},
 		},
@@ -139,7 +139,7 @@ func textOnlySSEResponse(msgID, text string, inputTokens, outputTokens int64) st
 	sseEvent(&b, "message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id": msgID, "type": "message", "role": "assistant", "model": "claude-test",
+			"id": msgID, "type": "message", "role": "assistant", "model": "test-model",
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
 			"usage": map[string]any{"input_tokens": inputTokens, "output_tokens": 0},
 		},
@@ -235,7 +235,7 @@ func TestNew_BaseURLReachesFakeServer(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g, err := New("test-key", ts.URL, "claude-test", "", "", 0, StreamTimeouts{})
+	g, err := New("test-key", ts.URL, "test-model", "", "", 0, StreamTimeouts{})
 	if err != nil {
 		t.Fatalf("New returned an error: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {
 // TestGenerate_ForcesProposeChangesNearIterationCeiling verifies the
 // budget-aware forcing added alongside the 20->28 maxToolIterations raise:
 // once the loop is within forceProposeWithinLastN iterations of the cap, the
-// request sent to Claude forces the specific propose_changes tool (not the
+// request sent to the model forces the specific propose_changes tool (not the
 // generic "any tool" choice) — so a model that's spent its budget reading
 // still gets pushed to commit to a proposal rather than reading indefinitely
 // and running out the clock with nothing produced.

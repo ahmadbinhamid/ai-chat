@@ -26,23 +26,19 @@ func TestDetectRegisterExisting_Matches(t *testing.T) {
 	}
 }
 
-// TestDetectRegisterExisting_RejectsNonMatches covers every reason a
-// prompt must NOT trigger the deterministic register path — see the
-// package doc comment on why a false positive here is the real risk.
+// TestDetectRegisterExisting_RejectsNonMatches covers every reason a prompt must not match.
 func TestDetectRegisterExisting_RejectsNonMatches(t *testing.T) {
 	for _, prompt := range []string{
-		// No page name to resolve — "the page" alone isn't enough context.
+		// No page name to resolve.
 		"register the page",
-		// "register" not opening the request — the theme's own signup page
-		// (a real systemPageTypes entry), not a registration request.
+		// "register" is the page's real name, not the command verb.
 		"fix the register page",
 		"the register page is broken",
 		"why does the register page look bad",
-		// Create, not register — a fundamentally different operation.
+		// Create, not register.
 		"create a new pricing page",
 		"add a pricing page",
-		// Register + an edit cue in the same prompt — the merchant wants
-		// more than just registration, defer to normal generation.
+		// Register + an edit cue — defer to normal generation.
 		"register the pricing page and redesign it",
 		"register the about page, change the color while you're at it",
 		"register the contact page and add a section for our hours",
@@ -52,7 +48,7 @@ func TestDetectRegisterExisting_RejectsNonMatches(t *testing.T) {
 		// Empty / whitespace only.
 		"",
 		"   ",
-		// Too long — a multi-part request, not a narrow single-purpose ask.
+		// Too long — a multi-part request.
 		"register the pricing page and also please rewrite the homepage hero section with a new headline about our summer sale and update the footer links to point to our new social media accounts",
 	} {
 		if name, ok := DetectRegisterExisting(prompt); ok {
@@ -72,10 +68,8 @@ func TestDetectDiagnoseExisting_Matches(t *testing.T) {
 		{"the about us page is broken", "about us"},
 		{"my careers page gives a 404", "careers"},
 		{"the blog page stopped working", "blog"},
-		// "register" as the page's actual NAME (the theme's own signup
-		// page — see themecheck's systemPageTypes), not the command verb —
-		// resolved correctly here specifically because diagnose's stopword
-		// set (unlike register's own) never strips "register" itself.
+		// "register" as the page's actual name, not the command verb — works because
+		// diagnose's stopword set never strips "register".
 		{"the register page is not working", "register"},
 	}
 	for _, c := range cases {

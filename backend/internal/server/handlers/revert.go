@@ -8,9 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// RevertHandler exposes reverting a chat's theme back to a past turn — see
-// themebuild.Service.RevertToMessage's doc comment for what "revert" means
-// in ai-chat's own (HTTP-only, no local disk) architecture.
+// RevertHandler exposes reverting a chat's theme back to a past turn.
 type RevertHandler struct {
 	builder *themebuild.Service
 }

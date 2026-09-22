@@ -8,19 +8,11 @@ import (
 	"ai-chat/internal/themecheck"
 )
 
-// fakeGenerator is a generator that never touches the real Claude API —
-// checkAndRepair's retry loop is the one piece of this wiring that calls
-// Generate more than once per turn, so it's the one piece that actually
-// needs a fake rather than an httptest server (there's no HTTP boundary to
-// intercept; ai.Generator wraps the Anthropic SDK client directly).
+// Fake generator; multi-generate calls require fake, not httptest (SDK wraps client directly).
 type fakeGenerator struct {
-	calls   int
-	results []*ai.Result // returned in order; the last one repeats once exhausted
-	// visionSupported backs SupportsVision — zero-value false, matching
-	// every existing test's expectation (none of them attach an image, so
-	// none of them care); set true only in a test that specifically needs
-	// Generate's own len(in.Images) > 0 && !SupportsVision() gate to pass.
-	visionSupported bool
+	calls           int
+	results         []*ai.Result // returned in order; last repeats once exhausted
+	visionSupported bool         // set true only for vision-specific tests
 }
 
 func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ []ai.Image, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
@@ -34,9 +26,7 @@ func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Tu
 
 func (f *fakeGenerator) SupportsVision() bool { return f.visionSupported }
 
-// Summarize satisfies the generator interface's history-summarization hook
-// (see history_summary.go) — this fake never needs it for real, since
-// these tests' history never exceeds summarizeHistoryThreshold turns.
+// Satisfies interface; tests never reach summarizeHistoryThreshold.
 func (f *fakeGenerator) Summarize(_ context.Context, turns []ai.Turn) (string, error) {
 	return "", nil
 }

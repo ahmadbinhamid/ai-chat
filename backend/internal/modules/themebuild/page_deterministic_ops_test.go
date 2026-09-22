@@ -35,10 +35,7 @@ func TestParsePageRegistryEntries(t *testing.T) {
 	}
 }
 
-// TestTryRegisterExistingPage_RegistersUnregisteredFile is the core
-// success path: a file that exists on disk but has no pages.json entry
-// gets a synthetic Result with its content unchanged and a
-// PageRegistryEntry attached, zero model calls.
+// A file that exists but has no pages.json entry gets a synthetic Result, zero model calls.
 func TestTryRegisterExistingPage_RegistersUnregisteredFile(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{
 		"pages/pricing.liquid": "PRICING CONTENT",
@@ -94,9 +91,7 @@ func TestTryRegisterExistingPage_AuthScopedFile(t *testing.T) {
 	}
 }
 
-// TestTryRegisterExistingPage_AlreadyRegisteredIsIdempotent covers the
-// idempotent no-op case — a second "register the pricing page" must not
-// error or re-propose the file, just report it's already done.
+// A second "register the pricing page" must not error or re-propose the file, just report done.
 func TestTryRegisterExistingPage_AlreadyRegisteredIsIdempotent(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{
 		"pages/pricing.liquid": "PRICING CONTENT",
@@ -117,10 +112,7 @@ func TestTryRegisterExistingPage_AlreadyRegisteredIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestTryRegisterExistingPage_NoMatchingFileFallsThrough covers the safe
-// failure mode: a slug that doesn't correspond to any real file must defer
-// to normal generation (which might mean "create a new page"), not invent
-// a registration for nothing.
+// A slug with no matching file must defer to normal generation, not invent a registration.
 func TestTryRegisterExistingPage_NoMatchingFileFallsThrough(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{"pages.json": `[]`})
 	defer ts.Close()

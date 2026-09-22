@@ -11,9 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// openTestRedis connects to the same Redis this repo's .env already points
-// at (REDIS_URL, defaulting to localhost) and skips the test if it isn't
-// reachable — mirrors openTestDB's approach for MySQL.
+// openTestRedis connects to the .env-configured Redis and skips the test if unreachable.
 func openTestRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	rdb, err := NewRedisClient(getenv("REDIS_URL", "redis://127.0.0.1:6379"))
@@ -106,12 +104,8 @@ func TestGenerationEvents_RetentionTrimsToLast200PerChat(t *testing.T) {
 	}
 }
 
-// TestNewEventEmitter_SeqContinuesAcrossGenerationsOnSameChat is the
-// regression test for the bug where every new generation on a chat
-// restarted its seq at 1, colliding with the previous generation's seq
-// numbers — see newEventEmitter's doc comment. Two sequential generations
-// on the same chat must produce strictly increasing, non-colliding seq
-// values (1,2 then 3,4 — not 1,2 again).
+// Two sequential generations on the same chat must produce strictly increasing, non-colliding
+// seq values (1,2 then 3,4 — not 1,2 again).
 func TestNewEventEmitter_SeqContinuesAcrossGenerationsOnSameChat(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -161,8 +155,7 @@ func TestEventEmitter_PublishesToRedis(t *testing.T) {
 
 	sub := rdb.Subscribe(ctx, redisChannelForChat(chatID))
 	defer func() { _ = sub.Close() }()
-	// Ensure the subscription is actually registered with Redis before we
-	// publish — Subscribe returns before the SUBSCRIBE command round-trips.
+	// Subscribe returns before the SUBSCRIBE command round-trips; wait for it to actually register.
 	if _, err := sub.Receive(ctx); err != nil {
 		t.Fatalf("subscribe failed: %v", err)
 	}
@@ -199,23 +192,15 @@ func TestNewRedisClient_InvalidURLReturnsError(t *testing.T) {
 
 func TestEventEmitter_NilRepoIsANoOp(t *testing.T) {
 	var emitter *eventEmitter
-	// Must not panic — this is the "test constructed a bare &Service{}"
-	// convenience checkAndRepair's tests already rely on.
+	// Must not panic — the "test constructed a bare &Service{}" convenience.
 	emitter.emit(context.Background(), EventTypeStarted, struct{}{})
 
 	emitter2 := newEventEmitter(context.Background(), nil, nil, "gen", "chat")
 	emitter2.emit(context.Background(), EventTypeStarted, struct{}{})
 }
 
-// TestEmitLive_PublishesButNeverPersistsOrAdvancesSeq is the regression
-// test for emitLive's whole reason to exist (see its doc comment): a
-// high-frequency ephemeral event (streamed model text) must reach a live
-// subscriber over the bus, but must never hit generation_events (an insert
-// plus a trim DELETE per call — see AppendGenerationEvent) and must never
-// consume a seq number, since seq is the replay watermark every durable
-// event on this chat shares (see eventEmitter's doc comment) — a "thinking"
-// event stealing one would desync GetEventsSince's replay window for
-// everything else.
+// A high-frequency ephemeral event must reach a live subscriber but never hit generation_events
+// and never consume a seq number — stealing one would desync GetEventsSince's replay window.
 func TestEmitLive_PublishesButNeverPersistsOrAdvancesSeq(t *testing.T) {
 	conn := openTestDB(t)
 	rdb := openTestRedis(t)
@@ -262,20 +247,14 @@ func TestEmitLive_PublishesButNeverPersistsOrAdvancesSeq(t *testing.T) {
 		}
 	}
 
-	// The one thing emitLive DOES gain (see the bug fix this test's own
-	// doc comment predates): a heartbeat UPDATE on `generations`, and
-	// nothing else — confirmed here, in the same test as the "never
-	// persists/advances seq" assertions above, so a future regression on
-	// either side shows up together.
+	// The one thing emitLive DOES do: a heartbeat UPDATE on `generations`, and nothing else.
 	if !getHeartbeat(t, conn, genID).Valid {
 		t.Error("expected emitLive to have stamped last_heartbeat_at")
 	}
 }
 
-// getHeartbeat reads generations.last_heartbeat_at directly — there is no
-// Repository getter for it (see UpdateGenerationHeartbeat's doc comment:
-// only ReapStaleGenerations' own query needs to read it back, and that's
-// SQL, not Go), so tests asserting on it go straight to the DB.
+// getHeartbeat reads generations.last_heartbeat_at directly — there is no Repository getter for
+// it, so tests asserting on it go straight to the DB.
 func getHeartbeat(t *testing.T, conn *sql.DB, genID string) sql.NullTime {
 	t.Helper()
 	var hb sql.NullTime
@@ -285,11 +264,8 @@ func getHeartbeat(t *testing.T, conn *sql.DB, genID string) sql.NullTime {
 	return hb
 }
 
-// TestEventEmitter_HeartbeatThrottled is the direct test for
-// updateHeartbeatThrottled (see its own doc comment and heartbeatThrottle's):
-// the first call in an emitter's lifetime always writes, a call inside the
-// throttle window is skipped, and emit/emitLive share the same throttle —
-// an emit immediately after an emitLive must not issue a second UPDATE.
+// The first call in an emitter's lifetime always writes, a call inside the throttle window is
+// skipped, and emit/emitLive share the same throttle.
 func TestEventEmitter_HeartbeatThrottled(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -299,38 +275,29 @@ func TestEventEmitter_HeartbeatThrottled(t *testing.T) {
 
 	emitter := newEventEmitter(ctx, repo, nil, genID, chatID)
 
-	// First call: no prior heartbeat, so it must write despite lastHeartbeat
-	// being the zero value (see updateHeartbeatThrottled's IsZero check).
+	// First call: no prior heartbeat, so it must write despite lastHeartbeat being the zero value.
 	emitter.emit(ctx, EventTypeStarted, struct{}{})
 	first := getHeartbeat(t, conn, genID)
 	if !first.Valid {
 		t.Fatal("expected the first emit to stamp last_heartbeat_at")
 	}
 
-	// Immediately after, well inside heartbeatThrottle: emitLive must skip
-	// the write (shared throttle, not a per-method one) — asserted by
-	// checking the DB timestamp is byte-identical, not just "still set".
+	// Immediately after, inside heartbeatThrottle: emitLive must skip the write (shared throttle).
 	emitter.emitLive(ctx, EventTypeThinking, map[string]string{"text": "x"})
 	second := getHeartbeat(t, conn, genID)
 	if !second.Time.Equal(first.Time) {
 		t.Errorf("expected emitLive inside the throttle window to skip the write, first=%v second=%v", first.Time, second.Time)
 	}
 
-	// And an emit right after THAT must also skip — proving the throttle is
-	// shared state, not reset by switching which method calls it.
+	// An emit right after THAT must also skip — the throttle is shared state, not per-method.
 	emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": 1})
 	third := getHeartbeat(t, conn, genID)
 	if !third.Time.Equal(first.Time) {
 		t.Errorf("expected emit right after emitLive (still inside the throttle window) to skip the write, first=%v third=%v", first.Time, third.Time)
 	}
 
-	// Manually age lastHeartbeat past the throttle window (real time.Sleep
-	// of heartbeatThrottle's real-world 30s has no place in a unit test) —
-	// the next call must write again. last_heartbeat_at is a DATETIME with
-	// only second-level precision (same hazard documented on created_at
-	// elsewhere in this package — see revert.go), so this also sleeps past
-	// a second boundary, or "new" and "first" could round to the same
-	// stored value despite the write actually happening.
+	// Manually age lastHeartbeat past the throttle window rather than a real 30s sleep. Also
+	// sleeps past a second boundary since last_heartbeat_at has only second-level precision.
 	emitter.lastHeartbeat = time.Now().Add(-heartbeatThrottle - time.Second)
 	time.Sleep(1100 * time.Millisecond)
 	emitter.emit(ctx, EventTypeDone, map[string]string{"summary": "ok"})
@@ -340,9 +307,7 @@ func TestEventEmitter_HeartbeatThrottled(t *testing.T) {
 	}
 }
 
-// TestEmit_StillPersistsAndAdvancesSeq is emitLive's test's counterpart —
-// the durable path (emit) must still do both of the things emitLive
-// deliberately skips.
+// emitLive's counterpart: the durable path (emit) must still do both things emitLive skips.
 func TestEmit_StillPersistsAndAdvancesSeq(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)

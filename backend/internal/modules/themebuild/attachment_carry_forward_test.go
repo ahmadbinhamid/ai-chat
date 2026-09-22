@@ -27,12 +27,8 @@ func TestLooksLikeFetchedLink(t *testing.T) {
 	}
 }
 
-// TestLooksTruncatedByStoredLength covers the regression Phase 3.1 fixes:
-// a link's stored content is a digest capped at urlfetch.DigestHardCapBytes
-// (16KB), not PostStripMaxBytes (~300KB) — comparing it against the wrong
-// cap meant this always returned false for a link, silently. filename is
-// what picks the cap (see looksLikeFetchedLink, the same signal used one
-// line earlier at both call sites to set HTMLAttachmentIsExternalLink).
+// Regression guard: a link is capped at urlfetch.DigestHardCapBytes (16KB), not
+// PostStripMaxBytes (~300KB) — comparing against the wrong cap silently always returned false.
 func TestLooksTruncatedByStoredLength(t *testing.T) {
 	htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
 	tests := []struct {
@@ -150,13 +146,7 @@ func TestFindCarryForwardSourceMessageID_NoneFound(t *testing.T) {
 	}
 }
 
-// TestFindCarryForwardSourceMessageID_ExcludesCurrentMessage confirms a
-// message never carries forward its own attachment — doGenerate only ever
-// calls this once it already knows the current turn resolved nothing, so in
-// practice the current message never has an attachment either, but the
-// exclusion is asserted directly here regardless: if the current message
-// somehow does carry one, it must still not be treated as a valid "earlier"
-// source for itself.
+// Confirms a message never carries forward its own attachment as an "earlier" source.
 func TestFindCarryForwardSourceMessageID_ExcludesCurrentMessage(t *testing.T) {
 	priorMessages := []chat.Message{
 		plainUserMsg("m1"),
@@ -167,20 +157,10 @@ func TestFindCarryForwardSourceMessageID_ExcludesCurrentMessage(t *testing.T) {
 	}
 }
 
-// The window findCarryForwardSourceMessageID applies mirrors exactly what
-// summarizeOldTurns/summarizeOldTurnsCached keep verbatim: the most recent
-// summarizeHistoryThreshold replayed turns, `turns[len(turns)-threshold:]`.
-// m0 (the attachment-carrying turn) is itself one slot in that window, so
-// it stays inside as long as the TOTAL replayed-turn count (m0 + fillers +
-// the current turn) is at most summarizeHistoryThreshold — i.e. at most
-// summarizeHistoryThreshold-2 filler turns in between. One more filler than
-// that pushes the total to threshold+1, and index(m0)=0 falls below the new
-// windowStart of 1, dropping it out. These two tests sit right either side
-// of that exact boundary.
+// Boundary: m0 stays in the window while total replayed turns <= summarizeHistoryThreshold;
+// one more filler turn pushes it out. The next two tests sit on either side of that cutoff.
 
-// TestFindCarryForwardSourceMessageID_JustInsideWindow: threshold-2 filler
-// turns between m0 and the current turn — total replayed count is exactly
-// summarizeHistoryThreshold, so nothing is trimmed and m0 is still found.
+// Replayed count lands exactly on summarizeHistoryThreshold, so nothing is trimmed and m0 is still found.
 func TestFindCarryForwardSourceMessageID_JustInsideWindow(t *testing.T) {
 	priorMessages := []chat.Message{htmlAttachedUserMsg("m0")}
 	for i := 0; i < summarizeHistoryThreshold-2; i++ {
@@ -197,9 +177,7 @@ func TestFindCarryForwardSourceMessageID_JustInsideWindow(t *testing.T) {
 	}
 }
 
-// TestFindCarryForwardSourceMessageID_JustOutsideWindow: one filler turn
-// more than the case above — total replayed count is threshold+1, which
-// trims exactly one turn off the front (m0) and m0 must no longer be found.
+// One more filler turn than above: replayed count is threshold+1, trimming m0 off the front.
 func TestFindCarryForwardSourceMessageID_JustOutsideWindow(t *testing.T) {
 	priorMessages := []chat.Message{htmlAttachedUserMsg("m0")}
 	for i := 0; i < summarizeHistoryThreshold-1; i++ {
@@ -212,9 +190,7 @@ func TestFindCarryForwardSourceMessageID_JustOutsideWindow(t *testing.T) {
 	}
 }
 
-// TestFindCarryForwardSourceMessageID_WellOutsideWindow is the same cutoff
-// with more headroom (threshold filler turns, not just threshold-1) —
-// guards against the boundary tests above passing only by coincidence.
+// Same cutoff with more headroom, to guard against the boundary tests above passing by coincidence.
 func TestFindCarryForwardSourceMessageID_WellOutsideWindow(t *testing.T) {
 	priorMessages := []chat.Message{htmlAttachedUserMsg("m0")}
 	for i := 0; i < summarizeHistoryThreshold; i++ {

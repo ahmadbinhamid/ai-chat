@@ -8,10 +8,7 @@ import (
 
 const ruleIDThemeToken = "theme-token"
 
-// colorProperties is the set of CSS properties rule 8 checks for a raw hex/
-// rgb value — narrowly scoped to properties that spec §6/§9 says must come
-// from a --theme-*/--layout-* token, not every property that happens to
-// accept a color (e.g. not box-shadow, outline).
+// colorProperties are properties spec §6/§9 requires a --theme-*/--layout-* token for, not every color-accepting property (e.g. not box-shadow).
 var colorProperties = map[string]bool{
 	"color": true, "background": true, "background-color": true,
 	"border-color": true, "fill": true, "stroke": true,
@@ -22,22 +19,8 @@ var varCallRe = regexp.MustCompile(`var\([^)]*\)`)
 var hexOrRGBRe = regexp.MustCompile(`#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)`)
 var themeVarNoFallbackRe = regexp.MustCompile(`var\(\s*(--(?:theme|layout)-[a-zA-Z0-9_-]+)\s*\)`)
 
-// checkThemeToken enforces rule 8: a raw hex/rgb value used directly as a
-// color/background/background-color/border-color/fill/stroke value (outside
-// any var() call) is an error; the same inside a --* custom property
-// declaration is only a warning (§9 permits component-local tokens with
-// literal values). Every var(--theme-*)/var(--layout-*) reference must carry
-// a fallback.
-//
-// Only NEW or CHANGED declarations are checked against this rule — a
-// declaration byte-identical to one already in the file's pre-edit content
-// (snap, for an "update" action) is grandfathered in rather than flagged.
-// Without this, asking the model to touch one unrelated line in an
-// old/imported theme's CSS file (one that predates this tool and was never
-// written with theme tokens) rejects the entire file over every pre-existing
-// violation, forcing a full-file rewrite the model wasn't asked for and often
-// can't finish repairing before generateTimeout. A "create" action has no
-// prior content, so everything in it is checked as normal.
+// checkThemeToken enforces rule 8: a raw color outside var() is an error, inside a --* custom property just a warning (§9); every var() reference needs a fallback.
+// Declarations byte-identical to pre-edit content are grandfathered, so editing one line of an old theme file doesn't reject the whole file.
 func checkThemeToken(p Proposal, snap Snapshot) []Finding {
 	var findings []Finding
 	for _, f := range p.Files {
@@ -92,10 +75,8 @@ func checkThemeToken(p Proposal, snap Snapshot) []Finding {
 	return findings
 }
 
-// normalizedMatches returns the set of re's matches in content, trimmed —
-// used to grandfather declarations/var-refs that already existed verbatim
-// before this edit. Empty content (no prior file, or a "create" action)
-// yields an empty set, so nothing is grandfathered.
+// normalizedMatches returns re's trimmed matches in content, used to grandfather pre-existing declarations/var-refs.
+// Empty content yields an empty set, so nothing is grandfathered for a "create" action.
 func normalizedMatches(content string, re *regexp.Regexp) map[string]bool {
 	set := make(map[string]bool)
 	if content == "" {

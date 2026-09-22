@@ -5,9 +5,7 @@ import (
 	"strings"
 )
 
-// Tag is one {% ... %} occurrence in a Liquid source, in source order.
-// Whitespace-trim markers ({%- / -%}) are stripped before Name/Raw are
-// extracted, so callers never have to account for them separately.
+// Tag is one {% ... %} occurrence in a Liquid source; whitespace-trim markers are stripped before Name/Raw are extracted.
 type Tag struct {
 	Name  string // e.g. "if", "endif", "for", "render", "assign", "capture", "comment"
 	Raw   string // trimmed tag body after the name, e.g. "x == true or x == 1"
@@ -66,9 +64,7 @@ var literalKeywords = map[string]bool{
 
 var numberRe = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
 
-// ParseExpression parses a single Liquid value expression into its dotted
-// identifier path (empty if it's a quoted string/number/keyword literal)
-// and any `| filter: args` pipeline applied to it.
+// ParseExpression parses a Liquid value expression into its dotted identifier path and any `| filter: args` pipeline.
 func ParseExpression(raw string) Expression {
 	raw = strings.TrimSpace(raw)
 	parts := splitTopLevel(raw, '|')
@@ -101,9 +97,7 @@ func ParseExpression(raw string) Expression {
 	return expr
 }
 
-// splitTopLevel splits s on sep, ignoring occurrences of sep inside single-
-// or double-quoted substrings — so a filter argument like `'a, b' `containing
-// the separator doesn't produce a spurious split.
+// splitTopLevel splits s on sep, ignoring sep inside quoted substrings.
 func splitTopLevel(s string, sep byte) []string {
 	var parts []string
 	var quote byte
@@ -133,11 +127,7 @@ type RenderParam struct {
 	Value string // raw, trimmed expression text — parse with ParseExpression if needed
 }
 
-// ParseRenderTag parses a render tag's Raw body (as produced by ScanTags) —
-// e.g. `'liquid/layout-start', page: page, store: store` — into its target
-// path (quotes stripped) and ordered key:value params. ok is false if the
-// first argument isn't a quoted literal, which every render call's target
-// must be per spec §1.
+// ParseRenderTag parses a render tag's Raw body into its target path and ordered key:value params; ok is false if the first argument isn't a quoted literal.
 func ParseRenderTag(raw string) (target string, params []RenderParam, ok bool) {
 	args := splitTopLevel(raw, ',')
 	if len(args) == 0 {
@@ -172,9 +162,7 @@ func ParseRenderTag(raw string) (target string, params []RenderParam, ok bool) {
 	return target, params, true
 }
 
-// splitForTag splits a {% for %} tag's Raw body ("choice in product.choices")
-// into its loop variable and source path. ok is false if Raw isn't a
-// recognizable "x in y" form.
+// splitForTag splits a {% for %} tag's Raw body into loop variable and source path; ok is false if Raw isn't an "x in y" form.
 func splitForTag(raw string) (varName, source string, ok bool) {
 	idx := strings.Index(raw, " in ")
 	if idx < 0 {
@@ -183,11 +171,7 @@ func splitForTag(raw string) (varName, source string, ok bool) {
 	return strings.TrimSpace(raw[:idx]), strings.TrimSpace(raw[idx+len(" in "):]), true
 }
 
-// IfCondition is one {% if %} / {% elsif %} tag's condition, parsed.
-// Intentionally shallow: this dialect's conditions are always either a bare
-// identifier (`x`), an `x != blank`-style comparison, or the required
-// bool-ish guard `x == true or x == 1` (§1) — never boolean algebra beyond
-// that.
+// IfCondition is one {% if %} / {% elsif %} tag's condition, parsed. Intentionally shallow: this dialect never has boolean algebra beyond a bare identifier, comparison, or the bool-ish guard.
 type IfCondition struct {
 	Raw  string
 	Line int
@@ -288,16 +272,12 @@ func splitOnWord(s, word string) []string {
 	return parts
 }
 
-// leftBoundary reports whether position i is a valid start for a whole-word
-// match — i.e. it's the start of s, or the preceding character isn't a word
-// character.
+// leftBoundary reports whether i is a valid whole-word match start.
 func leftBoundary(s string, i int) bool {
 	return i == 0 || !isWordChar(s[i-1])
 }
 
-// rightBoundary reports whether position j is a valid end for a whole-word
-// match — i.e. it's the end of s, or the following character isn't a word
-// character.
+// rightBoundary reports whether j is a valid whole-word match end.
 func rightBoundary(s string, j int) bool {
 	return j == len(s) || !isWordChar(s[j])
 }

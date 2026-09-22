@@ -40,9 +40,7 @@ func TestCheckBalancedTags_CrossedNesting(t *testing.T) {
 	content := "{% if x %}{% for i in y %}{% endif %}{% endfor %}"
 	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Content: content}}}
 	got := checkBalancedTags(p, Snapshot{})
-	// Two distinct real defects: the endif closes the wrong block (the for
-	// is still open), and — because that endif is rejected rather than
-	// popping the if — the if itself is left dangling unclosed too.
+	// Two defects: endif closes the wrong (still-open for) block, and the rejected endif leaves the if dangling too.
 	if len(got) != 2 {
 		t.Fatalf("expected 2 findings for crossed nesting, got %+v", got)
 	}

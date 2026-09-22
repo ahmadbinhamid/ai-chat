@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -34,12 +33,6 @@ func TestRepository_DequeueNext_OrdersByQueuedAt(t *testing.T) {
 	if pos0 != 0 {
 		t.Fatalf("expected the first enqueue to report position 0, got %d", pos0)
 	}
-	// queued_at has only second-level precision (see DequeueNext's doc
-	// comment on the id tie-break) — without this gap the two rows could
-	// tie on queued_at and this test would be asserting an arbitrary,
-	// non-chronological id-ordered outcome instead of the ordering it
-	// actually means to check.
-	time.Sleep(1100 * time.Millisecond)
 	second, pos1 := seedQueued(t, repo, chatID, "second")
 	if pos1 != 1 {
 		t.Fatalf("expected the second enqueue to report position 1 (one ahead of it), got %d", pos1)
@@ -100,17 +93,7 @@ func TestRepository_DequeueNext_WhileRunningReturnsErrGenerationInProgress(t *te
 	}
 }
 
-// TestRepository_DequeueNext_ConcurrentRace fires two DequeueNext calls at
-// the same chat at once — exactly one must win the running slot, the other
-// must lose with ErrGenerationInProgress, never both succeeding (which
-// would mean two callers both think they're running a generation for the
-// same chat at once — exactly what uniq_generations_running_chat exists to
-// make impossible). Seeds two queued rows, not one: with only one queued
-// row, the loser's UPDATE would just match zero rows (ErrNotFound) once the
-// winner claims it, which proves nothing about the unique index; with two,
-// the loser's UPDATE still finds a row to attempt promoting and collides
-// with the winner's on write, which is the actual race this index guards
-// against. Run with -race.
+// Two concurrent DequeueNext calls: exactly one wins, the other loses with ErrGenerationInProgress. Run with -race.
 func TestRepository_DequeueNext_ConcurrentRace(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -280,7 +263,6 @@ func TestRepository_ListPending_RunningFirstThenQueuedOldestFirst(t *testing.T) 
 		t.Fatalf("StartGeneration failed: %v", err)
 	}
 	q1, _ := seedQueued(t, repo, chatID, "one")
-	time.Sleep(1100 * time.Millisecond) // queued_at has only second-level precision
 	q2, _ := seedQueued(t, repo, chatID, "two")
 
 	pending, err := repo.ListPending(ctx, chatID)

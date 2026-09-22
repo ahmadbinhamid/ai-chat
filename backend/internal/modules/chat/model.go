@@ -1,10 +1,5 @@
-// Package chat owns the conversation aggregate: a Chat (thread) and its
-// Messages. This is a deliberately generic conversation log — it knows
-// nothing about themes, files, or Claude; the AI generation itself, and the
-// file artifacts a turn produces, live in the sibling themebuild module,
-// which depends on this one (never the other way around) and supplies its
-// own "builder" chat Type. That's what keeps this package reusable for a
-// future, unrelated chat use case on the same tenant.
+// Package chat owns the conversation aggregate (Chat, Message) — a generic log knowing
+// nothing about themes, files, or the AI provider; those live in the themebuild module.
 package chat
 
 import "time"
@@ -17,13 +12,8 @@ const (
 	RoleSystem    Role = "system"
 )
 
-// MessageStatus exists for a possible future state beyond "it happened" —
-// today most persisted messages are MessageStatusCompleted.
-// MessageStatusFailed is the one exception: themebuild.Service.doGenerate
-// records one of these for a merchant-visible failure notice when a
-// generation errors out, so the chat transcript itself shows *something*
-// went wrong (see doGenerate's defer) rather than a WebSocket-only error
-// event a merchant who wasn't watching live would never see.
+// MessageStatus records whether a turn completed. MessageStatusFailed lets the transcript
+// itself show a generation error, not just a WebSocket-only event a merchant might miss.
 type MessageStatus string
 
 const (
@@ -31,36 +21,21 @@ const (
 	MessageStatusFailed    MessageStatus = "failed"
 )
 
-// ApplyStatus records whether an assistant turn's proposed changes have
-// been written to the real theme. Generation no longer writes immediately
-// (see themebuild/model.go's own package doc comment on the draft/apply
-// split) — a turn with changes starts "pending" (generated, previewable via
-// the draft overlay, not yet on FlowPOS) and is later resolved to either
-// "applied" (themebuild.Service.ApplyDraft) or "discarded"
-// (Service.DiscardDraft), both of which stamp every "pending" message in
-// the chat at once — a draft is applied/discarded as a whole, there is no
-// per-turn apply.
+// ApplyStatus records whether a turn's changes were written to the real theme. Starts
+// "pending" (draft overlay only), then resolves to "applied"/"discarded" for the whole draft at once.
 type ApplyStatus string
 
 const (
 	ApplyStatusNotApplicable ApplyStatus = "not_applicable"
 	ApplyStatusApplied       ApplyStatus = "applied"
-	// ApplyStatusPending means this turn proposed changes that exist only
-	// in the draft overlay (chat_generated_files rows for this message) —
-	// not yet written to FlowPOS.
+	// ApplyStatusPending means changes exist only in the draft overlay, not yet on FlowPOS.
 	ApplyStatusPending ApplyStatus = "pending"
-	// ApplyStatusDiscarded means a pending turn's changes were thrown away
-	// (Service.DiscardDraft) rather than applied — kept, not deleted, so
-	// the transcript still shows the turn happened; see the discarded turn
-	// message. AppliedAt is never set for this status.
+	// ApplyStatusDiscarded means a pending turn's changes were thrown away, not deleted —
+	// the transcript still shows the turn happened. AppliedAt is never set for this status.
 	ApplyStatusDiscarded ApplyStatus = "discarded"
 )
 
-// Chat is the one, ongoing conversation thread for a (tenant_id, type) pair
-// — unique in the database, see the 20260727000001 migration. JSON tags are
-// snake_case to match the rest of this API (and every other flowPOS
-// service) — a struct with no tags would otherwise marshal as PascalCase
-// field names, which is what bit this file before a frontend ever consumed it.
+// Chat is the one, ongoing conversation thread for a (tenant_id, type) pair, unique in the DB.
 type Chat struct {
 	ID                string     `json:"id"`
 	TenantID          uint64     `json:"tenant_id"`
@@ -72,9 +47,8 @@ type Chat struct {
 	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
-// Message is one append-only turn in a Chat. UserName and UserEmail are only
-// ever set on user-role turns (see chk_chat_messages_user_role) — an
-// assistant turn has no speaker to attribute, it's always shown as the AI.
+// Message is one append-only turn in a Chat. UserName/UserEmail are only set on user-role
+// turns; an assistant turn has no speaker to attribute.
 type Message struct {
 	ID           string        `json:"id"`
 	ChatID       string        `json:"chat_id"`
@@ -90,29 +64,13 @@ type Message struct {
 	ApplyStatus  ApplyStatus   `json:"apply_status"`
 	AppliedAt    *time.Time    `json:"applied_at"`
 	CreatedAt    time.Time     `json:"created_at"`
-	// Attachments is only ever non-empty on a user-role turn that attached
-	// one or more files (images and/or one HTML reference — see the
-	// image/HTML-attachment features), stored in chat_message_attachments
-	// (see the 20260909000002 migration) rather than per-type columns on
-	// this row. Every normal read (ListMessagesByChat, hence GET /chat)
-	// populates this with METADATA ONLY — no bytes; see
-	// MessageAttachment's own doc comment for why, and for the one caller
-	// (themebuild.Service.doGenerate) that fetches actual bytes, and how.
-	// Never resurfaced to a DIFFERENT, later turn via toTurns itself (see
-	// themebuild's history-building) — a turn's own Content there is always
-	// just the merchant's original words, never this. An HTML reference
-	// specifically CAN still reach a later turn, just not through toTurns:
-	// see themebuild's findCarryForwardSourceMessageID, which doGenerate
-	// consults directly against this same metadata when a later turn has no
-	// attachment of its own. Images never carry forward this way.
+	// Attachments is only non-empty on a user-role turn with files attached. Normal reads
+	// populate METADATA ONLY (no bytes) — only doGenerate fetches actual content.
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
 }
 
-// AttachmentKind identifies what a chat_message_attachments row holds.
-// Adding a new kind (e.g. PDF) is a new value here plus a themebuild
-// validation-limit entry — not a migration, not new Message/GenerateInput
-// fields, not new scan arguments; that's the point of the table this type
-// backs (see the 20260909000002 migration's own doc comment).
+// AttachmentKind identifies what a chat_message_attachments row holds. Adding a new kind
+// (e.g. PDF) is just a new value here plus a themebuild validation-limit entry, no migration.
 type AttachmentKind string
 
 const (
@@ -120,22 +78,10 @@ const (
 	AttachmentKindHTML  AttachmentKind = "html"
 )
 
-// MessageAttachment is one file attached to a user-role turn's prompt — an
-// image (up to maxImagesPerMessage per message) or one reference HTML file
-// (see the image/HTML-attachment features). Content carries the
-// attachment's raw, decoded bytes (never base64 — see the 20260909000002
-// migration's own doc comment) and is populated ONLY by a read that
-// explicitly asks for it: Repository.GetAttachmentsContent, called by
-// themebuild.Service.doGenerate immediately before it needs to actually
-// send this attachment to the model — not by ListMessagesByChat, which
-// backs GET /chat and every other transcript read, and returns every other
-// field but leaves Content nil. That split is the entire reason this table
-// exists apart from chat_messages: a page load pays for filenames and
-// sizes, never for a turn's attached bytes.
-//
-// StorageKey is reserved for future external storage (see the migration's
-// own doc comment) — nil on every row today; Content is always what's
-// populated instead.
+// MessageAttachment is one file attached to a user-role turn's prompt (an image or one
+// reference HTML file). Content holds raw decoded bytes and is populated ONLY by
+// Repository.GetAttachmentsContent — normal transcript reads leave it nil, so a page load
+// never pays for attached bytes. StorageKey is reserved for future external storage; unused today.
 type MessageAttachment struct {
 	ID         string         `json:"id"`
 	MessageID  string         `json:"-"`
@@ -151,13 +97,8 @@ type MessageAttachment struct {
 	CreatedAt  time.Time      `json:"-"`
 }
 
-// MessageImage is one image attached to an OUTGOING prompt — the wire
-// format both the HTTP request body (sendMessageRequest.Images) and
-// GenerateInput.Images use. Base64 is raw (no data: URI prefix); this is
-// never what's stored or read back — chat.Service decodes it into a
-// MessageAttachment's raw Content bytes at write time (see
-// buildAttachments), and MessageAttachment is what every read path
-// (including doGenerate's re-resolution) deals with from then on.
+// MessageImage is one image attached to an OUTGOING prompt (raw base64, no data: URI prefix).
+// Never stored or read back as-is — decoded into a MessageAttachment's Content at write time.
 type MessageImage struct {
 	Base64    string `json:"base64"`
 	MediaType string `json:"media_type"`

@@ -1,17 +1,6 @@
-// Command eval drives the real AI theme-builder pipeline —
-// themebuild.Service.Generate, flowpos-backend, and Claude — against the
-// fixed task list in internal/evals, the same way cmd/server does for a real
-// request, just without the HTTP/gin layer. It requires a real, already
-// logged-in tenant user's bearer token (EVAL_BEARER_TOKEN) and tenant ID
-// (EVAL_TENANT_ID): this service has no service-to-service auth of its own
-// (see internal/auth's package doc comment) and never will just for this
-// tool, so a human obtaining a token via a real login is the only way in.
-//
-// Every task runs against the same persistent per-tenant "builder" chat (see
-// themebuild.Service.Generate) — there is no per-task chat reset — but each
-// task's GenerationMode restriction (if any) is set explicitly via
-// evals.Task.Mode, not inferred from turn count, so this is safe to re-run
-// against the same EVAL_TENANT_ID repeatedly.
+// Command eval runs the real theme-builder pipeline against internal/evals' task list,
+// using a real logged-in tenant's bearer token since this service has no service-to-service auth.
+// Safe to re-run: each task's mode is explicit (evals.Task.Mode), not inferred from turn count.
 package main
 
 import (
@@ -34,9 +23,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// pollInterval/pollTimeout bound how long eval waits for one async
-// Generate call to finish — generous enough for a slow xhigh-effort
-// generation (see cmd/server/main.go's writeTimeout comment), not unbounded.
+// pollInterval/pollTimeout bound how long eval waits for one async Generate call to finish.
 const (
 	pollInterval = 2 * time.Second
 	pollTimeout  = 5 * time.Minute
@@ -63,12 +50,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("EVAL_TENANT_ID must be a valid tenant id: %v", err)
 	}
-	// The AI theme builder never creates a theme itself — only edits one a
-	// merchant already installed/activated (see themebuild.GenerateInput.
-	// ThemeSlug's own doc comment) — so eval needs the same precondition
-	// EVAL_TENANT_ID already does: a human sets this up for real first
-	// (install or import a theme for that tenant through the normal
-	// flowpos-backend flow, activate it), then points eval at its slug.
+	// The AI builder never creates a theme, only edits an already-installed one, so
+	// a human must install/activate a real theme for EVAL_TENANT_ID first.
 	themeSlug := os.Getenv("EVAL_THEME_SLUG")
 	if themeSlug == "" {
 		log.Fatal("EVAL_THEME_SLUG is required — install/activate a real theme for EVAL_TENANT_ID first " +
@@ -89,16 +72,9 @@ func main() {
 		FirstTokenPages: cfg.FirstTokenTimeoutPages,
 	}
 
-	var generator *ai.Generator
-	if cfg.AIProvider == "deepseek" {
-		generator, err = ai.New(cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.DeepSeekModel, cfg.Effort, cfg.DeepSeekVisionModel, cfg.MaxTokens, streamTimeouts)
-	} else {
-		generator, err = ai.New(cfg.AnthropicAPIKey, "", cfg.AnthropicModel, cfg.Effort, cfg.AnthropicVisionModel, cfg.MaxTokens, streamTimeouts)
-	}
+	generator, err := ai.New(cfg.APIKey, cfg.BaseURL, cfg.Model, cfg.Effort, cfg.VisionModel, cfg.MaxTokens, streamTimeouts)
 	if err != nil {
-		// One-shot CLI command exiting the whole process — the OS reclaims
-		// conn's fd regardless of whether this function's own defer got a
-		// chance to run first.
+		// Process exit reclaims conn's fd regardless of the deferred Close.
 		log.Fatalf("ai.New failed: %v", err) //nolint:gocritic // process exit reclaims conn's fd either way
 	}
 	store := themefs.NewStore(cfg.FlowposAPIBase)
@@ -143,13 +119,8 @@ func main() {
 	}
 }
 
-// runTask sends the task's prompt against themeSlug (an already-existing,
-// already-activated theme — see EVAL_THEME_SLUG in main; the AI theme
-// builder never creates a theme itself, only edits one a merchant already
-// installed, and eval exercises the exact same real pipeline, so it needs
-// the same precondition), waits for the background generation to finish,
-// and checks whether files were actually written to this specific turn
-// against task.ExpectedOK.
+// runTask sends the task's prompt, waits for generation to finish, and checks
+// whether files were written this turn against task.ExpectedOK.
 func runTask(ctx context.Context, buildSvc *themebuild.Service, chatSvc *chat.Service, tenantID uint64, token, themeSlug string, task evals.Task) taskResult {
 	outcome, err := buildSvc.Generate(ctx, themebuild.GenerateInput{
 		TenantID:  tenantID,
@@ -183,9 +154,8 @@ func runTask(ctx context.Context, buildSvc *themebuild.Service, chatSvc *chat.Se
 	return taskResult{task: task, passed: passed, detail: detail}
 }
 
-// waitForGeneration polls Service.GenerationStatus until the background
-// Generate call for chatID finishes, returning its error message (empty on
-// success).
+// waitForGeneration polls until the background Generate call for chatID finishes,
+// returning its error message (empty on success).
 func waitForGeneration(ctx context.Context, buildSvc *themebuild.Service, chatID string) (string, error) {
 	deadline := time.Now().Add(pollTimeout)
 	for {
@@ -200,9 +170,7 @@ func waitForGeneration(ctx context.Context, buildSvc *themebuild.Service, chatID
 	}
 }
 
-// filesWrittenThisTurn reports whether the chat's most recent message is an
-// assistant reply that wrote at least one file — i.e. this specific turn's
-// outcome, not the theme's cumulative file history.
+// filesWrittenThisTurn reports whether the chat's last message wrote a file this turn.
 func filesWrittenThisTurn(ctx context.Context, buildSvc *themebuild.Service, chatSvc *chat.Service, tenantID uint64, chatID string) (bool, error) {
 	messages, err := chatSvc.ListMessages(ctx, tenantID, chatID)
 	if err != nil {

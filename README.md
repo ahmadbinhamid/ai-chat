@@ -1,7 +1,7 @@
 # ai-chat
 
 Go backend for the AI theme-builder chat feature: a merchant describes a page
-or section in chat, Claude generates the Liquid theme files implementing it,
+or section in chat, DeepSeek generates the Liquid theme files implementing it,
 and the merchant applies the change to their live theme with one click.
 
 ## Setup
@@ -35,8 +35,8 @@ cp backend/.env.example backend/.env
 Fill in `backend/.env`. The only values that are actually required to start
 the server are `FLOWPOS_API_BASE` (auth is fully delegated to FlowPOS — every
 request forwards its bearer token there, there is no local auth system) and
-`AI_PROVIDER` (`anthropic` or `deepseek`, must be one of those two). Everything
-else in `.env.example` has a working default. Leave `REDIS_URL` empty unless
+`DEEPSEEK_API_KEY`. Everything else in `.env.example` has a working default.
+Leave `REDIS_URL` empty unless
 you're actually running Redis locally — it only backs cross-replica event
 delivery and isn't needed for a single instance.
 
@@ -70,4 +70,4 @@ Run from `backend/`:
 | `make tidy` | Sync `go.mod`/`go.sum` with actual imports. |
 | `make test` | `go test ./...` |
 | `make lint` | `golangci-lint run ./...` (requires `golangci-lint` installed). |
-| `make eval` | Run the fixed task list in `internal/evals` against the real Claude + FlowPOS pipeline. Needs `EVAL_BEARER_TOKEN` and `EVAL_TENANT_ID` from a real logged-in tenant user — see `cmd/eval/main.go`'s doc comment. |
+| `make eval` | Run the fixed task list in `internal/evals` against the real DeepSeek + FlowPOS pipeline. Needs `EVAL_BEARER_TOKEN` and `EVAL_TENANT_ID` from a real logged-in tenant user — see `cmd/eval/main.go`'s doc comment. |

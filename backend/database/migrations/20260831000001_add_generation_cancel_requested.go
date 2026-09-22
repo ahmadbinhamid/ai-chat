@@ -14,19 +14,11 @@ func init() {
 	})
 }
 
-// cancel_requested_at is the durable half of cancelling a *running*
-// generation (see themebuild.Service.CancelQueuedGeneration's running
-// branch). The live EventTypeCancelRequested signal published alongside it
-// is best-effort and can miss its listener entirely: either published in
-// the gap between DequeueNext marking a row running and
-// runOneQueuedGeneration's own goroutine reaching its Subscribe call, or
-// dropped from a saturated live-event buffer under load (it shares that
-// channel with high-frequency "thinking" deltas — see eventBus's
-// subscriberBufferSize). This column is what a late or dropped signal is
-// recovered from: runOneQueuedGeneration checks it once immediately after
-// subscribing, then again on every heartbeat-ticker tick as a backstop, so
-// a cancel request is never silently lost — just possibly a little slower
-// than the live path.
+// cancel_requested_at is the durable half of cancelling a running generation — the live
+// EventTypeCancelRequested signal is best-effort and can be missed or dropped under load.
+//
+// runOneQueuedGeneration checks this column on subscribe and on every heartbeat tick as a
+// backstop, so a cancel request is never silently lost.
 func Up_20260831000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE generations

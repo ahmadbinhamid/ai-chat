@@ -72,9 +72,7 @@ func TestCheckPageRoute_DuplicateSystemType(t *testing.T) {
 	}
 	snap := Snapshot{Files: map[string]string{"pages.json": `[{"slug":"home","type":"home"}]`}}
 	got := checkPageRoute(p, snap)
-	// slug-taken and duplicate-system-type both fire here since the fixture
-	// reuses the same slug — that's realistic (a system route's slug is
-	// already registered) and both findings are independently correct.
+	// Both findings fire here since a system route's slug is realistically already registered.
 	if len(got) != 2 {
 		t.Fatalf("expected 2 findings (slug taken + duplicate system type), got %+v", got)
 	}

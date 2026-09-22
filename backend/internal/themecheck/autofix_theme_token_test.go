@@ -51,9 +51,7 @@ func TestAutoFixThemeTokens_RawHexBecomesToken(t *testing.T) {
 	}
 }
 
-// TestAutoFixThemeTokens_RawHexUsesKebabCaseTokenName confirms the
-// camelCase (defaults.json) <-> kebab-case (--theme-*) conversion, not just
-// the trivial single-word case the other tests use.
+// TestAutoFixThemeTokens_RawHexUsesKebabCaseTokenName covers the camelCase <-> kebab-case conversion, not just single-word names.
 func TestAutoFixThemeTokens_RawHexUsesKebabCaseTokenName(t *testing.T) {
 	defaultsJSON := `{"colors": {"footerBg": "#03318f"}}`
 	content := "a { background-color: #03318f; }\n"
@@ -90,12 +88,7 @@ func TestAutoFixThemeTokens_UnknownColorLeftAlone(t *testing.T) {
 	}
 }
 
-// TestAutoFixThemeTokens_GrandfatheredDeclarationNotRewritten is the scope
-// test this whole task hinges on: checkThemeToken never flags a
-// declaration byte-identical to the file's pre-edit content, so
-// AutoFixThemeTokens — which only acts on flagged lines — must never touch
-// it either, even though it contains a raw color that would otherwise be
-// fixable.
+// TestAutoFixThemeTokens_GrandfatheredDeclarationNotRewritten confirms a grandfathered (pre-edit, unflagged) declaration is never rewritten.
 func TestAutoFixThemeTokens_GrandfatheredDeclarationNotRewritten(t *testing.T) {
 	prevContent := "a { color: #1e3a8a; }\n"
 	p := Proposal{Files: []ProposedFile{{Path: "components/css/x.css", Action: "update", Content: prevContent}}}
@@ -114,9 +107,7 @@ func TestAutoFixThemeTokens_GrandfatheredDeclarationNotRewritten(t *testing.T) {
 	}
 }
 
-// TestAutoFixThemeTokens_PreservesRestOfShorthandValue confirms a
-// byte-range replacement, not a global substitution — the url(...) part of
-// a shorthand background declaration must survive untouched.
+// TestAutoFixThemeTokens_PreservesRestOfShorthandValue confirms the fix is a byte-range replacement, not a global substitution.
 func TestAutoFixThemeTokens_PreservesRestOfShorthandValue(t *testing.T) {
 	content := "a { background: #fff url('images/x.png') no-repeat; }\n"
 	p := Proposal{Files: []ProposedFile{{Path: "components/css/x.css", Action: "create", Content: content}}}
@@ -174,11 +165,7 @@ func TestAutoFixThemeTokens_UnparseableDefaultsJSONFixesNothing(t *testing.T) {
 	}
 }
 
-// TestAutoFixThemeTokens_DeclarationHittingBothFixTypes covers the
-// combined edge case: a var() with no fallback AND a raw hex elsewhere in
-// the SAME declaration. Both must be fixed, and the second fix's byte
-// offset must still land correctly after the first fix changed the
-// content's length.
+// TestAutoFixThemeTokens_DeclarationHittingBothFixTypes covers a var() with no fallback and a raw hex in the same declaration; the second fix's offset must still land correctly after the first changes content length.
 func TestAutoFixThemeTokens_DeclarationHittingBothFixTypes(t *testing.T) {
 	content := "a { border-color: var(--theme-primary) #dc2626; }\n"
 	p := Proposal{Files: []ProposedFile{{Path: "components/css/x.css", Action: "create", Content: content}}}
@@ -199,10 +186,7 @@ func TestAutoFixThemeTokens_DeclarationHittingBothFixTypes(t *testing.T) {
 	}
 }
 
-// TestAutoFixThemeTokens_SixFindingsAllFixableEndToEnd is the case that
-// motivates the whole task: six hardcoded colors in one file, all
-// resolvable against defaults.json, come back with zero findings on the
-// re-run Check — the repair round-trip is skipped entirely.
+// TestAutoFixThemeTokens_SixFindingsAllFixableEndToEnd checks that six all-fixable colors come back with zero findings on the re-run Check.
 func TestAutoFixThemeTokens_SixFindingsAllFixableEndToEnd(t *testing.T) {
 	content := `.a { color: #1e3a8a; }
 .b { color: #111111; }
@@ -231,12 +215,7 @@ func TestAutoFixThemeTokens_SixFindingsAllFixableEndToEnd(t *testing.T) {
 	}
 }
 
-// TestAutoFixThemeTokens_TwoDeclarationsOneLineOnlySecondNewRewritten is the
-// case that motivates the byte-offset scoping fix: declRe has no newline
-// anchor, so two declarations can share one line with only the second one
-// new. checkThemeToken already grandfathers the first correctly (it's
-// byte-identical to prevContent); the fixer must scope to that same
-// granularity, or it rewrites both just because they share a flagged line.
+// TestAutoFixThemeTokens_TwoDeclarationsOneLineOnlySecondNewRewritten covers two declarations sharing one line where only the second is new; byte-offset scoping must not rewrite both just because they share a line.
 func TestAutoFixThemeTokens_TwoDeclarationsOneLineOnlySecondNewRewritten(t *testing.T) {
 	prevContent := "a { color: #1e3a8a; }\n"
 	content := "a { color: #1e3a8a; border-color: #dc2626; }\n"
@@ -261,9 +240,7 @@ func TestAutoFixThemeTokens_TwoDeclarationsOneLineOnlySecondNewRewritten(t *test
 	}
 }
 
-// TestAutoFixThemeTokens_TwoVarRefsOneLineOnlySecondNewRewritten is the same
-// case for the no-fallback var() loop: two var(--theme-*) references
-// sharing a line, only the second one new.
+// TestAutoFixThemeTokens_TwoVarRefsOneLineOnlySecondNewRewritten is the same case for the no-fallback var() loop.
 func TestAutoFixThemeTokens_TwoVarRefsOneLineOnlySecondNewRewritten(t *testing.T) {
 	prevContent := "a { color: var(--theme-primary); }\n"
 	content := "a { color: var(--theme-primary); border-color: var(--theme-danger); }\n"

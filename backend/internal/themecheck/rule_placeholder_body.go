@@ -8,55 +8,27 @@ import (
 
 const ruleIDPlaceholderBody = "placeholder-body"
 
-// placeholderBodyRe matches a page body that is — once every Liquid/HTML
-// tag is stripped out — just a placeholder marker rather than real content.
-// Observed in practice: a vague merchant request ("make it better") caused
-// the model to overwrite an existing page's real content with the literal
-// word "placeholder", passing checkPageBoilerplate cleanly (the required
-// renders were still there) since that rule only checks the wrapper, never
-// what's inside it.
+// placeholderBodyRe matches a stripped page body that's just a placeholder marker (e.g. "placeholder", "todo") rather than real content.
 var placeholderBodyRe = regexp.MustCompile(`(?i)^(placeholder|lorem( ipsum)?|todo|tbd|to be (determined|decided|filled( in)?)|fill (this|me) in|your (content|text) here|coming soon|\.{3,}|n/?a|xxx+)$`)
 
-// outputExpressionRe matches a {{ ... }} Liquid output expression — a
-// dynamic binding like {{ product.name }}. Its mere presence is evidence of
-// real, page-specific content (there's no legitimate reason a placeholder
-// stub would reference live data), so a page containing one is never
-// flagged by this rule regardless of how little static prose surrounds it.
+// outputExpressionRe matches a {{ }} dynamic binding; its presence alone counts as real content, since a placeholder stub would never reference live data.
 var outputExpressionRe = regexp.MustCompile(`(?s)\{\{.*?\}\}`)
 
-// liquidOrHTMLTagRe strips {% ... %} Liquid tags and <...> HTML tags —
-// applied only after outputExpressionRe has already been checked for, so a
-// page's {{ }} bindings are never mistaken for "no content" just because
-// they're not static text.
+// liquidOrHTMLTagRe strips {% %} and <> tags; applied only after outputExpressionRe is checked, so {{ }} bindings aren't mistaken for empty content.
 var liquidOrHTMLTagRe = regexp.MustCompile(`(?s)\{%.*?%\}|<[^>]*>`)
 
-// minPriorSignalForShrinkCheck / maxShrinkRatio: an "update" whose new
-// contentSignal is under maxShrinkRatio of the real previous file's signal
-// is flagged — but only when the previous file's signal was already at
-// least minPriorSignalForShrinkCheck, so editing an already-small page
-// never trips this. This is a distinct, broader check from
-// placeholderBodyRe's exact-phrase match below — it catches a
-// page-destroying edit even when the replacement text doesn't match any
-// *known* placeholder phrase (observed in practice: a single stray
-// character "x" isn't a recognized placeholder word, but replacing a real
-// multi-paragraph FAQ page with it is exactly the destructive pattern this
-// whole rule exists to catch).
+// minPriorSignalForShrinkCheck / maxShrinkRatio flag an update whose contentSignal drops below maxShrinkRatio of a
+// previous file's signal >= minPriorSignalForShrinkCheck — catches destructive edits matching no known placeholder phrase.
 const minPriorSignalForShrinkCheck = 100
 const maxShrinkRatio = 0.35
 
-// renderSignalWeight/bindingSignalWeight let a component- or binding-driven
-// page register a substantial contentSignal even with little or no static
-// prose of its own — matching hasNonLayoutRender/outputExpressionRe's
-// exemptions below, just as a comparable magnitude instead of a bypass, so
-// the shrink comparison stays meaningful for pages built that way too.
+// renderSignalWeight/bindingSignalWeight let a component- or binding-driven page register a substantial contentSignal
+// without static prose, so the shrink comparison stays meaningful for it too.
 const renderSignalWeight = 200
 const bindingSignalWeight = 50
 
-// contentSignal is a rough, comparable measure of "how much real content is
-// here" — stripped prose length, plus credit for real (non-layout)
-// component/page renders and {{ }} dynamic bindings. Used only for the
-// shrink comparison above; the exact-phrase/empty checks below use the
-// stripped prose and the raw renders/bindings checks directly.
+// contentSignal is a rough measure of real content: stripped prose length plus credit for non-layout renders and
+// {{ }} bindings. Used only for the shrink comparison above.
 func contentSignal(content string) int {
 	prose := strings.TrimSpace(strings.Join(strings.Fields(liquidOrHTMLTagRe.ReplaceAllString(content, " ")), " "))
 	signal := len(prose)
@@ -67,20 +39,8 @@ func contentSignal(content string) int {
 	return signal
 }
 
-// checkPlaceholderBody enforces: a proposed pages/*.liquid file's actual
-// content must be real — literal prose (any non-empty amount; a
-// short-but-genuine body like "Sale!" is not this rule's business), a
-// dynamic {{ }} binding, or composed from at least one real component/page
-// render beyond the mandatory layout wrapper — and an "update" must not
-// drastically shrink a real previous file (see the constants above). A
-// file satisfying none of those is either a fully empty stub or, per the
-// cases this rule exists for, real content that got silently destroyed.
-// Deliberately no minimum-length heuristic on the new content alone beyond
-// non-empty: length alone can't distinguish a stub from genuinely terse
-// real content, and a wrong guess there means silently blocking a
-// legitimate short page — the shrink check below is what catches a tiny
-// replacement without that false-positive risk, by comparing against what
-// was really there before rather than judging the new content in isolation.
+// checkPlaceholderBody flags a pages/*.liquid file with no real content (prose, a {{ }} binding, or a component render), or a drastic shrink of prior content.
+// No minimum-length heuristic — length can't distinguish a stub from terse real content; the shrink check catches that instead.
 func checkPlaceholderBody(p Proposal, snap Snapshot) []Finding {
 	var findings []Finding
 	for _, f := range p.Files {
@@ -121,10 +81,7 @@ func checkPlaceholderBody(p Proposal, snap Snapshot) []Finding {
 				Rule:     ruleIDPlaceholderBody,
 				Severity: SeverityError,
 				Message: fmt.Sprintf(
-					// body is always short by construction here: every branch
-					// that reaches this Sprintf requires an exact
-					// placeholder-phrase match or an empty string, so no
-					// truncation is needed.
+					// body is always short here — every branch reaching this Sprintf is an exact placeholder match or empty.
 					"the page body looks like placeholder/stub content (%q) rather than real content answering the merchant's "+
 						"request — write actual content (prose, or renders of real existing components), and if the request is "+
 						"too vague to know what content to write, use needs_clarification instead of guessing.",
@@ -135,10 +92,7 @@ func checkPlaceholderBody(p Proposal, snap Snapshot) []Finding {
 	return findings
 }
 
-// nonLayoutRenderCount counts renders of anything besides the mandatory
-// liquid/layout-start / liquid/layout-end wrapper — a page composed of real
-// component renders (even with little or no prose of its own) counts as
-// real content, not a placeholder.
+// nonLayoutRenderCount counts renders besides the mandatory layout wrapper — real component renders count as real content.
 func nonLayoutRenderCount(content string) int {
 	count := 0
 	for _, t := range ScanTags(content) {

@@ -16,9 +16,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// seedPendingFile records an assistant message with apply_status='pending'
-// and one staged GeneratedFile row for it — the minimal shape a draft turn
-// leaves behind (see doGenerate's staging path).
+// Records assistant message with apply_status='pending' + staged GeneratedFile.
 func seedPendingFile(t *testing.T, chatSvc *chat.Service, buildRepo *Repository, c chat.Chat, path, content string, kind GeneratedFileKind) chat.Message {
 	t.Helper()
 	msg, err := chatSvc.RecordAssistantMessage(context.Background(), c, "turn", chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusPending)
@@ -35,7 +33,6 @@ func seedPendingFile(t *testing.T, chatSvc *chat.Service, buildRepo *Repository,
 	return msg
 }
 
-// Item 1: DraftFiles last-write-wins across three turns touching one path.
 func TestDraftFiles_LastWriteWinsAcrossThreeTurns(t *testing.T) {
 	conn := openTestDB(t)
 	chatSvc := chat.NewService(chat.NewRepository(conn))
@@ -50,11 +47,6 @@ func TestDraftFiles_LastWriteWinsAcrossThreeTurns(t *testing.T) {
 
 	for _, content := range []string{"v1", "v2", "v3"} {
 		seedPendingFile(t, chatSvc, buildRepo, c, "pages/home.liquid", content, GeneratedFileKindProposed)
-		// queued_at/created_at-style hazard (see DraftFiles' own doc
-		// comment): without a gap, three inserts in the same wall-clock
-		// second would tie on created_at and this test would just be
-		// asserting arbitrary id-ordered output.
-		time.Sleep(1100 * time.Millisecond)
 	}
 
 	draft, err := buildRepo.DraftFiles(ctx, c.ID)
@@ -113,14 +105,9 @@ func TestBuildSnapshot_SeesDraftCreatedFileInMergedTree(t *testing.T) {
 	}
 }
 
-// TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration covers the
-// pre-existing-violation-filtering edge case: a store error (network hiccup
-// to FlowPOS) fetching one proposed "update" file's baseline content must
-// not fail the whole generation — it degrades to that one file having no
-// baseline (today's stricter, no-grandfathering behavior), never an error
-// returned from buildSnapshot itself. The four required files (pages.json,
-// defaults.json, the two layout files) are unaffected — this fake server
-// serves them normally, a 500 only for the one proposed update file.
+// TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration: a store error
+// fetching one proposed update's baseline content degrades that file to no
+// baseline, it must never fail buildSnapshot itself.
 func TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/store/themes/active/files" {

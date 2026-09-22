@@ -14,9 +14,7 @@ var queriesRootRe = regexp.MustCompile(`\b(?:querySelector|getElementById)\s*\(`
 var classSelectorRe = regexp.MustCompile(`(?:querySelector|querySelectorAll)\(\s*['"]\.|getElementsByClassName\(`)
 var dataHookRe = regexp.MustCompile(`\[data-[a-zA-Z-]+|\.dataset\.`)
 
-// checkJSShape enforces rule 11 (warning): each new js/*.js file should be
-// IIFE-wrapped, query its root element and return early if absent, and use
-// data-* hooks rather than class selectors.
+// checkJSShape enforces rule 11 (warning): js/*.js should be IIFE-wrapped, guard its root element, and use data-* hooks not class selectors.
 func checkJSShape(p Proposal, _ Snapshot) []Finding {
 	var findings []Finding
 	for _, f := range p.Files {

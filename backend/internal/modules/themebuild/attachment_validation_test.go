@@ -14,12 +14,7 @@ import (
 	"ai-chat/internal/urlfetch"
 )
 
-// Every failure case here returns before Generate ever touches s.chats/
-// s.repo (see Generate's own validation order), so a bare &Service{gen: fg}
-// — no real database — is enough; only the "valid input is accepted" case
-// at the bottom needs newQueueTestService's real DB, since success proceeds
-// into GetOrCreateChat/RecordUserMessage.
-
+// Failure cases return before Generate touches s.chats/s.repo; only success cases need real DB.
 func TestGenerate_TooManyImages(t *testing.T) {
 	svc := &Service{gen: &fakeGenerator{visionSupported: true}}
 	images := make([]chat.MessageImage, maxImagesPerMessage+1)
@@ -33,10 +28,7 @@ func TestGenerate_TooManyImages(t *testing.T) {
 	}
 }
 
-// TestGenerate_ImagesAtCapAreNotRejectedForCount needs a real database:
-// exactly maxImagesPerMessage images pass every validation check (count,
-// vision-support, per-image size), so Generate proceeds past validation
-// into GetOrCreateChat/RecordUserMessage same as the success case below.
+// Real DB needed: exactly maxImagesPerMessage images pass all validation checks.
 func TestGenerate_ImagesAtCapAreNotRejectedForCount(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{visionSupported: true, results: []*ai.Result{{Summary: "ok"}}}
@@ -71,9 +63,7 @@ func TestGenerate_ImageAttachedButVisionNotConfigured(t *testing.T) {
 
 func TestGenerate_ImageTooLarge(t *testing.T) {
 	svc := &Service{gen: &fakeGenerator{visionSupported: true}}
-	// The size check is base64.StdEncoding.DecodedLen(len(base64)) — pure
-	// arithmetic on the string's own length, never an actual decode — so
-	// this doesn't need to be real base64 content, just the right length.
+	// Size check is pure arithmetic on base64 string length (no decode needed).
 	oversized := strings.Repeat("A", (MaxImageAttachmentBytes/3+1)*4)
 
 	_, err := svc.Generate(context.Background(), GenerateInput{
@@ -85,10 +75,7 @@ func TestGenerate_ImageTooLarge(t *testing.T) {
 	}
 }
 
-// TestGenerate_ImageUnderCapIsNotRejectedForSize needs a real database: an
-// under-cap image passes every validation check, so Generate proceeds past
-// validation into GetOrCreateChat/RecordUserMessage same as the success
-// case below.
+// Real DB needed: under-cap image passes all validation checks.
 func TestGenerate_ImageUnderCapIsNotRejectedForSize(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{visionSupported: true, results: []*ai.Result{{Summary: "ok"}}}
@@ -119,16 +106,11 @@ func TestGenerate_HTMLAttachmentRawUploadTooLarge(t *testing.T) {
 	}
 }
 
-// TestGenerate_HTMLAttachmentStillTooLargeAfterStripping covers the case
-// the raw-upload check alone can't catch: content under MaxHTMLUploadBytes
-// (5MB) but with nothing for SanitizeHTMLAttachment to strip (no scripts,
-// no embedded base64 assets), so it's still over MaxHTMLAttachmentBytes
-// (300KB) after stripping — the post-strip check must catch it separately.
+// Post-strip check catches content under 5MB but still over 300KB after stripping scripts/assets.
 func TestGenerate_HTMLAttachmentStillTooLargeAfterStripping(t *testing.T) {
 	svc := &Service{}
 	filename := "page.html"
-	// Plain text only — SanitizeHTMLAttachment removes nothing from this,
-	// so its length is unchanged by stripping.
+	// Plain text only; SanitizeHTMLAttachment removes nothing, so length unchanged.
 	content := strings.Repeat("<p>real paragraph text, nothing to strip</p>", (MaxHTMLAttachmentBytes/44)+100)
 	if len(content) <= MaxHTMLUploadBytes && len(content) <= MaxHTMLAttachmentBytes {
 		t.Fatalf("test setup bug: fixture content (%d bytes) doesn't actually exceed MaxHTMLAttachmentBytes (%d)", len(content), MaxHTMLAttachmentBytes)
@@ -144,10 +126,7 @@ func TestGenerate_HTMLAttachmentStillTooLargeAfterStripping(t *testing.T) {
 	}
 }
 
-// TestGenerate_HTMLAttachmentUnderCapIsSanitizedNotRejected needs a real
-// database: a small HTML attachment passes both size checks, so Generate
-// proceeds past validation into GetOrCreateChat/RecordUserMessage same as
-// the success case below.
+// Real DB needed: small HTML attachment passes both size checks.
 func TestGenerate_HTMLAttachmentUnderCapIsSanitizedNotRejected(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
@@ -165,9 +144,7 @@ func TestGenerate_HTMLAttachmentUnderCapIsSanitizedNotRejected(t *testing.T) {
 	}
 }
 
-// TestGenerate_ValidImageAttachmentIsAccepted is the one case here that
-// needs a real database — success proceeds past validation into
-// GetOrCreateChat/RecordUserMessage, unlike every failure case above.
+// Real DB needed: success proceeds into GetOrCreateChat/RecordUserMessage.
 func TestGenerate_ValidImageAttachmentIsAccepted(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{visionSupported: true, results: []*ai.Result{{Summary: "ok"}}}
@@ -185,14 +162,7 @@ func TestGenerate_ValidImageAttachmentIsAccepted(t *testing.T) {
 	}
 }
 
-// fakeLinkFetcher stands in for *urlfetch.Fetcher — never makes a real
-// network call, matching fakeGenerator's own pattern in
-// check_and_repair_test.go. FetchStylesheets always returns
-// stylesheetCSS/stylesheetCount unconditionally (no per-call error/
-// failure simulation the way Fetch has) — CSS fetching is best-effort by
-// design (see FetchStylesheets' own doc comment: a failure there is
-// swallowed, never surfaced to the caller), so there is no failure mode
-// for this fake to simulate in the first place.
+// Stands in for *urlfetch.Fetcher; no real network calls (CSS fetching is best-effort, no failure simulation).
 type fakeLinkFetcher struct {
 	calls     int
 	lastURL   string
@@ -218,18 +188,7 @@ func (f *fakeLinkFetcher) FetchStylesheets(_ context.Context, _ string, _ *url.U
 	return f.stylesheetCSS, f.stylesheetCount
 }
 
-// blockingLinkFetcher stands in for *urlfetch.Fetcher in tests that need to
-// prove Generate itself never calls Fetch — a plain call counter checked
-// right after Generate returns would be racing the background goroutine
-// Generate spawns to actually run the turn (see runGeneration), which may
-// or may not have been scheduled yet. Blocking Fetch on an unbuffered
-// channel closes that race outright: if Generate ever called Fetch
-// synchronously, the test would hang waiting on release (a much clearer
-// failure than a flaky counter check) instead of ever reaching the
-// assertions below Generate's own call. The test closes release once it's
-// done asserting, letting the real background fetch (if any) proceed so
-// runGeneration's goroutine finishes cleanly before the test's DB
-// connection is closed by newQueueTestService's own t.Cleanup.
+// Proves Generate never calls Fetch synchronously; blocks on unbuffered channel (test hangs if violated).
 type blockingLinkFetcher struct {
 	mu      sync.Mutex
 	calls   int
@@ -253,22 +212,12 @@ func (f *blockingLinkFetcher) callCount() int {
 	return f.calls
 }
 
-// FetchStylesheets is never expected to be reached by
-// TestGenerate_DoesNotFetchSynchronously (Fetch itself already blocks
-// forever on f.release, so doGenerate never gets past it) — implemented
-// only to satisfy the linkFetcher interface.
+// FetchStylesheets never reached (Fetch blocks forever); implemented only to satisfy interface.
 func (f *blockingLinkFetcher) FetchStylesheets(_ context.Context, _ string, _ *url.URL) (string, int) {
 	return "", 0
 }
 
-// TestGenerate_DoesNotFetchSynchronously is Phase 1's core invariant: a
-// prompt containing a URL must not make Generate itself do any network
-// work — see Generate's own doc comment on why (POST /chats/messages must
-// stay a fast, synchronous 202). The actual fetch happens later, in
-// doGenerate, once this turn is dequeued and running in the background
-// (see TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward).
-// This only asserts what Generate carries forward for that later fetch to
-// use: the enqueued Generation row's ReferenceURL.
+// Phase 1 invariant: URL in prompt must not trigger synchronous network work in Generate (POST must be fast 202).
 func TestGenerate_DoesNotFetchSynchronously(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
@@ -281,9 +230,7 @@ func TestGenerate_DoesNotFetchSynchronously(t *testing.T) {
 		TenantID: tenantID, UserID: &tenantID, Token: "t", ThemeSlug: "theme",
 		Prompt: "https://example.com can you access this link",
 	})
-	// Reaching this line at all — Fetch would block forever on the unclosed
-	// channel if Generate had called it synchronously — is itself part of
-	// the proof.
+	// Reaching this line proves Generate didn't call Fetch synchronously (would block forever).
 	if err != nil {
 		t.Fatalf("expected a link-only prompt to be accepted, got error: %v", err)
 	}
@@ -300,12 +247,7 @@ func TestGenerate_DoesNotFetchSynchronously(t *testing.T) {
 	}
 }
 
-// TestGenerate_MalformedURLStillRejectedSynchronously confirms the one
-// case that IS still a synchronous 4xx: a URL malformed enough that
-// ValidateURL rejects it needs no network call to know that, so there's no
-// async-design reason to defer it — see Generate's own doc comment.
-// user:pass@ userinfo is one of ValidateURL's own rejection cases (see
-// guard_test.go).
+// One case still synchronous 4xx: URL malformed enough that ValidateURL rejects it (no network needed).
 func TestGenerate_MalformedURLStillRejectedSynchronously(t *testing.T) {
 	svc := &Service{gen: &fakeGenerator{}, links: &fakeLinkFetcher{err: errors.New("must never be called — no network needed for a shape rejection")}}
 
@@ -317,12 +259,7 @@ func TestGenerate_MalformedURLStillRejectedSynchronously(t *testing.T) {
 	}
 }
 
-// TestGenerate_ExplicitHTMLAttachmentWinsOverLinkInPrompt confirms an
-// uploaded HTML file is a more deliberate signal than a URL the merchant
-// merely mentioned in the same message — see the link-reference feature's
-// own doc comment in Generate. Checked at the point precedence is actually
-// decided now: the enqueued row's ReferenceURL must stay empty, not (as
-// before Phase 1) a synchronous fetch call that never happens either way.
+// Uploaded HTML file is more deliberate signal than URL merely mentioned; ReferenceURL stays empty.
 func TestGenerate_ExplicitHTMLAttachmentWinsOverLinkInPrompt(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
@@ -348,8 +285,6 @@ func TestGenerate_ExplicitHTMLAttachmentWinsOverLinkInPrompt(t *testing.T) {
 	}
 }
 
-// TestGenerate_NoLinkInPromptSkipsFetch confirms a prompt with no URL at
-// all never touches the link fetcher.
 func TestGenerate_NoLinkInPromptSkipsFetch(t *testing.T) {
 	svc, _ := newQueueTestService(t)
 	svc.gen = &fakeGenerator{results: []*ai.Result{{Summary: "ok"}}}
@@ -368,12 +303,7 @@ func TestGenerate_NoLinkInPromptSkipsFetch(t *testing.T) {
 	}
 }
 
-// TestGenerate_NilLinksSkipsFetchGracefully is the regression this guards:
-// a Service built by struct literal without setting links (svc.links stays
-// nil, its zero value) — matching how every other test in this file
-// constructs one — must not panic on a prompt that happens to contain a
-// url; it should behave exactly as if no reference link feature existed at
-// all, same as before this feature was added.
+// Regression guard: Service without links set (nil) must not panic on URL in prompt.
 func TestGenerate_NilLinksSkipsFetchGracefully(t *testing.T) {
 	svc := &Service{gen: &fakeGenerator{visionSupported: true}}
 

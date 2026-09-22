@@ -16,24 +16,19 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
 )
 
-// newStreamingTestStream opens a real *ssestream.Stream against ts by
-// issuing a minimal Messages.NewStreaming call — used by the consumeStream
-// tests below, which need a real stream (consumeStream takes the SDK's
-// stream type directly, not an interface) rather than Generate's full tool
-// loop.
+// newStreamingTestStream opens a real *ssestream.Stream against ts; needed because
+// consumeStream takes the SDK's stream type directly, not an interface.
 func newStreamingTestStream(ts *httptest.Server) *ssestream.Stream[anthropic.MessageStreamEventUnion] {
 	client := anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key"))
 	return client.Messages.NewStreaming(context.Background(), anthropic.MessageNewParams{
-		Model:     "claude-test",
+		Model:     "test-model",
 		MaxTokens: 1024,
 		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock("hi"))},
 	})
 }
 
-// flush writes s to w and flushes it immediately, so a test server can send
-// a partial SSE response and then stall — http.ResponseWriter otherwise may
-// buffer until the handler returns, which would defeat every test below
-// that depends on the client seeing bytes before the handler blocks.
+// flush writes s and flushes immediately, so a test server can send a partial SSE
+// response and stall without buffering until the handler returns.
 func flush(w http.ResponseWriter, s string) {
 	fmt.Fprint(w, s)
 	if f, ok := w.(http.Flusher); ok {
@@ -41,16 +36,14 @@ func flush(w http.ResponseWriter, s string) {
 	}
 }
 
-// TestConsumeStream_IdleTimeoutFiresOnStalledConnection covers
-// streamIdleTimeout's whole reason to exist: a connection that goes quiet
-// after producing at least one event must be treated as hung and returned
-// as errStreamIdle, not left to block forever.
+// TestConsumeStream_IdleTimeoutFiresOnStalledConnection checks a connection that goes quiet
+// after producing at least one event is treated as hung, returned as errStreamIdle.
 func TestConsumeStream_IdleTimeoutFiresOnStalledConnection(t *testing.T) {
 	var b strings.Builder
 	sseEvent(&b, "message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
 			"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
 		},
@@ -60,8 +53,7 @@ func TestConsumeStream_IdleTimeoutFiresOnStalledConnection(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		flush(w, firstEvent)
-		// Deliberately never send anything else — the exact "stalled but
-		// still connected" scenario streamIdleTimeout exists to catch.
+		// Deliberately never send anything else — "stalled but still connected".
 		<-r.Context().Done()
 	}))
 	defer ts.Close()
@@ -83,10 +75,8 @@ func TestConsumeStream_IdleTimeoutFiresOnStalledConnection(t *testing.T) {
 	}
 }
 
-// TestConsumeStream_FirstTokenTimeoutFiresWhenNothingEverArrives covers the
-// other budget: a connection that never produces so much as one byte of
-// real content must fail on firstTokenTimeout, independent of (and here,
-// shorter than) the idle timeout.
+// TestConsumeStream_FirstTokenTimeoutFiresWhenNothingEverArrives checks a connection that
+// never produces one byte of real content fails on firstTokenTimeout, shorter than idle here.
 func TestConsumeStream_FirstTokenTimeoutFiresWhenNothingEverArrives(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -107,21 +97,15 @@ func TestConsumeStream_FirstTokenTimeoutFiresWhenNothingEverArrives(t *testing.T
 	}
 }
 
-// TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress is the load-
-// bearing regression case: a forced propose_changes call (or any call with
-// adaptive thinking off) can stream nothing but tool_use deltas with zero
-// narration text. If only text/thinking counted as progress, a model that
-// was actively streaming a large tool_use payload would still trip the
-// first-token timeout. Here the server sends only a tool_use content block
-// (no text) and then stalls — the first-token timeout must NOT be what
-// fires; only the (longer) idle timeout should, proving the tool_use bytes
-// were recognized as progress and stopped the first-token timer.
+// TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress checks tool_use-only streaming
+// (no narration text) still counts as first-token progress — only the idle timeout should
+// fire here, not the first-token one, since a text/thinking-only check would false-trip it.
 func TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress(t *testing.T) {
 	var b strings.Builder
 	sseEvent(&b, "message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
 			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
 			"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
 		},
@@ -147,8 +131,8 @@ func TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress(t *testing.T) {
 	var message anthropic.Message
 	coalescer := newDeltaCoalescer(func(string) {})
 
-	// firstToken shorter than idle: if tool_use bytes did NOT count as
-	// progress, this would return errStreamFirstToken at ~40ms instead.
+	// firstToken shorter than idle: if tool_use bytes didn't count as progress, this
+	// would return errStreamFirstToken at ~40ms instead.
 	err := consumeStream(context.Background(), stream, &message, coalescer, 150*time.Millisecond, 40*time.Millisecond)
 	_ = stream.Close()
 
@@ -157,10 +141,8 @@ func TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress(t *testing.T) {
 	}
 }
 
-// TestGenerate_RetriesOnIdleTimeout is the integration case: a stalled
-// first attempt must be retried exactly like a truncated/garbled stream
-// chunk already was, ending in a successful Result once a later attempt
-// completes normally — not a hard-failed generation.
+// TestGenerate_RetriesOnIdleTimeout checks a stalled first attempt is retried, ending in a
+// successful Result once a later attempt completes normally.
 func TestGenerate_RetriesOnIdleTimeout(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -196,15 +178,9 @@ func TestGenerate_RetriesOnIdleTimeout(t *testing.T) {
 	}
 }
 
-// TestStreamProgressBytes_CountsTextThinkingAndToolUse covers every branch
-// streamProgressBytes is supposed to count — see its own doc comment on why
-// tool_use must count alongside text/thinking.
-//
-// Content blocks are built via real json.Unmarshal, not a struct literal:
-// ContentBlockUnion's As* accessors (AsText/AsThinking/AsToolUse, which
-// AsAny/streamProgressBytes go through) re-decode from an internal raw-JSON
-// field that only json.Unmarshal populates — a struct literal leaves it
-// empty and every accessor silently returns a zero value.
+// TestStreamProgressBytes_CountsTextThinkingAndToolUse covers every branch streamProgressBytes
+// counts. Built via real json.Unmarshal, not a struct literal: the As* accessors re-decode
+// from an internal raw-JSON field that only json.Unmarshal populates.
 func TestStreamProgressBytes_CountsTextThinkingAndToolUse(t *testing.T) {
 	var blocks []anthropic.ContentBlockUnion
 	raw := `[
@@ -224,17 +200,15 @@ func TestStreamProgressBytes_CountsTextThinkingAndToolUse(t *testing.T) {
 	}
 }
 
-// TestStreamProgressBytes_EmptyMessageIsZero guards the "no progress yet"
-// baseline consumeStream's sawProgress check relies on.
+// TestStreamProgressBytes_EmptyMessageIsZero guards the "no progress yet" baseline.
 func TestStreamProgressBytes_EmptyMessageIsZero(t *testing.T) {
 	if got := streamProgressBytes(anthropic.Message{}); got != 0 {
 		t.Fatalf("expected 0 for an empty message, got %d", got)
 	}
 }
 
-// TestClampToContextDeadline_ShortensWhenParentDeadlineIsSooner covers the
-// reason clampToContextDeadline exists: a first-token budget must never
-// itself outlive the generation it's part of.
+// TestClampToContextDeadline_ShortensWhenParentDeadlineIsSooner checks a first-token budget
+// never outlives the generation it's part of.
 func TestClampToContextDeadline_ShortensWhenParentDeadlineIsSooner(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -245,9 +219,8 @@ func TestClampToContextDeadline_ShortensWhenParentDeadlineIsSooner(t *testing.T)
 	}
 }
 
-// TestClampToContextDeadline_LeavesUnchangedWithNoDeadline covers the
-// common case in tests (context.Background()) and any caller without a
-// parent deadline — clamping must be a no-op, not a zero timeout.
+// TestClampToContextDeadline_LeavesUnchangedWithNoDeadline checks clamping with no parent
+// deadline is a no-op, not a zero timeout.
 func TestClampToContextDeadline_LeavesUnchangedWithNoDeadline(t *testing.T) {
 	got := clampToContextDeadline(context.Background(), 45*time.Second)
 	if got != 45*time.Second {
@@ -255,9 +228,8 @@ func TestClampToContextDeadline_LeavesUnchangedWithNoDeadline(t *testing.T) {
 	}
 }
 
-// TestClampToContextDeadline_NeverGoesNegative covers a ctx whose deadline
-// has already passed — the caller must get 0, not a negative duration that
-// would make a subsequent time.NewTimer panic.
+// TestClampToContextDeadline_NeverGoesNegative checks an already-expired deadline returns
+// 0, not a negative duration that would make time.NewTimer panic.
 func TestClampToContextDeadline_NeverGoesNegative(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
@@ -267,11 +239,8 @@ func TestClampToContextDeadline_NeverGoesNegative(t *testing.T) {
 	}
 }
 
-// TestIsRetryableStreamErr_ExcludesContextCancellation covers a deliberate
-// exclusion: ctx.Err() (the generation's own parent budget running out, or
-// an explicit cancel) must never be treated as a retryable provider hiccup
-// — retrying it would just spend the retry delay against a context that's
-// already dead.
+// TestIsRetryableStreamErr_ExcludesContextCancellation checks ctx.Err() is never treated
+// as a retryable provider hiccup — retrying it would spend the delay against a dead context.
 func TestIsRetryableStreamErr_ExcludesContextCancellation(t *testing.T) {
 	if isRetryableStreamErr(context.DeadlineExceeded) {
 		t.Error("context.DeadlineExceeded must not be retryable")
@@ -290,9 +259,8 @@ func TestIsRetryableStreamErr_ExcludesContextCancellation(t *testing.T) {
 	}
 }
 
-// TestGenerator_FirstTokenTimeoutFor_MapsGenerationModes covers
-// StreamTimeouts' per-mode mapping and its zero-value fallback to the
-// package defaults.
+// TestGenerator_FirstTokenTimeoutFor_MapsGenerationModes covers StreamTimeouts' per-mode
+// mapping and its zero-value fallback to package defaults.
 func TestGenerator_FirstTokenTimeoutFor_MapsGenerationModes(t *testing.T) {
 	g := &Generator{streamTimeouts: StreamTimeouts{
 		FirstTokenEdit:  111 * time.Second,
@@ -318,10 +286,8 @@ func TestGenerator_FirstTokenTimeoutFor_MapsGenerationModes(t *testing.T) {
 	}
 }
 
-// TestGenerator_FirstTokenTimeoutFor_DefaultsWhenZero covers a Generator
-// built without New (e.g. a bare struct literal in a test) — a zero
-// StreamTimeouts must fall back to the package defaults, never to an
-// instant/zero timeout.
+// TestGenerator_FirstTokenTimeoutFor_DefaultsWhenZero checks a Generator built without New
+// (a bare struct literal) falls back to package defaults, never an instant/zero timeout.
 func TestGenerator_FirstTokenTimeoutFor_DefaultsWhenZero(t *testing.T) {
 	var g Generator
 	if got := g.firstTokenTimeoutFor(GenerationModeEdit); got != defaultFirstTokenTimeoutEdit {

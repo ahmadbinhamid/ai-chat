@@ -5,23 +5,16 @@ import (
 	"strings"
 )
 
-// maxRenderDepth guards against a render cycle (a component rendering
-// itself, directly or via a chain) — a real error case for a preview, not
-// something to hang forever on.
+// maxRenderDepth guards against a render cycle (a component rendering itself via a chain).
 const maxRenderDepth = 20
 
-// Renderer executes templates from Files (theme-relative path, including
-// its .liquid extension -> content) against a starting variable scope.
+// Renderer executes templates from Files (theme-relative path -> content) against a variable scope.
 type Renderer struct {
 	Files map[string]string
 }
 
-// Render renders entryPath (e.g. "pages/offers.liquid") with vars as its
-// top-level scope, returning the produced HTML and any errors encountered
-// (an unsupported tag/filter, a missing render target, etc.) — errors don't
-// stop rendering; the rest of the template still produces output around
-// the failure, which is more useful for a preview than an all-or-nothing
-// failure.
+// Render renders entryPath with vars as its top-level scope, returning HTML and any errors.
+// Errors don't stop rendering — the rest of the template still produces output around the failure.
 func (r *Renderer) Render(entryPath string, vars map[string]any) (string, []string) {
 	var errs []string
 	out := r.renderFile(entryPath, scope(vars), &errs, 0)
@@ -45,9 +38,8 @@ func (r *Renderer) renderFile(path string, vars scope, errs *[]string, depth int
 	return b.String()
 }
 
-// execBlock renders tokens from *pos into b until EOF or a tag whose name
-// is in stopAt, returning that tag's name ("" at EOF) without consuming it
-// — the caller (execIf, capture) decides what to do next.
+// execBlock renders tokens from *pos into b until EOF or a tag in stopAt, returning that
+// tag's name ("" at EOF) without consuming it; the caller decides what to do next.
 func (r *Renderer) execBlock(toks []token, pos *int, vars scope, b *strings.Builder, errs *[]string, depth int, stopAt map[string]bool) string {
 	for *pos < len(toks) {
 		t := toks[*pos]
@@ -146,14 +138,11 @@ func (r *Renderer) execIf(toks []token, pos *int, cond string, vars scope, b *st
 	}
 }
 
-// skipCondTag is a no-op placeholder kept for symmetry with execIf's
-// branch-consuming logic — elsif's condition is read directly from the
-// token when needed, nothing to separately skip here.
+// skipCondTag is a no-op placeholder; elsif's condition is read directly from the token.
 func skipCondTag(_ []token, _ *int) {}
 
-// execFor handles "{% for x in y %}...{% endfor %}", binding x plus
-// forloop.first/forloop.last (§1 — no other forloop field is supported)
-// for each element of y, which must evaluate to a slice.
+// execFor handles "{% for x in y %}...{% endfor %}", binding x plus forloop.first/last
+// (no other forloop field supported); y must evaluate to a slice.
 func (r *Renderer) execFor(toks []token, pos *int, raw string, vars scope, b *strings.Builder, errs *[]string, depth int) {
 	bodyStart := *pos
 
@@ -212,9 +201,8 @@ func execAssign(raw string, vars scope, errs *[]string) {
 	vars[name] = eval(strings.TrimSpace(raw[idx+1:]), vars, errs)
 }
 
-// execRender handles "{% render 'target', key: value, ... %}" — only the
-// explicit params are visible inside the partial (§1: "never rely on
-// implicit/global scope leaking into a component").
+// execRender handles "{% render 'target', key: value, ... %}"; only explicit params are
+// visible inside the partial — no implicit/global scope leaking into a component.
 func (r *Renderer) execRender(raw string, vars scope, b *strings.Builder, errs *[]string, depth int) {
 	target, params, ok := splitRenderArgs(raw)
 	if !ok {
@@ -234,10 +222,8 @@ func (r *Renderer) execRender(raw string, vars scope, b *strings.Builder, errs *
 	b.WriteString(r.renderFile(target+".liquid", partialVars, errs, depth+1))
 }
 
-// skipBlock advances *pos past tokens until it finds one of stopNames at
-// the same nesting level — an inner if/for/capture's own matching close
-// doesn't count, so nested blocks inside a skipped branch don't confuse
-// the search for the OUTER boundary.
+// skipBlock advances *pos past tokens until a stopNames tag at the same nesting level;
+// tracks depth so a nested if/for/capture's own close doesn't confuse the outer boundary.
 func skipBlock(toks []token, pos *int, stopNames map[string]bool) string {
 	depth := 0
 	for *pos < len(toks) {
@@ -267,9 +253,8 @@ func skipBlock(toks []token, pos *int, stopNames map[string]bool) string {
 	return ""
 }
 
-// evalCondition evaluates an if/elsif condition: a bare value, an
-// "A == B"/"A != B" comparison, or several such comparisons joined by
-// "or" — the only forms §1's dialect uses.
+// evalCondition evaluates a bare value, an "A == B"/"A != B" comparison, or several
+// such comparisons joined by "or".
 func evalCondition(raw string, vars scope, errs *[]string) bool {
 	for _, part := range splitOnWord(raw, "or") {
 		part = strings.TrimSpace(part)

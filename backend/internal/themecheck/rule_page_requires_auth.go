@@ -2,16 +2,8 @@ package themecheck
 
 const ruleIDPageRequiresAuth = "page-requires-auth"
 
-// checkPageRequiresAuth rejects any proposal that sets
-// page_registry_entry.requires_auth. resultSchema no longer lets the model
-// emit this field at all (see internal/ai/generator.go's resultSchema
-// comment: per spec §5, requires_auth only applies to the fixed
-// my_account/my_orders/change_password system routes ai-chat can never
-// register, and — separately — flowpos-backend doesn't forward it from this
-// API today regardless). themefs.PageEntry still carries the field because
-// it mirrors the full pages.json record shape, so it remains assignable in
-// Go even though nothing should ever set it; this rule is the cheap
-// insurance that catches it if something does.
+// checkPageRequiresAuth rejects a proposal setting page_registry_entry.requires_auth. The model can no longer emit
+// this field, but themefs.PageEntry still carries it (mirrors pages.json), so this is a cheap safety net.
 func checkPageRequiresAuth(p Proposal, _ Snapshot) []Finding {
 	if p.PageRegistryEntry == nil || !p.PageRegistryEntry.RequiresAuth {
 		return nil
