@@ -142,9 +142,7 @@ func TestApplyDraft_RejectedWhileGenerationRunningOrQueued(t *testing.T) {
 	}
 }
 
-// Item 7: ApplyDraft restores PageMeta for a pages/*.liquid file — the
-// model's own PageRegistryEntry is long gone by apply time; only the
-// persisted page_meta column has it.
+// Restores PageMeta for pages/*.liquid files.
 func TestApplyDraft_RestoresPageMetaForPagesFile(t *testing.T) {
 	fake := newFakeApplyServer()
 	svc, chatSvc, buildRepo := newApplyTestService(t, fake)
@@ -207,8 +205,6 @@ func TestApplyDraft_CarriesForwardPageMetaAcrossTurns(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateFile (turn 1) failed: %v", err)
 	}
-
-	time.Sleep(1100 * time.Millisecond)
 
 	// Turn 2: "make the heading bigger" — the page already exists, so the
 	// model sends no PageRegistryEntry this time; pageMeta is nil.
@@ -606,7 +602,6 @@ func TestRevertToMessage_WithinDraftMakesZeroFlowposCalls(t *testing.T) {
 		t.Fatalf("GetOrCreateChat failed: %v", err)
 	}
 	target := seedPendingFile(t, chatSvc, buildRepo, c, "pages/home.liquid", "v1", GeneratedFileKindProposed)
-	time.Sleep(1100 * time.Millisecond)
 	seedPendingFile(t, chatSvc, buildRepo, c, "pages/home.liquid", "v2", GeneratedFileKindProposed)
 
 	result, err := svc.RevertToMessage(ctx, tenantID, "tok", c.ID, target.ID)

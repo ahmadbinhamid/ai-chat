@@ -1,15 +1,6 @@
 package themefs
 
-// This file provides canned data matching theme_engine_spec.md §7's data
-// model, for rendering a page preview without a real storefront request
-// behind it (no real product/customer/basket exists for a "preview this
-// draft" call) — see internal/liquidrender and the preview handler.
-// Everything is a plain map[string]any (not a Go struct) so the renderer
-// can resolve dotted paths via simple map traversal, no reflection.
-
-// FixtureProduct returns one representative product detail context —
-// covers every field §7 lists, including the choices/variants branches a
-// real product page's conditional markup usually depends on.
+// This file provides canned §7-shaped data for previewing a page without a real storefront request ...
 func FixtureProduct() map[string]any {
 	return map[string]any{
 		"name": "Sample Product", "id": "1", "slug": "sample-product",
@@ -46,19 +37,12 @@ func FixtureProduct() map[string]any {
 		},
 		"default_variant_id": "v1",
 		"variants_json":      `[{"id":"v1"},{"id":"v2"}]`,
-		// Singular "product/", not "products/" — matches
-		// PageResolver::RESOURCE_ROUTES' hardcoded '#^product/([^/]+)$#' in
-		// flowpos-backend exactly; that pattern is fixed infrastructure, not
-		// something a theme's pages.json can configure, so this is the one
-		// correct value for every theme, not a per-theme guess.
+		// Singular "product/", not "products/" — matches flowpos-backend's hardcoded PageResolver::RESOURCE_ROUTES pattern exactly, fixed for every theme.
 		"url": "/product/sample-product",
 	}
 }
 
-// FixtureProducts returns a list-context products object (the shape used
-// by home/category/search grids) — items reuse FixtureProduct's shape
-// minus nothing in particular (see themecheck's own note that list and
-// detail contexts share a superset shape in this preview tooling too).
+// FixtureProducts returns a list-context products object (the shape used by home/category/search grids).
 func FixtureProducts() map[string]any {
 	item := FixtureProduct()
 	return map[string]any{
@@ -105,10 +89,7 @@ func FixtureBasket() map[string]any {
 	}
 }
 
-// FixtureContext assembles every §7 context object a page's boilerplate and
-// body markup might reference, in the shape render params expect —
-// everything a real storefront request would populate, standing in so a
-// preview doesn't need one.
+// FixtureContext assembles every §7 context object a page's boilerplate/body markup might reference, standing in for a real storefront request.
 func FixtureContext() map[string]any {
 	menuItems := []any{
 		map[string]any{"label": "Home", "url": "/", "active": true, "children": []any{}},
@@ -128,11 +109,8 @@ func FixtureContext() map[string]any {
 		"customer": map[string]any{
 			"name": "Jordan Merchant", "email": "jordan@example.com", "phone": "+44 20 7946 0000",
 		},
-		// auth_check, not customer_authenticated: §3's boilerplate render
-		// call is "customer_authenticated: auth_check" — the partial's
-		// parameter is named customer_authenticated, but the PAGE-level
-		// variable it's forwarded from is auth_check (see §7's own note on
-		// this field). Pages/preview content reference auth_check.
+		// auth_check, not customer_authenticated: §3's render call is "customer_authenticated: auth_check" — the
+		// page-level variable is auth_check, the partial's param name differs.
 		"auth_check":  true,
 		"environment": "preview",
 		"csrf_token":  "preview-csrf-token",

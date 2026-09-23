@@ -10,53 +10,34 @@ import (
 	"golang.org/x/net/html"
 )
 
-// maxCustomProperties bounds how many CSS custom properties (--brand-green:
-// #6E9A3A) BuildDigest lists verbatim, in first-declared order — a real
-// design system's :root block is usually a few dozen entries at most; this
-// is generous headroom above that while still bounding a pathological
-// stylesheet that declares hundreds.
+// maxCustomProperties bounds how many CSS custom properties BuildDigest
+// lists verbatim — generous headroom above a real :root block's typical size.
 const maxCustomProperties = 30
 
-// maxRankedValuesPerProperty bounds how many of each ranked CSS property's
-// (color, font-family, etc. — see rankedCSSProperties) most-frequent
-// distinct values BuildDigest keeps. Frequency is the actual signal (a
-// color used 40 times across a stylesheet is the brand color; one used
-// once is an edge case), so this caps the LONG TAIL, not the useful part.
+// maxRankedValuesPerProperty bounds how many of each ranked property's
+// most-frequent values are kept — frequency is the real signal (a color
 const maxRankedValuesPerProperty = 8
 
-// maxFontFaceFamilies and maxFontCDNHrefs bound the typefaces section — a
-// real page rarely declares or links more than a handful of distinct font
-// families; these are headroom above that, not a tight budget.
+// maxFontFaceFamilies and maxFontCDNHrefs bound the typefaces section —
+// headroom above what a real page typically declares/links.
 const (
 	maxFontFaceFamilies = 10
 	maxFontCDNHrefs     = 5
 )
 
-// maxCSSValueChars caps a single declared CSS value (ranked or custom-
-// property) — every other per-item field in this file is already length-
-// capped one way or another; without this, one pathological declared value
-// (a box-shadow with many comma-separated layers) could dominate the whole
-// budget on its own before DigestHardCapBytes' final truncation ever gets a
-// say in which section loses ground. See maxHeadingChars in
-// digest_structure.go for the same reasoning applied to heading text.
+// maxCSSValueChars caps one declared CSS value so a pathological value
+// (a box-shadow with many layers) can't dominate the budget before
 const maxCSSValueChars = 200
 
-// rankedCSSProperties are the declared-value properties BuildDigest ranks
-// by occurrence count (see maxRankedValuesPerProperty) — chosen because
-// each one is a concrete, reusable design decision (a palette color, a
-// typeface, a corner radius) a model can act on directly, unlike most of
-// the rest of a stylesheet (layout, positioning, vendor-specific rules).
+// rankedCSSProperties are the properties ranked by occurrence count — each
+// is a concrete, reusable design decision a model can act on directly.
 var rankedCSSProperties = []string{
 	"color", "background-color", "border-color", "font-family",
 	"font-size", "font-weight", "border-radius", "box-shadow", "letter-spacing",
 }
 
-// cssPropertyPatterns is built once, at package init — compiling
-// len(rankedCSSProperties) regexps is a one-time cost, not something to
-// repeat per fetched page. Each pattern requires its property name to be
-// preceded only by "{"/";" and optional whitespace, not by \b alone: CSS
-// uses "-" as a word-joining character regexes treat as a boundary, so a
-// bare \bcolor\b would also match the "color" inside "background-color".
+// cssPropertyPatterns is built once at package init. Each pattern requires
+// its property preceded only by "{"/";" + whitespace, not bare \b: CSS's "-"
 var cssPropertyPatterns = func() map[string]*regexp.Regexp {
 	m := make(map[string]*regexp.Regexp, len(rankedCSSProperties))
 	for _, p := range rankedCSSProperties {
@@ -65,24 +46,19 @@ var cssPropertyPatterns = func() map[string]*regexp.Regexp {
 	return m
 }()
 
-// customPropertyPattern matches a CSS custom property declaration anywhere
-// in the stylesheet text — deliberately not scoped to :root, since a
-// design system's tokens are sometimes declared per-component instead.
+// customPropertyPattern matches anywhere in the stylesheet, not just :root —
+// design-system tokens are sometimes declared per-component instead.
 var customPropertyPattern = regexp.MustCompile(`(--[a-zA-Z0-9-]+)\s*:\s*([^;{}]+)`)
 
-// fontFaceBlockPattern and fontFamilyValuePattern together extract a
-// declared family name from each @font-face rule — two patterns rather
-// than one, since font-family can appear anywhere inside the block, in any
-// order relative to the other descriptors (src, font-weight, etc.).
+// fontFaceBlockPattern and fontFamilyValuePattern are two patterns, not one,
+// since font-family can appear anywhere inside an @font-face block.
 var (
 	fontFaceBlockPattern   = regexp.MustCompile(`(?is)@font-face\s*\{([^}]*)\}`)
 	fontFamilyValuePattern = regexp.MustCompile(`(?i)font-family\s*:\s*([^;]+)`)
 )
 
-// fontCDNHosts are well-known font-hosting domains BuildDigest recognizes
-// when scanning the document's own <link href>s — matched by exact host or
-// subdomain (see isFontCDNHost), so "fonts.googleapis.com" also matches
-// "www.fonts.googleapis.com" but not "notfonts.googleapis.com.evil.example".
+// fontCDNHosts are matched by exact host or subdomain (see isFontCDNHost),
+// so "fonts.googleapis.com" also matches "www.fonts.googleapis.com" but not
 var fontCDNHosts = []string{
 	"fonts.googleapis.com", "fonts.gstatic.com", "use.typekit.net",
 	"use.fontawesome.com", "fonts.adobe.com", "fast.fonts.net", "p.typekit.net",
@@ -120,22 +96,16 @@ func extractDesignTokens(css, htmlSrc string) designTokens {
 	}
 }
 
-// normalizeCSSValue trims and collapses a raw regex-captured declaration
-// value ("  #FFF  " -> "#FFF", "red !important" -> "red") so trivially
-// different-looking captures of the same real value tally as one entry
-// instead of splitting the count between them, then caps it at
-// maxCSSValueChars (see that const's own doc comment).
+// normalizeCSSValue trims/collapses a captured value ("  #FFF  " -> "#FFF",
+// "red !important" -> "red") so equivalent captures tally as one entry.
 func normalizeCSSValue(raw string) string {
 	v := collapseWhitespace(raw)
 	v = strings.TrimSpace(strings.TrimSuffix(v, "!important"))
 	return truncateBytes(v, maxCSSValueChars)
 }
 
-// rankTopValues tallies every value pattern captures in css and returns
-// the topN most frequent, most-frequent first, ties broken by first-seen
-// order (via sort.SliceStable over a first-seen-ordered slice) so the
-// result is deterministic rather than dependent on Go's map iteration
-// order.
+// rankTopValues returns the topN most frequent values pattern captures in
+// css, ties broken by first-seen order for deterministic output.
 func rankTopValues(css string, pattern *regexp.Regexp, topN int) []rankedValue {
 	counts := make(map[string]int)
 	var order []string
@@ -258,11 +228,8 @@ func writeDesignTokensSection(b *strings.Builder, tokens designTokens) {
 			fmt.Fprintf(b, "  %s: %s\n", p.name, p.value)
 		}
 	}
-	// Iterate rankedCSSProperties (a fixed slice), not tokens.ranked (a
-	// map) directly, so section order is deterministic — Go map iteration
-	// order is randomized, and this output feeds a model prompt, where
-	// reordering runs between otherwise-identical fetches is exactly the
-	// kind of pointless noise worth avoiding.
+	// Iterate the fixed slice, not the map, so section order is deterministic
+	// (this feeds a model prompt — reordering between fetches is just noise).
 	for _, prop := range rankedCSSProperties {
 		values := tokens.ranked[prop]
 		if len(values) == 0 {

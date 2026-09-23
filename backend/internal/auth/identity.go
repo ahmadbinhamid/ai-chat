@@ -1,8 +1,7 @@
 package auth
 
-// Identity is the immutable, per-request identity Middleware resolves for
-// one specific tenant — built fresh on every request from the (cached or
-// live) introspection result, never itself cached (see CacheEntry).
+// Identity is the per-request identity Middleware resolves for one tenant; built fresh
+// every request, never itself cached.
 type Identity struct {
 	UserID      uint64
 	Name        string
@@ -14,9 +13,8 @@ type Identity struct {
 	Permissions []string
 }
 
-// superAdminRole ships with an empty Permissions slice — a naive
-// contains-check against Permissions would deny it every action. Can is the
-// only sanctioned way to check a permission for exactly this reason.
+// superAdminRole ships with an empty Permissions slice; always use Can, never a raw
+// contains-check against Permissions, or it's wrongly denied every action.
 const superAdminRole = "super-admin"
 
 // Can reports whether identity is allowed permission.

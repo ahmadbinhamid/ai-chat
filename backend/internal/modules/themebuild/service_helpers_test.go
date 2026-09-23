@@ -139,6 +139,50 @@ func TestRecapAssistantTurn_NeverEmpty(t *testing.T) {
 	}
 }
 
+// Shows original action (edit) even after materialization to (update).
+func TestRecapAssistantTurn_ShowsOriginalActionForMaterializedEdit(t *testing.T) {
+	result := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "components/footer.liquid", Action: "update", OriginalAction: "edit", Content: "<footer>new</footer>"},
+		},
+	}
+	got := recapAssistantTurn(result)
+	if !strings.Contains(got, "(edit)") {
+		t.Errorf("expected the recap to show the model's own original action (edit), got: %s", got)
+	}
+	if strings.Contains(got, "(update)") {
+		t.Errorf("expected the recap NOT to also show (update) for a materialized edit, got: %s", got)
+	}
+}
+
+// Back-compat: files without OriginalAction recap exactly as before.
+func TestRecapAssistantTurn_CreateAndUpdateByteIdenticalToBeforeOriginalAction(t *testing.T) {
+	result := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "pages/new.liquid", Action: "create", Content: "hello"},
+			{Path: "pages/offers.liquid", Action: "update", Content: "world"},
+		},
+	}
+	got := recapAssistantTurn(result)
+	want := "### pages/new.liquid (create)\nhello\n\n### pages/offers.liquid (update)\nworld"
+	if got != want {
+		t.Errorf("recap = %q, want %q", got, want)
+	}
+}
+
+// Failed materialization resubmitted as update recaps as (update).
+func TestRecapAssistantTurn_FailedMaterializationRecapsAsUpdate(t *testing.T) {
+	result := &ai.Result{
+		Files: []ai.GeneratedFile{
+			{Path: "components/footer.liquid", Action: "update", Content: "<footer>fixed</footer>"},
+		},
+	}
+	got := recapAssistantTurn(result)
+	if !strings.Contains(got, "(update)") {
+		t.Errorf("expected a resubmitted-as-update file to recap as (update), got: %s", got)
+	}
+}
+
 func TestRepairPrompt(t *testing.T) {
 	findings := []themecheck.Finding{
 		{Rule: "known-fields", Path: "pages/offers.liquid", Message: "invented field"},

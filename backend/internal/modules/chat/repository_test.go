@@ -17,15 +17,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// openTestDB connects to the same MySQL this repo's .env already points at
-// and skips the test if it isn't reachable — matches themebuild's own
-// openTestDB (see internal/modules/themebuild/generation_test.go). This
-// package's own DB tests need a real database for the same class of reason
-// themebuild's do: clientFoundRows=true (set in the DSN below) is a
-// MySQL-driver-level connection option, not something a fake/mock
-// database/sql driver can be trusted to reproduce faithfully — see
-// TestRepository_TouchChatUsage_ZeroDeltaSameSecond, the test this
-// specifically exists for.
+// openTestDB connects to the same MySQL this repo's .env points at, skipping the test if
+// unreachable — needed because clientFoundRows=true is a driver-level option a mock can't reproduce.
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=UTC&clientFoundRows=true",
@@ -106,17 +99,8 @@ func TestRepository_CreateMessageAndTouchUsage_CommitsBothWrites(t *testing.T) {
 	}
 }
 
-// TestRepository_CreateMessageAndTouchUsage_RollsBackOnFailure forces
-// createMessage's own INSERT to fail (chk_chat_messages_user_role rejects a
-// 'user'-role row with no user_id) and checks nothing lands durably as a
-// result. This is the only failure mode reachable through this repository's
-// public API: fk_chat_messages_chat means touchChatUsage can never run
-// against a chat_id that createMessage's own INSERT didn't already require
-// to exist, so a genuine "step one committed, step two failed" scenario
-// isn't constructible from outside the transaction — this test instead
-// verifies the transaction-wrapping actually works, i.e. a failure here
-// leaves the target chat's usage totals untouched, not incremented by a
-// message that was never really recorded.
+// TestRepository_CreateMessageAndTouchUsage_RollsBackOnFailure forces createMessage's INSERT
+// to fail and checks nothing lands durably — the target chat's usage totals stay untouched.
 func TestRepository_CreateMessageAndTouchUsage_RollsBackOnFailure(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -151,18 +135,7 @@ func TestRepository_CreateMessageAndTouchUsage_RollsBackOnFailure(t *testing.T) 
 	}
 }
 
-// TestRepository_TouchChatUsage_ZeroDeltaSameSecond is the critical test
-// item 5 calls out by name: touchChatUsage's UPDATE sets total_input_tokens
-// = total_input_tokens + 0 and updated_at to a value that can land in the
-// exact same wall-clock second as the row's current updated_at (created_at
-// == updated_at at seed time, both second-precision DATETIME columns).
-// Without clientFoundRows=true in the connection DSN, MySQL's default
-// affected-rows semantics report 0 rows affected for an UPDATE that
-// changed nothing byte-for-byte — which checkAffected would then
-// misreport as ErrNotFound for a chat that very much still exists. This
-// only ever surfaces with a real MySQL connection (see openTestDB's doc
-// comment), which is why this test — unlike touchChatUsage's caller-level
-// behavior — can't be verified with a fake/mock driver.
+// TestRepository_TouchChatUsage_ZeroDeltaSameSecond checks a zero-delta UPDATE that changes
 func TestRepository_TouchChatUsage_ZeroDeltaSameSecond(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -170,8 +143,7 @@ func TestRepository_TouchChatUsage_ZeroDeltaSameSecond(t *testing.T) {
 
 	c := seedChat(t, repo, "builder-"+uuid.NewString())
 
-	// Same instant as the seed's created_at/updated_at — the whole point is
-	// to land in the same wall-clock second, not merely a nearby one.
+	// Same instant as the seed's created_at/updated_at — must land in the same second.
 	err := touchChatUsage(ctx, repo.db, c.ID, 0, 0, c.CreatedAt)
 	if err != nil {
 		t.Fatalf("touchChatUsage with a zero delta unexpectedly failed (likely a clientFoundRows regression): %v", err)
@@ -189,14 +161,8 @@ func TestRepository_GetChatByTenantAndType_ReturnsErrNotFoundForTenantWithNoChat
 	}
 }
 
-// TestService_RecordUserMessage_ListReturnsAttachmentMetadataNoContent
-// round-trips a message with two images and one HTML attachment through
-// the real write path (chat.Service.RecordUserMessage, which decodes wire
-// base64 into raw bytes — see buildAttachments) and the real transcript
-// read path (ListMessagesByChat), asserting metadata comes back complete,
-// correctly ordered/positioned, and — the actual point of the
-// metadata/content split — that Content is nil on every attachment: a
-// transcript read must never carry attachment bytes.
+// TestService_RecordUserMessage_ListReturnsAttachmentMetadataNoContent round-trips a message
+// with attachments through the real write/read paths, checking Content is nil on every one.
 func TestService_RecordUserMessage_ListReturnsAttachmentMetadataNoContent(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -229,9 +195,7 @@ func TestService_RecordUserMessage_ListReturnsAttachmentMetadataNoContent(t *tes
 	if len(got.Attachments) != 3 {
 		t.Fatalf("expected 3 attachments (2 images + 1 html), got %d: %+v", len(got.Attachments), got.Attachments)
 	}
-	// Ordered by (kind, position) — see listAttachmentMetadata's own doc
-	// comment on why kind is the tiebreaker: html and the first image both
-	// have position 0 (position is scoped per kind, not per message), and
+	// Ordered by (kind, position): html and the first image both have position 0, and
 	// "html" sorts before "image" alphabetically.
 	html, img0, img1 := got.Attachments[0], got.Attachments[1], got.Attachments[2]
 
@@ -257,25 +221,14 @@ func TestService_RecordUserMessage_ListReturnsAttachmentMetadataNoContent(t *tes
 		}
 	}
 
-	// Sanity: RecordUserMessage's own return value also carries no
-	// unexpected extra rows and matches what got persisted.
+	// Sanity: RecordUserMessage's return value also matches what got persisted.
 	if len(created.Attachments) != 3 {
 		t.Fatalf("expected RecordUserMessage's own return value to report 3 attachments, got %d", len(created.Attachments))
 	}
 }
 
-// TestRepository_ListMessagesByChat_NoImagesFieldOnlyAttachments supersedes
-// what used to be TestRepository_ListMessagesByChat_ReturnsBothImagesShimAndAttachments
-// from the previous pass, which asserted the OPPOSITE of what this asserts:
-// that GET /chat carried both a deprecated images[] shim AND attachments[]
-// at once. That shim (and the chat.Message.Images field backing it) is now
-// gone entirely — this feature never shipped past one local branch owned by
-// one person, so there was no deployed frontend to decouple a deploy for —
-// so the old test's very subject no longer exists; it couldn't be
-// "call-site updated" without inverting its own assertion, which is what
-// this replacement does. GET /chat (backed by ListMessagesByChat, embedded
-// via messageWithFiles) must return attachments[] metadata and must NOT
-// carry an images key at all.
+// TestRepository_ListMessagesByChat_NoImagesFieldOnlyAttachments checks GET /chat returns
+// attachments[] metadata and must NOT carry a deprecated images key at all.
 func TestRepository_ListMessagesByChat_NoImagesFieldOnlyAttachments(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -316,11 +269,8 @@ func TestRepository_ListMessagesByChat_NoImagesFieldOnlyAttachments(t *testing.T
 	}
 }
 
-// TestRepository_GetAttachmentsContent_ReturnsDecodedBytes proves the one
-// content-fetching read path returns the RAW DECODED bytes — not base64,
-// no padding characters — with size_bytes and checksum matching those
-// decoded bytes exactly. This is the byte-identical round-trip the
-// LONGBLOB/no-base64-at-rest design depends on.
+// TestRepository_GetAttachmentsContent_ReturnsDecodedBytes checks the content-fetching read
+// path returns RAW DECODED bytes (not base64), with size_bytes/checksum matching exactly.
 func TestRepository_GetAttachmentsContent_ReturnsDecodedBytes(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -329,9 +279,7 @@ func TestRepository_GetAttachmentsContent_ReturnsDecodedBytes(t *testing.T) {
 
 	c := seedChat(t, repo, "builder-"+uuid.NewString())
 	userID := uint64(42)
-	// "hello world" base64-encoded, WITH padding, so a passing test proves
-	// the stored bytes are the decoded plaintext, not a copy of the base64
-	// string (which would still contain the '=' padding character).
+	// "hello world" base64-encoded, WITH padding — proves stored bytes are decoded plaintext.
 	images := []MessageImage{{Base64: "aGVsbG8gd29ybGQ=", MediaType: "image/png"}}
 
 	created, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "look at this", images, nil, nil)
@@ -363,11 +311,8 @@ func TestRepository_GetAttachmentsContent_ReturnsDecodedBytes(t *testing.T) {
 	}
 }
 
-// TestRepository_ListMessagesByChat_SkipsUnknownAttachmentKind inserts a
-// chat_message_attachments row directly with a kind this build has never
-// heard of (simulating a future version's data, or corruption) and proves
-// ListMessagesByChat skips it silently rather than erroring the whole
-// transcript read.
+// TestRepository_ListMessagesByChat_SkipsUnknownAttachmentKind inserts a row with an unknown
+// kind and checks ListMessagesByChat skips it rather than erroring the whole transcript read.
 func TestRepository_ListMessagesByChat_SkipsUnknownAttachmentKind(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -410,12 +355,8 @@ func TestRepository_ListMessagesByChat_SkipsUnknownAttachmentKind(t *testing.T) 
 	}
 }
 
-// TestRepository_AttachmentUniqueKey_RejectsDuplicateMessageKindPosition
-// proves uq_cma_message_kind_position (20260909000003 migration) actually
-// enforces at the write layer what the ORDER BY message_id, kind, position
-// tiebreak only made deterministic at read time: two rows sharing
-// (message_id, kind, position) must be impossible, not merely unlikely.
-// Requires `make migrate` to have run that migration against this database.
+// TestRepository_AttachmentUniqueKey_RejectsDuplicateMessageKindPosition checks
+// uq_cma_message_kind_position enforces at write time that two rows can't share
 func TestRepository_AttachmentUniqueKey_RejectsDuplicateMessageKindPosition(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -454,11 +395,8 @@ func TestRepository_AttachmentUniqueKey_RejectsDuplicateMessageKindPosition(t *t
 	}
 }
 
-// TestRepository_GetMessageByID_OmitsAttachments proves GetMessageByID's
-// narrower query (no attachment join at all — see its own doc comment on
-// why: its only caller, revert, never reads them) leaves Attachments nil,
-// even for a message that genuinely has some — distinguishing "correctly
-// not loaded" from "happened to have none".
+// TestRepository_GetMessageByID_OmitsAttachments checks Attachments is nil even for a
+// message that genuinely has some — distinguishing "not loaded" from "happened to have none".
 func TestRepository_GetMessageByID_OmitsAttachments(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -502,8 +440,7 @@ func TestService_GetChat_OtherTenantsChatReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("expected ErrNotFound (not a distinct permission error) for another tenant's chat, got %v", err)
 	}
 
-	// Sanity check: the owning tenant can still fetch it — proves the
-	// above failed on ownership, not on a broken lookup.
+	// Sanity check: the owning tenant can still fetch it — proves above failed on ownership.
 	if _, err := svc.GetChat(ctx, owner, c.ID); err != nil {
 		t.Fatalf("expected the owning tenant to fetch its own chat, got %v", err)
 	}

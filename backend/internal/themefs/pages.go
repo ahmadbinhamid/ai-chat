@@ -1,12 +1,7 @@
 package themefs
 
-// PageEntry mirrors one pages.json record (THEME_ENGINE_SPEC.md §5) — this
-// is the shape the model proposes when registering a new page. Field order
-// matches the reference theme's own entries. Unlike before, this service no
-// longer merges these into pages.json itself: flowpos-backend's own
-// theme-file API does that server-side (see Store.WriteFile's PageMeta) —
-// this type only exists now to give the model's structured output a place
-// to land, and to translate into a PageMeta when writing the file.
+// PageEntry mirrors one pages.json record (§5) — the shape the model proposes when registering a new page.
+// flowpos-backend's theme-file API merges it into pages.json server-side; this type just holds the model's output and translates to PageMeta.
 type PageEntry struct {
 	Title          string `json:"title"`
 	Slug           string `json:"slug"`

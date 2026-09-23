@@ -44,10 +44,7 @@ func TestStore_ListFiles(t *testing.T) {
 }
 
 func TestStore_ReadFileBytes_Base64Decodes(t *testing.T) {
-	// "hello" base64-encoded — proves the raw bytes round-trip intact
-	// through ReadFileBytes, unlike ReadFile's string conversion which
-	// would corrupt genuinely binary content (see ReadFileBytes's doc
-	// comment on why it exists as a separate method).
+	// "hello" base64-encoded — proves raw bytes round-trip intact through ReadFileBytes, unlike ReadFile's string conversion.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":{"path":"images/hero.png","content":"aGVsbG8=","encoding":"base64"},"status":true}`))

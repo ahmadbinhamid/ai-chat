@@ -9,10 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ApplyHandler exposes the explicit apply/discard step the draft/apply
-// split (see themebuild's package doc comment) requires — generation no
-// longer writes to FlowPOS itself, so something has to, deliberately, once
-// the merchant is happy with what they've previewed.
+// ApplyHandler exposes the explicit apply/discard step of the draft/apply split.
 type ApplyHandler struct {
 	builder *themebuild.Service
 }
@@ -32,8 +29,7 @@ func (h *ApplyHandler) Apply(c *gin.Context) {
 		respondBindErr(c, err)
 		return
 	}
-	// See message.go's Send for why this can't be skipped: binding:"required"
-	// alone doesn't reject a slug containing a path separator or "..".
+	// binding:"required" alone doesn't reject a path separator or "..".
 	if err := themefs.ValidateThemeSlug(in.ThemeSlug); err != nil {
 		respondBindErr(c, err)
 		return

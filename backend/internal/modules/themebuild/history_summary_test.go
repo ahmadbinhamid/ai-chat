@@ -10,9 +10,8 @@ import (
 	"ai-chat/internal/ai"
 )
 
-// summarizingFakeGenerator is a generator whose Summarize call is
-// independently controllable from fakeGenerator's Generate — used to test
-// summarizeOldTurns in isolation.
+// summarizingFakeGenerator has a Summarize call independently controllable from fakeGenerator's
+// Generate — used to test summarizeOldTurns in isolation.
 type summarizingFakeGenerator struct {
 	fakeGenerator
 	summarizeCalls int
@@ -39,9 +38,7 @@ func turnsOf(n int) []ai.Turn {
 	return turns
 }
 
-// TestSummarizeOldTurns_UnderThresholdUnchanged confirms a chat with at most
-// summarizeHistoryThreshold turns is left completely alone — no Summarize
-// call, no synthetic turn.
+// A chat at or under summarizeHistoryThreshold turns is left completely alone — no Summarize call.
 func TestSummarizeOldTurns_UnderThresholdUnchanged(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	turns := turnsOf(summarizeHistoryThreshold)
@@ -61,11 +58,8 @@ func TestSummarizeOldTurns_UnderThresholdUnchanged(t *testing.T) {
 	}
 }
 
-// TestSummarizeOldTurns_OverThresholdCollapses confirms a chat with more
-// than summarizeHistoryThreshold turns gets summarized down to
-// summarizeHistoryThreshold+1 turns (one synthetic summary turn, then the
-// most recent summarizeHistoryThreshold turns verbatim) before being sent to
-// Generate.
+// A chat over summarizeHistoryThreshold turns collapses to threshold+1 turns: one summary turn
+// plus the most recent threshold turns verbatim.
 func TestSummarizeOldTurns_OverThresholdCollapses(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	total := summarizeHistoryThreshold + 15
@@ -87,8 +81,7 @@ func TestSummarizeOldTurns_OverThresholdCollapses(t *testing.T) {
 	if !strings.Contains(got[0].Content, wantSummary) {
 		t.Errorf("expected summary turn to contain %q, got %q", wantSummary, got[0].Content)
 	}
-	// The recent summarizeHistoryThreshold turns must be preserved verbatim,
-	// in order, after the synthetic summary turn.
+	// The recent summarizeHistoryThreshold turns must be preserved verbatim, in order.
 	recentWant := turns[total-summarizeHistoryThreshold:]
 	for i, want := range recentWant {
 		if got[i+1] != want {
@@ -97,11 +90,8 @@ func TestSummarizeOldTurns_OverThresholdCollapses(t *testing.T) {
 	}
 }
 
-// TestSummarizeOldTurns_FakeModeNeverCallsRealAPI confirms fake mode's
-// Summarize (see ai.Generator.Summarize's fake branch) is deterministic and
-// never errors — exercised here through the real *ai.Generator built via
-// ai.NewFake, not a test double, since the requirement is specifically about
-// fake mode's own behavior.
+// Confirms fake mode's Summarize is deterministic and never errors, exercised through the real
+// *ai.Generator built via ai.NewFake, not a test double.
 func TestSummarizeOldTurns_FakeModeNeverCallsRealAPI(t *testing.T) {
 	fake := ai.NewFake(0)
 	total := summarizeHistoryThreshold + 5
@@ -119,10 +109,7 @@ func TestSummarizeOldTurns_FakeModeNeverCallsRealAPI(t *testing.T) {
 	}
 }
 
-// TestSummarizeOldTurns_FailsOpenOnSummarizeError confirms a Summarize
-// failure falls back to the full, unsummarized history rather than
-// propagating an error — this is a cost optimization, never a new way for
-// generation to break.
+// A Summarize failure falls back to full unsummarized history rather than propagating an error.
 func TestSummarizeOldTurns_FailsOpenOnSummarizeError(t *testing.T) {
 	fg := &summarizingFakeGenerator{summarizeErr: errors.New("boom")}
 	turns := turnsOf(summarizeHistoryThreshold + 10)
@@ -142,12 +129,8 @@ func TestSummarizeOldTurns_FailsOpenOnSummarizeError(t *testing.T) {
 	}
 }
 
-// newCachedTestService builds a Service around fg with history summarization
-// caching fully wired (matching what NewService sets up) — the bare
-// &Service{gen: fg} literal used above is deliberately minimal for testing
-// summarizeOldTurns in isolation, but summarizeOldTurnsCached needs its
-// cache/lock fields non-nil to exercise the real caching path rather than
-// its nil-guard fallback.
+// newCachedTestService wires cache/lock fields non-nil (matching NewService) so
+// summarizeOldTurnsCached exercises the real caching path, not its nil-guard fallback.
 func newCachedTestService(fg generator, enabled bool) *Service {
 	return &Service{
 		gen:                         fg,
@@ -157,10 +140,7 @@ func newCachedTestService(fg generator, enabled bool) *Service {
 	}
 }
 
-// TestSummarizeOldTurnsCached_ExactlyAtThresholdUnchanged confirms the
-// caching wrapper preserves summarizeOldTurns' own under/at-threshold
-// behavior exactly — a chat at exactly summarizeHistoryThreshold turns must
-// never summarize, cached or not.
+// A chat at exactly summarizeHistoryThreshold turns must never summarize, cached or not.
 func TestSummarizeOldTurnsCached_ExactlyAtThresholdUnchanged(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	svc := newCachedTestService(fg, true)
@@ -176,9 +156,7 @@ func TestSummarizeOldTurnsCached_ExactlyAtThresholdUnchanged(t *testing.T) {
 	}
 }
 
-// TestSummarizeOldTurnsCached_SameChatOneSummarizeCall covers the core fix:
-// two generations on the same chat, same older-turn set, must produce
-// exactly one Summarize call — the second reuses the cached summary.
+// Two generations on the same chat, same older-turn set, must produce exactly one Summarize call.
 func TestSummarizeOldTurnsCached_SameChatOneSummarizeCall(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	svc := newCachedTestService(fg, true)
@@ -195,12 +173,8 @@ func TestSummarizeOldTurnsCached_SameChatOneSummarizeCall(t *testing.T) {
 	}
 }
 
-// TestSummarizeOldTurnsCached_RecentChurnKeepsCacheHit confirms a cache hit
-// is keyed on the older-turn set alone — a different set of RECENT turns
-// (the part that's always resent verbatim, never summarized) attached to
-// the exact same older prefix must still hit the cache, and the turns
-// actually returned must be the current call's recent turns, never a stale
-// copy from whichever call happened to populate the cache.
+// A cache hit is keyed on the older-turn set alone; different RECENT turns on the same older
+// prefix must still hit, returning the current call's own recent turns, not a stale copy.
 func TestSummarizeOldTurnsCached_RecentChurnKeepsCacheHit(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	svc := newCachedTestService(fg, true)
@@ -226,10 +200,7 @@ func TestSummarizeOldTurnsCached_RecentChurnKeepsCacheHit(t *testing.T) {
 	}
 }
 
-// TestSummarizeOldTurnsCached_ChangedOlderSetRegenerates confirms a changed
-// older-turn count — grown or shrunk (e.g. a discard/revert) — always
-// misses the cache and regenerates, never reuses a summary that no longer
-// covers the right turns.
+// A changed older-turn count (grown or shrunk via discard/revert) always misses the cache and regenerates.
 func TestSummarizeOldTurnsCached_ChangedOlderSetRegenerates(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	svc := newCachedTestService(fg, true)
@@ -250,9 +221,7 @@ func TestSummarizeOldTurnsCached_ChangedOlderSetRegenerates(t *testing.T) {
 	}
 }
 
-// TestSummarizeOldTurnsCached_ErrorNotCached confirms a Summarize failure
-// falls back to full history without poisoning the cache — the next call on
-// the same chat must retry Summarize rather than reusing a fallback.
+// A Summarize failure falls back to full history without poisoning the cache — the next call must retry.
 func TestSummarizeOldTurnsCached_ErrorNotCached(t *testing.T) {
 	fg := &summarizingFakeGenerator{summarizeErr: errors.New("boom")}
 	svc := newCachedTestService(fg, true)
@@ -276,9 +245,7 @@ func TestSummarizeOldTurnsCached_ErrorNotCached(t *testing.T) {
 	}
 }
 
-// TestSummarizeOldTurnsCached_DisabledNeverSummarizes confirms
-// HistorySummarizationEnabled=false behaves exactly like the under-
-// threshold path — full history, unchanged, no Summarize call ever.
+// HistorySummarizationEnabled=false behaves like the under-threshold path: full history, no Summarize call.
 func TestSummarizeOldTurnsCached_DisabledNeverSummarizes(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	svc := newCachedTestService(fg, false)

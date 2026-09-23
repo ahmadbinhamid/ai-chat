@@ -14,10 +14,7 @@ var jsPathRe = regexp.MustCompile(`^js/[^/]+\.js$`)
 var linkHrefRe = regexp.MustCompile(`<link[^>]*href="\{\{\s*'([^']+)'\s*\|\s*asset_url\s*\}\}"[^>]*>`)
 var scriptSrcRe = regexp.MustCompile(`<script[^>]*src="\{\{\s*'([^']+)'\s*\|\s*asset_url\s*\}\}"[^>]*>`)
 
-// registeredAssetPaths returns every theme-relative asset path referenced
-// by a <link href=...> or <script src=...> tag (matching the {{ 'path' |
-// asset_url }} shape AddStylesheetLink/AddDeferredScript always produce),
-// in source order.
+// registeredAssetPaths returns every asset path referenced by a <link href> or <script src> tag, in source order.
 func registeredAssetPaths(content string, re *regexp.Regexp) []string {
 	var paths []string
 	for _, m := range re.FindAllStringSubmatch(content, -1) {
@@ -30,12 +27,8 @@ func registeredAssetPaths(content string, re *regexp.Regexp) []string {
 // in load order if it depends on it (§10).
 const storefrontAPIPath = "js/storefront-api.js"
 
-// checkAssetRegistered enforces rule 5: every pages/css/*.css or
-// components/css/*.css file needs a <link> in layout-start, every js/*.js
-// file needs a <script defer> in layout-end — satisfied by either what's
-// already in the current theme snapshot or what this turn's proposal adds
-// via LayoutLinksToAdd/LayoutScriptsToAdd. New scripts that call
-// window.StorefrontApi must be registered after storefront-api.js.
+// checkAssetRegistered enforces rule 5: every css file needs a matching <link> in layout-start, every js file a
+// <script defer> in layout-end; scripts calling window.StorefrontApi must be registered after storefront-api.js.
 func checkAssetRegistered(p Proposal, snap Snapshot) []Finding {
 	var findings []Finding
 
@@ -81,20 +74,8 @@ func checkAssetRegistered(p Proposal, snap Snapshot) []Finding {
 	return findings
 }
 
-// AutoFixMissingAssetRegistration deterministically repairs the "proposed a
-// css/js file but never registered it" failure mode of rule 5 — mechanical
-// because the fix is always exactly "add this path to
-// layout_links_to_add/layout_scripts_to_add", the same thing the model was
-// asked to do and simply omitted; no judgment call about content is
-// involved. The load-order violation (a script using window.StorefrontApi
-// registered before storefront-api.js) is deliberately left alone — fixing
-// that would mean moving an existing registration, an edit this function
-// doesn't attempt; that case still goes through the retry-with-model-repair
-// path (see themebuild's checkAndRepair).
-//
-// Returns the additional paths to append to the proposal's own
-// LayoutLinksToAdd/LayoutScriptsToAdd — callers apply it to their own copy
-// of the proposal/result; this function never mutates p.
+// AutoFixMissingAssetRegistration adds missing css/js files to layout_links_to_add/layout_scripts_to_add.
+// Load-order violations are left for model repair; it never mutates p, only returns paths to add.
 func AutoFixMissingAssetRegistration(p Proposal, snap Snapshot) (linksToAdd, scriptsToAdd []string, anyFixed bool) {
 	finalLinks := append(registeredAssetPaths(snap.LayoutStart(), linkHrefRe), p.LayoutLinksToAdd...)
 	linkSet := toSet(finalLinks)

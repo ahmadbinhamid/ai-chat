@@ -27,12 +27,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/server 
 # ---- runtime stage ----
 FROM alpine:3.20 AS runtime
 
-# ca-certificates: this service makes outbound HTTPS calls to Anthropic/
-# DeepSeek and flowpos-backend (internal/auth, internal/themefs) — without
-# this every one of those fails TLS certificate verification, not just
-# looks insecure. curl: needed for HEALTHCHECK below; distroless was
-# considered instead of alpine specifically for the smaller/more locked-down
-# image, but distroless ships no shell and no curl/wget, which makes a
+# ca-certificates: this service makes outbound HTTPS calls to DeepSeek and
+# flowpos-backend, which fail TLS verification without it. curl: needed for
+# HEALTHCHECK below; distroless ships no shell and no curl/wget, which makes a
 # curl-based HEALTHCHECK (what flowPOS's other services already use)
 # unworkable without vendoring a second, healthcheck-only binary into the
 # image — not worth it for one HTTP GET.

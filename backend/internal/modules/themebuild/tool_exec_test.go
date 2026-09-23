@@ -3,23 +3,19 @@ package themebuild
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"ai-chat/internal/ai"
-	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
 )
 
-// newFakeThemeServer stands in for flowpos-backend's theme-file API,
-// serving ListFiles (a flat tree — each map key becomes one top-level
-// "file" entry; the tool-exec methods under test only care whether an
-// entry is a file, never its nesting) and ReadFile from a fixed in-memory
-// file set.
+// newFakeThemeServer stands in for flowpos-backend's theme-file API, serving ListFiles (flat
+// tree, one entry per map key) and ReadFile from a fixed in-memory file set.
 func newFakeThemeServer(t *testing.T, files map[string]string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -66,13 +62,8 @@ func TestExecListThemeFiles(t *testing.T) {
 	}
 }
 
-// TestBuildFileReader_ReadsThroughDraftOverlay confirms the ai.FileReader
-// backing edit materialization (see MaterializeEdits in package ai) reads
-// through the SAME draft overlay the model's own read_theme_file tool
-// reads through — an edit targeting a file an earlier turn already staged
-// must see that staged content, never the stale saved-theme version
-// underneath it (same property execReadThemeFile's own test/doc comment
-// already establishes for the model-facing read tool).
+// Confirms buildFileReader reads through the SAME draft overlay read_theme_file does — an edit
+// targeting an earlier-staged file must see that staged content, never the stale saved version.
 func TestBuildFileReader_ReadsThroughDraftOverlay(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{"components/footer.liquid": "saved theme content"})
 	defer ts.Close()
@@ -128,14 +119,8 @@ func TestExecReadThemeFile_RejectsDisallowedExtension(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	// pages.json is a real, readable (and now writable) theme file, but
-	// read_theme_file still rejects it — not because of any extension
-	// restriction (pages.json is a legitimate .json file, same as any
-	// other now — see themefs.allowedGeneratedExtensions), but because
-	// it's already supplied directly in context (THEME_ENGINE_SPEC.md
-	// §0), so fetching it again through this tool is always a wasted
-	// round trip. See execReadThemeFile's own explicit pathPagesJSON/
-	// pathDefaultsJSON check.
+	// pages.json is readable/writable but read_theme_file rejects it anyway: it's already
+	// supplied in context, so fetching it here is always a wasted round trip.
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"pages.json"}})
 	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
 	if err != nil {
@@ -245,257 +230,52 @@ func TestBuildToolExecutor_UnknownTool(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
-	toolExec := svc.buildToolExecutor(svc.store, testStoreAuth(), ai.ThemeContext{}, themecheck.Snapshot{})
+	toolExec := svc.buildToolExecutor(svc.store, testStoreAuth())
 	if _, err := toolExec(context.Background(), "not_a_real_tool", nil); err == nil {
 		t.Error("expected an error for an unknown tool name")
 	}
 }
 
-// newRequestCountingThemeServer behaves like newFakeThemeServer, but also
-// counts how many times the file-listing endpoint is hit — used to confirm
-// the snapshot base (see buildSnapshotBase) is built once and reused, not
-// re-fetched on every validate_changes call.
-func newRequestCountingThemeServer(t *testing.T, files map[string]string, listCalls *atomic.Int64) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/store/themes/active/files" {
-			listCalls.Add(1)
-			entries := make([]themefs.FileTreeEntry, 0, len(files))
-			for p := range files {
-				entries = append(entries, themefs.FileTreeEntry{Name: p, Path: p, Type: "file"})
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"files": entries}, "status": true})
-			return
-		}
-		reqPath := strings.TrimPrefix(r.URL.Path, "/store/themes/active/files/")
-		content, ok := files[reqPath]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{"path": reqPath, "content": content, "encoding": "utf-8"},
-		})
-	}))
-}
+func TestRepairFileReader_PrefersPreviousProposalOverStore(t *testing.T) {
+	base := func(context.Context, string) (string, error) { return "STORE CONTENT", nil }
+	previous := &ai.Result{Files: []ai.GeneratedFile{
+		{Path: "components/home-bestsellers.liquid", Action: "create", Content: "PROPOSAL CONTENT"},
+	}}
+	reader := repairFileReader(base, previous)
 
-// hexColorCSSCandidate builds a validate_changes payload proposing a new
-// CSS file with a raw hex color in a color property — a deterministic
-// theme-token (rule 8) ERROR finding, since it's a brand-new "create" file
-// (nothing to grandfather) and no auto-fixer runs inside validate_changes.
-func hexColorCSSCandidate(t *testing.T, path string) json.RawMessage {
-	t.Helper()
-	in, err := json.Marshal(ai.Result{
-		Files:            []ai.GeneratedFile{{Path: path, Action: "create", Content: ".a { color: #ff0000; }"}},
-		LayoutLinksToAdd: []string{path}, // registered, so only the theme-token finding is in play
-	})
-	if err != nil {
-		t.Fatalf("marshal candidate: %v", err)
-	}
-	return in
-}
-
-func TestExecValidateChanges_ReportsThemeTokenViolation(t *testing.T) {
-	ts := newFakeThemeServer(t, map[string]string{})
-	defer ts.Close()
-	svc := &Service{store: themefs.NewStore(ts.URL)}
-	ctx := context.Background()
-
-	base, err := svc.buildSnapshotBase(ctx, svc.store, testStoreAuth())
-	if err != nil {
-		t.Fatalf("buildSnapshotBase failed: %v", err)
-	}
-	callCount := 0
-	out, err := svc.execValidateChanges(ctx, svc.store, testStoreAuth(), ai.ThemeContext{}, base, &callCount,
-		hexColorCSSCandidate(t, "components/css/hero.css"))
+	got, err := reader(context.Background(), "components/home-bestsellers.liquid")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(out, "theme-token") || !strings.Contains(out, "components/css/hero.css") {
-		t.Errorf("expected a theme-token finding naming the file, got: %s", out)
-	}
-	if !strings.Contains(out, "Blocking findings") {
-		t.Errorf("expected the error findings to read as blocking, got: %s", out)
+	if got != "PROPOSAL CONTENT" {
+		t.Errorf("expected the previous proposal's content to win over the store, got %q", got)
 	}
 }
 
-func TestExecValidateChanges_NoFindingsReturnsProceedMessage(t *testing.T) {
-	ts := newFakeThemeServer(t, map[string]string{})
-	defer ts.Close()
-	svc := &Service{store: themefs.NewStore(ts.URL)}
-	ctx := context.Background()
+func TestRepairFileReader_FallsBackToStoreForUnknownPath(t *testing.T) {
+	base := func(context.Context, string) (string, error) { return "STORE CONTENT", nil }
+	previous := &ai.Result{Files: []ai.GeneratedFile{
+		{Path: "components/other.liquid", Content: "unrelated"},
+	}}
+	reader := repairFileReader(base, previous)
 
-	base, err := svc.buildSnapshotBase(ctx, svc.store, testStoreAuth())
-	if err != nil {
-		t.Fatalf("buildSnapshotBase failed: %v", err)
-	}
-	in, _ := json.Marshal(ai.Result{
-		Files:            []ai.GeneratedFile{{Path: "components/css/hero.css", Action: "create", Content: ".a { color: var(--theme-primary, #ff0000); }"}},
-		LayoutLinksToAdd: []string{"components/css/hero.css"},
-	})
-	callCount := 0
-	out, err := svc.execValidateChanges(ctx, svc.store, testStoreAuth(), ai.ThemeContext{}, base, &callCount, in)
+	got, err := reader(context.Background(), "components/home-bestsellers.liquid")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(out, "No blocking findings") {
-		t.Errorf("expected the proceed message, got: %s", out)
+	if got != "STORE CONTENT" {
+		t.Errorf("expected fallback to the store for a path not in the previous proposal, got %q", got)
 	}
 }
 
-func TestExecValidateChanges_WarningsMarkedNonBlocking(t *testing.T) {
-	ts := newFakeThemeServer(t, map[string]string{})
-	defer ts.Close()
-	svc := &Service{store: themefs.NewStore(ts.URL)}
-	ctx := context.Background()
+// A real store read error must not be swallowed by the overlay.
+func TestRepairFileReader_PropagatesStoreErrorUnchanged(t *testing.T) {
+	wantErr := errors.New("boom")
+	base := func(context.Context, string) (string, error) { return "", wantErr }
+	reader := repairFileReader(base, &ai.Result{})
 
-	base, err := svc.buildSnapshotBase(ctx, svc.store, testStoreAuth())
-	if err != nil {
-		t.Fatalf("buildSnapshotBase failed: %v", err)
-	}
-	// A raw hex value inside a --custom-property declaration is only a
-	// warning (rule 8 permits component-local tokens with literal values —
-	// see checkThemeToken's own doc comment), so this candidate has no
-	// blocking findings but does have this one.
-	in, _ := json.Marshal(ai.Result{
-		Files:            []ai.GeneratedFile{{Path: "components/css/hero.css", Action: "create", Content: ".a { --hero-accent: #ff0000; }"}},
-		LayoutLinksToAdd: []string{"components/css/hero.css"},
-	})
-	callCount := 0
-	out, err := svc.execValidateChanges(ctx, svc.store, testStoreAuth(), ai.ThemeContext{}, base, &callCount, in)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !strings.Contains(out, "No blocking findings") {
-		t.Errorf("expected no blocking findings, got: %s", out)
-	}
-	if !strings.Contains(out, "Non-blocking warnings") || !strings.Contains(out, "theme-token") {
-		t.Errorf("expected the warning to be surfaced and marked non-blocking, got: %s", out)
-	}
-}
-
-func TestExecValidateChanges_CallCapEnforced(t *testing.T) {
-	ts := newFakeThemeServer(t, map[string]string{})
-	defer ts.Close()
-	svc := &Service{store: themefs.NewStore(ts.URL)}
-	ctx := context.Background()
-
-	base, err := svc.buildSnapshotBase(ctx, svc.store, testStoreAuth())
-	if err != nil {
-		t.Fatalf("buildSnapshotBase failed: %v", err)
-	}
-	callCount := 0
-	var lastOut string
-	for i := 0; i < maxValidateChangesCalls+1; i++ {
-		out, err := svc.execValidateChanges(ctx, svc.store, testStoreAuth(), ai.ThemeContext{}, base, &callCount,
-			hexColorCSSCandidate(t, "components/css/hero.css"))
-		if err != nil {
-			t.Fatalf("call %d: unexpected error: %v", i, err)
-		}
-		lastOut = out
-	}
-	if !strings.Contains(lastOut, fmt.Sprintf("already been called %d times", maxValidateChangesCalls)) {
-		t.Errorf("expected the over-cap message on call %d, got: %s", maxValidateChangesCalls+1, lastOut)
-	}
-}
-
-func TestExecValidateChanges_EmptyFilesArrayDoesNotCountAgainstCap(t *testing.T) {
-	ts := newFakeThemeServer(t, map[string]string{})
-	defer ts.Close()
-	svc := &Service{store: themefs.NewStore(ts.URL)}
-	ctx := context.Background()
-
-	base, err := svc.buildSnapshotBase(ctx, svc.store, testStoreAuth())
-	if err != nil {
-		t.Fatalf("buildSnapshotBase failed: %v", err)
-	}
-	emptyIn, _ := json.Marshal(ai.Result{Files: []ai.GeneratedFile{}})
-	callCount := 0
-	for i := 0; i < maxValidateChangesCalls+3; i++ {
-		out, err := svc.execValidateChanges(ctx, svc.store, testStoreAuth(), ai.ThemeContext{}, base, &callCount, emptyIn)
-		if err != nil {
-			t.Fatalf("call %d: unexpected error: %v", i, err)
-		}
-		if !strings.Contains(out, "Nothing to validate") {
-			t.Fatalf("call %d: expected the empty-files message, got: %s", i, out)
-		}
-	}
-	if callCount != 0 {
-		t.Errorf("expected empty-files calls to never increment the cap counter, got %d", callCount)
-	}
-
-	// A real call right after should still be well within budget.
-	out, err := svc.execValidateChanges(ctx, svc.store, testStoreAuth(), ai.ThemeContext{}, base, &callCount,
-		hexColorCSSCandidate(t, "components/css/hero.css"))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if strings.Contains(out, "already been called") {
-		t.Errorf("expected the empty-files calls not to count against the cap, got: %s", out)
-	}
-}
-
-func TestExecValidateChanges_EditActionMaterializedBeforeChecking(t *testing.T) {
-	const path = "components/css/hero.css"
-	ts := newFakeThemeServer(t, map[string]string{
-		path: ".a { color: var(--theme-primary, #111111); }",
-	})
-	defer ts.Close()
-	svc := &Service{store: themefs.NewStore(ts.URL)}
-	ctx := context.Background()
-
-	base, err := svc.buildSnapshotBase(ctx, svc.store, testStoreAuth())
-	if err != nil {
-		t.Fatalf("buildSnapshotBase failed: %v", err)
-	}
-	// This edit strips the var()/fallback wrapper, leaving a raw hex color —
-	// only valid after materialization resolves the edit against the file's
-	// real current content; checking the edit payload itself (old_string/
-	// new_string) would never see this violation at all.
-	in, _ := json.Marshal(ai.Result{
-		Files: []ai.GeneratedFile{{
-			Path: path, Action: "edit",
-			Edits: []ai.Edit{{OldString: "var(--theme-primary, #111111)", NewString: "#ff0000"}},
-		}},
-	})
-	callCount := 0
-	out, err := svc.execValidateChanges(ctx, svc.store, testStoreAuth(), ai.ThemeContext{}, base, &callCount, in)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !strings.Contains(out, "theme-token") || !strings.Contains(out, path) {
-		t.Errorf("expected the materialized content's theme-token violation to be reported, got: %s", out)
-	}
-}
-
-// TestBuildToolExecutor_ValidateChangesReusesSnapshotBase confirms the base
-// built once by buildSnapshotBase (see the doGenerate call site) is what
-// validate_changes reuses across several calls — the file-listing endpoint
-// must never be hit again by any of them.
-func TestBuildToolExecutor_ValidateChangesReusesSnapshotBase(t *testing.T) {
-	var listCalls atomic.Int64
-	ts := newRequestCountingThemeServer(t, map[string]string{}, &listCalls)
-	defer ts.Close()
-	svc := &Service{store: themefs.NewStore(ts.URL)}
-	ctx := context.Background()
-
-	base, err := svc.buildSnapshotBase(ctx, svc.store, testStoreAuth())
-	if err != nil {
-		t.Fatalf("buildSnapshotBase failed: %v", err)
-	}
-	if got := listCalls.Load(); got != 1 {
-		t.Fatalf("expected exactly 1 list-files call to build the base, got %d", got)
-	}
-
-	toolExec := svc.buildToolExecutor(svc.store, testStoreAuth(), ai.ThemeContext{}, base)
-	for i := 0; i < 3; i++ {
-		if _, err := toolExec(ctx, "validate_changes", hexColorCSSCandidate(t, fmt.Sprintf("components/css/hero%d.css", i))); err != nil {
-			t.Fatalf("validate_changes call %d failed: %v", i, err)
-		}
-	}
-	if got := listCalls.Load(); got != 1 {
-		t.Errorf("expected the snapshot base's single list-files call to be reused, got %d total calls", got)
+	_, err := reader(context.Background(), "components/missing.liquid")
+	if !errors.Is(err, wantErr) {
+		t.Errorf("expected the store's own error to propagate unchanged, got %v", err)
 	}
 }

@@ -34,8 +34,7 @@ func extractPage(htmlSrc string) pageIdentity {
 					page.lang = lang
 				}
 			case "title":
-				// First <title> wins — a second one is malformed markup,
-				// not a real second choice.
+				// First <title> wins — a second is malformed markup, not a real choice.
 				if page.title == "" {
 					inTitle = true
 					titleBuf.Reset()

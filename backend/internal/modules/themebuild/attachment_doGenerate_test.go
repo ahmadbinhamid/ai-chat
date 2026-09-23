@@ -15,18 +15,8 @@ import (
 	"ai-chat/internal/urlfetch"
 )
 
-// capturingGenerator records the prompt/images its FIRST Generate call
-// received, and ignores every call after — unlike scriptedGenerator/
-// fakeGenerator (both of which discard these entirely to focus on other
-// behavior), this is specifically for asserting on the ASSEMBLED model
-// input doGenerate builds for a turn's original prompt, not internals. A
-// trivial "ok" summary with no files/exploration reliably triggers
-// generateValidProposal's own empty-proposal retry loop, which resends a
-// DIFFERENT, nudge-only prompt ("Please try again...") on later calls — so
-// capturing only the first call (not "whatever's there when polled", and
-// not the most recent) is what makes an assertion about the ORIGINAL
-// prompt/attachments deterministic. See
-// TestDoGenerate_ResolvesAttachmentBytesIntoModelInput.
+// capturingGenerator records only the FIRST Generate call's prompt/images, since the
+// empty-proposal retry loop resends a different nudge prompt on later calls.
 type capturingGenerator struct {
 	mu              sync.Mutex
 	visionSupported bool
@@ -58,16 +48,8 @@ func (g *capturingGenerator) snapshot() (bool, string, []ai.Image) {
 	return g.captured, g.firstPrompt, g.firstImages
 }
 
-// allCallsCapturingGenerator records every Generate call's prompt, in
-// order — unlike capturingGenerator (which only keeps the first, for
-// asserting on a single turn's assembled input), the carry-forward tests
-// below send more than one turn to the same chat and need to inspect a
-// LATER turn's prompt specifically. Always returns AnsweredQuestion: true
-// so generateValidProposal accepts it immediately — see
-// isUnexploredEmptyProposal's own doc comment: a plain "ok" summary with no
-// files and no exploration otherwise looks like a suspected-hallucination
-// empty proposal and triggers a retry loop, which would make the number of
-// captured prompts per turn nondeterministic instead of exactly one.
+// allCallsCapturingGenerator records every call's prompt in order, for carry-forward tests
+// needing a later turn's prompt; AnsweredQuestion: true avoids the empty-proposal retry loop.
 type allCallsCapturingGenerator struct {
 	mu      sync.Mutex
 	prompts []string
@@ -94,13 +76,8 @@ func (g *allCallsCapturingGenerator) snapshot() []string {
 	return out
 }
 
-// waitForSecondAssistantReply polls until chatID has at least two
-// assistant-role messages — the two-turn counterpart to
-// waitForAssistantReply (see its own doc comment for why waiting for real
-// completion, not just the generator having been called, matters), for
-// tests that send a second prompt to the same chat (e.g. the carry-forward
-// tests below) and need to wait for THAT turn specifically, not just any
-// assistant reply.
+// waitForSecondAssistantReply is the two-turn counterpart to waitForAssistantReply, for tests
+// that send a second prompt to the same chat and need to wait for THAT turn specifically.
 func waitForSecondAssistantReply(t *testing.T, chatSvc *chat.Service, tenantID uint64, chatID string) {
 	t.Helper()
 	const wantReplies = 2
@@ -123,17 +100,8 @@ func waitForSecondAssistantReply(t *testing.T, chatSvc *chat.Service, tenantID u
 	t.Fatalf("timed out waiting for %d assistant replies", wantReplies)
 }
 
-// waitForAssistantReply polls until chatID has at least one assistant-role
-// message — proof the WHOLE background generation (not just its first
-// Generate call) has finished, including whatever runs after: retries,
-// event recording, draft staging. Every test in this file waits on this,
-// not just on capturingGenerator having seen a call — returning early would
-// leave runGeneration's goroutine still running against openTestDB's
-// connection after t.Cleanup closes it (see openTestDB), which doesn't just
-// log noise: the still-running goroutine keeps hitting MySQL and racing
-// with whatever test runs next in this package, which is exactly what made
-// unrelated timing-sensitive tests (TestRunGeneration_DrainsWholeQueueInOrder
-// et al) flake when this file's tests didn't wait for real completion.
+// waitForAssistantReply waits for the WHOLE background generation to finish, not just the
+// first Generate call — returning early leaves runGeneration's goroutine racing the next test.
 func waitForAssistantReply(t *testing.T, chatSvc *chat.Service, tenantID uint64, chatID string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -151,25 +119,15 @@ func waitForAssistantReply(t *testing.T, chatSvc *chat.Service, tenantID uint64,
 	t.Fatal("timed out waiting for the background generation to finish (no assistant reply recorded)")
 }
 
-// TestDoGenerate_ResolvesAttachmentBytesIntoModelInput runs a real prompt
-// with one image and one HTML attachment all the way through the actual
-// async pipeline (Generate -> RecordUserMessage -> queue -> doGenerate's
-// re-resolution -> generateValidProposal) against a real database, and
-// asserts on the model input doGenerate actually assembled — not on any
-// internal representation along the way. This is the round-trip that
-// matters: base64 in the request, decoded to raw bytes for storage,
-// re-encoded to base64 only transiently when calling the model, and the
-// HTML folded into the prompt text exactly as promptWithHTMLAttachment
-// always has.
+// Runs a real prompt with an image and HTML attachment through the full async pipeline and
+// asserts on the assembled model input, proving the decode/re-encode round trip works.
 func TestDoGenerate_ResolvesAttachmentBytesIntoModelInput(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &capturingGenerator{visionSupported: true}
 	svc.gen = gen
 
 	tenantID := uint64(time.Now().UnixNano())
-	// "hello world", base64-encoded WITH padding — a passing assertion
-	// that the model receives this exact base64 back proves a real
-	// decode-then-re-encode round trip happened, not a pass-through.
+	// Validates base64 decode-then-re-encode round trip.
 	const wantImageBytes = "hello world"
 	imageBase64 := base64.StdEncoding.EncodeToString([]byte(wantImageBytes))
 	filename := "reference.html"
@@ -214,13 +172,7 @@ func TestDoGenerate_ResolvesAttachmentBytesIntoModelInput(t *testing.T) {
 	}
 }
 
-// TestDoGenerate_ZeroAttachmentMessage_SkipsContentFetch is the
-// zero-attachments edge case at the doGenerate boundary: a plain
-// text-only prompt still runs the whole real pipeline, and must produce a
-// model input with no images and an unmodified prompt (no "Attached
-// reference file" framing) — proving the re-resolution block's
-// len(m.Attachments) == 0 guard actually short-circuits rather than
-// something further down silently tolerating empty attachment data.
+// A text-only prompt must produce a model input with no images and an unmodified prompt.
 func TestDoGenerate_ZeroAttachmentMessage_SkipsContentFetch(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &capturingGenerator{visionSupported: true}
@@ -251,11 +203,8 @@ func TestDoGenerate_ZeroAttachmentMessage_SkipsContentFetch(t *testing.T) {
 	}
 }
 
-// TestDoGenerate_CarriesForwardHTMLAttachmentFromEarlierTurn is the core
-// bug this feature fixes: turn 1 attaches an uploaded HTML reference, turn
-// 2 asks to build from it without re-attaching anything. Before the
-// carry-forward fallback, turn 2's assembled prompt had zero page content —
-// the model designed from its own earlier summary, not the actual page.
+// Core bug this feature fixes: turn 2 asking to build from turn 1's attachment without
+// re-attaching must carry the actual page forward, not just the model's earlier summary.
 func TestDoGenerate_CarriesForwardHTMLAttachmentFromEarlierTurn(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &allCallsCapturingGenerator{}
@@ -304,10 +253,8 @@ func TestDoGenerate_CarriesForwardHTMLAttachmentFromEarlierTurn(t *testing.T) {
 	}
 }
 
-// TestDoGenerate_CarriesForwardLinkAttachment_PreservesLinkFraming is the
-// same carry-forward path, but the source attachment came from a fetched
-// link (filename is a URL) rather than an upload — the carried-forward
-// prompt must keep the external-link framing too, not just the generic one.
+// Same carry-forward path but from a fetched link; the prompt must keep the external-link
+// framing too, not just the generic carry-forward one.
 func TestDoGenerate_CarriesForwardLinkAttachment_PreservesLinkFraming(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &allCallsCapturingGenerator{}
@@ -357,15 +304,8 @@ func TestDoGenerate_CarriesForwardLinkAttachment_PreservesLinkFraming(t *testing
 	}
 }
 
-// exactLengthFiller returns a string of EXACTLY n bytes, built from an
-// alternating "a "/space pattern rather than a single repeated character —
-// SanitizeHTMLAttachment's longBase64RunRe strips any run of 400+
-// consecutive characters from the base64 alphabet (which includes plain
-// lowercase letters), so a naive strings.Repeat("a", n) would silently be
-// stripped to "" by the upload-path validation these carry-forward tests
-// route through (see Generate's own HTMLAttachmentContent handling) before
-// ever reaching the length this test needs to control precisely. The
-// space breaks every run at length 1, so nothing here matches that regex.
+// exactLengthFiller returns a string of exactly n bytes using an alternating "a "/space
+// pattern — a plain repeated character would get stripped by the 400+-char base64-run filter.
 func exactLengthFiller(n int) string {
 	if n <= 0 {
 		return ""
@@ -374,19 +314,8 @@ func exactLengthFiller(n int) string {
 	return strings.Repeat(unit, n/len(unit)+1)[:n]
 }
 
-// TestDoGenerate_CarryForwardDigestAtHardCap_ReportsTruncated and
-// TestDoGenerate_CarryForwardDigestJustUnderTolerance_ReportsNotTruncated
-// cover the regression Phase 3 introduced and Phase 3.1 fixes:
-// looksTruncatedByStoredLength used to compare EVERY stored HTML
-// attachment's length against PostStripMaxBytes (~300KB) regardless of
-// kind, but Phase 3 changed a link's stored content from sanitized raw
-// markup to a digest capped at urlfetch.DigestHardCapBytes (16KB) — a
-// comparison against ~300KB could never be true for a digest, so a
-// carried-forward truncated link silently lost its "this copy was cut
-// short" note. Driven through a REAL carry-forward turn, not just the
-// helper in isolation, matching how the loss actually showed up: a
-// merchant building from a reference on turn 2 with no idea turn 1's
-// fetch was cut short.
+// This and the test below cover the regression where comparing a link's digest length
+// against the ~300KB upload cap instead of the 16KB digest cap silently lost the truncation note.
 func TestDoGenerate_CarryForwardDigestAtHardCap_ReportsTruncated(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &allCallsCapturingGenerator{}
@@ -394,9 +323,7 @@ func TestDoGenerate_CarryForwardDigestAtHardCap_ReportsTruncated(t *testing.T) {
 
 	tenantID := uint64(time.Now().UnixNano())
 	url := "https://example.com/big-reference"
-	// Exactly at urlfetch.DigestHardCapBytes — squarely inside
-	// digestTruncatedLengthTolerance's window, so this must read as
-	// truncated.
+	// Exactly at urlfetch.DigestHardCapBytes to test truncation window.
 	htmlContent := exactLengthFiller(urlfetch.DigestHardCapBytes)
 
 	outcome, err := svc.Generate(context.Background(), GenerateInput{
@@ -470,10 +397,7 @@ func TestDoGenerate_CarryForwardDigestJustUnderTolerance_ReportsNotTruncated(t *
 	}
 }
 
-// TestDoGenerate_CurrentTurnAttachmentWinsOverCarryForward confirms a turn
-// that attaches its OWN HTML reference never gets the carried-forward one
-// instead — the current turn's explicit attachment must always win, with no
-// carry-forward framing leaking in alongside it.
+// A turn's own explicit HTML attachment must always win over a carried-forward one.
 func TestDoGenerate_CurrentTurnAttachmentWinsOverCarryForward(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &allCallsCapturingGenerator{}
@@ -522,13 +446,8 @@ func TestDoGenerate_CurrentTurnAttachmentWinsOverCarryForward(t *testing.T) {
 	}
 }
 
-// TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn confirms Phase 1's
-// graceful-degradation contract: a reference-URL fetch failing inside
-// doGenerate must still produce a completed turn (the merchant asked a
-// real question and deserves an answer about everything except the page —
-// see GenerateInput.ReferenceURLFetchFailed's own doc comment), and the
-// prompt handed to the model must say so plainly rather than silently
-// proceeding as if no link had ever been mentioned.
+// A reference-URL fetch failing must still produce a completed turn, with the prompt saying
+// so plainly rather than proceeding as if no link had been mentioned.
 func TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &capturingGenerator{}
@@ -574,20 +493,8 @@ func TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn(t *testing.T) {
 	}
 }
 
-// TestDoGenerate_CurrentTurnFailedReferenceURL_DoesNotFallBackToEarlierTurn
-// covers a real observed production bug: a merchant references one site on
-// turn 1 (which fetches fine), then on turn 2 names a DIFFERENT site of
-// their own — whose fetch fails. Before this fix, the carry-forward
-// fallback (see doGenerate's own comment on it) ran whenever
-// HTMLAttachmentContent was nil, with no check for WHY it was nil — so a
-// turn with its own (just-failed) reference URL fell straight through to
-// carrying forward turn 1's completely unrelated page, with no indication
-// to the model (and so the merchant) that the new URL was ever tried at
-// all. The fix requires in.ReferenceURL == "" too: carry-forward is for "no
-// reference this turn," not "this turn's own reference didn't work out" —
-// the latter must surface as an honest failure note (see
-// TestDoGenerate_ReferenceURLFetchFailureDoesNotFailTurn above), never a
-// silent substitution.
+// Production regression: a turn whose OWN reference URL fetch fails must report that failure
+// honestly, not silently fall back to carrying forward an earlier, unrelated turn's page.
 func TestDoGenerate_CurrentTurnFailedReferenceURL_DoesNotFallBackToEarlierTurn(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &allCallsCapturingGenerator{}
@@ -605,10 +512,7 @@ func TestDoGenerate_CurrentTurnFailedReferenceURL_DoesNotFallBackToEarlierTurn(t
 	}
 	waitForAssistantReply(t, chatSvc, tenantID, outcome.Chat.ID)
 
-	// Turn 2 names its OWN, different URL — and that one's fetch fails.
-	// Flipping the shared fake's behavior here is safe: turn 1 has already
-	// completed (waitForAssistantReply above), so turn 1's own fetch call
-	// already happened against the old (successful) configuration.
+	// Safe to flip the shared fake here: turn 1's fetch already happened above.
 	fl.err = errors.New("simulated fetch failure for turn 2's own URL")
 
 	_, err = svc.Generate(context.Background(), GenerateInput{
@@ -630,9 +534,7 @@ func TestDoGenerate_CurrentTurnFailedReferenceURL_DoesNotFallBackToEarlierTurn(t
 		t.Errorf("expected NO carry-forward framing when turn 2 had its own (failed) reference URL, got: %s", second)
 	}
 	if strings.Contains(second, "cached") {
-		// fetchReferenceURLTestHTML's own distinguishing heading text
-		// ("cached") — proves turn 1's unrelated page content did not leak
-		// into turn 2's prompt.
+		// Turn 1's page content must not leak into turn 2.
 		t.Errorf("expected turn 1's carried-forward content to NOT appear in turn 2's prompt, got: %s", second)
 	}
 	if !strings.Contains(second, "could not reach or read it") {
@@ -640,14 +542,8 @@ func TestDoGenerate_CurrentTurnFailedReferenceURL_DoesNotFallBackToEarlierTurn(t
 	}
 }
 
-// TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward covers
-// Phase 1's persistence requirement end to end: a reference-URL fetch that
-// succeeds inside doGenerate must write the fetched content as a real
-// chat_message_attachments row (see chat.Service.AttachHTMLToMessage), not
-// just hold it in local GenerateInput scope for this one turn — otherwise
-// findCarryForwardSourceMessageID would find nothing on a later turn, since
-// RecordUserMessage itself no longer sees fetched content (only Generate's
-// pre-fetch URL detection).
+// A successful reference-URL fetch must persist as a real chat_message_attachments row, not
+// just live in local GenerateInput scope, or a later turn's carry-forward would find nothing.
 func TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &allCallsCapturingGenerator{}
@@ -678,18 +574,14 @@ func TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward(t *testi
 		t.Fatalf("expected exactly 2 Generate calls (one per turn), got %d: %+v", len(prompts), prompts)
 	}
 	first, second := prompts[0], prompts[1]
-	// Turn 1's OWN fetch — not carry-forward — produces a prompt with the
-	// digest, not raw markup: the heading's TEXT ("Reference Site")
-	// survives extraction, but the literal "<h1>" tag does not.
+	// Turn 1's fetch produces digest, not raw markup.
 	if !strings.Contains(first, "Reference Site") {
 		t.Errorf("expected turn 1 to contain the fetched page's extracted content, got: %s", first)
 	}
 	if strings.Contains(first, "<h1>") {
 		t.Errorf("expected turn 1's content to be a digest, not raw markup, got: %s", first)
 	}
-	// The fetched page is carried forward as its DIGEST, not raw markup
-	// (see Service.fetchReferenceURL) — the heading's TEXT ("Reference
-	// Site") survives extraction, but the literal "<h1>" tag does not.
+	// Fetched pages carry forward as digests, not raw markup.
 	if !strings.Contains(second, "Reference Site") {
 		t.Errorf("expected turn 2 to carry forward the fetched page's extracted content, got: %s", second)
 	}
@@ -701,15 +593,8 @@ func TestDoGenerate_SuccessfulReferenceURLFetch_PersistsForCarryForward(t *testi
 	}
 }
 
-// TestDoGenerate_LongReferenceURL_TruncatesStoredFilenameButKeepsFullURLInPrompt
-// covers the VARCHAR(255) filename column vs. urlfetch's 2048-char maxURLLen
-// mismatch: a URL over 255 chars must still round-trip in full to the
-// model (via GenerateInput.HTMLAttachmentFilename, never touched by the
-// truncation), while the persisted chat_message_attachments row's filename
-// is capped to fit the column — and must still look like a fetched link to
-// looksLikeFetchedLink after that truncation (i.e. the "https://" prefix
-// survives), or a later turn's carry-forward would misclassify it as an
-// upload.
+// Verifies truncation to 255 chars for storage while keeping full URL in prompt.
+// Critical: "https://" prefix must survive for carry-forward classification.
 func TestDoGenerate_LongReferenceURL_TruncatesStoredFilenameButKeepsFullURLInPrompt(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &capturingGenerator{}
@@ -761,23 +646,8 @@ func TestDoGenerate_LongReferenceURL_TruncatesStoredFilenameButKeepsFullURLInPro
 	}
 }
 
-// TestDoGenerate_LinkOverDigestHardCap_TruncatesInsteadOfFailing covers
-// truncate-not-fail for a link's DIGEST now, not its raw fetched HTML —
-// Phase 3 (see urlfetch.BuildDigest) replaced a link's raw sanitized
-// markup with a compact structured digest, capped at digestHardCapBytes
-// (16KB), well under MaxHTMLAttachmentBytes (PostStripMaxBytes, 300KB).
-// That makes the OLD version of this test's premise (a post-sanitize
-// result still over PostStripMaxBytes) effectively unreachable for a real
-// page — see Service.fetchReferenceURL's own doc comment on
-// PostStripMaxBytes now being a backstop, not the normal path — so this
-// exercises the truncation BuildDigest itself actually performs instead: a
-// page with far more extractable headings/landmarks/copy than fits in
-// 16KB still completes the turn, with the digest cut down (see
-// Digest.Truncated) rather than the reference being rejected. Still
-// exactly the same behavioral guarantee Phase 2 first established (an
-// oversized link truncates, it never fails the turn) — see
-// TestGenerate_HTMLAttachmentStillTooLargeAfterStripping, unchanged, for
-// the upload path's own, still-different, still-hard-rejecting behavior.
+// Verifies truncation not failure for links exceeding digestHardCapBytes (16KB).
+// Phase 3: digests instead of raw HTML; same behavioral guarantee as Phase 2.
 func TestDoGenerate_LinkOverDigestHardCap_TruncatesInsteadOfFailing(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &capturingGenerator{}
@@ -806,12 +676,7 @@ func TestDoGenerate_LinkOverDigestHardCap_TruncatesInsteadOfFailing(t *testing.T
 	html.WriteString("</body></html>")
 	bigContent := html.String()
 
-	// Every per-section cap above (40 headings, 20 landmarks, 2000-char
-	// copy, 40 labels) is already saturated by the HTML alone, but that
-	// combination alone lands just under digestHardCapBytes — a
-	// DESIGN TOKENS section (from CSS, which a real fetch would also
-	// collect via FetchStylesheets) is what pushes the total over, the
-	// same way it did for urlfetch's own over_hard_cap fixture.
+	// HTML alone lands just under digestHardCapBytes; CSS design tokens push it over.
 	var css strings.Builder
 	for i := 0; i < 30; i++ {
 		fmt.Fprintf(&css, "--token-%d: value-%d-padded-out-toward-the-two-hundred-character-cap-just-a-little-bit-more-text-here-to-make-it-longer;\n", i, i)
@@ -856,23 +721,13 @@ func TestDoGenerate_LinkOverDigestHardCap_TruncatesInsteadOfFailing(t *testing.T
 	}
 }
 
-// TestDoGenerate_LinkSanitizesToEmpty_TreatedAsFetchFailureNotSuccess covers
-// the client-rendered-SPA case: a page whose entire server-sent HTML is a
-// single <script> block digests to nothing (no headings, no landmarks, no
-// copy — see Digest.Empty's own doc comment; extraction excludes script
-// content the same way SanitizeHTMLAttachment used to strip it outright).
-// This must take the ReferenceURLFetchFailed path with the distinct
-// JS-rendered note (see promptWithHTMLAttachment), NOT the external-link
-// success framing with an empty attachment — the model has nothing to
-// actually read from the page, and the success framing would make it
-// falsely claim otherwise.
+// SPA pages that digest to nothing (all scripts) must be treated as fetch failures,
+// not successes with empty attachments.
 func TestDoGenerate_LinkSanitizesToEmpty_TreatedAsFetchFailureNotSuccess(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &capturingGenerator{}
 	svc.gen = gen
-	// Digests to "" in full: the whole body is one <script> block, which
-	// extraction excludes entirely, and nothing else in the page survives
-	// to take its place.
+	// Page is all scripts, digests to nothing.
 	svc.links = &fakeLinkFetcher{content: `<script>document.body.innerHTML = renderApp();</script>`}
 
 	tenantID := uint64(time.Now().UnixNano())

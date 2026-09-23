@@ -8,16 +8,8 @@ import (
 	"strconv"
 )
 
-// Product is the subset of flowpos-backend's GET /products response (the
-// same tenant-authenticated products-list endpoint tenant-dashboard's own
-// product management screens call — ProductController::index) the theme
-// engine's preview context needs. Field names and presence are confirmed
-// against tenant-dashboard's own Product TS type
-// (src/lib/api/products.ts), not just the raw Eloquent model, since that
-// type reflects the shape already relied on in production. Price is the
-// tenant's stored price as returned by that endpoint — the model also
-// appends a computed, VAT-inclusive gross_price, but that field isn't part
-// of the confirmed TS shape, so it's deliberately not depended on here.
+// Product is the subset of GET /products the preview context needs, confirmed against tenant-dashboard's Product TS type.
+// Price is the tenant's stored price — the endpoint also returns a computed gross_price, deliberately not depended on here.
 type Product struct {
 	ID             int                 `json:"id"`
 	Slug           string              `json:"slug"`
@@ -32,25 +24,17 @@ type Product struct {
 	DefaultVariant *ProductVariantRef  `json:"default_variant"`
 }
 
-// ProductAttachment is one of a product's images — URL is already the full,
-// ready-to-use absolute URL (Attachment::getUrlAttribute() on the
-// flowpos-backend side), not a relative path needing a base joined on.
+// ProductAttachment is one of a product's images — URL is already a full absolute URL, not a relative path.
 type ProductAttachment struct {
 	URL string `json:"url"`
 }
 
-// ProductVariantRef is the subset of a product's default variant this
-// package needs — just enough to resolve default_variant_id for the theme
-// engine's product-card "Add to Cart" branch (see spec §7's product-list-item
-// component signature).
+// ProductVariantRef is just enough of a product's default variant to resolve default_variant_id for the "Add to Cart" branch.
 type ProductVariantRef struct {
 	ID int `json:"id"`
 }
 
-// ProductsPage is one page of FetchProducts' result — Items capped at the
-// requested limit (see FetchProducts), the rest describing the full
-// catalogue on flowpos-backend's side so a caller can report accurate
-// pagination even though only the first page was ever fetched.
+// ProductsPage is one page of FetchProducts' result — Items capped at limit, the rest describing the full catalogue for accurate pagination.
 type ProductsPage struct {
 	Items       []Product
 	CurrentPage int
@@ -71,16 +55,8 @@ type productsPageEnvelope struct {
 	} `json:"data"`
 }
 
-// FetchProducts calls flowpos-backend's GET /products — the same
-// tenant-authenticated, paginated products-list endpoint tenant-dashboard's
-// own product management screens call (see src/lib/api/products.ts) —
-// filtered to published, active products (what a real shopper would
-// actually see on the live storefront) and capped at limit via that
-// endpoint's own "limit" query param, which directly controls its Laravel
-// paginate() page size server-side. Items is defensively re-capped at limit
-// in case that ever isn't honoured. First page only — see this function's
-// caller (PreviewHandler.buildPreviewContext) for why a full catalogue is
-// never needed here.
+// FetchProducts calls GET /products filtered to published/active products, capped at limit via the query param.
+// Items is defensively re-capped at limit in case that isn't honoured server-side. First page only.
 func (s *Store) FetchProducts(ctx context.Context, auth RequestAuth, limit int) (ProductsPage, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/products", nil)
 	if err != nil {

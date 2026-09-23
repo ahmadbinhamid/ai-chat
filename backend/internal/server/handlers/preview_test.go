@@ -118,13 +118,8 @@ func TestPreviewHandler_RendersUnsavedDraftContent(t *testing.T) {
 	}
 }
 
-// TestPreviewHandler_UsesRealStoreName covers buildPreviewContext's overlay:
-// both Preview and Context must report the tenant's real store name (from
-// flowpos-backend's GET /store), not FixtureContext's canned "Sample Store"
-// — and, critically, the SAME name from both, since PreviewPane's "Check
-// accuracy" button diffs one against the other (see buildPreviewContext's
-// own doc comment on why a mismatch between the two would be a regression,
-// not just a missed opportunity).
+// TestPreviewHandler_UsesRealStoreName confirms both Preview and Context report the tenant's real store name, and the
+// SAME name from both — PreviewPane's accuracy-check diffs one against the other, so a mismatch would be a regression.
 func TestPreviewHandler_UsesRealStoreName(t *testing.T) {
 	files := map[string]string{
 		"liquid/layout-start.liquid": `<body>`,
@@ -200,11 +195,7 @@ func TestPreviewHandler_UsesRealStoreName(t *testing.T) {
 	}
 }
 
-// TestPreviewHandler_UsesRealMenuItems covers buildPreviewContext's menu
-// overlay: a theme with more (or fewer) than FixtureContext's 3 canned
-// links must render all of its real defaults.json links, from both Preview
-// and Context (see TestPreviewHandler_UsesRealStoreName on why the two
-// must agree).
+// TestPreviewHandler_UsesRealMenuItems confirms a theme's real defaults.json links (not FixtureContext's 3 canned ones) render from both Preview and Context.
 func TestPreviewHandler_UsesRealMenuItems(t *testing.T) {
 	files := map[string]string{
 		"liquid/layout-start.liquid": `<body>`,

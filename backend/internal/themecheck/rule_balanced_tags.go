@@ -17,10 +17,7 @@ var blockClosers = map[string]string{
 	"endif": "if", "endfor": "for", "endcapture": "capture", "endcomment": "comment",
 }
 
-// checkBalancedTags enforces rule 3: every if/for/capture/comment has its
-// matching close, correctly nested — via a simple open/close stack over the
-// tag stream, since this dialect has no other block-scoped tags to confuse
-// the matching.
+// checkBalancedTags enforces rule 3: every if/for/capture/comment has its matching close, correctly nested.
 func checkBalancedTags(p Proposal, _ Snapshot) []Finding {
 	var findings []Finding
 	for _, f := range p.Files {

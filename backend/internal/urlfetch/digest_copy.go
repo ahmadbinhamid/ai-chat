@@ -8,18 +8,15 @@ import (
 )
 
 // maxCopyChars bounds the visible-body-text section; maxInteractiveLabels
-// and interactiveLabelMaxChars bound the separate interactive-labels list
-// (link/button/form-field text) — see BuildDigest's own doc comment for
-// why these are kept apart from the general copy.
+// and interactiveLabelMaxChars bound the separate interactive-labels list.
 const (
 	maxCopyChars             = 2000
 	maxInteractiveLabels     = 40
 	interactiveLabelMaxChars = 60
 )
 
-// interactiveLabelTags are the elements whose visible text BuildDigest
-// collects separately from general copy (see extractCopy) — what a
-// merchant usually means by "match the buttons/nav" on a reference page.
+// interactiveLabelTags get their visible text collected separately from
+// general copy — what a merchant usually means by "match the buttons/nav".
 var interactiveLabelTags = map[string]bool{"a": true, "button": true, "label": true}
 
 type copyInfo struct {
@@ -27,9 +24,8 @@ type copyInfo struct {
 	labels   []string
 }
 
-// labelFrame mirrors landmarkFrame for interactive elements (a, button,
-// label) — also stack-based since a <label> commonly wraps other markup
-// (an <input> plus its own text) rather than being a leaf.
+// labelFrame mirrors landmarkFrame — stack-based since a <label> commonly
+// wraps other markup (an <input> plus its own text) rather than being a leaf.
 type labelFrame struct {
 	tag string
 	buf strings.Builder
@@ -69,9 +65,8 @@ func extractCopy(htmlSrc string) copyInfo {
 				labelStack = append(labelStack, &labelFrame{tag: t.Data})
 				continue
 			}
-			// input[type=submit|button|reset] has no closing content of its
-			// own to capture text from — its visible label is its value
-			// attribute instead.
+			// input[type=submit|button|reset] has no closing content — its
+			// visible label is its value attribute instead.
 			if t.Data == "input" {
 				switch strings.ToLower(attrVal(t, "type")) {
 				case "submit", "button", "reset":

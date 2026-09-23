@@ -14,9 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// fakeAssetThemeServer serves one fixed binary file's bytes, base64-encoded
-// the same way flowpos-backend's real file API does for non-text content —
-// see themefs/disk.go's readFileRaw.
+// fakeAssetThemeServer serves one fixed binary file's bytes, base64-encoded like flowpos-backend's real file API.
 func fakeAssetThemeServer(relPath string, data []byte) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -37,11 +35,7 @@ func TestAssetHandler_SetsETagAndServesConditionalGet(t *testing.T) {
 
 	buildSvc := themebuild.NewService(nil, chat.NewService(nil), nil, themefs.NewStore(ts.URL), nil)
 	router := gin.New()
-	// Deliberately not 1 — every other fakeAuthMiddleware call site in this
-	// package happens to use 1, and golangci-lint's unparam flags a
-	// parameter that never varies across ALL call sites; using a different
-	// tenant id here (any value works, this test doesn't care which) keeps
-	// that param meaningfully exercised instead of suppressing the lint.
+	// Uses 2, not 1, so golangci-lint's unparam doesn't flag this param as unvarying across call sites.
 	router.Use(fakeAuthMiddleware(2))
 	router.GET("/theme-assets/*path", NewAssetHandler(buildSvc).Get)
 
@@ -63,9 +57,7 @@ func TestAssetHandler_SetsETagAndServesConditionalGet(t *testing.T) {
 		t.Error("expected a Cache-Control header")
 	}
 
-	// A repeat request carrying the ETag we just got back (what a browser
-	// does on refresh/revalidation) should short-circuit to 304 with no
-	// body, instead of re-transferring the asset.
+	// Repeating the request with the ETag (browser revalidation) should short-circuit to 304.
 	req2 := httptest.NewRequest(http.MethodGet, "/theme-assets/images/logo.png", nil)
 	req2.Header.Set("If-None-Match", etag)
 	rec2 := httptest.NewRecorder()

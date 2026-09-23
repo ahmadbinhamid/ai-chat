@@ -1,6 +1,5 @@
-// Package config loads process configuration from the environment into a
-// typed Config struct. Load fails fast (log.Fatal) on any required value
-// that is missing.
+// Package config loads process configuration from the environment. Load fails fast
+// (log.Fatal) on any required value that is missing.
 package config
 
 import (
@@ -22,153 +21,64 @@ type Config struct {
 	DBUsername string
 	DBPassword string
 
-	// FlowposAPIBase is the tenant-dashboard API this service delegates all
-	// authentication to (see internal/auth) — GET {FlowposAPIBase}/user
-	// verifies every incoming bearer token. Required: there is no local
-	// fallback identity provider, by design. Also the base URL for
-	// flowpos-backend's theme-file API (see internal/themefs.Store) — theme
-	// content lives and is written there, not on a filesystem this service
-	// shares with it.
+	// FlowposAPIBase is the tenant-dashboard API this service delegates auth to. Required.
 	FlowposAPIBase string
-	// AuthCacheTTL / AuthNegativeCacheTTL bound how long a verified (or
-	// rejected) token is trusted before internal/auth calls FlowPOS again —
-	// this is also this service's token-revocation lag, so keep it short if
-	// that matters more than upstream call volume.
+	// AuthCacheTTL / AuthNegativeCacheTTL bound how long a verified/rejected token is trusted.
 	AuthCacheTTL         time.Duration
 	AuthNegativeCacheTTL time.Duration
-	// FlowposHTTPTimeout bounds the /user introspection call itself — a
-	// slow-but-not-quite-down FlowPOS must fail fast (503) rather than hang
-	// the request indefinitely.
+	// FlowposHTTPTimeout bounds the /user introspection call itself.
 	FlowposHTTPTimeout time.Duration
 
-	// AIProvider selects which backing model ai.New talks to — "anthropic"
-	// (default) or "deepseek". Both speak the same Anthropic Messages API
-	// wire protocol (DeepSeek via its documented compat endpoint), so this
-	// only changes which API key/base URL/model string get used — the whole
-	// generation tool loop (internal/ai/generator.go) is unaware of which one
-	// is active. Anything else is a startup misconfiguration, not a silent
-	// fallback — see the log.Fatal in Load below.
-	AIProvider string
-
-	// Anthropic / Claude
-	AnthropicAPIKey string
-	AnthropicModel  string
-	// AnthropicVisionModel, when set, is used instead of AnthropicModel for
-	// any turn that attaches an image — see ai.Generator.visionModel's own
-	// doc comment for why a separate model rather than always using this
-	// one. Empty (the default) means image attachments are rejected
-	// outright for this provider — see themebuild.ErrVisionNotConfigured.
-	AnthropicVisionModel string
-
-	// Effort/MaxTokens are provider-neutral despite living next to the
-	// Anthropic/DeepSeek fields above: both providers speak the same
-	// Anthropic Messages API request shape (see ai.New's own doc comment),
-	// so the same two values control reasoning effort and output cap
-	// regardless of which one AIProvider selects — see their read in Load
-	// below (AI_EFFORT/AI_MAX_TOKENS, falling back to the older
-	// ANTHROPIC_EFFORT/ANTHROPIC_MAX_TOKENS names for compatibility) for
-	// why they aren't named AnthropicEffort/AnthropicMaxTokens: that
-	// naming genuinely cost debugging time once already, on a
-	// AI_PROVIDER=deepseek deployment where "Anthropic-only" was assumed
-	// and wrongly ruled out as a cause of DeepSeek latency.
+	// Effort/MaxTokens control reasoning effort and output cap for every generation call.
 	Effort string
-	// MaxTokens is the model call's max_tokens (see ai.defaultMaxTokens for
-	// the fallback when unset/invalid). Raise this if a generation is
-	// failing with "truncated at the max_tokens limit" more than
-	// occasionally on complex prompts.
+	// MaxTokens is the model call's max_tokens.
 	MaxTokens int64
 
-	// DeepSeek — only read/required when AIProvider == "deepseek".
-	DeepSeekAPIKey  string
-	DeepSeekModel   string
-	DeepSeekBaseURL string
-	// DeepSeekVisionModel — see AnthropicVisionModel's doc comment; same
-	// role, DeepSeek side. Defaults to DeepSeek's own documented
-	// experimental vision model (confirmed working against the real
-	// tool-loop pipeline via a one-off smoke test — see
-	// internal/ai/vision_smoke_test.go), NOT the same tier as DeepSeekModel
-	// — DeepSeek's vision support lives on a separate, lesser-tier,
-	// experimental model, not on deepseek-v4-pro itself.
-	DeepSeekVisionModel string
-	// HistorySummarizationEnabled gates themebuild's collapsed-history-turn
-	// summarization (see themebuild.Service.summarizeOldTurnsCached).
-	// Defaults to enabled for both providers, not just Anthropic — the
-	// summary is now cached per chat (keyed by how many older turns it
-	// covers), so the same synthetic turn is resent on every call instead
-	// of a freshly-generated one each time. That matters specifically for
-	// DeepSeek: its compat endpoint caches on request-prefix match rather
-	// than honoring cache_control, so a summary that changed text on every
-	// call used to invalidate that prefix cache for the whole conversation
-	// — see .env.example's own note on this var. Set to false to disable
-	// summarization outright (full history is always resent verbatim) if a
-	// deployment still finds it not worth the tradeoff.
+	// StreamIdleTimeout bounds how long a streaming attempt can go with no new event before retry.
+	StreamIdleTimeout time.Duration
+	// FirstTokenTimeout* bound time-to-first-byte per ai.GenerationMode.
+	FirstTokenTimeoutEdit  time.Duration
+	FirstTokenTimeoutBrand time.Duration
+	FirstTokenTimeoutCopy  time.Duration
+	FirstTokenTimeoutPages time.Duration
+
+	// APIKey/Model/BaseURL talk to the AI provider over its Anthropic Messages API compat endpoint.
+	APIKey  string
+	Model   string
+	BaseURL string
+	// VisionModel replaces Model for any turn with an image attached; empty rejects images outright.
+	VisionModel string
+	// HistorySummarizationEnabled gates collapsed-history-turn summarization; the cached
+	// summary also matters for DeepSeek's prefix-match request caching.
 	HistorySummarizationEnabled bool
-	// FakeAIMode, when true, skips the real Claude API entirely — see
-	// ai.NewFake. For debugging the surrounding plumbing (the async
-	// generation lifecycle, the stream WebSocket, the dashboard) without
-	// spending real API tokens while that plumbing is broken. Never leave
-	// this on — nothing gets written to the theme while it's set. Also
-	// makes ANTHROPIC_API_KEY optional, since it's never actually used.
+	// FakeAIMode skips the real AI provider entirely. Never leave this on — nothing gets
+	// written to the theme while it's set.
 	FakeAIMode bool
-	// FakeAIDelay simulates real generation latency in fake mode — long
-	// enough that a client watching the stream WebSocket live still sees a
-	// realistic "generating" window instead of an instant no-op.
+	// FakeAIDelay simulates generation latency so a live WebSocket client still sees a
+	// realistic "generating" window in fake mode.
 	FakeAIDelay time.Duration
 
-	// GenerationRateLimitPerMinute caps how many /messages (generation)
-	// calls a single tenant can make per minute — see internal/ratelimit.
-	// Generation calls an LLM and costs real money per call, unlike the rest
-	// of this API, so it gets its own limiter distinct from a general one.
+	// GenerationRateLimitPerMinute caps /messages calls per tenant per minute.
 	GenerationRateLimitPerMinute int
 
-	// CORSAllowedOrigins is the browser origins allowed to call this API
-	// directly (the tenant dashboard's own origin(s) — dev and prod). Empty
-	// by default, which safely blocks all cross-origin browser requests
-	// rather than falling back to a permissive "*" — misconfiguring this
-	// breaks the feature, it doesn't open a hole, so unlike FLOWPOS_API_BASE
-	// this one degrades instead of failing the process at startup.
+	// CORSAllowedOrigins is the browser origins allowed to call this API. Empty blocks all
+	// cross-origin requests (fails closed).
 	CORSAllowedOrigins []string
 
-	// RedisURL backs cross-replica generation-event pub/sub (phase 3b/3c —
-	// see themebuild's event log and GET /chats/:chatId/stream). Optional:
-	// empty means events still land in generation_events, just without
-	// live delivery to a WebSocket connected to a different replica than
-	// the one running the generation — a real limitation on more than one
-	// instance, but not a reason to fail startup on a single-instance
-	// deployment that doesn't have Redis yet.
+	// RedisURL backs cross-replica generation-event pub/sub. Optional: empty means no
+	// cross-replica live delivery, not a startup failure.
 	RedisURL string
 
-	// MaxRequestBodyBytes caps every JSON request body this API accepts
-	// (see server.go's maxBodySize middleware) — without it, any
-	// authenticated caller can send an arbitrarily large body (bounded only
-	// by the HTTP server's own read timeout) and force a large in-memory
-	// allocation before struct-tag validation (e.g. sendMessageRequest's
-	// Prompt max=6000) ever runs, since c.ShouldBindJSON fully unmarshals
-	// first. 45MB is sized for POST /chats/messages' own worst case, the
-	// largest legitimate payload today: up to 5 images at
-	// maxImageAttachmentBytes (5MB) each — base64 inflates that ~4/3, so
-	// ~33MB just for images — plus one HTML attachment up to
-	// maxHTMLUploadBytes (5MB raw, before stripping), plus JSON/field
-	// overhead. (POST /themes/:slug/preview's own full draft theme
-	// Files map is comfortably smaller than that and was this cap's
-	// previous 10MB high-water mark.) Still far short of "an attacker can
-	// meaningfully exhaust memory with one call."
+	// MaxRequestBodyBytes caps request bodies; sized for POST /chats/messages' worst case
+	// (base64 images + an HTML attachment).
 	MaxRequestBodyBytes int64
 }
 
-// Load reads configuration from the process environment. Callers are
-// expected to have already loaded a .env file (see cmd/server/main.go),
-// this package does not read .env itself so it stays testable without
-// filesystem side effects.
+// Load reads configuration from the process environment; callers must already have loaded a .env file.
 func Load() Config {
 	flowposAPIBase := os.Getenv("FLOWPOS_API_BASE")
 	if flowposAPIBase == "" {
 		log.Fatal("FLOWPOS_API_BASE is required — every request is authenticated by delegating to it, there is no local fallback")
-	}
-
-	aiProvider := getenv("AI_PROVIDER", "anthropic")
-	if aiProvider != "anthropic" && aiProvider != "deepseek" {
-		log.Fatalf("AI_PROVIDER must be %q or %q, got %q", "anthropic", "deepseek", aiProvider)
 	}
 
 	return Config{
@@ -185,20 +95,21 @@ func Load() Config {
 		AuthNegativeCacheTTL: time.Duration(getenvInt("AUTH_NEGATIVE_CACHE_TTL_SECONDS", 10)) * time.Second,
 		FlowposHTTPTimeout:   time.Duration(getenvInt("FLOWPOS_HTTP_TIMEOUT_MS", 2000)) * time.Millisecond,
 
-		AIProvider: aiProvider,
+		Effort:      getenv("AI_EFFORT", "xhigh"),
+		MaxTokens:   int64(getenvInt("AI_MAX_TOKENS", 64000)),
+		FakeAIMode:  getenvBool("AI_CHAT_FAKE_MODE", false),
+		FakeAIDelay: time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
-		AnthropicAPIKey:      os.Getenv("ANTHROPIC_API_KEY"),
-		AnthropicModel:       getenv("ANTHROPIC_MODEL", "claude-opus-5"),
-		AnthropicVisionModel: getenv("ANTHROPIC_VISION_MODEL", ""),
-		Effort:               getenvDeprecated("AI_EFFORT", "ANTHROPIC_EFFORT", "xhigh"),
-		MaxTokens:            int64(getenvIntDeprecated("AI_MAX_TOKENS", "ANTHROPIC_MAX_TOKENS", 64000)),
-		FakeAIMode:           getenvBool("AI_CHAT_FAKE_MODE", false),
-		FakeAIDelay:          time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
+		StreamIdleTimeout:      time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_SECONDS", 12)) * time.Second,
+		FirstTokenTimeoutEdit:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_SECONDS", 120)) * time.Second,
+		FirstTokenTimeoutBrand: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
+		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
+		FirstTokenTimeoutPages: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_PAGES_SECONDS", 150)) * time.Second,
 
-		DeepSeekAPIKey:      os.Getenv("DEEPSEEK_API_KEY"),
-		DeepSeekModel:       getenv("DEEPSEEK_MODEL", "deepseek-v4-pro"),
-		DeepSeekVisionModel: getenv("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
-		DeepSeekBaseURL:     getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/anthropic"),
+		APIKey:      os.Getenv("AI_API_KEY"),
+		Model:       getenv("AI_MODEL", "deepseek-v4-pro"),
+		VisionModel: getenv("AI_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
+		BaseURL:     getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
 
 		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
 
@@ -212,8 +123,7 @@ func Load() Config {
 	}
 }
 
-// getenvList parses a comma-separated env var into a trimmed, non-empty
-// slice — "" (unset) yields an empty (not nil-vs-empty-ambiguous) slice.
+// getenvList parses a comma-separated env var into a trimmed, non-empty slice.
 func getenvList(key string) []string {
 	raw := os.Getenv(key)
 	if raw == "" {
@@ -234,57 +144,6 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-// getenvDeprecated resolves a value that has moved from oldKey to newKey:
-// newKey wins if set, oldKey is used (with a deprecation warning) if newKey
-// isn't, and fallback applies if neither is — same "" -> unset treatment
-// getenv already uses, so newKey set to an empty string falls through to
-// oldKey exactly like an unset newKey would. Warns via the standard log
-// package, not slog: Load runs before cmd/server/main.go calls
-// slog.SetDefault, so an slog call here would go through slog's
-// unconfigured default handler and look inconsistent with every other line
-// this process logs — see getenvBool/getenvInt's own WARNING lines above,
-// the same reasoning already applied to invalid values in this file.
-func getenvDeprecated(newKey, oldKey, fallback string) string {
-	newVal := os.Getenv(newKey)
-	oldVal := os.Getenv(oldKey)
-	switch {
-	case newVal != "" && oldVal != "":
-		log.Printf("WARNING: both %s and %s are set — using %s (%q), ignoring %s. Remove %s once you've moved off it.",
-			newKey, oldKey, newKey, newVal, oldKey, oldKey)
-		return newVal
-	case newVal != "":
-		return newVal
-	case oldVal != "":
-		log.Printf("WARNING: %s is deprecated, use %s instead — still honoring %s (%q) for now.", oldKey, newKey, oldKey, oldVal)
-		return oldVal
-	default:
-		return fallback
-	}
-}
-
-// getenvIntDeprecated is getenvDeprecated for an integer value, reusing
-// getenvInt itself (not os.Getenv + strconv directly) so an invalid value
-// under whichever key actually supplied it still gets getenvInt's own
-// existing invalid-value WARNING and fallback behavior — unchanged by this
-// rename, per Load's own doc comment on not adding new validation here.
-func getenvIntDeprecated(newKey, oldKey string, fallback int) int {
-	newVal := os.Getenv(newKey)
-	oldVal := os.Getenv(oldKey)
-	switch {
-	case newVal != "" && oldVal != "":
-		log.Printf("WARNING: both %s and %s are set — using %s, ignoring %s. Remove %s once you've moved off it.",
-			newKey, oldKey, newKey, oldKey, oldKey)
-		return getenvInt(newKey, fallback)
-	case newVal != "":
-		return getenvInt(newKey, fallback)
-	case oldVal != "":
-		log.Printf("WARNING: %s is deprecated, use %s instead — still honoring %s for now.", oldKey, newKey, oldKey)
-		return getenvInt(oldKey, fallback)
-	default:
-		return fallback
-	}
 }
 
 func getenvBool(key string, fallback bool) bool {
@@ -313,13 +172,8 @@ func getenvInt(key string, fallback int) int {
 	return n
 }
 
-// DSN builds the MySQL data source name for database/sql + go-sql-driver/mysql.
-// clientFoundRows=true makes an UPDATE's reported affected-row count mean
-// "rows matched", not MySQL's default "rows actually changed" — without it,
-// an UPDATE that matches an existing row but happens to change nothing
-// (e.g. TouchChatUsage with a zero token delta landing in the same second
-// as the row's current last_message_at) reports 0 rows affected, and
-// checkAffected (chat/repository.go) would misreport that row as not found.
+// DSN builds the MySQL data source name. clientFoundRows=true makes affected-row count mean
+// "rows matched" not "rows changed" — otherwise a no-op UPDATE misreports the row as not found.
 func (c Config) DSN() string {
 	return c.DBUsername + ":" + c.DBPassword + "@tcp(" + c.DBHost + ":" + c.DBPort + ")/" + c.DBDatabase +
 		"?parseTime=true&charset=utf8mb4&loc=UTC&clientFoundRows=true"

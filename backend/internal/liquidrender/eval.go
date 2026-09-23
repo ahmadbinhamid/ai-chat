@@ -7,9 +7,7 @@ import (
 	"strings"
 )
 
-// scope is one template's (or partial's) variable bindings — a plain
-// map[string]any so fixture data (see themefs.FixtureContext) and
-// evaluation both stay reflection-free.
+// scope is one template's (or partial's) variable bindings, kept reflection-free.
 type scope map[string]any
 
 var literalKeywords = map[string]any{
@@ -18,8 +16,7 @@ var literalKeywords = map[string]any{
 
 var numberRe = regexp.MustCompile(`^-?\d+(\.\d+)?$`)
 
-// evalValue evaluates a single value expression (no filters) — a quoted
-// string, a number, a keyword, or a dotted variable path.
+// evalValue evaluates a single value expression (no filters): string, number, keyword, or path.
 func evalValue(raw string, vars scope) any {
 	raw = strings.TrimSpace(raw)
 	switch {
@@ -43,10 +40,8 @@ func evalValue(raw string, vars scope) any {
 	}
 }
 
-// resolvePath resolves a dotted path ("product.choices") against vars —
-// map[string]any at every level, since fixtures never use Go structs.
-// Returns nil for any unknown root or field, matching Liquid's own
-// "undefined renders as nothing" behavior rather than erroring.
+// resolvePath resolves a dotted path ("product.choices") against vars, returning nil for any
+// unknown root or field — matches Liquid's "undefined renders as nothing" behavior.
 func resolvePath(path string, vars scope) any {
 	segments := strings.Split(path, ".")
 	cur := vars[segments[0]]
@@ -71,10 +66,8 @@ func eval(raw string, vars scope, errs *[]string) any {
 	return val
 }
 
-// applyFilter applies one "name" or "name: arg1, arg2" filter segment —
-// exactly §1's seven filters, nothing else (an unrecognized filter is
-// reported, not silently ignored, since a preview should surface a spec
-// violation rather than mask it).
+// applyFilter applies one "name" or "name: arg1, arg2" filter segment. An unrecognized
+// filter is reported as an error, not silently ignored.
 func applyFilter(seg string, val any, vars scope, errs *[]string) any {
 	name := seg
 	var argsRaw string
@@ -167,12 +160,8 @@ func sliceOf(v any, args []any) any {
 		return ""
 	}
 	end := start + length
-	// A negative length (or one that overflows) must not push end below
-	// start — s[start:end] panics ("slice bounds out of range") the moment
-	// end < start, and length is arbitrary caller/model-supplied input (see
-	// this filter's callers: AI-proposed page content rendered straight
-	// through POST /themes/:slug/preview) rather than something this engine
-	// controls the shape of.
+	// length is arbitrary model-supplied input; a negative value must not push end below
+	// start, or s[start:end] panics with "slice bounds out of range".
 	if end < start {
 		end = start
 	}
@@ -182,8 +171,7 @@ func sliceOf(v any, args []any) any {
 	return s[start:end]
 }
 
-// toDisplayString renders val the way {{ }} output would — Liquid's
-// standard scalar formatting, "" for nil (never "<nil>").
+// toDisplayString renders val the way {{ }} output would: standard scalar formatting, "" for nil.
 func toDisplayString(v any) string {
 	switch x := v.(type) {
 	case nil:
@@ -207,10 +195,8 @@ func toDisplayString(v any) string {
 	}
 }
 
-// isTruthy is Liquid's own truthiness, extended with this dialect's
-// boolean-ish coercion (§1): nil/false/""/0/"0" are falsy, everything else
-// (including the string "false" is NOT special-cased here on purpose —
-// only the listed boolean-ish literal shapes are) is truthy.
+// isTruthy: nil/false/""/0/"0" are falsy, everything else is truthy (the string "false" is
+// intentionally not special-cased).
 func isTruthy(v any) bool {
 	switch x := v.(type) {
 	case nil:
@@ -227,9 +213,7 @@ func isTruthy(v any) bool {
 	return true
 }
 
-// looseEqual implements §1's "booleans arrive inconsistently" comparison:
-// true/1/"1" are one equivalence class, false/0/"0" another, everything
-// else compares by display string.
+// looseEqual: true/1/"1" are one equivalence class, false/0/"0" another, else compares by string.
 func looseEqual(a, b any) bool {
 	if boolish, ok := boolishClass(a); ok {
 		if bboolish, ok2 := boolishClass(b); ok2 {

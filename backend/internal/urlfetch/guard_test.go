@@ -40,10 +40,8 @@ func TestValidateURL_Rejected(t *testing.T) {
 }
 
 func TestValidateURL_AllowsNonStandardPorts(t *testing.T) {
-	// A public host on an unusual port (a staging site, shared hosting) is
-	// an ordinary web request, not an SSRF risk — see ValidateURL's own doc
-	// comment on why only IsBlockedIP, not a port allowlist, is the real
-	// boundary here.
+	// A public host on an unusual port is an ordinary web request, not an
+	// SSRF risk — IsBlockedIP, not a port allowlist, is the real boundary.
 	for _, u := range []string{"https://example.com:6379", "https://example.com:3000", "https://example.com:54321"} {
 		if _, err := ValidateURL(u); err != nil {
 			t.Errorf("expected %q to be allowed, got error: %v", u, err)

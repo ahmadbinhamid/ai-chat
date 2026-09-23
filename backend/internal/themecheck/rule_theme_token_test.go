@@ -44,9 +44,7 @@ func TestCheckThemeToken_HexInCustomPropertyIsWarning(t *testing.T) {
 func TestCheckThemeToken_ThemeVarMissingFallback(t *testing.T) {
 	p := Proposal{Files: []ProposedFile{{Path: "components/css/testimonials.css", Content: ".x { color: var(--theme-primary); }"}}}
 	got := checkThemeToken(p, Snapshot{})
-	// Fires twice: once for the missing-fallback var() itself, and once
-	// more because after stripping the var() call the color-property check
-	// no longer sees a raw hex, so only the fallback finding is expected.
+	// Only the fallback finding fires — after stripping the var() call, the color-property check no longer sees a raw hex.
 	if len(got) != 1 || got[0].Severity != SeverityError {
 		t.Fatalf("expected 1 error finding for a missing fallback, got %+v", got)
 	}

@@ -9,7 +9,11 @@
    pre-approved; nothing else is.
 4. Do not refactor code the phase doesn't require. No drive-by cleanups.
 5. Comments explain non-obvious constraints only. No comments narrating what a
-   line does.
+   line does. Keep all comments to 1–2 lines max; delete narrative, code restatement,
+   and cross-references. Preserve only load-bearing constraints: race conditions,
+   concurrency guards, correctness invariants, safety requirements, timing/resource
+   constraints, architectural boundaries. This prevents comment bloat and ensures
+   future changes don't inherit dead commentary.
 6. Every phase ends with `make test` and `make lint` passing.
 7. If a requirement here conflicts with the spec or the existing code, stop and
    say so instead of guessing.

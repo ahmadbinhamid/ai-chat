@@ -25,11 +25,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// loadThemeFilesConcurrency bounds how many concurrent ReadFile calls
-// LoadThemeFiles makes — generous enough to turn a few dozen sequential
-// ~50ms reads into a fraction of a second, not so high it looks like a
-// burst to flowpos-backend or exhausts this process's own outbound
-// connection pool.
+// Bounds concurrent ReadFile calls; avoids overwhelming backend/exhausting connections.
 const loadThemeFilesConcurrency = 8
 
 const (
@@ -37,78 +33,33 @@ const (
 	pathLayoutStart = "liquid/layout-start.liquid"
 	pathLayoutEnd   = "liquid/layout-end.liquid"
 
-	// ChatType is the chat.Chat "type" this module owns — the chat package
-	// itself is generic (see its doc comment); "builder" is what scopes a
-	// tenant's theme-builder thread apart from any future, unrelated chat
-	// use case sharing the same tenant.
 	ChatType = "builder"
 
-	// maxThemeCheckRetries bounds how many times a proposal themecheck
-	// rejects is sent back to the model with its findings before doGenerate
-	// gives up — up to maxThemeCheckRetries+1 total Generate calls (the
-	// original attempt plus this many retries).
+	// Limits repair retries to maxThemeCheckRetries+1 total Generate calls.
 	maxThemeCheckRetries = 2
 
-	// maxImagesPerMessage bounds how many images one prompt can attach —
-	// see the image-attachment feature. Enforced here (not just the
-	// frontend) since a client-side cap alone is trivially bypassable by
-	// anyone calling this API directly.
+	// Enforced server-side; client-side cap alone is trivially bypassable.
 	maxImagesPerMessage = 5
 
-	// MaxImageAttachmentBytes bounds one attached image's decoded size —
-	// exported (all attachment size/validation logic lives here in the
-	// service, not the HTTP handler — see the image/HTML-attachment
-	// features' own doc comments) so the handler never needs its own
-	// mirrored literal. The same 5MB tenant-dashboard already enforces
-	// client-side for its own image uploads (MAX_IMAGE_UPLOAD_BYTES) — a
-	// client-side cap alone is trivially bypassable by anyone calling this
-	// API directly, so this is the real enforcement.
+	// Server-enforced; client-side cap is trivially bypassable.
 	MaxImageAttachmentBytes = 5 * 1024 * 1024
 
-	// MaxHTMLUploadBytes is what's accepted on the wire, BEFORE
-	// SanitizeHTMLAttachment strips it — generous, since a real "save page
-	// as HTML" export commonly embeds every image as a giant inline base64
-	// data: URI, which stripping removes entirely. MaxHTMLAttachmentBytes
-	// below is the real, much tighter cap that applies AFTER stripping,
-	// since that's what actually reaches the model as prompt text.
+	// Pre-sanitize cap; post-sanitize is much tighter due to text token cost.
 	MaxHTMLUploadBytes = 5 * 1024 * 1024
 
-	// MaxHTMLAttachmentBytes bounds one attached reference HTML file's
-	// content AFTER SanitizeHTMLAttachment strips scripts and inline
-	// base64 assets. Far tighter than an image's cost: raw text tokens
-	// cost roughly 1 per ~4 characters, unlike an image's flat per-image
-	// token cost, so this can't be anywhere near the image size cap
-	// without risking a very expensive single turn — ~300KB is generous
-	// for real markup/CSS once embedded assets are gone, while staying
-	// well under maxTokens' own headroom once combined with the rest of a
-	// turn's prompt/system/tool-loop budget.
+	// Post-sanitize cap: text tokens cost ~1 per 4 chars, unlike images' per-image cost.
 	MaxHTMLAttachmentBytes = 300_000
 
 	pathDefaultsJSON = "defaults.json"
 )
 
-// attachmentKindLimit is one kind's count/size caps — see attachmentLimits.
-// PostStripMaxBytes is zero for a kind with no post-sanitize pass (today,
-// only HTML has one: SanitizeHTMLAttachment). Both byte fields are decoded/
-// raw-byte sizes, never base64 length — MaxImageAttachmentBytes is checked
-// via base64.StdEncoding.DecodedLen (the wire value is base64, the check
-// isn't), and MaxHTMLUploadBytes/MaxHTMLAttachmentBytes were already
-// decoded-size checks even before this restructuring: HTMLAttachmentContent
-// is plain UTF-8 text on the wire, never base64, so len() on it already
-// measured raw bytes.
+// PostStripMaxBytes zero for no-post-sanitize kinds; byte fields are decoded/raw, never base64.
 type attachmentKindLimit struct {
 	MaxCount          int
 	MaxBytes          int64
 	PostStripMaxBytes int64
 }
 
-// attachmentLimits keys maxImagesPerMessage/MaxImageAttachmentBytes/
-// MaxHTMLUploadBytes/MaxHTMLAttachmentBytes by chat.AttachmentKind — adding
-// a new kind's count/size caps (e.g. PDF) is one more map entry, not a new
-// exported const plus a new `if` in Generate. The numbers and their
-// reasoning are unchanged from before this restructuring — see each const's
-// own doc comment above; this just gives Generate one place to look them up
-// by kind instead of a literal per attachment type.
 var attachmentLimits = map[chat.AttachmentKind]attachmentKindLimit{
 	chat.AttachmentKindImage: {
 		MaxCount: maxImagesPerMessage,
@@ -121,39 +72,17 @@ var attachmentLimits = map[chat.AttachmentKind]attachmentKindLimit{
 	},
 }
 
-// generateTimeoutNanos backs generateTimeout()/setGenerateTimeoutForTest —
-// an atomic.Int64 (nanoseconds), not a plain time.Duration var: production
-// code never writes it, but TestRunGeneration_EachIterationGetsFreshTimeout
-// does, from the test goroutine, concurrently with background drain-loop
-// goroutines reading it (see runOneQueuedGeneration) — a plain var would be
-// a genuine, race-detector-flagged data race between the two, even though
-// in practice the write always happens well outside any window a
-// background goroutine is reading it.
+// atomic.Int64, not plain var: tests write it concurrently with background drain-loop reads (race condition).
 var generateTimeoutNanos = func() *atomic.Int64 {
 	var v atomic.Int64
-	// 65 minutes: not unbounded, but generous enough for a full-site
-	// redesign at high effort, which can legitimately run close to an hour.
-	// Also reused as the staleness threshold for reaping abandoned
-	// "in progress" rows (see ReapStaleGenerations) — raising this means a
-	// truly stuck generation stays marked in-progress that much longer
-	// before being cleaned up.
 	v.Store(int64(65 * time.Minute))
 	return &v
 }()
 
-// generateTimeout bounds one drain-loop iteration's background work — see
-// runOneQueuedGeneration, which gives every queued generation its own fresh
-// context.WithTimeout(ctx, generateTimeout()) rather than sharing one
-// budget across a whole queue.
+// Each drain-loop iteration gets its own fresh timeout, not shared across queue.
 func generateTimeout() time.Duration { return time.Duration(generateTimeoutNanos.Load()) }
 
-// heartbeatTickerNanos backs runOneQueuedGeneration's heartbeat ticker
-// interval — same atomic.Int64 reasoning as generateTimeoutNanos above:
-// production never writes it, but a test needs to shrink it far below the
-// real-world 30s (matching heartbeatThrottle — see generation_events.go) so
-// it doesn't have to wait 30 real seconds for a tick, while a concurrent
-// generation's own ticker goroutine (started on a background drain-loop
-// goroutine, not the test's) may be reading it at the same time.
+// atomic.Int64: tests write concurrently with background ticker reads (same race reason as generateTimeoutNanos).
 var heartbeatTickerNanos = func() *atomic.Int64 {
 	var v atomic.Int64
 	v.Store(int64(heartbeatThrottle))
@@ -162,96 +91,46 @@ var heartbeatTickerNanos = func() *atomic.Int64 {
 
 func heartbeatTickerInterval() time.Duration { return time.Duration(heartbeatTickerNanos.Load()) }
 
-// generator is the subset of *ai.Generator's behavior Service depends on —
-// letting tests substitute a fake that never calls the real Claude API,
-// which matters most for checkAndRepair's retry loop (multiple Generate
-// calls per turn). *ai.Generator satisfies this today with no changes on
-// its side; callers passing one continue to work unchanged.
+// Subset of *ai.Generator for testability; lets tests substitute fake without real AI provider.
 type generator interface {
 	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, images []ai.Image, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor, readFile ai.FileReader) (*ai.Result, error)
-	// SupportsVision reports whether this generator was configured with a
-	// vision-capable model — see Generate's own guard using this, which
-	// rejects an image-bearing prompt up front rather than persisting an
-	// image nothing downstream can ever process.
 	SupportsVision() bool
-	// Summarize is used by summarizeOldTurns to collapse old chat history
-	// into one synthetic turn instead of resending it verbatim on every
-	// call — see summarizeOldTurns's doc comment. *ai.Generator's fake mode
-	// (see ai.NewFake) implements this with a cheap deterministic string
-	// and never calls the real API, matching Generate's own fake-mode
-	// convention.
 	Summarize(ctx context.Context, turns []ai.Turn) (string, error)
 }
 
-// linkFetcher matches *urlfetch.Fetcher's own methods — a private
-// interface (same pattern as generator above) so Generate/doGenerate can
-// be tested against a fake that never makes a real network call, and so
-// this package doesn't need to import urlfetch's concrete type anywhere
-// but NewService. FetchStylesheets was added alongside Fetch once
-// Service.fetchReferenceURL started building a digest instead of just
-// sanitizing raw HTML — see its own doc comment.
+// Private interface: lets tests substitute fake without real network calls.
 type linkFetcher interface {
 	Fetch(ctx context.Context, rawURL string, maxBytes int64) (urlfetch.Result, error)
 	FetchStylesheets(ctx context.Context, htmlSrc string, finalURL *url.URL) (css string, count int)
 }
 
-// Service is the AI theme builder's orchestration: turn a prompt into
-// proposed changes and stage them into the chat's draft overlay (see
-// Generate) — writing to the real theme is a separate, explicit ApplyDraft
-// step (see this package's own doc comment for the draft/apply split).
+// Service orchestrates prompt → draft staging; ApplyDraft writes to real theme (see package doc).
 type Service struct {
 	repo  *Repository
 	chats *chat.Service
 	gen   generator
-	// links fetches a merchant-pasted reference URL's HTML — see the
-	// link-reference feature in Generate. nil in tests that construct a
-	// Service by struct literal without setting it (see e.g.
-	// generate_valid_proposal_test.go); Generate treats that the same way
-	// it already treats a turn with no reference link at all, so those
-	// tests need no changes.
+	// nil in struct-literal tests; Generate treats as no reference link.
 	links linkFetcher
-	// linkCache is a short-TTL cache in front of links.Fetch (see
-	// fetchReferenceURL and referenceURLCache's own doc comment) — nil in
-	// the same struct-literal tests links itself can be nil in;
-	// fetchReferenceURL falls back to an uncached call when either is nil.
+	// nil in same tests; fetchReferenceURL falls back to uncached call.
 	linkCache *referenceURLCache
-	// store is always the REAL (non-overlay) store — see doGenerate, which
-	// wraps it in a fresh themefs.OverlayStore per generation call rather
-	// than mutating this field. A mutable "current store" field here would
-	// be a data race: this Service is shared across every concurrent
-	// generation for every chat/tenant, and each one's draft is its own.
+	// Always REAL (non-overlay) store. Wrapping in OverlayStore per call avoids data race.
 	store      themefs.ThemeStore
-	themeLocks themeLocker // redisThemeLock if REDIS_URL was configured, keyedMutex otherwise — see themelock.go
-	bus        eventBus    // redisEventBus if REDIS_URL was configured, inProcessEventBus otherwise — see eventEmitter
+	themeLocks themeLocker
+	bus        eventBus
 	tokens     *pendingTokens
-	// historySummarizationEnabled/historySummaries/historySummaryLocks back
-	// summarizeOldTurnsCached (see history_summary.go for the full
-	// rationale) — always non-nil/true after NewService; not a constructor
-	// parameter because NewService's 5-arg shape is depended on by every
-	// test in this package and several in internal/server/handlers, for a
-	// value that in practice never varies across the single Service
-	// instance this process ever builds. Overridden via
-	// SetHistorySummarizationEnabled, called once by server.go's wiring.
+	// Not a NewService param to keep its 5-arg shape stable. Overridable via SetHistorySummarizationEnabled.
 	historySummarizationEnabled bool
 	historySummaries            *historySummaryCache
 	historySummaryLocks         *stripedMutex
 }
 
-// SetHistorySummarizationEnabled overrides the default (enabled) — see the
-// Service struct's own doc comment on why this isn't a NewService
-// parameter. Call once, before serving traffic; not safe to call
-// concurrently with a generation already reading the field.
+// Call once before serving; not safe to call concurrently with generations reading the field.
 func (s *Service) SetHistorySummarizationEnabled(enabled bool) {
 	s.historySummarizationEnabled = enabled
 }
 
-// NewService wires the service's dependencies. rdb may be nil (see
-// NewRedisClient) — generation events are then still durably written to
-// generation_events, and live delivery falls back to an in-process fan-out
-// (see eventbus.go) that only reaches a WebSocket connected to this same
-// replica. store takes the themefs.ThemeStore interface, not the concrete
-// *themefs.Store, purely so tests can substitute a fake — server.go's own
-// wiring still always passes a real *themefs.Store.
+// rdb may be nil; events still durably written, live delivery falls back to in-process fan-out.
+// store takes interface for test fakes; server.go always passes real *themefs.Store.
 func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store themefs.ThemeStore, rdb *redis.Client) *Service {
 	var bus eventBus
 	var locks themeLocker
@@ -260,11 +139,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 		locks = newRedisThemeLock(rdb)
 	} else {
 		bus = newInProcessEventBus()
-		// In-process locking only serializes staging/apply/revert within
-		// THIS replica — two replicas can still race the same theme_slug.
-		// Same degradation this service already accepts for the event bus
-		// when REDIS_URL is unset (see the warning above it in server.go):
-		// tolerable for a single-replica deployment, not for more than one.
+		// In-process lock doesn't prevent replica races; see REDIS_URL requirement in server.go.
 		slog.Warn("REDIS_URL is not set — theme write locking falls back to a single-replica, in-process lock, " +
 			"which does not prevent two replicas from staging/applying/reverting the same theme concurrently")
 		locks = newKeyedMutex()
@@ -285,29 +160,7 @@ func NewService(repo *Repository, chats *chat.Service, gen *ai.Generator, store 
 	}
 }
 
-// pendingTokens holds each queued generation's bearer token in memory only,
-// keyed by generation ID — never in the generations table (see the
-// 20260812000001 migration's doc comment): a bearer token in a DB column is
-// a credential-at-rest problem, and a prompt queued behind several others
-// may not run for many minutes, by which time flowpos-backend may no longer
-// accept it anyway.
-//
-// Keyed by generation ID rather than owned by whichever goroutine happens
-// to call DequeueNext: two requests racing to claim an empty running slot
-// (see Generate) can result in either one's DequeueNext call promoting
-// *either* request's own enqueued row — the token has to travel with the
-// row that actually gets promoted, not with whichever caller won the race
-// to promote something. store is called once per accepted prompt (Generate);
-// take is called once per drain-loop iteration (runGeneration) and removes
-// the entry — a queued generation only ever runs once, a failure is never
-// retried (see runOneQueuedGeneration), so there is nothing to keep it
-// around for afterward.
-//
-// On a pod restart this map is empty. A queued row that survives in the
-// database (queued rows are just data) has no entry here anymore — take
-// reports that exactly like an expired token, which is the correct
-// treatment: see runOneQueuedGeneration and reapOrphanedQueues, which hits
-// the identical "no token" path for the same reason after a crash.
+// In-memory only (security); keyed by gen ID to allow either race winner to promote.
 type pendingTokens struct {
 	mu     sync.Mutex
 	tokens map[string]string
@@ -323,8 +176,7 @@ func (p *pendingTokens) store(generationID, token string) {
 	p.tokens[generationID] = token
 }
 
-// take returns generationID's token and whether one was found, removing it
-// either way.
+// Returns token and whether found, removing either way.
 func (p *pendingTokens) take(generationID string) (string, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -333,259 +185,72 @@ func (p *pendingTokens) take(generationID string) (string, bool) {
 	return token, ok
 }
 
-// discard drops generationID's token without returning it — used when a
-// queued generation is cancelled (see QueueService.Cancel) before it ever
-// gets a chance to run, so the map doesn't hold a stale entry until process
-// exit.
+// Drops token without returning; used when queued generation is cancelled before running.
 func (p *pendingTokens) discard(generationID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.tokens, generationID)
 }
 
-// ErrVisionNotConfigured means a prompt attached an image but this
-// deployment has no vision-capable model configured (DEEPSEEK_VISION_MODEL/
-// ANTHROPIC_VISION_MODEL) — rejected up front, before RecordUserMessage
-// ever persists an image nothing could process.
 var ErrVisionNotConfigured = errors.New("image attachments aren't enabled on this deployment")
-
-// ErrTooManyImages means a prompt attached more than maxImagesPerMessage
-// images.
 var ErrTooManyImages = errors.New("too many images attached")
-
-// ErrImageTooLarge means one attached image's decoded size exceeded
-// MaxImageAttachmentBytes.
 var ErrImageTooLarge = errors.New("an attached image is too large")
-
-// ErrHTMLAttachmentTooLarge means the attached HTML file's content
-// exceeded MaxHTMLUploadBytes (raw) or MaxHTMLAttachmentBytes (post-strip).
 var ErrHTMLAttachmentTooLarge = errors.New("attached HTML file is too large")
 
-// ErrLinkFetchFailed means a reference URL the merchant pasted directly in
-// their prompt (see the link-reference feature in Generate) couldn't be
-// used — wraps the underlying urlfetch error (invalid URL, blocked/private
-// host, unreachable, or wrong content type) for detail; every one of those
-// is already merchant-readable on its own (see urlfetch's own sentinel
-// errors), so nothing here needs to redact or re-explain it. A URL past
-// MaxHTMLUploadBytes is truncated rather than rejected (see urlfetch.Fetch),
-// so "too large" is no longer one of the reasons this wraps.
+// Wraps urlfetch error; already merchant-readable on its own.
 var ErrLinkFetchFailed = errors.New("could not use the link in your message as a reference")
 
-// ErrGenerationInProgress means the tenant's chat already has a background
-// generation running — see the generations table (phase 3a) and
-// Repository.StartGeneration/DequeueNext. Generate itself never returns
-// this anymore: a prompt that can't run immediately is queued instead of
-// rejected (see Generate's doc comment). It's now purely an internal signal
-// between DequeueNext and its callers (Generate, runGeneration,
-// reapOrphanedQueues) for "something is already running, this dequeue
-// attempt legitimately lost the race" — never surfaced to a caller as an
-// error to react to.
+// Internal signal between DequeueNext and callers; never surfaced to clients (prompts are queued instead).
 var ErrGenerationInProgress = errors.New("a generation is already in progress for this chat")
 
-// GenerateInput is one merchant prompt, always against the tenant's one
-// ongoing "builder" chat (see chat.Service.GetOrCreateChat).
+// One merchant prompt against the tenant's "builder" chat.
 type GenerateInput struct {
 	TenantID  uint64
 	UserID    *uint64
 	UserName  string
 	UserEmail string
-	// Token is the caller's own bearer token, forwarded to flowpos-backend's
-	// theme-file API (see internal/themefs.Store) so every read/write acts
-	// as this same user, subject to flowpos-backend's own ownership checks.
 	Token     string
 	ThemeSlug string
 	Prompt    string
-	// Images, when non-empty (capped at maxImagesPerMessage), attaches one
-	// or more images to this turn's prompt — see the image-attachment
-	// feature. Only ever sent to the model for turns processed as part of
-	// THIS generation call (the initial attempt and any invalid-proposal/
-	// repair retries within it, which each call Generate fresh — see
-	// generateValidProposal/checkAndRepair); never resurfaced on a later,
-	// separate prompt.
+	// Only sent for turns in THIS generation call (initial + retries); never on later prompts.
 	Images []chat.MessageImage
-	// HTMLAttachmentFilename/HTMLAttachmentContent, when both set, attach
-	// one reference HTML file to this turn's prompt — see the
-	// HTML-attachment feature. Folded into the effective prompt text at
-	// each Generate call within this turn (see promptWithHTMLAttachment)
-	// rather than sent as a separate structured param, since it's plain
-	// text — no vision-model plumbing needed for it. Unlike Images (which
-	// really is only ever this one call), doGenerate can also populate
-	// these two from an EARLIER turn's attachment when the current turn
-	// has none of its own — see findCarryForwardSourceMessageID and
-	// HTMLAttachmentCarriedForward below.
+	// Both set: attach HTML file to turn. Carried forward from earlier turns if current has none.
 	HTMLAttachmentFilename *string
 	HTMLAttachmentContent  *string
-	// HTMLAttachmentIsExternalLink is true when HTMLAttachmentContent came
-	// from a URL fetch (see the link-reference feature) rather than a file
-	// the merchant uploaded — true whether that fetch happened on THIS turn
-	// or an earlier one it was carried forward from (see
-	// HTMLAttachmentCarriedForward). promptWithHTMLAttachment uses it to
-	// call out explicitly that the content is a completely different,
-	// external website — not the merchant's own theme — since a fetched
-	// competitor/inspiration site's markup routinely contains the same kind
-	// of e-commerce shapes (add-to-cart buttons, product data attributes)
-	// the merchant's own theme does, and without this the model has been
-	// observed going to grep the merchant's own theme files for matching
-	// patterns even for a plain read-only question about the fetched site.
-	// Restored from storage via looksLikeFetchedLink — chat_message_attachments
-	// has no column of its own for this (see that function's own doc
-	// comment for why the filename alone is a reliable enough signal).
+	// True when content came from URL fetch vs upload (used to explain external source to model).
 	HTMLAttachmentIsExternalLink bool
-	// HTMLAttachmentCarriedForward is true when HTMLAttachmentFilename/
-	// Content came from an earlier turn in this chat (see
-	// findCarryForwardSourceMessageID), not from the current turn's own
-	// message. promptWithHTMLAttachment uses it to tell the model the
-	// reference won't be mentioned again in the merchant's latest message
-	// but is still the active one — without this, the model has no way to
-	// know the attachment below wasn't just silently dropped.
+	// True when content came from earlier turn (model needs to know reference persists).
 	HTMLAttachmentCarriedForward bool
-	// HTMLAttachmentTruncated is true when a link-fetched attachment had to
-	// be cut short — either the raw HTML fetch itself (see urlfetch.Result.
-	// Truncated) or the built digest exceeding its own hard cap (see
-	// urlfetch.Digest.Truncated); PostStripMaxBytes truncation is a third,
-	// now-effectively-unreachable backstop (see Service.fetchReferenceURL's
-	// own doc comment) kept only for a future change to either constant.
-	// Unlike an uploaded file, which is still hard-rejected over its own
-	// limit — the merchant controls what they upload, not how heavy someone
-	// else's homepage is. promptWithHTMLAttachment states this in the
-	// framing so the model doesn't read a missing footer/section as absent
-	// from the real page — it's just past where this turn's copy was cut.
+	// True when attachment was truncated (helps model understand missing content).
 	HTMLAttachmentTruncated bool
-	// ReferenceURL is a URL Generate found in Prompt (see
-	// urlfetch.ExtractReferenceURL) and validated the shape of, but has not
-	// fetched — carried through the queue via Generation.ReferenceURL
-	// exactly like Prompt itself, since runOneQueuedGeneration rebuilds
-	// GenerateInput fresh from that row on every dequeue. doGenerate does
-	// the actual fetch (see its own reference-URL block) and, on success,
-	// populates HTMLAttachmentFilename/Content/IsExternalLink from it —
-	// this field itself is never read past that point in the same turn.
+	// Detected in Prompt by Generate, validated but not fetched until doGenerate.
 	ReferenceURL string
-	// ReferenceURLFetchFailed is set by doGenerate when ReferenceURL was
-	// present but the fetch itself failed — network error, blocked host,
-	// non-HTML response, etc. (never a malformed-URL case; Generate already
-	// rejects that synchronously before ReferenceURL is ever set). Unlike
-	// every other HTML-attachment failure in this service, this one must
-	// NOT fail the turn: the merchant asked a real question and deserves an
-	// answer about everything except the page. promptWithHTMLAttachment
-	// uses this to tell the model plainly that the fetch failed, instead of
-	// silently proceeding as if no link had ever been mentioned.
+	// Set by doGenerate when fetch failed; turn still succeeds (merchant gets answer).
 	ReferenceURLFetchFailed bool
-	// ReferenceURLBlocked is set alongside ReferenceURLFetchFailed
-	// specifically when the failure was urlfetch.ErrBlocked (the site
-	// itself refused the request — a 401/403/429 — rather than being
-	// unreachable) — promptWithHTMLAttachment uses it to give the model
-	// the actionable version of the note ("ask the merchant to paste the
-	// HTML instead") rather than a generic "couldn't reach it."
+	// Set when failure was ERR_BLOCKED (site refused request, not unreachable).
 	ReferenceURLBlocked bool
-	// ReferenceURLEmptyAfterSanitize is set alongside ReferenceURLFetchFailed
-	// when the fetch itself succeeded but the built digest came back Empty
-	// (see urlfetch.Digest.Empty — no headings, no landmarks, no real
-	// copy) — a client-rendered page (React/Vue/etc.) whose server-sent
-	// HTML is just an empty mount point with its real content injected by
-	// scripts digests to exactly this. Treated as a failure, not a success
-	// with an empty attachment: without this, doGenerate would hand the
-	// model an empty HTMLAttachmentContent alongside the external-link
-	// success framing, which had the model assert it read a page it has
-	// nothing from. promptWithHTMLAttachment gives this its own distinct
-	// note rather than the generic "couldn't reach it" one. (Field name
-	// kept from when this was measured on SanitizeHTMLAttachment's output —
-	// renaming it now would touch every caller for no behavioral change.)
+	// Set when fetch succeeded but digest was empty (client-rendered page).
 	ReferenceURLEmptyAfterSanitize bool
-	// UserMessageID is set by Generate right after RecordUserMessage and
-	// carried through the queue (Generation.UserMessageID) so doGenerate
-	// can re-resolve Images from chat_messages once this turn actually
-	// runs — runOneQueuedGeneration rebuilds GenerateInput fresh from the
-	// generations row on every dequeue, so Images set here don't otherwise
-	// survive that rebuild. See doGenerate.
+	// Carried through queue from RecordUserMessage so doGenerate can re-resolve images.
 	UserMessageID *string
-	// Mode restricts what this one turn may touch — see the
-	// ai.GenerationMode* constants. Empty (the default, and what every
-	// caller sends today) behaves as ai.GenerationModeEdit: the full
-	// read/write tool loop, no restriction. This must be explicit, set only
-	// by a caller deliberately running the guided "start a theme from
-	// scratch" flow (turn 1 brand-only, turn 2 copy-only) — inferring it
-	// from the chat's turn count instead was tried and reverted: a chat's
-	// turn count says nothing about whether this is a fresh onboarding
-	// sequence or an ordinary chat on an already-established theme, and
-	// forcing the latter's first two turns into brand/copy-only mode is a
-	// regression, not a feature (it silently refuses everyday requests like
-	// "create a page").
+	// Restricts turn scope (brand-only, copy-only, or full edit); must be explicit, not inferred.
 	Mode string
 }
 
-// GenerateOutcome is the immediate (synchronous) result of accepting a
-// prompt: the chat, the user's own recorded message, and where this
-// prompt's generation landed in line. AssistantMessage and Files are always
-// nil here — Generate now returns as soon as the prompt is recorded and
-// either kicked off or queued (see Generate's doc comment), not once Claude
-// has actually replied. The real outcome (a new assistant message,
-// generated files, or an error) arrives later — the caller polls GET
-// /chat, which reports the pending queue (see ListPending) and surfaces the
-// new history once each turn is done.
+// Synchronous result of accepting prompt; AssistantMessage/Files always nil.
+// Caller polls GET /chat for actual outcome after generation completes.
 type GenerateOutcome struct {
 	Chat             chat.Chat
 	UserMessage      chat.Message
 	AssistantMessage *chat.Message
 	Files            []GeneratedFile
-	// QueuePosition is how many generations (running + queued) were ahead
-	// of this one at the moment it was accepted — 0 means it was dequeued
-	// immediately and is the one running now.
+	// How many generations (running + queued) were ahead at moment accepted; 0 = running now.
 	QueuePosition int
-	// GenerationID is the row this prompt is tracked under — the caller
-	// needs it to cancel a queued prompt (DELETE /chats/:chatId/queue/
-	// :generationId) or to correlate it with the "queued"/"dequeued"/
-	// "done"/"failed" events it'll see on the stream.
+	// Tracks prompt; needed to cancel or correlate stream events.
 	GenerationID string
 }
 
-// Generate resolves (or creates) the chat, records the prompt, and returns
-// immediately — the actual Claude call, proposal validation, and (if the
-// model proposed changes) staging them into the chat's draft overlay all
-// happen in a background goroutine (see runGeneration), not before this
-// returns.
-//
-// This is deliberately async, not a synchronous call the client awaits:
-// a full generation can legitimately take several minutes, and no
-// intermediary in a real deployment — a CDN proxy, a corporate firewall, a
-// flaky mobile connection, even the browser backgrounding the tab — can be
-// trusted to keep one HTTP request alive that long. Every request this
-// service handles now finishes in milliseconds; the caller learns the
-// actual result by polling GET /chat's `queue` field instead of waiting on
-// this call's response.
-//
-// Prompts queue and run one at a time, in order, never in parallel: a
-// second prompt usually depends on the first's result ("now make that
-// header blue"), and themeLocks/uniq_generations_running_chat both exist
-// specifically to prevent two writers touching the same theme at once. So
-// this never returns ErrGenerationInProgress anymore — a prompt that can't
-// run immediately is queued instead of rejected:
-//
-//  1. Record the user's message immediately, unconditionally — the
-//     merchant's prompt appears in the transcript the moment they hit send,
-//     whether or not it runs right now. This is the reverse of the old
-//     ordering (record-then-claim used to be claim-then-record): enqueueing
-//     below can't fail with "already running" the way StartGeneration used
-//     to, so there's no slot to release if RecordUserMessage had come first
-//     and something after it failed.
-//  2. Enqueue a "queued" row carrying everything a later, detached
-//     runGeneration call will need to actually run this turn (see the
-//     Generation struct) — everything except the bearer token, which is
-//     kept in memory only (see pendingTokens).
-//  3. Try to immediately dequeue the oldest pending row for this chat. If
-//     that succeeds, this prompt (or, in a rare race with another request
-//     for the same chat, whichever prompt actually was oldest) starts
-//     running right now. If something is already running, this prompt just
-//     waits — the generation currently running will dequeue it in turn once
-//     it finishes (see runGeneration's drain loop), no extra work needed
-//     here.
-//
-// A model/infra failure, a rejected proposal, or a failure while staging
-// changes into the draft is recorded as a failed chat turn (see doGenerate's
-// own defer and chat.MessageStatusFailed's doc comment), so the transcript
-// itself shows something went wrong — unlike before this became async, when
-// errors were purely request-scoped and never touched chat history. The
-// generations table (phase 3a) tracks the same failure independently,
-// feeding GenerationStatus rather than the transcript.
+// Background execution; queued one-at-a-time.
 func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutcome, error) {
 	if in.ThemeSlug == "" {
 		return GenerateOutcome{}, errors.New("theme_slug is required")
@@ -594,46 +259,18 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if len(in.Images) > imageLimit.MaxCount {
 		return GenerateOutcome{}, fmt.Errorf("%w: at most %d images per message", ErrTooManyImages, imageLimit.MaxCount)
 	}
-	// Reject before ever persisting an image nothing downstream can
-	// process — cheaper and clearer than letting it fail deep inside
-	// doGenerate once this turn is dequeued.
+	// Reject before persisting (fails cheaper than dequeued).
 	if len(in.Images) > 0 && !s.gen.SupportsVision() {
 		return GenerateOutcome{}, ErrVisionNotConfigured
 	}
-	// DecodedLen is pure arithmetic on the base64 string's own length — no
-	// need to actually decode just to measure size (the HTTP handler
-	// already validated each Base64 field really is valid base64 at bind
-	// time; this only needs the size).
+	// DecodedLen is cheap arithmetic; HTTP handler already validated base64.
 	for i, img := range in.Images {
 		if int64(base64.StdEncoding.DecodedLen(len(img.Base64))) > imageLimit.MaxBytes {
 			return GenerateOutcome{}, fmt.Errorf("%w: image %d", ErrImageTooLarge, i)
 		}
 	}
-	// A merchant pasting a bare reference link directly in their prompt
-	// ("https://example.com can you access this link") gets treated almost
-	// exactly like uploading that URL's page as an HTML attachment — but
-	// the actual fetch does NOT happen here. This method backs POST
-	// /chats/messages, which cmd/server/main.go documents as never doing
-	// slow synchronous work; an outbound HTTP call (urlfetch.fetchTimeout
-	// is 10s) blocking the request, and a fetch failure returning before
-	// RecordUserMessage even runs (silently dropping the merchant's prompt
-	// from the transcript, unlike every other failure this service
-	// records), both violate that. So this only ever DETECTS a URL and
-	// validates its shape — genuinely malformed input (ValidateURL) is the
-	// one case a synchronous 4xx is still correct, since it needs no
-	// network — and carries the URL on the enqueued Generation row.
-	// doGenerate does the real fetch once this turn is actually dequeued
-	// (see its own reference-URL block). Only runs when no HTML file was
-	// explicitly uploaded this turn — an upload is a more deliberate
-	// signal than a URL that merely appears somewhere in the prompt text,
-	// so it always wins over a link mentioned in passing.
-	//
-	// ExtractReferenceURL, not the looser ExtractFirstURL: any URL
-	// anywhere in the prompt used to count, which meant "our shop is at
-	// https://example.com — make the header blue" fetched a whole
-	// unrelated page and injected external-link framing into a request
-	// that had nothing to do with it. See ExtractReferenceURL's own doc
-	// comment for the intent check it applies instead.
+	// Detect URL, validate shape; doGenerate does actual fetch (sync work not allowed here).
+	// Upload always wins over link in prompt text (more deliberate signal).
 	var referenceURL string
 	if in.HTMLAttachmentContent == nil {
 		if link, ok := urlfetch.ExtractReferenceURL(in.Prompt); ok {
@@ -649,6 +286,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		if int64(len(*in.HTMLAttachmentContent)) > htmlLimit.MaxBytes {
 			return GenerateOutcome{}, fmt.Errorf("%w: attached HTML file is over %d bytes", ErrHTMLAttachmentTooLarge, htmlLimit.MaxBytes)
 		}
+		// Validate post-sanitize size (where it's actually sent to model).
 		sanitized := SanitizeHTMLAttachment(*in.HTMLAttachmentContent)
 		if int64(len(sanitized)) > htmlLimit.PostStripMaxBytes {
 			return GenerateOutcome{}, fmt.Errorf(
@@ -694,23 +332,13 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	next, err := s.repo.DequeueNext(ctx, c.ID)
 	switch {
 	case err == nil:
-		// Detached from the caller's own request lifecycle (which is about
-		// to end the moment this function returns) but not unbounded: each
-		// drain-loop iteration gets its own generateTimeout budget (see
-		// runGeneration), matching the HTTP server's own writeTimeout.
+		// Detached from request lifecycle, but bounded: each iteration gets its own generateTimeout.
 		go func() {
-			// One-shot: a panic here ends just this generation's run — the
-			// reaper's own orphaned-queue sweep independently recovers a
-			// generation that never finished, so this doesn't need to keep
-			// retrying itself. See safego's package doc comment on why this
-			// is needed at all: gin.Recovery() doesn't reach a bare `go`.
 			defer safego.Recover("themebuild.runGeneration")
 			s.runGeneration(context.WithoutCancel(ctx), c, next)
 		}()
 	case errors.Is(err, ErrGenerationInProgress):
-		// Something else is already running for this chat — nothing more
-		// to do here. That generation's own drain loop will dequeue this
-		// row once it finishes (see runGeneration).
+		// Already running; its drain loop will dequeue this row when it finishes.
 		emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
 		emitter.emit(ctx, EventTypeQueued, map[string]any{
 			"position": position, "prompt_preview": PromptPreview(in.Prompt),
@@ -722,18 +350,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	return GenerateOutcome{Chat: c, UserMessage: userMsg, QueuePosition: position, GenerationID: genID}, nil
 }
 
-// runGeneration drains chatID's queue one generation at a time, starting
-// with g (the row DequeueNext already promoted to running to get here) and
-// continuing until the queue is empty. Without the loop, only g itself
-// would ever run — every prompt queued behind it would sit in the database
-// forever with nothing left to dequeue it, since nothing else calls
-// DequeueNext for a chat that already has something running.
-//
-// If g fails, the loop still continues to whatever's next: a failed
-// generation earlier in the queue is not a reason to auto-cancel later,
-// possibly-unrelated prompts the merchant queued behind it (see
-// runOneQueuedGeneration/doGenerate — a failure is always recorded as a
-// visible chat message, never silently swallowed).
+// Drains chatID's queue one-at-a-time starting with g; continues on failure (visible chat message).
 func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) {
 	for {
 		s.runOneQueuedGeneration(ctx, c, g)
@@ -743,13 +360,8 @@ func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) 
 			return // queue drained
 		}
 		if err != nil {
-			// Not ErrGenerationInProgress (this same loop is the only thing
-			// that can be running for c.ID right now — EndGeneration inside
-			// runOneQueuedGeneration always clears the running slot first)
-			// — a genuine DB error. The reaper's periodic sweep will pick
-			// this chat's queue back up as orphaned (see
-			// ChatsWithOrphanedQueues) rather than retrying it in a tight
-			// loop here.
+			// DB error (not ErrGenerationInProgress; this loop is only thing running for c.ID).
+			// Reaper's sweep will restart as orphaned.
 			slog.Error("failed to dequeue next generation; the reaper will restart this chat's queue", "chat_id", c.ID, "error", err)
 			return
 		}
@@ -757,33 +369,15 @@ func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) 
 	}
 }
 
-// runOneQueuedGeneration runs a single already-dequeued (status=running)
-// generation to completion and records its outcome — one iteration of
-// runGeneration's drain loop.
+// Runs one already-dequeued (status=running) generation to completion and records outcome.
 func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Generation) {
 	emitter := newEventEmitter(ctx, s.repo, s.bus, g.ID, c.ID)
 	emitter.emit(ctx, EventTypeDequeued, struct{}{})
 
 	token, ok := s.tokens.take(g.ID)
 	if !ok {
-		// No token in memory for this generation — either this process
-		// never served the request that enqueued it (a pod restart between
-		// enqueue and dequeue) or it's being restarted by the reaper's own
-		// orphaned-queue path (Part 4), which never had one to begin with.
-		// Either way there's no bearer token left to forward to FlowPOS, so
-		// this can't run — fail it with a message the merchant can act on
-		// instead of either silently dropping it or calling FlowPOS
-		// unauthenticated.
-		//
-		// Warn (not Error): a pod restart or a reaper-restarted queue
-		// losing its token is an expected, already-handled condition, not
-		// a bug — but it should still be visible. Before the heartbeat fix
-		// (see the 20260813000002 migration), a slow-but-healthy
-		// generation could cause the reaper to spuriously mark it stale
-		// and orphan its queue, producing THIS exact message for every
-		// prompt behind it despite nothing actually being wrong — logging
-		// this is what makes a spike from that failure mode (or any other
-		// unexpectedly frequent cause) visible instead of silent.
+		// Pod restart (between enqueue and dequeue) or reaper-restarted queue has no token.
+		// Expected condition (Warn not Error) but should be visible to catch spurious reaping.
 		slog.Warn("generation has no bearer token available; failing with session-expired", "chat_id", c.ID, "generation_id", g.ID)
 		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
 		endCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -804,65 +398,27 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		UserMessageID: g.UserMessageID,
 	}
 
-	// Each drain-loop iteration gets its own fresh timeout — one shared
-	// deadline across a queue of five prompts would starve the later ones
-	// of their fair share of generateTimeout, or worse, kill them
-	// mid-generation through no fault of their own. ctx itself is already
-	// context.WithoutCancel of the original request (see Generate), so it
-	// outlives any one HTTP call without being unbounded itself.
+	// Fresh timeout per iteration, not shared across queue (prevents starvation).
 	workCtx, cancel := context.WithTimeout(ctx, generateTimeout())
 	defer cancel()
 
-	// A second, inner cancel layer over the timeout above, purely to
-	// interrupt doGenerate promptly — NOT what tells its defer "the
-	// merchant stopped this" (see cancelledByUser below for that): ctx can
-	// arrive here already-canceled for entirely unrelated reasons (a
-	// caller whose own request context died — see
-	// TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext),
-	// which is indistinguishable from userCancel() below by error type
-	// alone (both are plain context.Canceled). cancelledByUser is the
-	// explicit, unambiguous signal instead.
+	// Second cancel layer: for interrupting doGenerate; NOT what signals merchant stop.
+	// ctx can be pre-canceled for unrelated reasons; cancelledByUser is explicit signal.
 	workCtx, userCancel := context.WithCancel(workCtx)
 	defer userCancel()
 
-	// Set (before userCancel() is called, never after) by the listener
-	// goroutine below the moment it recognizes a genuine cancel request
-	// for THIS generation — read back both by doGenerate's own defer (to
-	// decide whether to emit EventTypeCancelled instead of
-	// EventTypeFailed) and by this function's own tail (to decide between
-	// EndGenerationCancelled and EndGeneration). atomic because it's
-	// written from the listener goroutine and read from this one.
+	// atomic: written by listener goroutine, read by doGenerate defer and tail.
+	// Tells whether to emit EventTypeCancelled vs EventTypeFailed.
 	var cancelledByUser atomic.Bool
 
-	// Listens for this specific generation's EventTypeCancelRequested (see
-	// Service.CancelQueuedGeneration's running branch) and, on receipt,
-	// cancels workCtx so doGenerate unwinds — same subscribe-by-chat-id
-	// bus every connected client's stream uses, since a cancel request can
-	// land on any replica, not necessarily the one actually running this
-	// generation. Torn down via userCancelDone the moment this generation
-	// ends for any other reason, so it never outlives the goroutine below.
+	// Listens for EventTypeCancelRequested; cancels workCtx so doGenerate unwinds.
 	userCancelDone := make(chan struct{})
 	defer close(userCancelDone)
 	cancelEvents, cancelSub := s.bus.Subscribe(context.Background(), c.ID)
 	defer cancelSub()
 
-	// Closes the subscribe-after-cancel race: a cancel request can be
-	// published (see CancelQueuedGeneration's running branch) in the gap
-	// between DequeueNext marking this row running and the Subscribe call
-	// just above — Publish only reaches subscribers already registered at
-	// the moment it's sent, so that request would otherwise be silently
-	// missed. RequestGenerationCancellation's durable write is what this
-	// checks back; see its doc comment. The heartbeat ticker below
-	// re-checks the same flag on every tick as a backstop for a dropped
-	// live event too, so this one check only needs to close the narrow
-	// startup race, not stand in for the live path generally.
-	//
-	// Bounded the same as every other ad hoc call in this function
-	// (endCtx/hbCtx/emitCtx/commitCtx) — this one runs synchronously,
-	// before the listener goroutine, heartbeat ticker, or doGenerate even
-	// start, so an unbounded call here would stall this generation's
-	// entire start on a slow/locked database instead of just this one
-	// check.
+	// Closes subscribe-after-cancel race (cancel published between DequeueNext and Subscribe).
+	// Bounded: runs sync before listener/ticker/doGenerate, so unbounded call would stall startup.
 	precheckCtx, precheckCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if requested, err := s.repo.IsCancellationRequested(precheckCtx, c.ID, g.ID); err == nil && requested {
 		cancelledByUser.Store(true)
@@ -898,25 +454,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		}
 	}()
 
-	// Heartbeat ticker — the second of two layers keeping generations
-	// with a healthy but slow model call from being reaped mid-flight
-	// (see the 20260813000002 migration and generationHeartbeatTimeout).
-	// eventEmitter.emitLive (generation_events.go) already stamps the
-	// heartbeat on every thinking delta, throttled the same
-	// heartbeatThrottle interval — but ToolChoiceAny is forced on every
-	// tool-loop iteration (see ai.Generate), so a turn that goes straight
-	// to a tool call with no narration text produces no delta at all,
-	// and nothing durable fires until the NEXT iteration boundary either
-	// (tool_call/tool_result/checking/repairing — see emit's call sites).
-	// A single slow call in between is exactly the gap the bug report
-	// described. This ticker doesn't depend on what the model chooses to
-	// emit: it only needs this goroutine to still be alive and running,
-	// which is the actual thing the reaper cares about. It alone would
-	// already fix the reaping bug; emitLive's heartbeat stays because it
-	// reflects real progress rather than merely "the process hasn't
-	// crashed", which is the more useful signal to see when reading the
-	// generations table by hand — keeping it costs nothing once this
-	// ticker exists as the robustness backstop.
+	// Heartbeat ticker: keeps slow-but-healthy generations from being reaped mid-flight (second layer after emitLive).
 	heartbeatTicker := time.NewTicker(heartbeatTickerInterval())
 	defer heartbeatTicker.Stop()
 	go func() {
@@ -925,32 +463,16 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 			case <-workCtx.Done():
 				return
 			case <-heartbeatTicker.C:
-				// Wrapped per-tick (not once for the whole goroutine): this
-				// loop is meant to keep running for the generation's entire
-				// duration, so one bad tick recovering shouldn't end
-				// heartbeats for everything after it too.
+				// Per-tick recovery: one bad tick shouldn't end heartbeats for rest of generation.
 				func() {
 					defer safego.Recover("themebuild.heartbeatTicker")
-					// Best-effort, matching UpdateGenerationHeartbeat's own
-					// convention (see eventEmitter.emit): a fresh, short-lived
-					// context rather than workCtx, since workCtx can already be
-					// canceled by the time a tick lands right as the
-					// generation finishes — a heartbeat write for a generation
-					// about to be marked done/failed anyway is harmless to
-					// lose, not worth erroring over.
+					// Fresh context (not workCtx): may be canceled by generation finish, harmless to lose.
 					hbCtx, hbCancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer hbCancel()
 					if err := s.repo.UpdateGenerationHeartbeat(hbCtx, g.ID); err != nil {
 						slog.Error("failed to update generation heartbeat (ticker)", "generation_id", g.ID, "error", err)
 					}
-					// Backstop for a cancel request whose live event was
-					// dropped — EventTypeCancelRequested shares a bounded,
-					// best-effort channel with high-frequency "thinking"
-					// deltas (see eventBus's subscriberBufferSize) and can
-					// be silently lost under load. Piggybacked on this
-					// same tick rather than a second ticker: same cadence,
-					// same already-open DB round trip's neighborhood, one
-					// fewer goroutine.
+					// Backstop for dropped cancel event (EventTypeCancelRequested shares bounded channel with high-frequency deltas).
 					if requested, err := s.repo.IsCancellationRequested(hbCtx, c.ID, g.ID); err == nil && requested {
 						cancelledByUser.Store(true)
 						userCancel()
@@ -962,33 +484,15 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 
 	err := s.doGenerate(workCtx, in, c, g.ID, &cancelledByUser)
 
-	// A deliberately fresh, short-lived context for this one bookkeeping
-	// write: workCtx may already be expired (a generation that hit
-	// generateTimeout, or that userCancel above ended early), and the
-	// outcome still needs recording either way.
+	// Fresh context: workCtx may be expired (timeout or userCancel).
 	endCtx, endCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer endCancel()
-	// One unambiguous line per ended generation, logged before deciding
-	// which of the two outcomes below to record — settles, from the logs
-	// alone, whether a cut-short generation was an explicit stop request
-	// (cancelled=true; cross-reference cancelOneRunning's own "cancel
-	// requested" log for the same generation_id to see exactly when/how it
-	// was asked to stop) or a genuine failure/timeout (cancelled=false;
-	// error is the raw, unsanitized cause — never shown to the merchant,
-	// see ai.SanitizeError, but exactly what's needed here to tell a real
-	// timeout apart from, say, a context canceled for some other reason).
-	// This is what earlier incidents lacked: without it, "it just stopped"
-	// could only be diagnosed by inference from request timing.
+	// Log error/cancellation before deciding which EndGeneration to call.
 	if err != nil {
 		slog.Info("generation ended", "chat_id", c.ID, "generation_id", g.ID,
 			"cancelled_by_user", cancelledByUser.Load(), "error", err.Error())
 	}
-	// err != nil is required here, not cancelledByUser.Load() alone: the
-	// flag can still flip true after doGenerate has already committed a
-	// real, successful result (see doGenerate's own defer, which applies
-	// the identical guard for the same reason) — a nil err unambiguously
-	// means the turn completed, and must never be relabeled "cancelled"
-	// just because a cancel request happened to race its very end.
+	// err != nil required: flag can flip true after doGenerate committed success.
 	if err != nil && cancelledByUser.Load() {
 		if endErr := s.repo.EndGenerationCancelled(endCtx, c.ID); endErr != nil {
 			slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
@@ -998,21 +502,10 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	}
 }
 
-// errSessionExpired is what a queued generation fails with when it has no
-// bearer token left to run with — see pendingTokens' doc comment. Sent to
-// the merchant close to verbatim (never through ai.SanitizeError, which is
-// for AI-provider failures and would mislabel this as one — see
-// doGenerate's use of it and recordGenerationFailure).
+// Queued generation failure when no bearer token available (see pendingTokens).
 var errSessionExpired = errors.New("your session expired before this prompt ran — send it again")
 
-// recordGenerationFailure appends a merchant-visible failed assistant
-// message and a "failed" event for a generation that never made it into
-// doGenerate — currently only the "no auth token available" case (see
-// runOneQueuedGeneration and reapOrphanedQueues in generation.go). A
-// failure inside doGenerate already gets equivalent treatment from its own
-// defer, which isn't reused here directly since it also closes over
-// doGenerate's own stack (the emitter it already built, the summary
-// variable, etc.) in a way that doesn't factor out cleanly.
+// Records failed message for generation that never made it to doGenerate (e.g., no token).
 func (s *Service) recordGenerationFailure(ctx context.Context, c chat.Chat, genID string, err error) {
 	slog.Error("generation failed before it could start", "chat_id", c.ID, "tenant_id", c.TenantID, "error", err)
 	emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
@@ -1022,46 +515,12 @@ func (s *Service) recordGenerationFailure(ctx context.Context, c chat.Chat, genI
 	}
 }
 
-// fetchReferenceURL is s.links.Fetch, plus fetching the page's stylesheets
-// (s.links.FetchStylesheets) and building a compact structured digest from
-// the two (urlfetch.BuildDigest) — see BuildDigest's own doc comment for
-// why a digest, not raw markup, is what a link-fetched reference sends to
-// the model. A short-TTL cache sits in front of the whole thing, holding
-// that FINISHED digest text (see referenceURLCache's own doc comment for
-// why post-digest, not the raw fetch, is what's cached) — a merchant
-// iterating on the same reference across several turns in one session
-// shouldn't pay for the HTML fetch, the stylesheet fetches, AND building
-// the digest again, on every single one. Falls back to an uncached call
-// when s.linkCache is nil (struct-literal tests, same nil-guard convention
-// as s.links itself).
-//
-// Unlike the upload path (Generate's HTML-attachment handling, which
-// still runs an uploaded file's raw content through
-// SanitizeHTMLAttachment unchanged — that file IS what the model reads
-// verbatim, so stripping script/SVG/base64 out of it still matters),
-// SanitizeHTMLAttachment plays no role here any more: BuildDigest performs
-// STRUCTURAL EXTRACTION, walking the document's own tokens to pull out
-// headings/copy/design tokens rather than stripping a few dangerous
-// patterns out of markup that's otherwise sent through as-is. A link's raw
-// HTML never reaches the model at all any more, only what BuildDigest
-// extracted from it, so there is nothing left for the sanitizer to
-// usefully remove.
+// Fetches HTML, stylesheets, builds structured digest; cached short-TTL to avoid repeat on iteration.
+// BuildDigest extracts structure (not raw HTML); SanitizeHTMLAttachment not used here.
 func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url string, maxBytes int64) (content string, truncated, empty bool, title string, styleCount int, err error) {
 	if s.linkCache != nil {
 		if cached, cachedTitle, wasTruncated, ok := s.linkCache.get(tenantID, url); ok {
-			// Latency: a hit returns the already-built digest directly and
-			// skips fetching stylesheets and building a fresh digest
-			// entirely — a cache hit is strictly faster than a miss, not
-			// just smaller to store. A cache hit is never Empty by
-			// construction (see the set call below), so there's nothing for
-			// a caller to route to the empty-after-fetch path either.
-			// styleCount stays 0 on a hit — the merchant-facing "fetched N
-			// stylesheets" narration genuinely means nothing was fetched
-			// THIS turn, which is accurate and not worth a cache schema
-			// change to preserve. title DOES ride along (cachedReference
-			// carries it — see its own doc comment): showing the merchant
-			// which page they referenced, even from cache, beats a blank
-			// step in the narration.
+			// Cache hit is never Empty (never empty by construction); styleCount stays 0 (accurate: nothing fetched THIS turn).
 			return cached, wasTruncated, false, cachedTitle, 0, nil
 		}
 	}
@@ -1072,89 +531,29 @@ func (s *Service) fetchReferenceURL(ctx context.Context, tenantID uint64, url st
 	css, styleCount := s.links.FetchStylesheets(ctx, result.HTML, result.FinalURL)
 	digest := urlfetch.BuildDigest(result.FinalURL, result.HTML, css)
 	content = digest.Text
-	// Either cause counts: the raw HTML fetch itself may have been cut off
-	// (result.Truncated), OR the page fetched in full but extraction alone
-	// still produced more than digestHardCapBytes once combined
-	// (digest.Truncated) — see Digest.Truncated's own doc comment. Either
-	// way the merchant-facing "this copy was cut short" note needs to fire.
+	// Truncated if raw fetch cut off OR extraction alone exceeded cap.
 	truncated = result.Truncated || digest.Truncated
-	// PostStripMaxBytes is now a BACKSTOP, not the normal path:
-	// digestHardCapBytes (16KB) is already comfortably under
-	// PostStripMaxBytes (300KB), so a real digest should never actually
-	// reach this branch — kept only so a future change to either constant
-	// can't silently reintroduce an oversized reference-link attachment.
+	// PostStripMaxBytes is backstop only; digestHardCapBytes already under it.
 	postStripMax := attachmentLimits[chat.AttachmentKindHTML].PostStripMaxBytes
 	if int64(len(content)) > postStripMax {
 		content = urlfetch.TruncateAtTagBoundary(content, postStripMax)
 		truncated = true
 	}
-	// digest.Empty (no headings, no landmarks, effectively no copy —
-	// measured on the digest's own EXTRACTED text, not on raw HTML byte
-	// length; see Digest.Empty's own doc comment) is the client-rendered-
-	// shell case — not a successful fetch+digest in the sense
-	// referenceURLCache.set requires, even though no error occurred:
-	// caching it would hold an empty shell for the full TTL, contradicting
-	// the cache's own "successes only" contract. Unlike a network failure,
-	// this result is deterministic for a given page — skipping the cache
-	// here just costs a repeat fetch next turn, not a repeat of whatever
-	// actually went wrong.
+	// Empty digest (client-rendered shell) not cached: deterministic but doesn't count as success.
 	if s.linkCache != nil && !digest.Empty {
 		s.linkCache.set(tenantID, url, content, digest.Title, truncated)
 	}
 	return content, truncated, digest.Empty, digest.Title, styleCount, nil
 }
 
-// truncatedLengthTolerance bounds how far under PostStripMaxBytes an
-// UPLOADED attachment's stored length can be and still be inferred as
-// truncated (see looksTruncatedByStoredLength) — chat_message_attachments
-// has no truncated column of its own, so a later turn's carry-forward has
-// only the stored length to go on. An exact-cap comparison misses the case
-// where the cut landed mid-tag: TruncateAtTagBoundary backs up to the last
-// "<" (and, on top of that, may trim a few more bytes to avoid splitting a
-// rune — see trimIncompleteTrailingRune in urlfetch), so the stored length
-// can land noticeably short of PostStripMaxBytes even though the fetch was
-// genuinely truncated. 4096 is comfortably larger than any single HTML tag
-// plus a trailing rune, while still far below any plausible real page that
-// just happens to end within a few KB of the cap by coincidence. This is a
-// heuristic over a stored length, not a persisted fact, so it's allowed to
-// be wrong in either direction — a false positive only costs an
-// unnecessary "this was cut short" note in the prompt, while a false
-// negative costs that note on a turn that actually needed it. The
-// tolerance is sized to favor the former, cheaper mistake.
-//
-// This path is dead in practice today: an uploaded HTML file over its
-// limit is hard-rejected (see ErrHTMLAttachmentTooLarge), never truncated,
-// so no upload attachment is ever actually stored at this length. It's
-// kept as the upload-side half of looksTruncatedByStoredLength's dispatch
-// in case that changes, and because the const it anchors
-// (PostStripMaxBytes) is also the link path's own now-unreachable backstop
-// (see Service.fetchReferenceURL) — removing it would leave that backstop
-// with no matching truncation-detection story either.
+// Upload path tolerance: TruncateAtTagBoundary backs up; heuristic over stored length.
+// Dead path today (over-limit rejected, never truncated), kept for backstop symmetry.
 const truncatedLengthTolerance = 4096
 
-// digestTruncatedLengthTolerance is truncatedLengthTolerance's counterpart
-// for a LINK attachment's stored digest — a much smaller number, because
-// the two paths truncate differently. TruncateAtTagBoundary (the upload/
-// PostStripMaxBytes path) can back up over a whole HTML tag to avoid
-// leaving one half-written; BuildDigest's own hard-cap truncation (see
-// urlfetch.DigestHardCapBytes) is a plain byte slice plus
-// trimIncompleteTrailingRune, which trims at most 3 bytes to stay on a
-// valid UTF-8 boundary. Reusing truncatedLengthTolerance's 4096 here would
-// flag any digest over roughly 12KB (16KB cap minus 4096) as truncated
-// even when it isn't. 64 is comfortably larger than the 3-byte maximum a
-// rune trim can remove, with headroom to spare.
+// Link path tolerance (smaller): BuildDigest trims ≤3 bytes for UTF-8; TruncateAtTagBoundary trims ≤4096.
 const digestTruncatedLengthTolerance = 64
 
-// looksTruncatedByStoredLength reports whether contentLength is close
-// enough to its cap to infer the stored HTML attachment was truncated on
-// write — see truncatedLengthTolerance's and digestTruncatedLengthTolerance's
-// own doc comments for why this is a range check, not an exact comparison,
-// and why the two paths need different tolerances. filename picks which
-// cap/tolerance applies: looksLikeFetchedLink(filename) is the same signal
-// both call sites already use one line earlier to set
-// HTMLAttachmentIsExternalLink, so a link compares against
-// urlfetch.DigestHardCapBytes and an upload keeps comparing against
-// PostStripMaxBytes.
+// Reports if contentLength close enough to cap to infer truncation (heuristic, not persisted fact).
 func looksTruncatedByStoredLength(filename string, contentLength int64) bool {
 	if looksLikeFetchedLink(filename) {
 		return contentLength >= urlfetch.DigestHardCapBytes-digestTruncatedLengthTolerance
@@ -1163,29 +562,15 @@ func looksTruncatedByStoredLength(filename string, contentLength int64) bool {
 	return contentLength >= postStripMax-truncatedLengthTolerance
 }
 
-// doGenerate is the part of generation that used to be Generate's entire
-// body before it became async: ask Claude for the resulting file changes
-// and stage them into the chat's draft overlay — see this package's own
-// doc comment for the draft/apply split; writing to the real theme is a
-// separate, explicit Service.ApplyDraft step, not something this does.
-// cancelledByUser is nil from tests that drive doGenerate directly with no
-// cancel machinery of their own (see
-// TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext) — only
-// runOneQueuedGeneration ever passes a real one.
+// Calls AI provider for file changes; stages into draft overlay (ApplyDraft writes to real theme).
+// cancelledByUser nil from tests; only runOneQueuedGeneration passes real one.
 func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat, genID string, cancelledByUser *atomic.Bool) (retErr error) {
 	emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
 	emitter.emit(ctx, EventTypeStarted, struct{}{})
 
-	// summary is declared here (not with := at its point of use below) so
-	// this defer's closure captures the same variable and sees its final
-	// value — a "done" event needs the actual summary, not a placeholder.
+	// summary declared here for defer closure to capture final value.
 	var summary string
-	// doGenerateStart/hasChanges back the end-to-end wall-clock log below —
-	// this is the number the merchant actually experiences; everything
-	// internal/ai logs explains it. hasChanges is declared here (rather
-	// than with := at its normal point of use further down) purely so this
-	// defer's closure can see its final value the same way summary above
-	// does; it's assigned, never redeclared, below.
+	// hasChanges declared here for defer closure to see final value.
 	doGenerateStart := time.Now()
 	var hasChanges bool
 	defer func() {
@@ -1193,52 +578,13 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			"elapsed_ms", time.Since(doGenerateStart).Milliseconds(), "has_changes", hasChanges)
 	}()
 	defer func() {
-		// A deliberately fresh, short-lived context for this defer's own
-		// writes — mirrors runGeneration's endCtx pattern. ctx itself may
-		// already be expired here (the common failure case this defer
-		// exists for: a generation that hit generateTimeout, or whose
-		// caller's context was canceled) — emitting on a dead ctx makes
-		// AppendGenerationEvent (and RecordAssistantMessage below) silently
-		// no-op, which is exactly the bug this fixes: a timed-out
-		// generation with a dead ctx would emit nothing and leave the
-		// WebSocket (and the chat) with no record of why it failed.
+		// Fresh context: ctx may be expired (timeout/cancellation).
 		emitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// retErr != nil is required alongside cancelledByUser, not
-		// cancelledByUser alone: the listener/backstop can flip it true at
-		// any point relative to this function's own progress, including
-		// after RecordAssistantMessage + persistFileRecords below have
-		// already committed a real, successful result — commitCtx (see
-		// below) makes that commit itself immune to cancellation once
-		// reached, so retErr == nil there unambiguously means the turn
-		// really did complete and must never be relabeled "cancelled"
-		// just because a request happened to race its very end.
-		//
-		// Deliberately NOT ctx.Err()-based either: ctx can arrive here
-		// already canceled for reasons that have nothing to do with a
-		// merchant cancel request (a caller whose own request context died
-		// — see TestDoGenerate_FailureEventStillWrittenOnAlreadyCanceledContext),
-		// which is indistinguishable from a real cancel by error type
-		// alone. cancelledByUser is the explicit, unambiguous signal.
+		// retErr != nil required: flag can flip true after commit (immunized with commitCtx).
 		if retErr != nil && cancelledByUser != nil && cancelledByUser.Load() {
-			// A merchant-requested stop (see
-			// Service.CancelQueuedGeneration's running branch and
-			// runOneQueuedGeneration's cancelledByUser), not a failure — no
-			// failed message gets recorded, mirroring how cancelling a
-			// still-queued prompt already leaves no chat message behind
-			// either.
-			//
-			// retErr is still logged if it ISN'T the expected
-			// context.Canceled this cancellation itself produces:
-			// cancelledByUser being true only means a cancel request was
-			// observed at some point, not that it's what caused retErr —
-			// a genuinely unrelated failure (a DB error, an AI-provider
-			// error) can coincidentally race a cancel request landing at
-			// the same moment. Silently treating every such coincidence as
-			// "just a cancellation" would erase the one place doGenerate's
-			// real failures are diagnosable server-side (see the retErr !=
-			// nil branch below, which logs unconditionally).
+			// Merchant-requested stop; no failed message (mirrors queued-prompt cancellation).
 			if !errors.Is(retErr, context.Canceled) {
 				slog.Error("generation failed (raced a concurrent cancel request)", "chat_id", c.ID, "tenant_id", in.TenantID, "error", retErr)
 			}
@@ -1247,21 +593,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 
 		if retErr != nil {
-			// Never surface retErr.Error() directly — it can contain the
-			// backing AI provider's name/URL/request ID (see
-			// ai.SanitizeError's doc comment). Log the raw error here, the one
-			// place doGenerate's failure is fully known, so a generic
-			// "something went wrong" shown to the merchant is still
-			// diagnosable server-side.
+			// Log raw error (never surfaced to merchant; contains provider name/URL).
 			slog.Error("generation failed", "chat_id", c.ID, "tenant_id", in.TenantID, "error", retErr)
 			message := ai.SanitizeError(retErr)
 			if isUnauthorizedErr(retErr) {
-				// A queued generation's token can go stale before its turn
-				// comes up (see "Auth for queued work" / pendingTokens) —
-				// the model was never even called here, so
-				// ai.SanitizeError's generic "AI agent" framing would be
-				// actively misleading. Give the merchant the one thing that
-				// actually explains it and tells them what to do.
+				// Token stale before queued generation's turn; model never called.
 				message = errSessionExpired.Error()
 			}
 			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
@@ -1275,42 +611,21 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
 
-	// The draft overlay this whole feature exists for: every prior turn's
-	// still-'pending' file content, read first before falling through to
-	// the real (last-applied) theme — see themefs.OverlayStore. Built once
-	// per generation call and threaded through every read the rest of this
-	// function does; store (not s.store) is what buildThemeContext,
-	// buildToolExecutor's three tools, buildSnapshot, and buildWritePlan
-	// all read from, so a second/third prompt in this chat always sees
-	// what earlier turns in the SAME draft already changed, never the
-	// stale saved theme. See doGenerate's package-level doc comment.
+	// Draft overlay: prior turns' pending changes overlaid on real theme.
+	// CachingStore scoped per call: caches within one generation, not across turns.
 	draft, err := s.repo.DraftFiles(ctx, c.ID)
 	if err != nil {
 		return fmt.Errorf("load draft overlay: %w", err)
 	}
-	store := themefs.NewOverlayStore(s.store, draft)
+	store := themefs.NewCachingStore(themefs.NewOverlayStore(s.store, draft))
 
 	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
 		return fmt.Errorf("load chat history: %w", err)
 	}
 
-	// in arrives here rebuilt fresh from the generations row (see
-	// runOneQueuedGeneration) — it never carries an image straight from
-	// Generate's own local scope, since a dequeue can happen well after
-	// that scope returns. Re-resolve it from the just-loaded history
-	// instead: in.UserMessageID (carried through Generation.UserMessageID)
-	// points at the exact chat_messages row Generate wrote it to. in is a
-	// value parameter, so this reassignment is local to this call only —
-	// never leaks back to the caller.
-	//
-	// priorMessages carries attachment METADATA only (see
-	// chat.MessageAttachment's own doc comment) — the len(m.Attachments) >
-	// 0 check below is what keeps the overwhelmingly common
-	// zero-attachment turn from costing a second query: GetAttachmentsContent
-	// (the one call that actually pulls bytes out of MySQL) only runs when
-	// this turn's own message is known, from metadata already in hand, to
-	// have something to fetch.
+	// Re-resolve images from history (in rebuilt fresh from generations row).
+	// priorMessages carries metadata only; GetAttachmentsContent only runs if metadata shows attachments.
 	if in.UserMessageID != nil {
 		for _, m := range priorMessages {
 			if m.ID != *in.UserMessageID {
@@ -1336,14 +651,9 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 					in.HTMLAttachmentFilename = &filename
 					in.HTMLAttachmentContent = &content
 					in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
-					// See looksTruncatedByStoredLength's own doc comment for
-					// why this is a tolerance range, not an exact-cap check,
-					// and why filename decides which cap applies.
+					// Tolerance range, not exact-cap check (see looksTruncatedByStoredLength).
 					in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(filename, int64(len(content)))
 				default:
-					// Repository already filters unknown kinds before they
-					// get here — this is defense in depth, not the primary
-					// enforcement (see Repository.GetAttachmentsContent).
 					slog.Warn("doGenerate: unknown attachment kind, skipping", "kind", a.Kind, "attachment_id", a.ID)
 				}
 			}
@@ -1351,35 +661,15 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
-	// Reference-URL fetch: Generate only detected the URL and validated its
-	// shape (see its own doc comment on why the actual fetch is deferred to
-	// here) — this is where the network call happens, now that a
-	// generation is genuinely running in the background and slow work is
-	// safe. Runs before the carry-forward fallback below so a reference
-	// on THIS turn always wins over an earlier turn's, the same precedence
-	// Generate already applies for an uploaded file vs. a URL in the
-	// prompt.
+	// Generate detected URL; deferred fetch now that generation runs safely in background.
+	// Runs before carry-forward fallback; this turn's reference wins over earlier turn's.
 	if in.HTMLAttachmentContent == nil && in.ReferenceURL != "" && s.links != nil {
 		emitter.emit(ctx, EventTypeFetchingLink, map[string]string{"url": in.ReferenceURL})
 		htmlLimit := attachmentLimits[chat.AttachmentKindHTML]
-		// Fetching the HTML, fetching its stylesheets, and building the
-		// digest all happen entirely inside fetchReferenceURL now — see
-		// its own doc comment for why: keeping it in exactly one place
-		// also lets a cache hit skip all three, not just re-fetching.
 		digestContent, truncated, digestEmpty, title, styleCount, ferr := s.fetchReferenceURL(ctx, in.TenantID, in.ReferenceURL, htmlLimit.MaxBytes)
-		// A page whose real content lives entirely in client-rendered
-		// <script> blocks (a React/Vue SPA whose server-sent HTML is just
-		// an empty mount point) digests to nothing usable — no headings,
-		// no landmarks, no real copy (see Digest.Empty's own doc comment).
-		// Treated as a failure, not a success with an empty attachment —
-		// see ReferenceURLEmptyAfterSanitize's own doc comment.
+		// Client-rendered page (empty digest) treated as failure, not success with empty attachment.
 		emptyAfterSanitize := ferr == nil && digestEmpty
-		// Must NOT fail the turn either way — the merchant asked a real
-		// question and deserves an answer about everything except the
-		// page (see ReferenceURLFetchFailed's own doc comment).
-		// promptWithHTMLAttachment tells the model the fetch failed
-		// instead of silently proceeding as if no link had ever been
-		// mentioned.
+		// Must NOT fail turn: merchant deserves answer about everything except the page.
 		switch {
 		case ferr != nil:
 			slog.Warn("reference URL fetch failed", "chat_id", c.ID, "url", in.ReferenceURL, "error", ferr)
@@ -1390,11 +680,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			in.ReferenceURLFetchFailed = true
 			in.ReferenceURLEmptyAfterSanitize = true
 		default:
-			// Narration that something real happened — see
-			// EventTypeFetchedLink's own doc comment for why this only
-			// fires on this success path, not on a failure or an empty
-			// digest (both already have their own explanation via the
-			// turn's eventual reply).
+			// Success narration (failure/empty both have their own via turn's reply).
 			emitter.emit(ctx, EventTypeFetchedLink, map[string]any{"title": title, "stylesheet_count": styleCount})
 
 			filename := in.ReferenceURL
@@ -1403,28 +689,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			in.HTMLAttachmentIsExternalLink = true
 			in.HTMLAttachmentTruncated = truncated
 
-			// Persisted so findCarryForwardSourceMessageID still works on a
-			// later turn — that lookup reads chat_message_attachments, and
-			// nothing else writes there for a link now that RecordUserMessage
-			// no longer sees the fetched content (only Generate's raw
-			// detection, before any network call). filename is capped to 255
-			// (the column's width — urlfetch.maxURLLen is 2048, so a long URL
-			// would otherwise blow up the insert under strict SQL mode) while
-			// keeping the "https://" prefix intact so looksLikeFetchedLink
-			// still matches on read-back; the full URL still goes to the
-			// model via HTMLAttachmentFilename above, only the persisted copy
-			// is shortened. Best-effort: logged and swallowed on failure — a
-			// lost persist only costs carry-forward on a later turn, it must
-			// not fail a generation that already has the content in hand.
-			//
-			// What's stored here is the DIGEST now, not raw HTML — a real
-			// change to chat_message_attachments.content's meaning for a
-			// link-kind attachment going forward. An OLD row from before
-			// this phase still holds raw sanitized markup; that reads back
-			// fine on a later carry-forward turn (see doGenerate's
-			// carry-forward block below) — it's still real page content the
-			// model can use, just not in digest form — so no backfill or
-			// migration is needed for it.
+			// Persist digest for carry-forward on later turns (filename capped to 255 for DB column width).
+			// Best-effort: lost persist only costs carry-forward, must not fail generation.
 			if in.UserMessageID != nil {
 				storedFilename := filename
 				if len(storedFilename) > 255 {
@@ -1437,32 +703,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
-	// Carry-forward fallback: this turn attached no HTML reference of its
-	// own — look back for the most recent earlier turn in this chat that
-	// did, still inside the window actually replayed to the model (see
-	// findCarryForwardSourceMessageID). Without this, "here's a link"
-	// followed later by "build it like that" runs the actual build with no
-	// page content at all — the model designs from its own earlier summary
-	// of the page, not the page itself. currentID is empty (never matches a
-	// real message.ID) when in.UserMessageID is nil, which only happens in
-	// tests that drive doGenerate directly — harmless: nothing to exclude
-	// from the scan in that case either.
-	//
-	// in.ReferenceURL == "" is required alongside the nil check: without it,
-	// a turn that named its OWN new reference URL but whose fetch just
-	// failed/came back empty (the switch above, case ferr != nil / case
-	// emptyAfterSanitize — both leave HTMLAttachmentContent nil on purpose)
-	// would silently fall through to an EARLIER, unrelated turn's reference
-	// instead — reported to the merchant as if their new link had never
-	// been mentioned at all. A real observed failure: merchant pastes
-	// ebay.com wanting the homepage redesigned to match it, the fetch
-	// fails, and the turn quietly redesigns against a completely different
-	// site referenced several turns earlier instead — no acknowledgment
-	// that ebay.com itself was ever tried. Carry-forward is for "this turn
-	// has no reference of its own," not "this turn's own reference didn't
-	// work out" — the latter already has its own honest narration via
-	// ReferenceURLFetchFailed/ReferenceURLBlocked/ReferenceURLEmptyAfterSanitize
-	// (see promptWithHTMLAttachment), which must not be silently overridden.
+	// Carry-forward fallback: look back for most recent earlier turn's reference within replay window.
+	// in.ReferenceURL == "" required: without it, failed fetch would silently use unrelated earlier reference.
 	if in.HTMLAttachmentContent == nil && in.ReferenceURL == "" {
 		currentID := ""
 		if in.UserMessageID != nil {
@@ -1482,8 +724,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				in.HTMLAttachmentFilename = &filename
 				in.HTMLAttachmentContent = &content
 				in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
-				// See the identical check in the current-turn attachment
-				// block above — same heuristic, same reason.
+				// Same heuristic as current-turn attachment check above.
 				in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(filename, int64(len(content)))
 				in.HTMLAttachmentCarriedForward = true
 				slog.Info("carried forward an earlier turn's HTML reference", "chat_id", c.ID,
@@ -1504,24 +745,28 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return fmt.Errorf("build snapshot base: %w", err)
 	}
 
-	toolExec := s.buildToolExecutor(store, storeAuth, tc, snapBase)
+	toolExec := s.buildToolExecutor(store, storeAuth)
 	readFile := s.buildFileReader(store, storeAuth)
 
 	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
-	result, turns, err := s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
-	if err != nil {
-		return err
+
+	// Deterministic page-lifecycle ops (register existing page, diagnose failures).
+	result, deterministic := s.tryDeterministicPageOp(ctx, store, storeAuth, in.Prompt)
+	if !deterministic {
+		var err error
+		result, turns, err = s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
+		if err != nil {
+			return err
+		}
 	}
 
+	// Fill create-without-registry gap deterministically before themecheck would reject it.
+	synthesizeMissingPageRegistry(result)
+
 	var warnings []themecheck.Finding
-	if proposalHasChanges(result) {
-		// Emitted for the model's first accepted propose_changes call, not
-		// whatever checkAndRepair's retries eventually settle on below — by
-		// the time a repair retry replaces result, the merchant watching
-		// the step list has already seen "Writing N files…" once for this
-		// turn, which is the narration point that matters (a repair retry
-		// changing the exact count isn't worth a second, confusing
-		// "Writing M files…" for the same turn).
+	// Skip check/repair for deterministic ops: no new changes to validate.
+	if !deterministic && proposalHasChanges(result) {
+		// Emitted for first accepted propose_changes, not repair retries (narration point already seen).
 		emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(result.Files)})
 
 		snap := s.buildSnapshot(ctx, store, storeAuth, snapBase, result)
@@ -1531,42 +776,29 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
+	// Final gate: never silently delete/unregister protected pages (blog, home).
+	var blockedPages []string
+	result, blockedPages = protectPages(result, in.Prompt, tc.PagesJSON)
+
 	hasChanges = proposalHasChanges(result)
 
 	var staged []writtenFile
 	if hasChanges {
-		// Still locked, even though nothing is written to FlowPOS here
-		// anymore — buildWritePlan still READS the layout files and the
-		// theme's current file list, and two concurrent generations for
-		// the same theme staging at once could otherwise compute their
-		// layout splices against an inconsistent view of each other's
-		// in-flight (but not yet persisted-as-pending) draft. Scoped
-		// tightly to just this section per its existing convention (see
-		// themeLocks' own doc comment) — the Claude call above can take
-		// minutes, and a second tab's turn shouldn't queue behind that.
+		// Lock for buildWritePlan (reads layout files); concurrent generations could race.
 		unlock, err := s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
 		defer unlock()
 
-		// Computed entirely in memory first, nothing staged yet: a
-		// failure here (e.g. a duplicate page slug) leaves the draft
-		// completely untouched, rather than a validation error arriving
-		// after some files already landed in chat_generated_files with
-		// nothing recording that they did.
+		// Computed entirely in memory; failure leaves draft untouched (not half-staged).
 		plan, err := s.buildWritePlan(ctx, store, storeAuth, result)
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
 		emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": plan.paths()})
 
-		// No commitWritePlan call — this is the entire point of the
-		// draft/apply split (see themebuild's package doc comment):
-		// nothing reaches FlowPOS here. planToStaged turns the plan into
-		// the same writtenFile shape persistFileRecords already knows how
-		// to audit, including the layout splices (see GeneratedFileKind)
-		// that used to be silently un-audited when writes were immediate.
+		// Draft/apply split: nothing reaches FlowPOS here (only staged, not committed).
 		staged = planToStaged(plan)
 	}
 
@@ -1575,29 +807,15 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		applyStatus = chat.ApplyStatusPending
 	}
 
-	// The schema requires "summary" as a key but not a non-empty one, so an
-	// empty string is a valid (if unhelpful) reply the model can return. A
-	// "completed" turn with empty content isn't just a bland reply, though —
-	// it's a landmine: internal/ai applies a prompt-cache breakpoint to the
-	// last history turn on every subsequent call, and Anthropic rejects
-	// cache_control on an empty text block outright (400), which would take
-	// down every future message in this chat, not just this one. Never
-	// persist that state.
+	// Empty summary with cache_control breakpoint breaks all future messages (Anthropic rejects it).
 	summary = result.Summary
 	if summary == "" {
 		summary = "Done."
 	}
 	summary = appendWarningsNote(summary, warnings)
+	summary = protectedPagesNote(summary, blockedPages)
 
-	// A cancel request landing in this exact window — after the model's
-	// output has already been decided and is only being committed — must
-	// never be allowed to leave a "completed" assistant message
-	// referencing files that were only partially written, or vice versa.
-	// commitCtx is deliberately detached from ctx (rooted at
-	// context.Background(), not derived from it, with its own bounded
-	// timeout — the same pattern as endCtx/emitCtx elsewhere in this
-	// file) so a cancellation can only ever stop this turn BEFORE this
-	// point, never in the middle of recording its result.
+	// Detached commitCtx: cancel can only stop BEFORE this point, never mid-commit.
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer commitCancel()
 
@@ -1613,13 +831,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	return nil
 }
 
-// GenerationStatus reports whether chatID currently has a background
-// Generate call running, and the error from the most recently finished one
-// if it failed (cleared as soon as the next generation starts) — backed by
-// the generations table (phase 3a), so this survives a pod restart and is
-// correct with more than one replica, unlike the in-memory tracker it
-// replaced. A chat with no generation row yet (never sent a first message)
-// reports not-generating, no error — a normal state, not an error itself.
+// Reports if chatID has running generation and error from most recent failure (cleared on next start).
+// Backed by generations table; survives pod restart and works with multiple replicas.
 func (s *Service) GenerationStatus(ctx context.Context, chatID string) (generating bool, errMsg string) {
 	g, err := s.repo.GetGeneration(ctx, chatID)
 	if err != nil {
@@ -1635,47 +848,27 @@ func (s *Service) GenerationStatus(ctx context.Context, chatID string) (generati
 	return g.Status == GenerationStatusRunning, ""
 }
 
-// manifestGenerator is the *themefs.Store-only capability buildThemeContext
-// needs beyond themefs.ThemeStore (see ThemeStore's own doc comment on why
-// GetOrGenerateManifest isn't part of it). store here is whatever this
-// generation call is actually reading from (the draft overlay, mid-
-// generation) — its manifest is always generated from s.store (the real,
-// non-overlay store, see Service.store's doc comment), never the draft:
-// making the component-signature manifest draft-aware isn't required by
-// this feature and manifest caching is keyed to the real theme's own
-// fingerprint (see manifest.go), which a draft has no independent notion of.
+// *themefs.Store-only capability; manifest cached against real theme, not draft.
 type manifestGenerator interface {
 	GetOrGenerateManifest(ctx context.Context, auth themefs.RequestAuth) (themefs.Manifest, error)
 }
 
-// rawAssetReader is the *themefs.Store-only capability ReadThemeAssetBytes
-// needs, same reasoning as manifestGenerator above: ThemeStore's ReadFile
-// returns a string, which silently corrupts binary content (theme images/
-// fonts) — see themefs.Store.ReadFileBytes's own doc comment.
+// *themefs.Store-only capability; ThemeStore.ReadFile returns string (corrupts binary).
 type rawAssetReader interface {
 	ReadFileBytes(ctx context.Context, auth themefs.RequestAuth, relPath string) ([]byte, error)
 }
 
-// storeSettingsFetcher is the *themefs.Store-only capability
-// FetchStoreSettings needs, same reasoning as rawAssetReader above: store
-// settings aren't a theme file, so they're not part of ThemeStore.
+// *themefs.Store-only capability; store settings aren't theme files.
 type storeSettingsFetcher interface {
 	FetchStoreSettings(ctx context.Context, auth themefs.RequestAuth) (themefs.StoreSettings, error)
 }
 
-// productsFetcher is the *themefs.Store-only capability FetchPreviewProducts
-// needs, same reasoning as storeSettingsFetcher above: a real products list
-// isn't a theme file, so it's not part of ThemeStore.
+// *themefs.Store-only capability; products list isn't theme files.
 type productsFetcher interface {
 	FetchProducts(ctx context.Context, auth themefs.RequestAuth, limit int) (themefs.ProductsPage, error)
 }
 
-// FetchPreviewProducts fetches the tenant's real published, active products
-// (first page, capped at limit) for PreviewHandler's buildPreviewContext, so
-// the AI-chat preview's shop/product-detail pages show real product data
-// instead of FixtureProducts' canned "Sample Product" — see
-// themefs.Store.FetchProducts' own doc comment for the endpoint and filters
-// used.
+// Fetches real published products for preview (instead of sample data).
 func (s *Service) FetchPreviewProducts(ctx context.Context, storeAuth themefs.RequestAuth, limit int) (themefs.ProductsPage, error) {
 	fetcher, ok := s.store.(productsFetcher)
 	if !ok {
@@ -1684,10 +877,7 @@ func (s *Service) FetchPreviewProducts(ctx context.Context, storeAuth themefs.Re
 	return fetcher.FetchProducts(ctx, storeAuth, limit)
 }
 
-// FetchStoreSettings fetches the tenant's real store settings (currently
-// just its name) for PreviewHandler's buildPreviewContext, so the AI-chat
-// preview's header shows the merchant's actual store name instead of
-// FixtureContext's canned "Sample Store".
+// Fetches real store settings (name) for preview (instead of sample data).
 func (s *Service) FetchStoreSettings(ctx context.Context, storeAuth themefs.RequestAuth) (themefs.StoreSettings, error) {
 	fetcher, ok := s.store.(storeSettingsFetcher)
 	if !ok {
@@ -1696,13 +886,7 @@ func (s *Service) FetchStoreSettings(ctx context.Context, storeAuth themefs.Requ
 	return fetcher.FetchStoreSettings(ctx, storeAuth)
 }
 
-// FetchThemeMenu reads the tenant's real defaults.json and returns its
-// menu object (`items[]` — see theme_engine_spec.md §6) for
-// PreviewHandler's buildPreviewContext, so the AI-chat preview's nav shows
-// every link the merchant has actually configured instead of
-// FixtureContext's static 3-link fallback. Unlike FetchStoreSettings, menu
-// data lives in a theme file, so it's read straight off ThemeStore —
-// no *themefs.Store-only capability interface needed.
+// Reads real defaults.json menu object for preview (instead of static fallback).
 func (s *Service) FetchThemeMenu(ctx context.Context, storeAuth themefs.RequestAuth) (map[string]any, error) {
 	raw, err := s.store.ReadFile(ctx, storeAuth, pathDefaultsJSON)
 	if err != nil {
@@ -1721,14 +905,7 @@ func (s *Service) FetchThemeMenu(ctx context.Context, storeAuth themefs.RequestA
 	return parsed.Menu, nil
 }
 
-// ReadThemeAssetBytes fetches one theme file's raw bytes, authenticated as
-// storeAuth — backs AssetHandler, which lets the frontend's client-side
-// LiquidJS preview (a sandboxed iframe with no real origin — see
-// tenant-dashboard's usePreviewDoc.ts) resolve an <img src="/theme-assets/
-// ...restrictive-path"> reference into actual image bytes instead of a
-// broken relative path. Always reads the real theme (s.store, not a draft
-// overlay): images aren't something a generation turn's proposal ever
-// writes, so there's no draft-vs-real distinction to make here.
+// Fetches theme file's raw bytes for AssetHandler (always real theme, never draft).
 func (s *Service) ReadThemeAssetBytes(ctx context.Context, storeAuth themefs.RequestAuth, relPath string) ([]byte, error) {
 	reader, ok := s.store.(rawAssetReader)
 	if !ok {
@@ -1737,17 +914,7 @@ func (s *Service) ReadThemeAssetBytes(ctx context.Context, storeAuth themefs.Req
 	return reader.ReadFileBytes(ctx, storeAuth, relPath)
 }
 
-// buildThemeContext's four store round trips (two file reads, a listing,
-// and a manifest lookup) are independent of one another — GetOrGenerateManifest
-// internally calls ListFiles too, but against s.store (the real, non-overlay
-// store, to fingerprint its cache against committed theme state) rather than
-// the overlay store parameter this function lists against, so neither
-// result feeds the other. Run concurrently via errgroup, the same pattern
-// LoadThemeFiles/buildWritePlan already use in this file (capped there at
-// loadThemeFilesConcurrency; uncapped here since there are only ever
-// exactly four goroutines). Each goroutine assigns its own dedicated
-// variable rather than a shared map, so — unlike those two — no mutex is
-// needed: g.Wait() establishes happens-before for every read below it.
+// Four independent store round trips run concurrently; each goroutine owns its variable (no mutex).
 func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, themeSlug string) (ai.ThemeContext, error) {
 	var pagesJSON, defaultsJSON string
 	var tree []themefs.FileTreeEntry
@@ -1782,16 +949,8 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 	}, nil
 }
 
-// buildSnapshotBase fetches the part of a themecheck.Snapshot that's
-// invariant for the life of one merchant turn: the full file-path listing
-// (every path that exists, for rule 4's render-target-exists check — see
-// themecheck.Snapshot.Paths) plus real content for the handful of files
-// themecheck actually reads (pages.json, defaults.json, the two layout
-// files). Nothing is written to the theme until the check-and-repair loop
-// accepts a proposal, so this is safe to build once per doGenerate call and
-// reuse for every validate_changes call (see buildToolExecutor) and the
-// final buildSnapshot call below, instead of repeating this same
-// ListFiles + 4 ReadFile round trip on every check.
+// Fetches invariant snapshot part: file-path listing + content for files themecheck reads.
+// Split from buildSnapshot for independent testability; lets future callers reuse base.
 func (s *Service) buildSnapshotBase(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth) (themecheck.Snapshot, error) {
 	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
@@ -1811,26 +970,8 @@ func (s *Service) buildSnapshotBase(ctx context.Context, store themefs.ThemeStor
 	return themecheck.Snapshot{Files: files, Paths: paths}, nil
 }
 
-// buildSnapshot layers, on top of base (see buildSnapshotBase), the real
-// current content of every file result proposes to "update" (see
-// themecheck.checkPlaceholderBody's content-shrink check, which needs a
-// real "before" to compare the proposal's "after" against — a page's prior
-// content was never loaded into the snapshot before this, so that check had
-// nothing to compare with). That same per-file "before" content is also
-// what themecheck.DowngradePreExistingFindings uses as its baseline (see
-// checkAndRepair) to tell a violation the merchant's theme already had from
-// one this proposal just introduced — sourced from store, the same overlay
-// store the model's own read_theme_file tool reads through, so it reflects
-// what the model actually saw, staged draft changes from earlier turns
-// included. base is built once per doGenerate call, before the
-// check-and-repair loop: nothing is written to the theme until after that
-// loop accepts a proposal, so the same base snapshot is valid across every
-// retry within one call, never a prior failed attempt's own output
-// (checkAndRepair keeps re-using this same snapshot; only fresh update
-// paths that first appear on a retry would miss a "before" here, same as
-// before this change for any path). Never itself fails — the one call that
-// can error (each proposed file's baseline fetch) fails open instead, so
-// unlike buildSnapshotBase this has no error return.
+// Layers real content of proposed-update files on top of base (for placeholder/pre-existing checks).
+// Fetches fail open; base built once before check-repair loop, valid across retries.
 func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, base themecheck.Snapshot, result *ai.Result) themecheck.Snapshot {
 	files := make(map[string]string, len(base.Files)+len(result.Files))
 	for k, v := range base.Files {
@@ -1845,13 +986,7 @@ func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, s
 		}
 		content, err := store.ReadFile(ctx, storeAuth, f.Path)
 		if err != nil {
-			// Fails open, unlike the four required files above: this fetch
-			// only backs the placeholder-body "before" compare and the
-			// pre-existing-violation baseline, both optional refinements —
-			// missing it just means that one file falls back to today's
-			// stricter behavior (no grandfathering, no shrink check) rather
-			// than failing the whole generation over a network hiccup to
-			// FlowPOS.
+			// Fails open: this backs optional checks (placeholder, pre-existing); miss reverts to stricter behavior.
 			slog.Warn("failed to fetch baseline content for proposed file; treating it as having no baseline",
 				"path", f.Path, "error", err)
 			continue
@@ -1862,8 +997,7 @@ func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, s
 	return themecheck.Snapshot{Files: files, Paths: base.Paths}
 }
 
-// flattenFileTree walks a theme's file tree (see themefs.Store.ListFiles),
-// recording every FILE path (not directories) into paths.
+// Walks file tree, recording every FILE path (not directories).
 func flattenFileTree(entries []themefs.FileTreeEntry, paths map[string]bool) {
 	for _, e := range entries {
 		if e.Type == "file" {
@@ -1875,20 +1009,8 @@ func flattenFileTree(entries []themefs.FileTreeEntry, paths map[string]bool) {
 	}
 }
 
-// toTurns replays a chat's history as message turns for the model. Anthropic
-// rejects an empty text content block outright ("text content blocks must
-// be non-empty") — not just for the cache_control breakpoint, for any
-// message anywhere in the request — so an empty turn is skipped rather than
-// replayed, regardless of role or status. This also self-heals any chat
-// that already has an empty "completed" turn sitting in its history from
-// before the fix that stops persisting one (see Generate): the bad row
-// stays in the database, but it's excluded here every time history gets
-// rebuilt, so it can't keep breaking every future message in that chat.
-// Delegates its inclusion rule to isReplayedMessage (attachment_carry_forward.go)
-// rather than inlining it a second time — findCarryForwardSourceMessageID
-// needs the exact same rule to determine whether an earlier turn is still
-// inside the window actually replayed here, and a second, drifted copy of
-// it would silently desync the two.
+// Replays chat history as turns; skips empty turns (Anthropic rejects empty text blocks).
+// Delegates inclusion to isReplayedMessage to keep carry-forward sync'd.
 func toTurns(messages []chat.Message) []ai.Turn {
 	turns := make([]ai.Turn, 0, len(messages))
 	for _, m := range messages {
@@ -1904,21 +1026,12 @@ func toTurns(messages []chat.Message) []ai.Turn {
 	return turns
 }
 
-// isUnauthorizedErr reports whether err looks like a 401 from FlowPOS.
-// themefs.Store doesn't expose a structured status code for this (see
-// statusErr in disk.go) — every read/write error is built as a plain
-// fmt.Errorf wrapping "unexpected status %d: %s" — so this matches on that
-// literal text rather than requiring a themefs API change for a single
-// call site. Used to give a queued generation whose token expired before
-// its turn came up a clear, specific failure message instead of a generic
-// one (see doGenerate's failure defer).
+// Reports if err looks like a 401 from FlowPOS (matches literal text; no structured status).
 func isUnauthorizedErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "status 401:")
 }
 
-// persistFileRecords writes the audit row for each staged/written file
-// (see planToStaged/commitWritePlan) — done after the assistant message
-// exists since chat_generated_files.message_id is a foreign key into it.
+// Writes audit row for each staged file; done after assistant message (FK constraint).
 func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID string, written []writtenFile) ([]GeneratedFile, error) {
 	files := make([]GeneratedFile, 0, len(written))
 	now := time.Now().UTC()
@@ -1949,29 +1062,8 @@ func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID
 	return files, nil
 }
 
-// LoadThemeFiles fetches every render-relevant theme file's content, keyed
-// by theme-relative path. store lets a caller pass a draft overlay (see
-// themefs.OverlayStore) so a preview reflects unsaved changes instead of
-// only the last-applied theme — the AI chat page's draft preview always
-// does; Preview (the Go-renderer fidelity check) still passes s.store
-// directly, unchanged, since it works from its own explicit overlay map
-// instead (see handlers/preview.go).
-//
-// includeAssets adds .css/.js alongside .liquid — the original .liquid-only
-// behavior stays available (includeAssets: false) for callers that only
-// ever needed templates (nothing but a template is a render target for the
-// Go engine — see liquidrender). LiquidJS's frontend preview needs CSS/JS
-// too, to inline draft stylesheets/scripts (see asset_url's doc comment in
-// liquid-engine.ts). pages.json is always included, regardless of
-// includeAssets — a route's slug can differ from its liquid file's name
-// (PageEntry.Slug vs .Page), so any caller resolving a URL to an entry file
-// needs it to do that correctly.
-//
-// Reads run concurrently (errgroup, capped at 8 in flight) rather than one
-// HTTP round trip at a time — sequential reads of a real theme's full file
-// set (a few dozen files at flowpos-backend's typical latency) added up to
-// multiple seconds of pure network wait, and this is now called on every
-// turn (draft preview), not just once per Editor page load.
+// Fetches render-relevant theme files (liquid + optional css/js + pages.json); concurrent reads capped at 8.
+// store lets caller pass draft overlay (AI chat does; preview fidelity check doesn't).
 func (s *Service) LoadThemeFiles(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, includeAssets bool) (map[string]string, error) {
 	tree, err := store.ListFiles(ctx, storeAuth)
 	if err != nil {
@@ -1990,14 +1082,7 @@ func (s *Service) LoadThemeFiles(ctx context.Context, store themefs.ThemeStore, 
 			wanted = append(wanted, path)
 		}
 	}
-	// pages.json unconditionally, not gated behind includeAssets: a route's
-	// slug and its actual liquid file name can differ (e.g. slug "shop" ->
-	// page "products" — see PageEntry.Slug vs .Page), and any caller that
-	// resolves a URL path to an entry file needs this to do it correctly
-	// instead of guessing pages/<slug>.liquid, which breaks for exactly that
-	// case. Harmless for callers that don't: the Go liquidrender.Renderer
-	// this also feeds (handlers/preview.go) never references a "pages.json"
-	// key from a {% render %}/{% include %} tag.
+	// pages.json unconditionally (slug ≠ liquid filename; needed for URL→entry resolution).
 	if paths[pathPagesJSON] {
 		wanted = append(wanted, pathPagesJSON)
 	}
@@ -2024,42 +1109,28 @@ func (s *Service) LoadThemeFiles(ctx context.Context, store themefs.ThemeStore, 
 	return files, nil
 }
 
-// LoadBaseThemeFiles is LoadThemeFiles against the real (non-overlay)
-// store — a convenience for callers (handlers/preview.go) that have no
-// draft-overlay reason to build one themselves and shouldn't need to know
-// s.store is even a field they could reach for.
+// LoadThemeFiles against real (non-overlay) store; convenience to hide s.store field.
 func (s *Service) LoadBaseThemeFiles(ctx context.Context, storeAuth themefs.RequestAuth, includeAssets bool) (map[string]string, error) {
 	return s.LoadThemeFiles(ctx, s.store, storeAuth, includeAssets)
 }
 
-// FilesForChat returns every generated file ever written across a chat's
-// whole history — used to hydrate GET /chat so reopening the page still
-// shows each turn's "Generated files" card, not just the most recent one.
-// Does not check ownership itself; the caller (the chat handler) has
-// already scoped the chat to the requesting tenant.
+// Returns all generated files across chat's history for GET /chat hydration.
+// Caller already scoped chat to requesting tenant (no ownership check needed).
 func (s *Service) FilesForChat(ctx context.Context, chatID string) ([]GeneratedFile, error) {
 	return s.repo.ListFilesByChat(ctx, chatID)
 }
 
-// LatestGeneration returns chatID's most recently started generation — see
-// GET /chats/:chatId/stream (phase 3c), which needs to know which
-// generation_id to replay events for and whether it's still running.
+// Returns most recently started generation (needed to replay stream events and check status).
 func (s *Service) LatestGeneration(ctx context.Context, chatID string) (Generation, error) {
 	return s.repo.GetGeneration(ctx, chatID)
 }
 
-// EventsSince returns chatID's events after sinceSeq — what the stream
-// handler replays before subscribing to live Redis delivery. See
-// Repository.GetEventsSince's doc comment for why this is chat-scoped
-// rather than tied to one generation.
+// Returns events after sinceSeq (replayed by stream handler before live subscription).
 func (s *Service) EventsSince(ctx context.Context, chatID string, sinceSeq int64) ([]GenerationEvent, error) {
 	return s.repo.GetEventsSince(ctx, chatID, sinceSeq)
 }
 
-// SubscribeToGenerationEvents subscribes to chatID's live event bus — see
-// eventBus's doc comment for the Redis-vs-in-process distinction, which is
-// invisible to this method's caller (the stream handler): either way it
-// gets a channel of live events and a cancel func to release it.
+// Subscribes to live event bus (Redis-vs-in-process transparent to caller).
 func (s *Service) SubscribeToGenerationEvents(ctx context.Context, chatID string) (<-chan GenerationEvent, func()) {
 	return s.bus.Subscribe(ctx, chatID)
 }

@@ -1,15 +1,5 @@
-// Package liquidrender executes theme_engine_spec.md's simplified Liquid
-// dialect against real data — the tag/filter subset in §1 (render,
-// if/elsif/else/endif, for/endfor with forloop.first/last, assign, capture,
-// comment, and the 7 filters), nothing more. It exists for phase 5's render
-// preview: a merchant's dashboard needs to see a page rendered with
-// realistic data (see themefs.FixtureContext) before ever writing it to the
-// real theme, and no general-purpose Shopify-Liquid library would enforce
-// (or even necessarily support) this bespoke, narrower dialect's exact
-// rules — e.g. render's path-prefix convention, or the boolean-ish
-// true/false/1/0 coercion §1 requires. A generation's own correctness is
-// themecheck's job (static analysis); this package actually runs the
-// template.
+// Package liquidrender executes a simplified, narrower Liquid dialect against real data, for
+// previewing a page's rendered output before writing it to the real theme.
 package liquidrender
 
 import (

@@ -14,16 +14,8 @@ func init() {
 	})
 }
 
-// chats is the one, ongoing conversation thread per (tenant_id, type) — no
-// per-user ownership and no theme_slug: this table is deliberately generic
-// (see the chat package's doc comment) so it isn't coupled to the
-// theme-builder use case. type is "builder" today; a future chat use case
-// on the same tenant gets its own row via a new type value, not a schema
-// change. There's no local FK to tenant/user: identity lives in the calling
-// system, not duplicated here (see internal/auth — every request is
-// authenticated by delegating the bearer token to FlowPOS's own /user
-// endpoint, and tenant_id comes from the resolved identity, not a
-// blindly-trusted header).
+// chats is one row per (tenant_id, type) — deliberately generic (no theme_slug/per-user
+// ownership) so it isn't coupled to the theme-builder use case.
 func Up_20260727000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS chats (

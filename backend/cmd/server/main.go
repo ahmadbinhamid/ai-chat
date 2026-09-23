@@ -1,7 +1,5 @@
-// Command server is the ai-chat HTTP API entrypoint. It never auto-migrates
-// the schema (see cmd/migration) and shuts down gracefully on SIGINT/SIGTERM
-// — in-flight requests, including a long-running generation call, are given
-// a chance to finish rather than being severed by an abrupt process kill.
+// Command server is the ai-chat HTTP API entrypoint. It never auto-migrates the
+// schema and drains in-flight requests on SIGINT/SIGTERM before exiting.
 package main
 
 import (
@@ -22,15 +20,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// writeTimeout bounds every response this server writes. POST
-// /chats/messages — the one route that used to call Claude/DeepSeek inline
-// — now only records the user message and kicks off generation in a
-// background goroutine (see themebuild.Service.Generate), returning
-// 202 Accepted in milliseconds; the actual generation is bounded separately
-// by themebuild.generateTimeout and delivered to the client over the
-// WebSocket stream or GET /chat polling, not this response. No route on
-// this server does slow synchronous work anymore, so a short timeout here
-// is safe.
+// writeTimeout bounds every response. Generation runs in a background goroutine and is
+// delivered over WebSocket/polling, not this response, so no route needs a long timeout.
 const writeTimeout = 30 * time.Second
 
 func main() {

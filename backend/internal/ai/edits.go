@@ -9,53 +9,20 @@ import (
 	"strings"
 )
 
-// FileReader reads one theme file's current raw content by path — used only
-// to materialize a GeneratedFile's "edit" action into full content (see
-// MaterializeEdits). Distinct from ToolExecutor: that's scoped to
-// model-invoked tool calls and returns a human-formatted string for the
-// model to read; this needs one file's exact raw bytes and a clean error,
-// never model-facing text. An empty, non-error return means the path
-// doesn't exist — the same convention themefs.ThemeStore.ReadFile already
-// uses (a 404 is not an error), so a themebuild-supplied FileReader is
-// just that method with auth curried in, nothing extra to implement.
+// FileReader reads one theme file's current raw content by path, for materializing a
+// GeneratedFile's "edit" action. An empty, non-error return means the path doesn't exist.
 type FileReader func(ctx context.Context, path string) (content string, err error)
 
-// maxEditMaterializationFailures bounds how many times a materialization
-// failure is allowed to repeat — a bad old_string, a read error, a
-// nonexistent edit target — before MaterializeEdits stops just repeating
-// its usual guidance and tells the model plainly that doing it again will
-// fail the generation. Keyed per file path for those; the duplicate-paths
-// failure below isn't about any single file, so it gets its own reserved
-// key (duplicatePathsFailureKey) in the same map instead. See
-// MaterializeEdits' own doc comment on why this is the safe fallback rather
-// than looping indefinitely on something the model can't get right.
+// maxEditMaterializationFailures bounds how many times a failure can repeat before warning
+// the model plainly, rather than looping indefinitely on something it can't get right.
 const maxEditMaterializationFailures = 2
 
-// duplicatePathsFailureKey is the failureCounts key used to strike-count the
-// duplicate-paths failure below, which isn't about any single file so it
-// can't be keyed by path the way every other failure here is. Angle
-// brackets never appear in a theme-relative file path, so this can never
-// collide with a real per-file count sharing the same map.
+// duplicatePathsFailureKey strike-counts the duplicate-paths failure, which isn't about
+// any single file. Angle brackets never appear in a real theme-relative path, so no collision.
 const duplicatePathsFailureKey = "<duplicate-paths>"
 
-// MaterializeEdits turns every "edit"-action file in result into "update"
-// with real content, in place — see GeneratedFile's own doc comment for why
-// this makes "edit" a wire-format optimization only, invisible to every
-// caller downstream of Generate. ok is false when at least one file failed
-// to materialize (a duplicate path, a missing edits[] entry, an old_string
-// that matched zero or several times at every tier, a read failure);
-// retryMessage then describes every failure so Generate's caller can feed
-// it back as a tool_result and let the model correct itself on the next
-// iteration, rather than failing the generation over what's usually a
-// one-line mistake — this matters a lot more than it sounds: a
-// propose_changes call can take minutes to stream, so a rejected
-// materialization throws away that whole cost, not just a cheap round trip.
-// failureCounts is keyed by path and must persist across the whole Generate
-// call (not be reset per attempt) — see the constant above. Exported so
-// themebuild's validate_changes tool executor can materialize a candidate
-// proposal's edits the exact same way, before checking it — see
-// tool_exec.go's execValidateChanges.
-func MaterializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
+// materializeEdits turns every "edit"-action file into "update" with real content, in place.
+func materializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
 	if dupes := duplicateFilePaths(result.Files); len(dupes) > 0 {
 		failureCounts[duplicatePathsFailureKey]++
 		msg := fmt.Sprintf(
@@ -88,15 +55,8 @@ func MaterializeEdits(ctx context.Context, result *Result, readFile FileReader, 
 			continue
 		}
 		if content == "" {
-			// readFile returns "" for a path that doesn't exist (see
-			// FileReader's doc comment) — an edit target must already
-			// exist, that's the whole premise of a find/replace. The
-			// correct escape is "create", not "update" (the applyErr
-			// fallback below), but a model that keeps proposing "edit" for
-			// a nonexistent path still needs a hard stop after
-			// maxEditMaterializationFailures like every other
-			// materialization failure — the fix being different from
-			// applyErr's doesn't mean it should retry forever.
+			// An edit target must already exist. Still needs a hard stop after
+			// maxEditMaterializationFailures like any other materialization failure.
 			failureCounts[f.Path]++
 			slog.Warn("ai: edit materialization failed", "path", f.Path, "reason", "file_not_found", "failure_count", failureCounts[f.Path])
 			msg := fmt.Sprintf(
@@ -118,12 +78,16 @@ func MaterializeEdits(ctx context.Context, result *Result, readFile FileReader, 
 					`%s: edits failed to apply %d times — resubmit this file with action "update" and its complete `+
 						`corrected content instead of another edit attempt`, f.Path, failureCounts[f.Path]))
 			} else {
-				problems = append(problems, fmt.Sprintf("%s: %s", f.Path, applyErr))
+				// Give the model the content it needs to self-correct without a tool call —
+				// "try again" with no content just drives it to re-read/re-grep instead.
+				problems = append(problems, noMatchProblem(f.Path, content, f.Edits, applyErr))
 			}
 			continue
 		}
 
 		slog.Info("ai: edit materialization succeeded", "path", f.Path, "tier", tier.String())
+		// Captured before Action is overwritten; recapAssistantTurn needs the original value.
+		f.OriginalAction = "edit"
 		f.Action = "update"
 		f.Content = newContent
 		f.Edits = nil
@@ -137,13 +101,66 @@ func MaterializeEdits(ctx context.Context, result *Result, readFile FileReader, 
 	for _, p := range problems {
 		fmt.Fprintf(&b, "- %s\n", p)
 	}
+	// This is Generate's own retry loop for a materialization failure, distinct from
+	// repairPrompt's themecheck-rejection retry. Said once here, not once per problem.
+	b.WriteString("\nDo not explore, read, or touch anything else — everything needed to fix the edit(s) above " +
+		"is already here, or in your own last proposal already in this conversation. Fix them and call " +
+		"propose_changes again.")
 	return false, b.String()
 }
 
-// matchTier identifies which matching strategy resolved an edit, in
-// increasing order of tolerance — see findMatch. Logged (never old_string
-// or file content itself) so a real-world materialization failure says
-// which tier the file needed, or that none worked.
+// noMatchContentCap bounds how much of a file's content is inlined into a no_match retry
+// message — covers most theme files whole, while keeping several simultaneous failures bounded.
+const noMatchContentCap = 8_000
+
+// noMatchWindowBytes is the near-miss window size when a file exceeds noMatchContentCap,
+// half before/after the anchor — enough to show surrounding markup, cheap even at scale.
+const noMatchWindowBytes = 4_000
+
+// noMatchProblem builds the retry message for one no_match failure: full content if it fits,
+func noMatchProblem(path, content string, edits []Edit, applyErr error) string {
+	base := fmt.Sprintf("%s: %s", path, applyErr)
+	if len(content) <= noMatchContentCap {
+		return fmt.Sprintf("%s\n\n%s's real current content, to find the exact text to match:\n\n%s", base, path, content)
+	}
+	if window, ok := nearMissWindow(content, edits, noMatchWindowBytes); ok {
+		return fmt.Sprintf(
+			"%s\n\n%s is %d bytes, too large to inline in full — here is the content around where this text "+
+				"looks closest:\n\n%s", base, path, len(content), window)
+	}
+	return fmt.Sprintf(
+		"%s\n\n%s is %d bytes, too large to inline, and no close match was found nearby — re-read this one "+
+			"file specifically (not the rest of the theme) before trying again.", base, path, len(content))
+}
+
+// nearMissWindow locates a plausible anchor cheaply via plain substring search for each
+// edit's first line, returning up to windowBytes centered on the first match found.
+func nearMissWindow(content string, edits []Edit, windowBytes int) (window string, found bool) {
+	for _, e := range edits {
+		anchor := firstLine(e.OldString)
+		if strings.TrimSpace(anchor) == "" {
+			continue
+		}
+		idx := strings.Index(content, anchor)
+		if idx < 0 {
+			continue
+		}
+		half := windowBytes / 2
+		start := idx - half
+		if start < 0 {
+			start = 0
+		}
+		end := idx + len(anchor) + half
+		if end > len(content) {
+			end = len(content)
+		}
+		return content[start:end], true
+	}
+	return "", false
+}
+
+// matchTier identifies which matching strategy resolved an edit, increasing tolerance order.
+// Logged (never old_string or file content) so a failure says which tier the file needed.
 type matchTier int
 
 const (
@@ -166,15 +183,7 @@ func (t matchTier) String() string {
 	}
 }
 
-// applyEdits applies edits to content in order, each edit's old_string
-// located via findMatch against content AS IT STANDS after every prior
-// edit in the list has already been applied — so two edits that overlap or
-// target the same text simply have the second one fail its own uniqueness
-// check naturally, with no special handling, and the tiers are always run
-// against genuinely current content rather than offsets pre-computed
-// against the original. worstTier is the loosest tier any single edit in
-// the list needed (tierExact if every one matched byte-for-byte) — the
-// summary MaterializeEdits logs for the whole file.
+// applyEdits applies edits in order, each old_string located against content AS IT STANDS
 func applyEdits(content string, edits []Edit) (result string, worstTier matchTier, matchCount int, err error) {
 	worstTier = tierExact
 	for i, e := range edits {
@@ -188,14 +197,8 @@ func applyEdits(content string, edits []Edit) (result string, worstTier matchTie
 
 		replacement := e.NewString
 		if tier != tierExact && replacement != "" {
-			// Tier 1 (exact) means old_string was already byte-identical to
-			// the file, including its indentation — new_string, written to
-			// align with what the model read, needs no adjustment. Tiers 2
-			// and 3 matched despite whitespace drift, so the matched
-			// region's real indentation (which the replacement is about to
-			// discard, since the whole region including its own leading
-			// whitespace is being replaced) has to be reapplied — see
-			// reindentToMatch.
+			// Tiers 2/3 matched despite whitespace drift, so the matched region's real
+			// indentation (which the replacement is about to discard) must be reapplied.
 			replacement = reindentToMatch(content[start:end], replacement)
 		}
 		content = content[:start] + replacement + content[end:]
@@ -203,31 +206,7 @@ func applyEdits(content string, edits []Edit) (result string, worstTier matchTie
 	return content, worstTier, 0, nil
 }
 
-// findMatch locates old_string in content, trying tiers in order and
-// stopping at the first that resolves to exactly one location:
-//
-//  1. Exact — byte-for-byte substring match. Unchanged from before tiered
-//     matching existed; this is the fast path and must stay first.
-//  2. Per-line trimmed — old_string's lines against a same-length window of
-//     content's real lines, each side stripped of leading/trailing
-//     whitespace before comparing.
-//  3. Whitespace-collapsed — as tier 2, but internal runs of spaces/tabs are
-//     also collapsed to one space on both sides first. Catches
-//     `class="a  b"` vs `class="a b"` and similar reflow.
-//
-// A tier producing zero matches falls through to the next; a tier
-// producing more than one is an immediate failure — never picked, never
-// falls through to a looser tier (a looser tier finding a unique answer
-// where a stricter one found two would be picking blind). matchCount is 0
-// or the actual (>1) count on failure, for structured logging — callers
-// must never parse it back out of err's text.
-//
-// start/end are always byte offsets into the ORIGINAL, unmodified content:
-// tiers 2/3 compare whitespace-normalized copies of each candidate line,
-// but the returned range is read from the real, unnormalized line
-// boundaries (see splitContentLines) — never from the normalized strings,
-// which have a different length whenever anything actually needed
-// normalizing.
+// Tries tiers: exact, per-line trimmed, whitespace-collapsed. Zero matches falls through; >1 is failure (never blind pick). Offsets are byte positions in original.
 func findMatch(content, oldString string) (start, end int, tier matchTier, matchCount int, err error) {
 	switch count := strings.Count(content, oldString); count {
 	case 1:
@@ -239,21 +218,14 @@ func findMatch(content, oldString string) (start, end int, tier matchTier, match
 		return 0, 0, tierNone, count, fmt.Errorf("old_string matched %d times, must match exactly once — add more surrounding context to make it unique", count)
 	}
 
-	// A whitespace-only old_string would trivially "match" every blank line
-	// under trimmed comparison — not a real anchor. Only exact matching
-	// (already tried above) applies to it.
+	// A whitespace-only old_string would trivially "match" every blank line under trimmed
+	// comparison; only exact matching (already tried above) applies to it.
 	if strings.TrimSpace(oldString) == "" {
 		return 0, 0, tierNone, 0, fmt.Errorf("old_string not found (0 matches)")
 	}
 
-	// A trailing "\n" in old_string terminates its last real line rather
-	// than declaring an extra blank line after it — strings.Split would
-	// otherwise produce a synthetic empty final element that forces a
-	// nonexistent blank line into the match window. Trimming it once here
-	// (not repeatedly — a second, intentional trailing blank line stays
-	// represented by its own empty element) is the whole fix; the
-	// newline's presence in the file is preserved separately, by end never
-	// extending past the matched lines' own text (see below).
+	// A trailing "\n" in old_string terminates its last line rather than declaring an extra
+	// blank line — strings.Split would otherwise produce a synthetic empty final element.
 	oldLines := strings.Split(strings.TrimSuffix(oldString, "\n"), "\n")
 	contentLines := splitContentLines(content)
 
@@ -270,13 +242,8 @@ func findMatch(content, oldString string) (start, end int, tier matchTier, match
 			continue
 		case 1:
 			i := matches[0]
-			// end is the last matched line's own text end — BEFORE its
-			// trailing '\n', not after. content[end:] then still starts
-			// with that '\n' (or whatever followed), so the line ending
-			// between the matched region and the rest of the file is
-			// preserved untouched regardless of how old_string itself was
-			// terminated — simpler and just as correct as tracking
-			// old_string's own trailing-newline intent separately.
+			// end is BEFORE the last matched line's trailing '\n', so the line ending
+			// between the matched region and the rest of the file stays untouched.
 			return contentLines[i].start, contentLines[i+len(oldLines)-1].end, tier.id, 1, nil
 		default:
 			return 0, 0, tierNone, len(matches), fmt.Errorf("old_string matched %d locations, must match exactly one — add more surrounding context to make it unique", len(matches))
@@ -286,32 +253,21 @@ func findMatch(content, oldString string) (start, end int, tier matchTier, match
 	return 0, 0, tierNone, 0, fmt.Errorf("old_string not found (0 matches)")
 }
 
-// whitespaceRunRe matches a run of spaces/tabs — never newlines, which
-// splitContentLines/strings.Split already use as the line boundary.
+// whitespaceRunRe matches a run of spaces/tabs, never newlines (already the line boundary).
 var whitespaceRunRe = regexp.MustCompile(`[ \t]+`)
 
 func collapseTrimmed(s string) string {
 	return whitespaceRunRe.ReplaceAllString(strings.TrimSpace(s), " ")
 }
 
-// lineOffset is one line of some content string, with byte offsets back
-// into that ORIGINAL string — [start, end) selects exactly text, which
-// never includes the line's own '\n' AND never includes a trailing '\r'
-// either (a CRLF-terminated line's '\r' belongs to the line ending, not the
-// line's content — see newLineOffset). That matters for more than
-// comparison: end is also the splice boundary a matched multi-line region
-// is cut at, and a '\r' left inside that boundary would get silently eaten
-// by the replacement instead of surviving as part of the line ending that
-// follows it untouched.
+// lineOffset is one line with byte offsets back into the ORIGINAL content string. [start, end)
 type lineOffset struct {
 	text       string
 	start, end int
 }
 
-// newLineOffset builds one lineOffset for content[start:end), first
-// trimming a trailing '\r' from the boundary itself (not just from text)
-// if content uses CRLF at this line — see lineOffset's own doc comment for
-// why the boundary, not just the text, has to exclude it.
+// newLineOffset builds one lineOffset for content[start:end), trimming a trailing '\r'
+// from the boundary itself (not just the text) if content uses CRLF at this line.
 func newLineOffset(content string, start, end int) lineOffset {
 	if end > start && content[end-1] == '\r' {
 		end--
@@ -319,11 +275,8 @@ func newLineOffset(content string, start, end int) lineOffset {
 	return lineOffset{text: content[start:end], start: start, end: end}
 }
 
-// splitContentLines splits content into lines with byte offsets, without
-// copying or modifying content itself — every offset returned is valid to
-// slice content directly. Content with no trailing newline still yields a
-// final line for whatever follows the last '\n' (or the whole string, if
-// there's no '\n' at all).
+// splitContentLines splits content into lines with byte offsets valid to slice content
+// directly. Content with no trailing newline still yields a final line.
 func splitContentLines(content string) []lineOffset {
 	var lines []lineOffset
 	start := 0
@@ -337,9 +290,8 @@ func splitContentLines(content string) []lineOffset {
 	return lines
 }
 
-// findLineWindows returns the starting content-line index of every place a
-// same-length, contiguous window of contentLines matches oldLines under
-// normal (applied to both sides independently, never compared cross-tier).
+// findLineWindows returns the starting index of every contiguous window of contentLines
+// matching oldLines under normal, applied to both sides independently.
 func findLineWindows(contentLines []lineOffset, oldLines []string, normal func(string) string) []int {
 	normOld := make([]string, len(oldLines))
 	for i, l := range oldLines {
@@ -362,50 +314,11 @@ func findLineWindows(contentLines []lineOffset, oldLines []string, normal func(s
 	return matches
 }
 
-// reindentTabWidth is the fixed column width a '\t' counts as when
-// measuring indentation for reindentToMatch's delta — not an attempt to
-// match any real editor's tab-stop rendering, just a consistent,
-// deterministic width to compute a signed delta from. Theme files are
-// near-universally space-indented in practice; this only matters at all on
-// the rare file that mixes tabs in.
+// reindentTabWidth is the fixed column width a '\t' counts as when measuring indentation for
+// reindentToMatch's delta — a consistent width to compute from, not real tab-stop rendering.
 const reindentTabWidth = 4
 
-// reindentToMatch re-indents inserted (new_string) to sit at matched's
-// (the real file region old_string resolved to, tier 2/3 only) leading
-// indentation. The replacement text entirely replaces matched, including
-// matched's own leading whitespace — so unless inserted supplies the right
-// indentation itself, the file loses it at the edit point.
-//
-// Rule applied: a signed DELTA, not a prefix strip. delta = target's
-// leading-whitespace width minus inserted's own first line's
-// leading-whitespace width (widths measured with reindentTabWidth). That
-// same delta is added to every line's own existing indentation width,
-// clamped at zero. A line indented deeper than the first keeps its extra
-// depth on top of the shift; a line indented SHALLOWER than the first — a
-// closing-tag cascade dedenting back out through several nested elements,
-// completely normal in Liquid/HTML — keeps its own smaller depth too,
-// rather than being flattened to one uniform indentation (a real bug an
-// earlier strip-and-prepend version of this rule had: any line that didn't
-// start with the first line's exact indentation prefix fell back to
-// discarding its indentation entirely). A genuinely blank line is left
-// blank, never given trailing whitespace it didn't have.
-//
-// Mixed tabs/spaces: every output line's new indentation is always plain
-// spaces, one per column of the computed width — never the target's or the
-// line's own original whitespace character. Re-indenting already rebuilds
-// the indent from scratch rather than shifting existing characters in
-// place, so there is no original character being preserved either way;
-// the choice is purely between "always spaces" and "whatever the target
-// happened to use". A tab counts as reindentTabWidth columns (see
-// indentWidth) for the delta ARITHMETIC, but emitting that many literal
-// tab characters back out — the bug this comment used to describe — turns
-// one tab of indentation into reindentTabWidth tabs, a 4x blowup at zero
-// delta whenever the target is tab-indented. Spaces have no such
-// character-vs-column ambiguity: a computed width of N always means
-// exactly N space characters. A few space-indented lines inside an
-// otherwise tab-indented file are cosmetically inconsistent but render
-// identically; that's a strictly smaller problem than visibly mangled
-// indentation.
+// reindentToMatch re-indents inserted (new_string) to sit at matched's leading indentation
 func reindentToMatch(matched, inserted string) string {
 	targetWidth := indentWidth(leadingWhitespace(firstLine(matched)))
 	insertedLines := strings.Split(inserted, "\n")
@@ -426,9 +339,7 @@ func reindentToMatch(matched, inserted string) string {
 	return strings.Join(insertedLines, "\n")
 }
 
-// indentWidth measures s — expected to already be pure leading whitespace,
-// via leadingWhitespace — in columns: a tab counts as reindentTabWidth,
-// everything else (a space) counts as 1.
+// indentWidth measures s (pure leading whitespace, via leadingWhitespace) in columns.
 func indentWidth(s string) int {
 	width := 0
 	for i := 0; i < len(s); i++ {
@@ -452,11 +363,8 @@ func firstLine(s string) string {
 	return s
 }
 
-// duplicateFilePaths returns every path that appears more than once in
-// files, sorted for a deterministic message — proposing the same path twice
-// is ambiguous regardless of which actions are involved (edit+update on the
-// same path is the case that motivated this, but two "edit" entries for one
-// path, or two "update" entries, are exactly as undefined).
+// duplicateFilePaths returns every path appearing more than once in files, sorted for a
+// deterministic message — proposing the same path twice is always ambiguous.
 func duplicateFilePaths(files []GeneratedFile) []string {
 	seen := make(map[string]int, len(files))
 	for _, f := range files {

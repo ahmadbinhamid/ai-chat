@@ -33,7 +33,7 @@ test:
 lint:
 	golangci-lint run ./...
 
-# Run the fixed eval task list against the real pipeline (Claude + flowpos-backend + DB).
+# Run the fixed eval task list against the real pipeline (DeepSeek + flowpos-backend + DB).
 # Requires EVAL_BEARER_TOKEN and EVAL_TENANT_ID (a real, already logged-in test tenant
 # user) — see cmd/eval/main.go's package doc comment.
 eval:

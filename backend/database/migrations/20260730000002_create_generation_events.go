@@ -14,18 +14,7 @@ func init() {
 	})
 }
 
-// generation_events is the durable progress log a WebSocket client replays
-// on (re)connect (phase 3b/3c) — seq is monotonic per chat_id (continued
-// across every generation that chat ever runs, not reset per generation;
-// see themebuild.newEventEmitter), assigned by the single goroutine running
-// that chat's current generation, so no cross-process coordination is
-// needed to keep it gap-free (generations for one chat never run
-// concurrently — see ErrGenerationInProgress). Since seq is unique per
-// chat_id, it's necessarily also unique per (generation_id, seq), so the
-// UNIQUE KEY below still holds even though it predates this. chat_id is
-// denormalized from generations so a chat's retention trim (see
-// Repository.AppendGenerationEvent — "keep the last 200 per chat") doesn't
-// need a join.
+// generation_events is the durable event log a WebSocket client replays on reconnect.
 func Up_20260730000002(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS generation_events (

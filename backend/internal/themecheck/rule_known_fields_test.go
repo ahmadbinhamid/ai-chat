@@ -99,7 +99,6 @@ func TestCheckKnownFields_FilterCategoriesIsItselfAnArray(t *testing.T) {
 func TestCheckKnownFields_UnknownLoopSourceSkipsAliasing(t *testing.T) {
 	// The loop source's root is unknown, so it's skipped (no finding on the
 	// loop itself), and the loop var never becomes a known alias either —
-	// any field access on it is likewise skipped as an unknown root.
 	content := `{% for x in something_unknown %}{{ x.whatever }}{% endfor %}`
 	p := Proposal{Files: []ProposedFile{{Path: "components/widget.liquid", Content: content}}}
 	if got := checkKnownFields(p, Snapshot{}); len(got) != 0 {
@@ -110,7 +109,6 @@ func TestCheckKnownFields_UnknownLoopSourceSkipsAliasing(t *testing.T) {
 func TestCheckKnownFields_ReusedLoopVarAcrossSequentialLoops_MenuFirst(t *testing.T) {
 	// Two sequential (not nested) loops reusing the short name "item" for
 	// different sources — each must resolve against its own binding, not
-	// whichever one happened to be seen last across the whole file.
 	content := `{% for item in menu.items %}{{ item.active }}{% endfor %}
 {% for item in products.items %}{{ item.price_formatted }}{% endfor %}`
 	p := Proposal{Files: []ProposedFile{{Path: "components/header.liquid", Content: content}}}
@@ -131,7 +129,6 @@ func TestCheckKnownFields_ReusedLoopVarAcrossSequentialLoops_ProductsFirst(t *te
 func TestCheckKnownFields_LoopVarOutOfScopeAfterEndfor(t *testing.T) {
 	// After the loop closes, "item" is no longer a known alias — a
 	// reference to it outside the loop is an unknown root and must be
-	// skipped, not resolved against the stale binding.
 	content := `{% for item in products.items %}{{ item.name }}{% endfor %}{{ item.name }}`
 	p := Proposal{Files: []ProposedFile{{Path: "pages/home.liquid", Content: content}}}
 	if got := checkKnownFields(p, Snapshot{}); len(got) != 0 {
