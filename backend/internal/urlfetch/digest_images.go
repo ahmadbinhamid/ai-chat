@@ -18,10 +18,8 @@ type imageInfo struct {
 	stem string
 }
 
-// filenameStem reduces an <img> src to a short filename-derived hint — the
-// full URL is mostly noise (a CDN host, a cache-busting query string, a
-// content hash), but the base filename itself ("hero-banner") is often a
-// real, human-chosen clue about the image's subject.
+// filenameStem reduces an <img> src to its base filename ("hero-banner") —
+// often a real clue about the image's subject, unlike the rest of the URL.
 func filenameStem(src string) string {
 	if src == "" {
 		return ""

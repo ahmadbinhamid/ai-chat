@@ -2,10 +2,7 @@ package ratelimit
 
 import "testing"
 
-// TestPerTenantLimiter_BurstThenDeny covers the doc comment's own claim:
-// burst equals ratePerMin, so a tenant can spend their whole minute's
-// allowance immediately, and the very next request past that must be
-// denied rather than silently allowed through.
+// TestPerTenantLimiter_BurstThenDeny checks burst equals ratePerMin and the next request over it is denied.
 func TestPerTenantLimiter_BurstThenDeny(t *testing.T) {
 	l := NewPerTenantLimiter(5)
 
@@ -20,9 +17,7 @@ func TestPerTenantLimiter_BurstThenDeny(t *testing.T) {
 	}
 }
 
-// TestPerTenantLimiter_PerTenantIsolation covers the "per-tenant" half of
-// PerTenantLimiter's name: one tenant exhausting their own allowance must
-// never affect a different tenant's independent bucket.
+// TestPerTenantLimiter_PerTenantIsolation checks one tenant's exhausted bucket doesn't affect another's.
 func TestPerTenantLimiter_PerTenantIsolation(t *testing.T) {
 	l := NewPerTenantLimiter(1)
 
@@ -38,11 +33,24 @@ func TestPerTenantLimiter_PerTenantIsolation(t *testing.T) {
 	}
 }
 
-// TestNewPerTenantLimiter_ClampsNonPositiveRate covers the constructor's
-// own guard: a caller passing 0 or a negative GENERATION_RATE_LIMIT_PER_MINUTE
-// must still get a usable (if maximally strict) limiter, not one that
-// permits everything (rate.Limit(0) would otherwise mean "unlimited" is
-// never reached, not "always allow") or panics.
+// TestPerTenantLimiter_BoundedByMaxTenants checks the map never grows past ratelimitMaxTenants.
+func TestPerTenantLimiter_BoundedByMaxTenants(t *testing.T) {
+	l := NewPerTenantLimiter(5)
+
+	for i := range uint64(ratelimitMaxTenants + 100) {
+		l.Allow(i)
+		if len(l.limiters) > ratelimitMaxTenants {
+			t.Fatalf("limiters map grew to %d entries after tenant %d, want at most %d", len(l.limiters), i, ratelimitMaxTenants)
+		}
+	}
+
+	if len(l.limiters) != ratelimitMaxTenants {
+		t.Fatalf("expected the map to sit exactly at its cap of %d once more than that many tenants have been seen, got %d", ratelimitMaxTenants, len(l.limiters))
+	}
+}
+
+// TestNewPerTenantLimiter_ClampsNonPositiveRate checks a 0/negative rate clamps to a
+// usable strict limiter instead of meaning "unlimited" or panicking.
 func TestNewPerTenantLimiter_ClampsNonPositiveRate(t *testing.T) {
 	l := NewPerTenantLimiter(0)
 

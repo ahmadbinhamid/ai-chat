@@ -10,31 +10,15 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// writtenFile is one proposed or layout file staged into the draft (see
-// planToStaged) or, for Service.ApplyDraft, actually written to FlowPOS
-// (see commitWritePlan) — paired with whatever content it replaced so the
-// audit row persisted afterward (see persistFileRecords) can still record
-// what changed, even after the real "before" state is gone. Despite the
-// name (kept from when this only ever meant "already committed to disk" —
-// see doGenerate's staging path, which never calls commitWritePlan at all
-// now), the struct itself is just "here's what to audit," write or no write.
+// One file staged/written, paired with prior content for audit row.
 type writtenFile struct {
 	generated ai.GeneratedFile
 	previous  *string
-	// kind/pageMeta are what the 20260813000001 migration's two new
-	// columns exist for — see GeneratedFileKind and persistFileRecords.
-	kind     GeneratedFileKind
-	pageMeta *themefs.PageMeta
+	kind      GeneratedFileKind
+	pageMeta  *themefs.PageMeta
 }
 
-// planFile is one file a writePlan will commit — either a proposed file
-// (action/content straight from the model) or the recomputed content of a
-// shared file (a layout file) after folding in this turn's splice. previous
-// is only meaningful for proposed files (see writtenFile) and is nil
-// otherwise. pageMeta is set only when this file is the page.liquid file
-// PageRegistryEntry describes — flowpos-backend's own theme-file API upserts
-// pages.json itself from these fields (see themefs.Store.WriteFile), so this
-// service no longer computes pages.json content directly.
+// One file writePlan will commit; pageMeta set for page.liquid (backend upserts pages.json).
 type planFile struct {
 	path     string
 	action   FileAction
@@ -43,18 +27,13 @@ type planFile struct {
 	pageMeta *themefs.PageMeta
 }
 
-// writePlan is everything one turn needs to commit to the real theme,
-// computed entirely in memory before anything is written — see
-// buildWritePlan/commitWritePlan.
+// Everything one turn needs to commit, computed in-memory before writing.
 type writePlan struct {
 	files       []planFile
 	layoutStart *planFile
 	layoutEnd   *planFile
 }
 
-// paths lists every path this plan will write, in the same order it's
-// computed — used only for EventTypeStaged's narration payload; the write
-// itself (commitWritePlan) doesn't need this, it walks the struct directly.
 func (p writePlan) paths() []string {
 	paths := make([]string, 0, len(p.files)+2)
 	for _, f := range p.files {
@@ -68,36 +47,18 @@ func (p writePlan) paths() []string {
 	return paths
 }
 
-// buildWritePlan computes every file this turn would write — proposed
-// files verbatim (with page metadata attached to the one matching
-// PageRegistryEntry, if any), plus the layout-file splices — using only
-// reads, never a write. Nothing is committed until commitWritePlan runs, so
-// a failure here (a layout file missing its insertion marker, a page
-// registry entry with no matching file) leaves the real theme completely
-// untouched instead of partially, silently modified.
+// Reads-only computation; failure leaves theme untouched (no partial silent modifications).
 func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, result *ai.Result) (writePlan, error) {
 	var plan writePlan
 
-	// Reads run concurrently (errgroup, capped at 8 in flight) rather than
-	// one HTTP round trip at a time — this whole call happens inside
-	// themeLocks (see doGenerate), so a turn proposing a few dozen file
-	// edits was serializing every OTHER chat's staging behind that many
-	// sequential round trips to flowpos-backend. files is pre-sized and
-	// written by index rather than appended, so the plan's file order
-	// stays exactly result.Files' order regardless of which read finishes
-	// first — order matters below (deterministic commitWritePlan writes).
+	// Concurrent reads (inside themeLocks) to avoid serializing other chats; order by index.
 	if len(result.Files) > 0 {
 		files := make([]planFile, len(result.Files))
 		g, gctx := errgroup.WithContext(ctx)
 		g.SetLimit(loadThemeFilesConcurrency)
 		for i, f := range result.Files {
 			g.Go(func() error {
-				// store here is the draft overlay (see doGenerate) —
-				// "previous" must be the draft's own prior content (what
-				// an earlier turn in THIS chat already staged), not the
-				// last-applied theme, or revert-within-a-draft (see
-				// RevertToMessage's updated doc comment) would restore
-				// the wrong "before" state.
+				// Previous must be drafted content, not last-applied, or revert restores wrong state.
 				previous, err := store.ReadFile(gctx, storeAuth, f.Path)
 				if err != nil {
 					return fmt.Errorf("read %q: %w", f.Path, err)
@@ -123,10 +84,7 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 
 	if result.PageRegistryEntry != nil {
 		entry := result.PageRegistryEntry
-		// entry.Path is the route prefix ("/pages" or "/pages/auth"), never a
-		// file path — the proposed file's actual theme-relative path has to be
-		// derived from it the same way §5 requires: page == the .liquid file's
-		// basename.
+		// entry.Path is a route prefix, never a file path; derive the actual path from page basename.
 		wantPath := "pages/" + entry.Page + ".liquid"
 		if entry.Path == "/pages/auth" {
 			wantPath = "pages/auth/" + entry.Page + ".liquid"
@@ -156,19 +114,7 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 		}
 	}
 
-	// layout-start.liquid/layout-end.liquid are directly editable now (a
-	// files[] entry for either is no longer rejected — see proposal.go's
-	// own doc comment on why that check was removed). A turn that directly
-	// edits one of them has, by doing so, taken full ownership of that
-	// file's content for this turn: skip computing a splice for the same
-	// path here rather than layering it on top. Two reasons, not one — the
-	// documented production crash (a duplicate chat_generated_files audit
-	// row for the same (message_id, file_path), see planToStaged) is the
-	// smaller of them; the real one is that commitWritePlan writes
-	// plan.files first and a layout splice after, against content read
-	// BEFORE the direct edit landed — applying it anyway would silently
-	// overwrite the model's own direct edit with stale content plus the
-	// spliced tag, not just double an audit row.
+	// A turn that directly edits layout-start/end.liquid has taken full ownership of its content;
 	if len(result.LayoutLinksToAdd) > 0 && !hasDirectEdit(plan.files, pathLayoutStart) {
 		current, err := store.ReadFile(ctx, storeAuth, pathLayoutStart)
 		if err != nil {
@@ -214,9 +160,7 @@ func (s *Service) buildWritePlan(ctx context.Context, store themefs.ThemeStore, 
 	return plan, nil
 }
 
-// hasDirectEdit reports whether files already has an entry for path —
-// checked before computing a layout splice for that same path (see
-// buildWritePlan's own doc comment above).
+// hasDirectEdit reports whether files already has an entry for path.
 func hasDirectEdit(files []planFile, path string) bool {
 	for _, f := range files {
 		if f.path == path {
@@ -226,11 +170,8 @@ func hasDirectEdit(files []planFile, path string) bool {
 	return false
 }
 
-// commitWritePlan writes everything in plan through flowpos-backend's own
-// theme-file API (each individual write already atomic on its side — see
-// themefs.Store.WriteFile). Only the proposed files (plan.files) get an
-// audit trail (see persistFileRecords) — the layout files are shared,
-// structurally-spliced config, not "generated files" in their own right.
+// commitWritePlan writes everything in plan. Only plan.files gets an audit trail; layout files
+// are shared, structurally-spliced config, not "generated files" of their own.
 func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.RequestAuth, plan writePlan) ([]writtenFile, error) {
 	written := make([]writtenFile, 0, len(plan.files))
 	for _, f := range plan.files {
@@ -253,16 +194,8 @@ func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.Request
 	return written, nil
 }
 
-// planToStaged converts a writePlan into the same writtenFile shape
-// commitWritePlan's callers already know how to audit — used by
-// doGenerate's staging path (no write, see its own comment) instead of
-// commitWritePlan, which actually writes and is now only ever called by
-// Service.ApplyDraft. Unlike commitWritePlan, this DOES include
-// plan.layoutStart/layoutEnd (tagged GeneratedFileKindLayout) — see the
-// 20260813000001 migration's doc comment for why an unaudited layout
-// splice, harmless when writes were immediate, is a silent data-loss bug
-// the moment the write is deferred: nothing else remembers the splice
-// happened until Apply runs.
+// planToStaged converts a writePlan into writtenFile shape for staging, without writing. Unlike
+// commitWritePlan it also includes the layout splices — unaudited, they'd be lost until Apply.
 func planToStaged(plan writePlan) []writtenFile {
 	staged := make([]writtenFile, 0, len(plan.files)+2)
 	for _, f := range plan.files {

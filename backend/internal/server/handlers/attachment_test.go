@@ -14,12 +14,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// TestAttachmentHandler_ServesBytesForOwnAttachment is the round trip GET
-// /chat's now-metadata-only response depends on: attach an image via the
-// real write path, then fetch it back through the byte-serving route and
-// confirm the exact raw bytes, media type, and a working ETag/304 come
-// back — mirroring TestAssetHandler_SetsETagAndServesConditionalGet's own
-// shape for the equivalent theme-asset route.
+// TestAttachmentHandler_ServesBytesForOwnAttachment attaches an image via the real write
+// path and confirms the byte-serving route returns the exact bytes, media type, and ETag/304.
 func TestAttachmentHandler_ServesBytesForOwnAttachment(t *testing.T) {
 	conn := openStreamTestDB(t)
 	chatRepo := chat.NewRepository(conn)
@@ -77,13 +73,8 @@ func TestAttachmentHandler_ServesBytesForOwnAttachment(t *testing.T) {
 	}
 }
 
-// TestAttachmentHandler_SetsPrivateCacheControl proves this route marks its
-// response private — the URL carries no tenant identifier, so without this
-// header an intermediary (CDN, corporate proxy) could treat one tenant's
-// attachment bytes as shared-cacheable and serve them to a different
-// tenant requesting the same path. A separate test from
-// TestAttachmentHandler_ServesBytesForOwnAttachment on purpose (that one
-// already covers ETag/304 — this is specifically the header value itself).
+// TestAttachmentHandler_SetsPrivateCacheControl proves the response is marked private, since
+// the URL carries no tenant id and an intermediary could otherwise share-cache it across tenants.
 func TestAttachmentHandler_SetsPrivateCacheControl(t *testing.T) {
 	conn := openStreamTestDB(t)
 	chatRepo := chat.NewRepository(conn)
@@ -122,10 +113,8 @@ func TestAttachmentHandler_SetsPrivateCacheControl(t *testing.T) {
 	}
 }
 
-// TestAttachmentHandler_OtherTenantGets404 proves the ownership chain
-// (tenant -> chat -> message, same as RevertToMessage) actually blocks
-// cross-tenant access to an attachment id — not merely "an attachment id
-// that doesn't exist," but one that's real and belongs to someone else.
+// TestAttachmentHandler_OtherTenantGets404 proves the ownership chain blocks cross-tenant
+// access to an attachment id that's real and belongs to someone else.
 func TestAttachmentHandler_OtherTenantGets404(t *testing.T) {
 	conn := openStreamTestDB(t)
 	chatRepo := chat.NewRepository(conn)

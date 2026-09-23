@@ -8,19 +8,11 @@ import (
 	"ai-chat/internal/themecheck"
 )
 
-// fakeGenerator is a generator that never touches the real Claude API —
-// checkAndRepair's retry loop is the one piece of this wiring that calls
-// Generate more than once per turn, so it's the one piece that actually
-// needs a fake rather than an httptest server (there's no HTTP boundary to
-// intercept; ai.Generator wraps the Anthropic SDK client directly).
+// Fake generator; multi-generate calls require fake, not httptest (SDK wraps client directly).
 type fakeGenerator struct {
-	calls   int
-	results []*ai.Result // returned in order; the last one repeats once exhausted
-	// visionSupported backs SupportsVision — zero-value false, matching
-	// every existing test's expectation (none of them attach an image, so
-	// none of them care); set true only in a test that specifically needs
-	// Generate's own len(in.Images) > 0 && !SupportsVision() gate to pass.
-	visionSupported bool
+	calls           int
+	results         []*ai.Result // returned in order; last repeats once exhausted
+	visionSupported bool         // set true only for vision-specific tests
 }
 
 func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ []ai.Image, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
@@ -34,9 +26,7 @@ func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Tu
 
 func (f *fakeGenerator) SupportsVision() bool { return f.visionSupported }
 
-// Summarize satisfies the generator interface's history-summarization hook
-// (see history_summary.go) — this fake never needs it for real, since
-// these tests' history never exceeds summarizeHistoryThreshold turns.
+// Satisfies interface; tests never reach summarizeHistoryThreshold.
 func (f *fakeGenerator) Summarize(_ context.Context, turns []ai.Turn) (string, error) {
 	return "", nil
 }
@@ -113,9 +103,7 @@ func TestCheckAndRepair_RetriesOnceThenSucceeds(t *testing.T) {
 	if got.Summary != "good" {
 		t.Fatalf("expected the retried (good) result to be returned, got %+v", got)
 	}
-	// Token usage from the rejected first attempt (100/50) must still be
-	// folded into the accepted result's totals — otherwise the first
-	// attempt's cost silently vanishes from what gets billed/recorded.
+	// Token usage from first attempt must be folded into totals.
 	if got.InputTokens != 120 || got.OutputTokens != 60 {
 		t.Errorf("expected accumulated tokens 120/60, got %d/%d", got.InputTokens, got.OutputTokens)
 	}
@@ -135,12 +123,7 @@ func TestCheckAndRepair_ExhaustsRetriesAndFails(t *testing.T) {
 	}
 }
 
-// invalidResult mimics a garbled/corrupted repair reply — e.g. the model's
-// proposed path field coming back mangled — which validateProposal rejects
-// outright (see service.go's checkAndRepair: a validateProposal failure
-// during a retry must not immediately kill the whole generation, it should
-// consume one of the same maxThemeCheckRetries slots as a themecheck
-// rejection does).
+// Garbled repair reply; rejection consumes retry slot, doesn't kill generation.
 func invalidResult() *ai.Result {
 	return &ai.Result{
 		Summary:      "garbled",
@@ -153,8 +136,6 @@ func invalidResult() *ai.Result {
 func TestCheckAndRepair_RetriesPastAnInvalidRepairReply(t *testing.T) {
 	// First repair attempt comes back malformed (rejected by validateProposal,
 	// not themecheck); the second repair attempt is clean. With
-	// maxThemeCheckRetries == 2, this must still succeed — the malformed
-	// reply consumes a retry slot rather than hard-failing the generation.
 	fg := &fakeGenerator{results: []*ai.Result{invalidResult(), goodResult()}}
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
@@ -198,7 +179,6 @@ func TestCheckAndRepair_WarningsPassThroughOnAccept(t *testing.T) {
 
 	// Use a snapshot missing the theme-token var fallback to produce a
 	// harmless warning-severity finding instead: add a CSS file with a
-	// component-local custom property baking in a literal hex color.
 	result.Files = append(result.Files, ai.GeneratedFile{
 		Path: "components/css/testimonials.css", Action: "create", Content: ".x { --testimonials-accent: #ff6600; }",
 	})
@@ -221,17 +201,10 @@ func TestCheckAndRepair_WarningsPassThroughOnAccept(t *testing.T) {
 
 // footerTrustpilotScript mirrors the incident this feature exists to
 // prevent: a merchant's theme already carries a third-party <script src>
-// (Trustpilot, Meta pixel, GA, Intercom, ...) before the model ever touches
-// the file.
 const footerTrustpilotScript = `  <script src="https://widget.trustpilot.com/tp-widget.min.js"></script>`
 
 // TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair is the
 // footer/"Powered By FlowPOS" incident end to end: the model's proposal
-// re-emits the whole file (proposals are always complete files, never
-// diffs) with the merchant's pre-existing script intact plus its own new
-// line. Without pre-existing-violation filtering this used to cost a full
-// repair round-trip whose only way to "fix" an error it didn't cause was to
-// delete the merchant's script.
 func TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair(t *testing.T) {
 	baselineFooter := "<footer>\n" + footerTrustpilotScript + "\n</footer>"
 	proposedFooter := "<footer>\n  <p>Powered by FlowPOS</p>\n" + footerTrustpilotScript + "\n</footer>"
@@ -265,8 +238,6 @@ func TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair(t *testing.T) {
 
 // TestCheckAndRepair_SameViolationInNewFileStillRepairs confirms the same
 // off-theme script, when it's the model's OWN new file rather than an edit
-// to an existing one, still triggers a real repair — a brand-new file has
-// no baseline, so the model owns every line of it.
 func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
 	badNewFooter := "<footer>\n" + footerTrustpilotScript + "\n</footer>"
 	fixedNewFooter := "<footer></footer>"
@@ -300,9 +271,6 @@ func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
 
 // TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip is the case
 // that motivates AutoFixThemeTokens: six hardcoded colors the model could
-// have reached for real defaults.json tokens for, all mechanically
-// resolvable — the repair round-trip (a real Generate call, minutes of
-// wall-clock in production) must never happen at all.
 func TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip(t *testing.T) {
 	defaultsJSON := `{"colors": {
 		"primary": "#1e3a8a", "secondary": "#111111", "accent": "#3d5bbf",

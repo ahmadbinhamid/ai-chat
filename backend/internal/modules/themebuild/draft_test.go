@@ -16,9 +16,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// seedPendingFile records an assistant message with apply_status='pending'
-// and one staged GeneratedFile row for it — the minimal shape a draft turn
-// leaves behind (see doGenerate's staging path).
+// Records assistant message with apply_status='pending' + staged GeneratedFile.
 func seedPendingFile(t *testing.T, chatSvc *chat.Service, buildRepo *Repository, c chat.Chat, path, content string, kind GeneratedFileKind) chat.Message {
 	t.Helper()
 	msg, err := chatSvc.RecordAssistantMessage(context.Background(), c, "turn", chat.MessageStatusCompleted, 0, 0, chat.ApplyStatusPending)
@@ -35,7 +33,6 @@ func seedPendingFile(t *testing.T, chatSvc *chat.Service, buildRepo *Repository,
 	return msg
 }
 
-// Item 1: DraftFiles last-write-wins across three turns touching one path.
 func TestDraftFiles_LastWriteWinsAcrossThreeTurns(t *testing.T) {
 	conn := openTestDB(t)
 	chatSvc := chat.NewService(chat.NewRepository(conn))
@@ -50,11 +47,6 @@ func TestDraftFiles_LastWriteWinsAcrossThreeTurns(t *testing.T) {
 
 	for _, content := range []string{"v1", "v2", "v3"} {
 		seedPendingFile(t, chatSvc, buildRepo, c, "pages/home.liquid", content, GeneratedFileKindProposed)
-		// queued_at/created_at-style hazard (see DraftFiles' own doc
-		// comment): without a gap, three inserts in the same wall-clock
-		// second would tie on created_at and this test would just be
-		// asserting arbitrary id-ordered output.
-		time.Sleep(1100 * time.Millisecond)
 	}
 
 	draft, err := buildRepo.DraftFiles(ctx, c.ID)
@@ -68,7 +60,6 @@ func TestDraftFiles_LastWriteWinsAcrossThreeTurns(t *testing.T) {
 
 // Item 2: execReadThemeFile returns draft content, not FlowPOS content —
 // the regression this whole feature hinges on (a model re-reading a file
-// it just edited must never see the stale pre-edit version).
 func TestExecReadThemeFile_ReturnsDraftContentNotFlowposContent(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{"pages/home.liquid": "SAVED ON FLOWPOS"})
 	defer ts.Close()
@@ -94,8 +85,6 @@ func TestExecReadThemeFile_ReturnsDraftContentNotFlowposContent(t *testing.T) {
 
 // Item 3: buildSnapshot sees a draft-created file in the merged tree —
 // otherwise themecheck validates against the wrong file set and "repairs"
-// non-problems (a render target that actually exists in the draft, just
-// not on FlowPOS yet, would look like a missing-target error).
 func TestBuildSnapshot_SeesDraftCreatedFileInMergedTree(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{}) // empty real theme
 	defer ts.Close()
@@ -113,14 +102,8 @@ func TestBuildSnapshot_SeesDraftCreatedFileInMergedTree(t *testing.T) {
 	}
 }
 
-// TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration covers the
-// pre-existing-violation-filtering edge case: a store error (network hiccup
-// to FlowPOS) fetching one proposed "update" file's baseline content must
-// not fail the whole generation — it degrades to that one file having no
-// baseline (today's stricter, no-grandfathering behavior), never an error
-// returned from buildSnapshot itself. The four required files (pages.json,
-// defaults.json, the two layout files) are unaffected — this fake server
-// serves them normally, a 500 only for the one proposed update file.
+// TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration: a store error
+// fetching one proposed update's baseline content degrades that file to no
 func TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/store/themes/active/files" {
@@ -135,7 +118,6 @@ func TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration(t *testing.T) {
 		}
 		// Every other path (the four required files) — empty content, same
 		// as a brand-new theme, matching newFakeThemeServer's own behavior
-		// for a path outside its files map.
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer ts.Close()
@@ -157,7 +139,6 @@ func TestBuildSnapshot_BaselineFetchFailureDoesNotFailGeneration(t *testing.T) {
 
 // Item 4: two prompts in sequence — the second buildThemeContext call must
 // see the first turn's own staged output (via the draft overlay's merged
-// file tree), not just the last-applied theme.
 func TestBuildThemeContext_SecondCallSeesFirstTurnsDraftOutput(t *testing.T) {
 	conn := openTestDB(t)
 	chatSvc := chat.NewService(chat.NewRepository(conn))
@@ -207,7 +188,6 @@ func TestBuildThemeContext_SecondCallSeesFirstTurnsDraftOutput(t *testing.T) {
 
 // TestBuildThemeContext_ConcurrentCallsMatchSequentialShape confirms
 // parallelizing buildThemeContext's four store round trips (see its own
-// doc comment) doesn't change what it returns.
 func TestBuildThemeContext_ConcurrentCallsMatchSequentialShape(t *testing.T) {
 	ts := newFakeThemeServer(t, map[string]string{"pages.json": `[{"slug":"home"}]`, "defaults.json": `{"colors":{}}`})
 	defer ts.Close()
@@ -233,7 +213,6 @@ func TestBuildThemeContext_ConcurrentCallsMatchSequentialShape(t *testing.T) {
 
 // TestBuildThemeContext_FailsOnASingleReadError confirms the parallelized
 // version still fails the whole call the same way a sequential one would —
-// on the first error any of the four concurrent calls hits.
 func TestBuildThemeContext_FailsOnASingleReadError(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/store/themes/active/files" {

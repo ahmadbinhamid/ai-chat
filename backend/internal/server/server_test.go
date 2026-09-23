@@ -17,12 +17,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-// testConfig is the minimum Config New needs to construct without a real
-// FlowPOS/Anthropic/database dependency being reachable — FakeAIMode skips
-// the ANTHROPIC_API_KEY requirement (see ai.NewFake), and every other field
-// here only needs to be well-formed, not point at something live: New
-// itself makes no outbound call during construction (see server.go — conn
-// is only touched inside the /health handler closure, at request time).
+// testConfig is the minimum Config New needs to construct without a real dependency being
+// reachable — New makes no outbound call during construction.
 func testConfig() config.Config {
 	return config.Config{
 		Port:                         "8080",
@@ -30,7 +26,6 @@ func testConfig() config.Config {
 		AuthCacheTTL:                 time.Minute,
 		AuthNegativeCacheTTL:         time.Minute,
 		FlowposHTTPTimeout:           time.Second,
-		AIProvider:                   "anthropic",
 		FakeAIMode:                   true,
 		FakeAIDelay:                  time.Millisecond,
 		GenerationRateLimitPerMinute: 10,
@@ -38,13 +33,8 @@ func testConfig() config.Config {
 	}
 }
 
-// lazyDB opens a *sql.DB against an address nothing listens on — sql.Open
-// never dials (database/sql connections are lazy), so this is safe to pass
-// anywhere a *sql.DB is required by construction but never queried by the
-// test itself. The background reaper goroutine New starts does query it and
-// will log connection errors — harmless noise, not a test failure, and
-// exactly the "database temporarily unreachable" case that goroutine is
-// already built to tolerate.
+// lazyDB opens a *sql.DB against an address nothing listens on; sql.Open never dials, so
+// it's safe wherever a *sql.DB is required but never queried by the test itself.
 func lazyDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:1)/doesnotmatter")
@@ -65,11 +55,8 @@ func newTestServer(t *testing.T, cfg config.Config) *Server {
 	return srv
 }
 
-// TestNew_MountsExpectedRoutes checks a representative sample of routes
-// from every handler group New wires up — not every route (that would just
-// duplicate server.go's route table in test form), enough to catch a
-// wiring mistake (a handler never mounted, a method/path typo) without
-// this test needing to change every time a new endpoint is added.
+// TestNew_MountsExpectedRoutes checks a representative sample of routes from every handler
+// group, enough to catch a wiring mistake without changing every time a new route is added.
 func TestNew_MountsExpectedRoutes(t *testing.T) {
 	srv := newTestServer(t, testConfig())
 
@@ -81,11 +68,8 @@ func TestNew_MountsExpectedRoutes(t *testing.T) {
 		http.MethodPost + " /api/v1/chats/:chatId/apply": false,
 		http.MethodGet + " /api/v1/chats/:chatId/draft":  false,
 		http.MethodGet + " /api/v1/chats/:chatId/stream": false,
-		// /api/v1/themes (POST, create-from-base) was removed — the AI
-		// theme builder never creates a theme itself, only edits one a
-		// merchant already installed/activated. /themes/:slug/preview
-		// stays as this test's representative route for the same handler
-		// group.
+		// /api/v1/themes (create-from-base) was removed; the AI builder only edits an
+		// existing theme, never creates one.
 		http.MethodPost + " /api/v1/themes/:slug/preview": false,
 	}
 
@@ -103,11 +87,8 @@ func TestNew_MountsExpectedRoutes(t *testing.T) {
 	}
 }
 
-// TestNew_CORSFailsClosedWithNoOrigins covers the degradation pattern
-// documented in server.go: an empty CORSAllowedOrigins must never fall back
-// to a permissive "*" — it must block every cross-origin browser request,
-// which shows up as no Access-Control-Allow-Origin header on the response
-// regardless of what Origin the request claims.
+// TestNew_CORSFailsClosedWithNoOrigins checks an empty CORSAllowedOrigins never falls back
+// to a permissive "*" — it must block every cross-origin request.
 func TestNew_CORSFailsClosedWithNoOrigins(t *testing.T) {
 	cfg := testConfig()
 	cfg.CORSAllowedOrigins = nil
@@ -123,10 +104,8 @@ func TestNew_CORSFailsClosedWithNoOrigins(t *testing.T) {
 	}
 }
 
-// TestNew_CORSAllowsConfiguredOrigin is the positive-path counterpart to
-// the fail-closed test above — without it, that test alone can't
-// distinguish "CORS correctly blocked this origin" from "CORS middleware
-// never runs at all."
+// TestNew_CORSAllowsConfiguredOrigin is the positive-path counterpart to the fail-closed
+// test above, ruling out "CORS middleware never runs at all."
 func TestNew_CORSAllowsConfiguredOrigin(t *testing.T) {
 	cfg := testConfig()
 	cfg.CORSAllowedOrigins = []string{"https://dashboard.example.test"}
@@ -142,11 +121,8 @@ func TestNew_CORSAllowsConfiguredOrigin(t *testing.T) {
 	}
 }
 
-// echoBodyLen is a minimal handler for testing maxBodySize in isolation —
-// deliberately not routed through auth.Middleware (which would reject an
-// unauthenticated test request before the body is ever read, making it
-// impossible to tell "rejected for being too large" apart from "rejected
-// for having no token").
+// echoBodyLen is a minimal handler for testing maxBodySize in isolation, deliberately not
+// routed through auth.Middleware, which would reject the request before the body is read.
 func echoBodyLen(c *gin.Context) {
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, c.Request.Body); err != nil {

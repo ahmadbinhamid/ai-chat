@@ -8,11 +8,7 @@ import (
 	"strconv"
 )
 
-// StoreSettings is the subset of flowpos-backend's GET /store response the
-// theme engine's `store.*` preview context needs — not the full settings
-// shape (minimum_order, guest checkout, logo, etc. — see tenant-dashboard's
-// own StoreSettings type for those), since nothing in the theme dialect
-// references them today.
+// StoreSettings is the subset of GET /store the theme engine's store.* preview context needs, not the full settings shape.
 type StoreSettings struct {
 	Name string `json:"name"`
 }
@@ -23,14 +19,8 @@ type storeSettingsEnvelope struct {
 	} `json:"data"`
 }
 
-// FetchStoreSettings calls flowpos-backend's GET /store — the same route
-// tenant-dashboard's own getStoreSettings() calls — so the preview context
-// can carry the tenant's real store name instead of
-// FixtureContext's canned "Sample Store" (see handlers/preview.go's
-// buildPreviewContext). Not part of ThemeStore/the file-CRUD surface (see
-// ThemeStore's own doc comment on this pattern) since store settings aren't
-// a theme file — reached via a type assertion, same as ReadFileBytes and
-// GetOrGenerateManifest.
+// FetchStoreSettings calls GET /store so the preview context can carry the tenant's real store name instead of
+// FixtureContext's canned "Sample Store". Not part of ThemeStore since store settings aren't a theme file; reached via type assertion.
 func (s *Store) FetchStoreSettings(ctx context.Context, auth RequestAuth) (StoreSettings, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/store", nil)
 	if err != nil {

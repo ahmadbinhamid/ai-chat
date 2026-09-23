@@ -13,13 +13,8 @@ import (
 	"github.com/google/uuid"
 )
 
-// openTestDB connects to the same MySQL this repo's .env already points
-// at (DB_HOST/DB_PORT/DB_DATABASE/DB_USERNAME/DB_PASSWORD, defaulting to
-// the .env.example values) and skips the test if it isn't reachable —
-// these are the only tests in this package that need a real database,
-// since the generations table's uniq_generations_running_chat virtual-
-// column index is exactly the kind of thing worth verifying against real
-// MySQL rather than assuming from reading the SQL.
+// openTestDB connects to the .env-configured MySQL and skips the test if unreachable — needed to
+// verify things like the generations table's virtual-column unique index against real MySQL.
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&loc=UTC&clientFoundRows=true",
@@ -86,9 +81,7 @@ func TestGenerationRepository_StartEndGetLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetGeneration failed: %v", err)
 	}
-	// EndGeneration sanitizes genErr before storing it (see ai.SanitizeError)
-	// — the raw "boom" never reaches this column, only its generic fallback
-	// wrapping, since "boom" matches no recognized category.
+	// EndGeneration sanitizes error messages via ai.SanitizeError.
 	wantErr := "Error from AI agent: something went wrong while generating a response — please try again in a moment"
 	if g.Status != GenerationStatusFailed || g.Error == nil || *g.Error != wantErr || g.FinishedAt == nil {
 		t.Fatalf("unexpected generation state after end: %+v", g)
@@ -153,13 +146,8 @@ func TestGenerationRepository_ReapStaleGenerations(t *testing.T) {
 	}
 }
 
-// TestGenerationRepository_ReapStaleGenerations_HeartbeatOverridesStartedAt
-// covers the case the 20260813000002 migration exists for: a generation
-// whose started_at is old (well past what would be a stale threshold on
-// its own) but whose last_heartbeat_at is recent must NOT be reaped — a
-// live generation still emitting progress events must survive exactly
-// because those events are stamping the heartbeat, regardless of how long
-// ago it started.
+// A generation with an old started_at but a recent last_heartbeat_at must NOT be reaped — still
+// emitting progress events means it's alive, regardless of how long ago it started.
 func TestGenerationRepository_ReapStaleGenerations_HeartbeatOverridesStartedAt(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)

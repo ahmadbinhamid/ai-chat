@@ -8,9 +8,7 @@ func TestValidatePathSafety_Allowed(t *testing.T) {
 		"pages/css/offers.css",
 		"js/offers-filter.js",
 		"components/header.liquid",
-		// Extension-agnostic: internal reads/writes of known config files
-		// (pages.json, defaults.json) must pass this check — only
-		// ValidateGeneratedFilePath restricts extensions.
+		// Extension-agnostic: internal reads/writes of pages.json/defaults.json must pass this check.
 		"pages.json",
 		"defaults.json",
 	} {
@@ -41,10 +39,7 @@ func TestValidateGeneratedFilePath_Allowed(t *testing.T) {
 		"pages/css/offers.css",
 		"js/offers-filter.js",
 		"components/header.liquid",
-		// .json is a generally allowed extension (see
-		// allowedGeneratedExtensions) — pages.json and defaults.json are
-		// both real .json files, no separate carve-out needed for either
-		// anymore; a component-scoped config file works the same way.
+		// .json is a generally allowed extension — pages.json/defaults.json and component-scoped configs all qualify.
 		"defaults.json",
 		"pages.json",
 		"components/some-widget.json",
@@ -67,10 +62,7 @@ func TestValidateGeneratedFilePath_Rejected(t *testing.T) {
 		"pages\\offers.liquid",
 		"pages/offers.liquid/../../secret.js",
 		"pages/offers", // no extension
-		// A different tech stack entirely — the allowlist's real job (see
-		// allowedGeneratedExtensions's own doc comment): every real theme
-		// file kind is allowed now, but nothing outside that vocabulary
-		// ever will be.
+		// A different tech stack entirely — the allowlist's real job: every real theme file kind is allowed, nothing outside that vocabulary ever will be.
 		"pages/offers.php",
 		"components/Widget.jsx",
 		"scripts/build.py",

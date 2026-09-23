@@ -9,9 +9,7 @@ import (
 	"testing"
 )
 
-// fakeManifestServer serves a fixed theme and counts how many times each
-// endpoint was hit, so tests can assert a cache hit skips the expensive
-// per-file reads.
+// fakeManifestServer serves a fixed theme and counts endpoint hits, so tests can assert a cache hit skips per-file reads.
 type fakeManifestServer struct {
 	files     map[string]string
 	listCalls atomic.Int64

@@ -13,12 +13,8 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
-// TestGenerate_EditMaterializesWithoutExtraAPICall covers the whole point of
-// action "edit": a unique old_string materializes into full "update"
-// content with zero extra round trips, and the Result leaving Generate is
-// indistinguishable from what a normal "update" proposal would have
-// produced — see GeneratedFile's own doc comment on why nothing downstream
-// needs to know "edit" ever existed.
+// TestGenerate_EditMaterializesWithoutExtraAPICall checks a unique old_string materializes
+// into full "update" content with zero extra round trips, indistinguishable downstream.
 func TestGenerate_EditMaterializesWithoutExtraAPICall(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -70,10 +66,8 @@ func TestGenerate_EditMaterializesWithoutExtraAPICall(t *testing.T) {
 	}
 }
 
-// editProposeChangesFixture builds the SSE tool-call payload for a
-// propose_changes call proposing a single edit-action file — shared by the
-// zero-match/multi-match retry tests below, which only differ in what
-// old_string the (fake) model sends.
+// editProposeChangesFixture builds the SSE tool-call payload for a propose_changes call
+// proposing a single edit-action file, shared by the retry tests below.
 func editProposeChangesFixture(oldString string) map[string]any {
 	return map[string]any{
 		"summary":             "attempting a fix",
@@ -101,11 +95,8 @@ func updateProposeChangesFixture(content string) map[string]any {
 	}
 }
 
-// TestGenerate_ZeroMatchOldStringRetriesNotFails is the "zero matches"
-// half of materializeEdits' contract: a materialization failure must not
-// end the generation — it's fed back as this propose_changes call's own
-// tool_result and the loop continues, exactly like an ordinary failed tool
-// call would.
+// TestGenerate_ZeroMatchOldStringRetriesNotFails checks a materialization failure doesn't
+// end the generation — it's fed back as a tool_result and the loop continues.
 func TestGenerate_ZeroMatchOldStringRetriesNotFails(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -144,8 +135,7 @@ func TestGenerate_ZeroMatchOldStringRetriesNotFails(t *testing.T) {
 	}
 }
 
-// TestGenerate_MultipleMatchesRetriesNotFails is the "several matches" half
-// of the same contract.
+// TestGenerate_MultipleMatchesRetriesNotFails is the "several matches" half of the same contract.
 func TestGenerate_MultipleMatchesRetriesNotFails(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -184,11 +174,8 @@ func TestGenerate_MultipleMatchesRetriesNotFails(t *testing.T) {
 	}
 }
 
-// TestGenerate_TwoFailedEditsFallBackToFullContentRequest covers the bound
-// on retries: the same file failing materialization twice must, on its
-// SECOND failure, tell the model to resubmit as "update" with full content
-// rather than inviting another edit attempt — see
-// maxEditMaterializationFailures.
+// TestGenerate_TwoFailedEditsFallBackToFullContentRequest checks a file failing
+// materialization twice tells the model to resubmit as "update" on its SECOND failure.
 func TestGenerate_TwoFailedEditsFallBackToFullContentRequest(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -201,7 +188,6 @@ func TestGenerate_TwoFailedEditsFallBackToFullContentRequest(t *testing.T) {
 		case 3:
 			// Body is JSON, so a literal `"` inside the message text is
 			// escaped to `\"` on the wire — match on a quote-free substring
-			// instead of fighting that escaping.
 			body, _ := io.ReadAll(r.Body)
 			if !strings.Contains(string(body), "resubmit this file with action") {
 				t.Errorf("expected the 3rd call's request to carry the fall-back-to-update advice after 2 failures, body: %s", body)

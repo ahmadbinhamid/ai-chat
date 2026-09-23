@@ -2,19 +2,12 @@ package themecheck
 
 import "testing"
 
-// trustpilotScript is the exact kind of pre-existing off-theme <script src>
-// the Trustpilot-widget incident this feature exists to prevent involved —
-// see DowngradePreExistingFindings' own doc comment. Deliberately avoids the
-// word "bootstrap" in the URL (the real widget's CDN path has one) — that
-// would also trip frameworkSignals' unrelated Bootstrap-name-mention regex,
-// muddying these tests with a second, incidental finding.
+// trustpilotScript is a pre-existing off-theme script tag; avoids "bootstrap" in the URL so it doesn't also trip the Bootstrap-mention regex.
 const trustpilotScript = `  <script src="https://widget.trustpilot.com/tp-widget.min.js"></script>`
 
 func TestDowngradePreExistingFindings_PreExistingScriptBecomesWarning(t *testing.T) {
 	baselineFooter := "<footer>\n" + trustpilotScript + "\n</footer>"
-	// The model re-emits the whole file (proposals are always complete
-	// files, never diffs) with the pre-existing script intact, plus its own
-	// genuinely new line.
+	// Proposals are always complete files, never diffs, so the pre-existing script is re-emitted intact.
 	proposedFooter := "<footer>\n  <p>Powered by FlowPOS</p>\n" + trustpilotScript + "\n</footer>"
 
 	p := Proposal{Files: []ProposedFile{{Path: "components/footer.liquid", Action: "update", Content: proposedFooter}}}
@@ -80,9 +73,7 @@ func TestDowngradePreExistingFindings_ModelIntroducedViolationStaysError(t *test
 func TestDowngradePreExistingFindings_SurvivesLineShift(t *testing.T) {
 	// The violating line sits at line 2 in the baseline.
 	baselineFooter := "<footer>\n" + trustpilotScript + "\n</footer>"
-	// The model inserts three new lines ABOVE it — in the proposal, the
-	// same violating line is now line 5, not line 2. Index/line-number
-	// comparison would call this "different"; content comparison must not.
+	// Three lines inserted above shift it to line 5 — content comparison must still match despite the line-number drift.
 	proposedFooter := "<footer>\n  <p>One</p>\n  <p>Two</p>\n  <p>Three</p>\n" + trustpilotScript + "\n</footer>"
 
 	p := Proposal{Files: []ProposedFile{{Path: "components/footer.liquid", Action: "update", Content: proposedFooter}}}
@@ -102,12 +93,7 @@ func TestDowngradePreExistingFindings_SurvivesLineShift(t *testing.T) {
 	}
 }
 
-// TestDowngradePreExistingFindings_MissingBaselineStaysError models a
-// baseline fetch failure (store error, network hiccup to FlowPOS) — from
-// this function's point of view that's indistinguishable from a brand-new
-// file (see themebuild.Service.buildSnapshot, which logs a Warn and simply
-// omits the map entry rather than failing the generation): no entry means
-// no baseline, which means stay strict.
+// TestDowngradePreExistingFindings_MissingBaselineStaysError: a baseline fetch failure looks identical to a new file — no entry means stay strict.
 func TestDowngradePreExistingFindings_MissingBaselineStaysError(t *testing.T) {
 	content := "<footer>\n" + trustpilotScript + "\n</footer>"
 	p := Proposal{Files: []ProposedFile{{Path: "components/footer.liquid", Action: "update", Content: content}}}

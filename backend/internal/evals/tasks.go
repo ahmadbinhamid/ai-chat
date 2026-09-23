@@ -1,6 +1,5 @@
-// Package evals defines the fixed task list cmd/eval runs against the real
-// AI theme-builder pipeline (themebuild.Service.Generate, flowpos-backend,
-// and Claude) to catch regressions before they reach merchants.
+// Package evals defines the fixed task list cmd/eval runs against the real AI
+// theme-builder pipeline to catch regressions before they reach merchants.
 package evals
 
 // Task is one scripted prompt sent to a fresh, base-themed test theme.
@@ -8,23 +7,15 @@ type Task struct {
 	ID          string
 	Description string
 	Prompt      string
-	// Mode is forwarded verbatim as themebuild.GenerateInput.Mode — empty
-	// (the common case) is full edit, no restriction. See that field's doc
-	// comment: this must be explicit, never inferred from turn count.
+	// Mode is forwarded verbatim as themebuild.GenerateInput.Mode; empty means full edit.
 	Mode string
-	// ExpectedOK: should this prompt produce a successful generation that
-	// writes at least one file to the theme? false means the prompt is
-	// expected to be rejected or answered without any file change (e.g. an
-	// out-of-scope question, or an input themecheck/validation should reject
-	// outright even after the model's retry budget is exhausted).
+	// ExpectedOK: should this prompt write at least one file? false means it should be
+	// rejected or answered without any file change.
 	ExpectedOK bool
 }
 
-// Tasks runs in this exact order against one persistent per-tenant "builder"
-// chat (see themebuild.Service.Generate / GetOrCreateChat) — there is no
-// per-task chat reset, so later tasks accumulate turn history from earlier
-// ones. That's harmless for everything except the two mode-restricted tasks
-// below, which set Mode explicitly and so are unaffected by turn count.
+// Tasks runs in order against one persistent per-tenant chat with no per-task reset;
+// harmless since Mode is always explicit, never inferred from turn count.
 var Tasks = []Task{
 	{
 		ID:          "brand_mode",

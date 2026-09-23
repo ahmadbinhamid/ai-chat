@@ -38,9 +38,7 @@ func TestCheckPlaceholderBody_AllowsRealProse(t *testing.T) {
 }
 
 func TestCheckPlaceholderBody_AllowsDynamicBinding(t *testing.T) {
-	// A page whose only "content" is a {{ }} output expression (e.g.
-	// displaying a live product name) is real, page-specific content —
-	// must never be flagged just because it has no static prose.
+	// A page whose only content is a {{ }} binding is real, page-specific content and must never be flagged.
 	body := "<p>{{ product.name }}</p>"
 	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update", Content: validBoilerplateInlineWithBody(body)}}}
 	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 0 {
@@ -49,9 +47,7 @@ func TestCheckPlaceholderBody_AllowsDynamicBinding(t *testing.T) {
 }
 
 func TestCheckPlaceholderBody_AllowsComponentOnlyPage(t *testing.T) {
-	// A page composed entirely of real component renders, with no prose of
-	// its own — the spec's own preferred "compose from components" pattern
-	// — must never be flagged, regardless of how little literal text it has.
+	// A page composed entirely of real component renders (the spec's preferred pattern) must never be flagged.
 	body := "{% render 'components/store-hero-banner' %}\n{% render 'components/testimonials' %}"
 	p := Proposal{Files: []ProposedFile{{Path: "pages/home.liquid", Action: "update", Content: validBoilerplateInlineWithBody(body)}}}
 	if got := checkPlaceholderBody(p, Snapshot{}); len(got) != 0 {
@@ -60,10 +56,7 @@ func TestCheckPlaceholderBody_AllowsComponentOnlyPage(t *testing.T) {
 }
 
 func TestCheckPlaceholderBody_RejectsDrasticShrinkEvenWithoutKnownPhrase(t *testing.T) {
-	// The exact bug this was added for: a single stray character ("x")
-	// isn't a *known* placeholder phrase and would pass every other check
-	// in this file, but replacing a real, substantial page with it is
-	// exactly the destructive pattern this rule exists to catch.
+	// A stray "x" isn't a known placeholder phrase, but replacing a substantial page with it is the destructive pattern this rule catches.
 	prev := validBoilerplateInlineWithBody(strings.Repeat("Real FAQ content. ", 20)) // well over 200 chars
 	p := Proposal{Files: []ProposedFile{{Path: "pages/faq.liquid", Action: "update", Content: validBoilerplateInlineWithBody("x")}}}
 	snap := Snapshot{Files: map[string]string{"pages/faq.liquid": prev}}
@@ -75,10 +68,7 @@ func TestCheckPlaceholderBody_RejectsDrasticShrinkEvenWithoutKnownPhrase(t *test
 }
 
 func TestCheckPlaceholderBody_ShrinkCheckIgnoresAlreadySmallPages(t *testing.T) {
-	// A previously tiny page (under the shrink-check's own floor) being
-	// replaced with something else tiny is not this check's business —
-	// it's the exact-phrase/empty check below that covers that case, and
-	// only if the new content is itself a known placeholder or empty.
+	// A previously tiny page replaced with something tiny isn't this check's business — the exact-phrase/empty check covers that.
 	prev := validBoilerplateInlineWithBody("Sale!") // well under 200 chars
 	p := Proposal{Files: []ProposedFile{{Path: "pages/offers.liquid", Action: "update", Content: validBoilerplateInlineWithBody("New sale!")}}}
 	snap := Snapshot{Files: map[string]string{"pages/offers.liquid": prev}}

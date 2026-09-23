@@ -8,41 +8,8 @@ import (
 	"strings"
 )
 
-// AutoFixThemeTokens mechanically resolves the two deterministic shapes of
-// a theme-token (rule 8) error finding — a var(--theme-*)/var(--layout-*)
-// reference with no fallback, and a raw hex/rgb color literal used directly
-// in a color property — without spending a model round-trip on what's
-// usually a one-line substitution. Same pattern as
-// AutoFixMissingBoilerplate/AutoFixMissingAssetRegistration: fix
-// mechanically, let the caller re-run Check, only ask the model for
-// whatever's genuinely left.
-//
-// Scoped to EXACTLY findings — never independently re-scans file content
-// the way checkThemeToken itself does to decide WHAT counts as a
-// violation. checkThemeToken grandfathers a declaration byte-identical to
-// the file's pre-edit content (see its own doc comment); re-deriving that
-// grandfathering logic here would risk silently diverging from it and
-// rewriting a declaration the rule never actually flagged — the same class
-// of bug DowngradePreExistingFindings exists to prevent elsewhere in this
-// package. Instead, findings' Path+Offset say precisely which declarations
-// are real, non-grandfathered violations; this function then re-runs the
-// exact same regexes checkThemeToken itself uses, and only accepts a match
-// whose start offset (m[0]) is one of those flagged ones. Scoping by byte
-// offset rather than line matters: checkThemeToken's declRe has no newline
-// anchor, so two declarations can share one line with only one of them
-// flagged (new) and the other grandfathered (pre-existing) — line-level
-// scoping can't tell them apart and would rewrite both. A match at a
-// flagged offset is guaranteed to be a real violation — grandfathering is
-// never reimplemented, only deferred to.
-//
-// Both fix kinds resolve against defaults.json's colors map only — never
-// font/layout/header/etc. — matching this whole feature's scope (hardcoded
-// COLORS specifically, the entire premise of rule 8's existence). A
-// var(--theme-font-family) or var(--layout-radius) reference with no
-// fallback, or a raw color matching no colors.* value, is left for the
-// model to resolve, exactly like an unfixable case already is — guessing a
-// non-color fallback, or a nearest-color match, is precisely the kind of
-// invention this function must not do.
+// AutoFixThemeTokens mechanically fixes var()-no-fallback and raw-color findings from rule 8 against defaults.json's colors map, without a model round-trip.
+// It only fixes flagged byte offsets, not a re-scan, since declRe has no newline anchor and two declarations can share a line with only one flagged.
 func AutoFixThemeTokens(p Proposal, snap Snapshot, findings []Finding) (fixed map[string]string, anyFixed bool) {
 	colors, ok := parseDefaultsColors(snap.DefaultsJSON())
 	if !ok {
@@ -82,30 +49,14 @@ func AutoFixThemeTokens(p Proposal, snap Snapshot, findings []Finding) (fixed ma
 	return fixed, true
 }
 
-// themeTokenFix is one byte-range replacement — start/end are offsets into
-// the ORIGINAL content passed to autoFixThemeTokensInFile, computed before
-// any fix in the same file is applied (see that function's own doc
-// comment on why offsets are never recomputed mid-way through).
+// themeTokenFix is a byte-range replacement; start/end are offsets into the original, pre-fix content.
 type themeTokenFix struct {
 	start, end  int
 	replacement string
 }
 
-// autoFixThemeTokensInFile finds every fixable var()-no-fallback and raw-
-// color-in-a-color-property match starting at a flagged offset, then
-// applies them all at once, back-to-front by start offset. All fix ranges
-// are computed
-// against the SAME original, unmodified content — never against a
-// partially-patched copy — so every offset stays valid regardless of how
-// many earlier (lower-offset) fixes are still pending; applying back-to-
-// front (highest offset first) means a fix already applied can never shift
-// the position of one that hasn't been yet. Fix 1's and Fix 2's own ranges
-// never overlap by construction: Fix 1 only ever targets a bare var(...)
-// call with no color content inside it, and Fix 2 only ever targets a raw
-// color OUTSIDE any var(...) call (mirroring checkThemeToken's own
-// withoutVarCalls exclusion) — so a color Fix 1 is about to insert as a
-// fallback can never be mistaken by Fix 2 for a pre-existing raw literal,
-// without either fix needing to know about the other.
+// autoFixThemeTokensInFile finds every fixable match at a flagged offset and applies them back-to-front by start offset
+// against the original, unmodified content, so earlier fixes never invalidate offsets of ones still pending.
 func autoFixThemeTokensInFile(content string, flaggedOffsets map[int]bool, colors map[string]string) (result string, fixCount int, ok bool) {
 	var fixes []themeTokenFix
 
@@ -154,12 +105,7 @@ func autoFixThemeTokensInFile(content string, flaggedOffsets map[int]bool, color
 	return content, len(fixes), true
 }
 
-// findRawColorsOutsideVarCalls returns the [start,end] byte ranges — in the
-// coordinates of the OUTER content valueOffset was taken from, not value's
-// own — of every hexOrRGBRe match in value that does not fall inside a
-// var(...) call. Mirrors checkThemeToken's own withoutVarCalls exclusion
-// (see hexOrRGBRe/varCallRe in rule_theme_token.go), just returning
-// positions instead of only a boolean.
+// findRawColorsOutsideVarCalls returns byte ranges, in the outer content's coordinates, of raw color matches outside var(...) calls.
 func findRawColorsOutsideVarCalls(value string, valueOffset int) [][2]int {
 	varRanges := varCallRe.FindAllStringIndex(value, -1)
 	insideVarCall := func(start, end int) bool {
@@ -181,12 +127,7 @@ func findRawColorsOutsideVarCalls(value string, valueOffset int) [][2]int {
 	return out
 }
 
-// resolveThemeVarColor resolves a "--theme-<kebab>"/"--layout-<kebab>"
-// token (themeVarNoFallbackRe's captured group) against colors. Only a
-// "--theme-*" token can ever resolve — see AutoFixThemeTokens' own doc
-// comment on why this is scoped to colors.* and therefore never resolves a
-// "--layout-*" reference (defaults.json's layout.* values — radius,
-// spacing, shadow — aren't colors at all).
+// resolveThemeVarColor resolves a "--theme-<kebab>" token against colors; "--layout-*" never resolves since layout values aren't colors.
 func resolveThemeVarColor(token string, colors map[string]string) (string, bool) {
 	suffix, ok := strings.CutPrefix(token, "--theme-")
 	if !ok {
@@ -196,13 +137,7 @@ func resolveThemeVarColor(token string, colors map[string]string) (string, bool)
 	return value, ok
 }
 
-// findColorToken reverse-looks-up raw (a raw color literal from a
-// declaration) against colors, returning the matching key. When more than
-// one key shares the same value, the lexicographically first key is
-// chosen — deterministic and arbitrary in exactly the same spirit as which
-// key a merchant would have picked by hand; the substituted VALUE is
-// identical either way, so which name wins only matters for readability,
-// never correctness.
+// findColorToken reverse-looks-up raw against colors; when multiple keys share a value, the lexicographically first wins (arbitrary, doesn't affect correctness).
 func findColorToken(colors map[string]string, raw string) (key string, ok bool) {
 	var candidates []string
 	for k, v := range colors {
@@ -217,14 +152,7 @@ func findColorToken(colors map[string]string, raw string) (key string, ok bool) 
 	return candidates[0], true
 }
 
-// colorValuesEqual compares two CSS color literals for AutoFixThemeTokens'
-// reverse lookup. A hex value on both sides is compared after
-// normalizeOpaqueHex (case and 3-vs-6-digit form ignored); anything else
-// (rgb()/rgba(), or a hex form normalizeOpaqueHex refuses — 4-digit
-// #rgba/8-digit #rrggbbaa, which carry alpha) is compared as a literal,
-// trimmed string — no hex<->rgb conversion is attempted, and an
-// alpha-carrying value never matches an opaque defaults.json color even if
-// the RGB channels agree.
+// colorValuesEqual compares hex values via normalizeOpaqueHex, else falls back to trimmed string equality; no hex<->rgb conversion, so an alpha-carrying value never matches an opaque one.
 func colorValuesEqual(a, b string) bool {
 	an, aok := normalizeOpaqueHex(a)
 	bn, bok := normalizeOpaqueHex(b)
@@ -237,12 +165,7 @@ func colorValuesEqual(a, b string) bool {
 	return strings.TrimSpace(a) == strings.TrimSpace(b)
 }
 
-// normalizeOpaqueHex lowercases and expands a 3-digit hex color to 6-digit
-// so #FFF, #ffffff and #FFFFFF all compare equal. ok is false for anything
-// that isn't a plain 3- or 6-digit hex color — in particular a 4-digit
-// (#rgba) or 8-digit (#rrggbbaa) hex, which carries alpha and so can never
-// represent the same color as an opaque defaults.json value, and anything
-// that isn't hex at all (rgb()/rgba()).
+// normalizeOpaqueHex normalizes a 3- or 6-digit hex color; ok is false for anything else, including alpha-carrying 4/8-digit hex.
 func normalizeOpaqueHex(s string) (string, bool) {
 	if !strings.HasPrefix(s, "#") {
 		return "", false
@@ -259,12 +182,7 @@ func normalizeOpaqueHex(s string) (string, bool) {
 	}
 }
 
-// kebabToCamel converts a kebab-case CSS custom-property suffix (e.g.
-// "footer-bg") to the camelCase key convention defaults.json's colors map
-// uses ("footerBg") — confirmed against a real theme's defaults.json/CSS
-// pairing (colors.footerBg <-> --theme-footer-bg), the standard,
-// unambiguous camelCase<->kebab-case correspondence platform-side
-// generation already uses (see theme_engine_spec.md §6).
+// kebabToCamel converts a kebab-case CSS custom-property suffix (e.g. "footer-bg") to defaults.json's colors key convention ("footerBg").
 func kebabToCamel(s string) string {
 	parts := strings.Split(s, "-")
 	for i := 1; i < len(parts); i++ {
@@ -276,9 +194,7 @@ func kebabToCamel(s string) string {
 	return strings.Join(parts, "")
 }
 
-// camelToKebab converts a defaults.json colors key (e.g. "footerBg") to
-// the kebab-case suffix its --theme-* custom property uses ("footer-bg") —
-// the inverse of kebabToCamel, same convention.
+// camelToKebab converts a defaults.json colors key ("footerBg") to its --theme-* kebab-case suffix ("footer-bg") — the inverse of kebabToCamel.
 func camelToKebab(s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
@@ -294,12 +210,7 @@ func camelToKebab(s string) string {
 	return b.String()
 }
 
-// parseDefaultsColors extracts defaults.json's colors map. ok is false for
-// missing or unparseable defaults.json, or one with no colors at all —
-// AutoFixThemeTokens then fixes nothing, the same safe no-op today's
-// (pre-auto-fix) behavior already is; a Warn is logged so a systematically
-// broken defaults.json (rather than a merely brand-new theme with none yet)
-// is still visible somewhere.
+// parseDefaultsColors extracts defaults.json's colors map; ok is false for missing/unparseable/empty, in which case AutoFixThemeTokens safely fixes nothing.
 func parseDefaultsColors(defaultsJSON string) (map[string]string, bool) {
 	if defaultsJSON == "" {
 		return nil, false

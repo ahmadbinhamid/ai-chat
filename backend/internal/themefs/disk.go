@@ -14,14 +14,8 @@ import (
 	"time"
 )
 
-// ThemeStore is the subset of *Store's behavior themebuild depends on —
-// exists so OverlayStore (see overlay.go) can wrap either a real *Store or,
-// in tests, a fake, and so themebuild.Service can hold one without caring
-// which. *Store satisfies this with no changes on its side. Deliberately
-// doesn't include GetOrGenerateManifest: manifest generation isn't made
-// draft-aware by this interface (see themebuild.Service's own doc comment
-// on why) and stays a *Store-only capability, reached via a type assertion
-// where it's still needed.
+// ThemeStore is the subset of *Store's behavior themebuild depends on, so OverlayStore can wrap either a real *Store or a test fake.
+// Deliberately excludes GetOrGenerateManifest — that stays a *Store-only capability, reached via type assertion where needed.
 type ThemeStore interface {
 	ReadFile(ctx context.Context, auth RequestAuth, relPath string) (string, error)
 	WriteFile(ctx context.Context, auth RequestAuth, relPath, content string, meta *PageMeta) error
@@ -29,15 +23,8 @@ type ThemeStore interface {
 	ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntry, error)
 }
 
-// Store reads and writes the tenant's active theme's files through
-// flowpos-backend's own theme-file API (store/themes/active/files/...) —
-// see ThemeFileController/ThemeFileService in flowpos-backend. This service
-// never touches theme files on local disk: it doesn't assume it shares a
-// filesystem mount with flowpos-backend, so the two can run on separate
-// hosts. Every call authenticates as the same user who made the original
-// request (see RequestAuth) — flowpos-backend applies its own ownership
-// checks (ActorGate) on every file access, the same as it would for a
-// request from the dashboard's own Editor page.
+// Store reads/writes the active theme's files via flowpos-backend's theme-file API — never touches local disk, so the two
+// services can run on separate hosts. Every call authenticates as the requesting user; flowpos-backend applies its own ownership checks.
 type Store struct {
 	baseURL string
 	client  *http.Client
@@ -45,14 +32,8 @@ type Store struct {
 	manifests manifestCache
 }
 
-// storeHTTPTimeout bounds every flowpos-backend file-API call Store makes —
-// without it, a single hung connection occupies the calling goroutine
-// indefinitely, relying entirely on the caller's own context for a deadline
-// (which is either generateTimeout, up to 65 minutes, or nothing at all for
-// a request-scoped call). Generous rather than tight: this same client
-// fetches theme-asset bytes up to a few MB (video, see AssetHandler), not
-// just small JSON payloads, and a real but slow transfer shouldn't be cut
-// off at the same threshold that catches a genuinely dead connection.
+// storeHTTPTimeout bounds every file-API call so a hung connection doesn't block indefinitely on the caller's own context.
+// Generous, not tight — this client also fetches multi-MB theme assets, not just small JSON payloads.
 const storeHTTPTimeout = 60 * time.Second
 
 // NewStore builds a Store calling baseURL (config.FlowposAPIBase) — the same
@@ -64,30 +45,15 @@ func NewStore(baseURL string) *Store {
 	}
 }
 
-// RequestAuth is the caller identity Store forwards on every call — the
-// same bearer token and resolved tenant ID this service's own auth
-// middleware already validated for the current request (see auth.Token,
-// auth.TenantID). Token authenticates as that user; TenantID is sent as the
-// TID header flowpos-backend's own SetActorMiddleware requires to select
-// which of that user's tenants the request acts as — the same purpose this
-// service's own X-Tenant-Id header serves, just a different header name on
-// flowpos-backend's side.
+// RequestAuth is the caller identity Store forwards on every call — the same bearer token and tenant ID this service's
+// auth middleware already validated. TenantID is sent as the TID header flowpos-backend's SetActorMiddleware requires.
 type RequestAuth struct {
 	Token    string
 	TenantID uint64
 }
 
-// PageMeta is the subset of pages.json fields ai-chat can set when writing
-// a page file — flowpos-backend's own store() endpoint upserts pages.json
-// itself from these (see ThemeFileService::save / ThemePagesManifest)
-// whenever the path matches pages/*.liquid, so this service no longer
-// merges pages.json itself. published_at is deliberately not sent:
-// flowpos-backend stamps it itself when Status is "published" and it's
-// omitted, which is the same "just-published" semantics this service used
-// to set explicitly. requires_auth is a known gap: flowpos-backend's store()
-// endpoint doesn't currently forward it from this API (only title/slug/
-// type/status/seo_*/og_* — see ThemeFileController::store), so a page the
-// model wants gated can't be expressed through this path yet.
+// PageMeta is the subset of pages.json fields ai-chat can set; flowpos-backend's store() endpoint upserts pages.json from
+// these for pages/*.liquid paths. requires_auth is a known gap — flowpos-backend doesn't forward it from this API yet.
 type PageMeta struct {
 	Title          string `json:"title,omitempty"`
 	Slug           string `json:"slug,omitempty"`
@@ -109,9 +75,7 @@ type themeFileEnvelope struct {
 	} `json:"data"`
 }
 
-// ReadFile returns a theme file's current content, or ("", nil) if it
-// doesn't exist yet (e.g. reading pages.json for a theme with no custom
-// pages registered yet is a normal, empty case, not an error).
+// ReadFile returns a theme file's current content, or ("", nil) if it doesn't exist yet — a normal case, not an error.
 func (s *Store) ReadFile(ctx context.Context, auth RequestAuth, relPath string) (string, error) {
 	b, err := s.readFileRaw(ctx, auth, relPath)
 	if err != nil {
@@ -120,19 +84,13 @@ func (s *Store) ReadFile(ctx context.Context, auth RequestAuth, relPath string) 
 	return string(b), nil
 }
 
-// ReadFileBytes is ReadFile's binary-safe counterpart — for anything that
-// isn't UTF-8 text (theme images/fonts, fetched via AssetHandler for the
-// LiquidJS preview, see server.go's route comment), converting through a Go
-// string the way ReadFile does silently corrupts the content. Not part of
-// the ThemeStore interface (see its own doc comment on the same pattern for
-// GetOrGenerateManifest) — reached via a type assertion where needed.
+// ReadFileBytes is ReadFile's binary-safe counterpart — converting non-UTF-8 content (images/fonts) through a Go string
+// like ReadFile does would silently corrupt it. Not part of ThemeStore; reached via a type assertion where needed.
 func (s *Store) ReadFileBytes(ctx context.Context, auth RequestAuth, relPath string) ([]byte, error) {
 	return s.readFileRaw(ctx, auth, relPath)
 }
 
-// readFileRaw is the shared HTTP round trip + base64 decoding behind
-// ReadFile and ReadFileBytes — the only difference between the two is
-// whether the caller wants the result as text or as binary-safe bytes.
+// readFileRaw is the shared HTTP round trip + base64 decoding behind ReadFile and ReadFileBytes.
 func (s *Store) readFileRaw(ctx context.Context, auth RequestAuth, relPath string) ([]byte, error) {
 	if err := ValidatePathSafety(relPath); err != nil {
 		return nil, err
@@ -212,12 +170,8 @@ func (s *Store) WriteFile(ctx context.Context, auth RequestAuth, relPath, conten
 	return nil
 }
 
-// DeleteFile removes a theme file — used by revert (see themebuild's
-// RevertToMessage) to undo a file that didn't exist yet at the point being
-// reverted to. A no-op (not an error) if the file is already gone.
-// flowpos-backend's own delete endpoint un-registers the pages.json entry
-// too when relPath is a pages/*.liquid file (see ThemeFileService::delete),
-// so a reverted new page is fully removed, not just its file.
+// DeleteFile removes a theme file; a no-op if already gone. For a pages/*.liquid path, flowpos-backend's delete endpoint
+// also un-registers the pages.json entry, so a reverted new page is fully removed, not just its file.
 func (s *Store) DeleteFile(ctx context.Context, auth RequestAuth, relPath string) error {
 	if err := ValidatePathSafety(relPath); err != nil {
 		return err
@@ -243,10 +197,7 @@ func (s *Store) DeleteFile(ctx context.Context, auth RequestAuth, relPath string
 	return nil
 }
 
-// FileTreeEntry is one node of the theme's file tree, as returned by
-// flowpos-backend's GET store/themes/active/files
-// (ThemeFileController::index -> ThemeFileService::listTree) — a directory
-// carries Children (recursively, the whole subtree), a file doesn't.
+// FileTreeEntry is one node of the theme's file tree — a directory carries Children (recursively), a file doesn't.
 type FileTreeEntry struct {
 	Name     string          `json:"name"`
 	Path     string          `json:"path"`
@@ -260,11 +211,8 @@ type fileTreeEnvelope struct {
 	} `json:"data"`
 }
 
-// ListFiles returns the active theme's full file tree (names and paths
-// only, no content) — the same data flowpos-backend's dashboard Editor
-// sidebar renders from. One shared method: themebuild's Check() snapshot
-// (phase 1) and the AI tool loop's list_theme_files tool (phase 2) both call
-// this rather than each hitting the endpoint their own way.
+// ListFiles returns the active theme's full file tree (names/paths only, no content) — one shared method both
+// themebuild's Check() and the AI tool loop's list_theme_files call, rather than each hitting the endpoint separately.
 func (s *Store) ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/store/themes/active/files", nil)
 	if err != nil {
@@ -301,10 +249,7 @@ func (s *Store) newRequest(ctx context.Context, auth RequestAuth, method, relPat
 	return req, nil
 }
 
-// encodePathSegments percent-encodes each "/"-separated segment of relPath
-// individually, so the literal "/" separators survive in the URL — matches
-// the tenant-dashboard's own encodeThemeFilePath (src/store-builder/api/
-// editor.ts), which calls this exact same route.
+// encodePathSegments percent-encodes each "/"-separated segment individually, so literal "/" separators survive in the URL.
 func encodePathSegments(relPath string) string {
 	segments := strings.Split(relPath, "/")
 	for i, seg := range segments {
@@ -317,21 +262,11 @@ func encodePathSegments(relPath string) string {
 // two delays used across readRetryAttempts-1 retries.
 var readRetryBackoff = []time.Duration{300 * time.Millisecond, 900 * time.Millisecond}
 
-// readRetryAttempts bounds ReadFile's retries against a transient upstream
-// failure (a brief Cloudflare 5xx — 521/522/523/524 are "origin
-// unreachable/timeout", not a real error in the theme file itself — or a
-// dropped connection) so one momentary blip mid-generation doesn't fail an
-// otherwise-successful, possibly 30+ minute generation at its very last
-// step (buildSnapshot reads files to validate what the model already
-// proposed). Not applied to WriteFile: retrying a write that may have
-// already landed risks a duplicate/partial write, a different risk profile
-// than a read. Must stay one more than len(readRetryBackoff) — one initial
-// attempt plus one retry per backoff delay.
+// readRetryAttempts bounds ReadFile's retries against a transient upstream failure, so one blip doesn't fail a long
+// generation. Not applied to WriteFile — retrying a write that may have landed risks a duplicate/partial write. Must stay len(readRetryBackoff)+1.
 var readRetryAttempts = len(readRetryBackoff) + 1
 
-// doReadWithRetry runs req (a GET with no body, safe to resend as-is) and
-// retries on a network error or 5xx response — anything else (2xx, 404,
-// 401, etc.) returns immediately on the first attempt.
+// doReadWithRetry runs req (a GET, safe to resend) and retries on a network error or 5xx; anything else returns immediately.
 func (s *Store) doReadWithRetry(req *http.Request) (*http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < readRetryAttempts; attempt++ {

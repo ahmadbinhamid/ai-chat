@@ -14,16 +14,8 @@ func init() {
 	})
 }
 
-// images lets a user-role turn carry up to maxImagesPerMessage attached
-// images (the image-attachment feature — attach design references, ask the
-// AI to redesign a page/component against them). A single JSON-array
-// column (LONGTEXT) rather than N sets of paired columns, since the count
-// per message varies (1-5) — each array entry is
-// {"base64": "...", "media_type": "..."}, same base64-string shape
-// chat_generated_files.content already uses for images (see the
-// 20260727000003 migration), just wrapped in a JSON array here instead of
-// one bare string. NULL on every non-image turn, which is the vast
-// majority.
+// images lets a user turn carry up to maxImagesPerMessage attachments, as a JSON array
+// (LONGTEXT, not paired columns) since the count varies (1-5); NULL on non-image turns.
 func Up_20260908000001(db *sql.DB) error {
 	_, err := db.Exec(`
 		ALTER TABLE chat_messages

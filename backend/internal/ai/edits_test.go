@@ -54,9 +54,8 @@ func TestApplyEdits_EmptyNewStringDeletes(t *testing.T) {
 }
 
 func TestApplyEdits_AppliedInOrderOverlapFailsNaturally(t *testing.T) {
-	// Two edits both target "target" — the first consumes it, so the second
-	// (now searching post-first-edit content, which no longer contains
-	// "target") fails its own zero-match check. No special-casing needed.
+	// The first edit consumes "target"; the second, now searching content that no longer
+	// contains it, fails its own zero-match check. No special-casing needed.
 	_, _, _, err := applyEdits("target\n", []Edit{
 		{OldString: "target", NewString: "first"},
 		{OldString: "target", NewString: "second"},
@@ -66,17 +65,11 @@ func TestApplyEdits_AppliedInOrderOverlapFailsNaturally(t *testing.T) {
 	}
 }
 
-// TestApplyEdits_Tier2MatchesWrongIndentation covers the primary reason
-// tiered matching exists: the model reproduces a line's real text but not
-// its exact indentation (having read it many iterations earlier). old_string
-// here is indented with 2 spaces; the file actually has 4. Tier 2 must
-// still find it, and the replacement must come out at the FILE's real
-// indentation, not old_string's.
+// TestApplyEdits_Tier2MatchesWrongIndentation checks the model reproducing text but not
+// exact indentation still matches at tier 2, with the replacement at the FILE's real indentation.
 func TestApplyEdits_Tier2MatchesWrongIndentation(t *testing.T) {
-	// old_string uses MORE leading spaces than the file's real 4 — deliberately
-	// not just fewer, since "  <li>old</li>" (2 spaces) would still be a
-	// literal byte substring of "    <li>old</li>" (4 spaces), letting tier 1
-	// match it by accident and defeating the point of this test.
+	// old_string uses MORE leading spaces than the file's real 4, so it can't accidentally
+	// be a literal byte substring of the real line (which would let tier 1 match instead).
 	content := "<ul>\n    <li>keep</li>\n    <li>old</li>\n</ul>\n"
 	got, tier, _, err := applyEdits(content, []Edit{{OldString: "      <li>old</li>", NewString: "      <li>new</li>"}})
 	if err != nil {
@@ -91,9 +84,8 @@ func TestApplyEdits_Tier2MatchesWrongIndentation(t *testing.T) {
 	}
 }
 
-// TestApplyEdits_Tier3MatchesCollapsedSpacing covers internal whitespace
-// reflow (e.g. class="a  b" vs "a b") that tier 2's per-line trim alone
-// doesn't fix.
+// TestApplyEdits_Tier3MatchesCollapsedSpacing covers internal whitespace reflow that
+// tier 2's per-line trim alone doesn't fix.
 func TestApplyEdits_Tier3MatchesCollapsedSpacing(t *testing.T) {
 	content := `<div class="a  b  c">text</div>` + "\n"
 	got, tier, _, err := applyEdits(content, []Edit{
@@ -111,15 +103,11 @@ func TestApplyEdits_Tier3MatchesCollapsedSpacing(t *testing.T) {
 	}
 }
 
-// TestApplyEdits_Tier2AmbiguousFailsRatherThanFallingThrough confirms the
-// non-negotiable ambiguity rule: a tier-2 candidate appearing twice must
-// fail outright, never fall through to tier 3 (which might resolve to one
-// match) and never silently pick the first.
+// TestApplyEdits_Tier2AmbiguousFailsRatherThanFallingThrough checks a tier-2 candidate
+// appearing twice fails outright, never falling through to tier 3 or silently picking the first.
 func TestApplyEdits_Tier2AmbiguousFailsRatherThanFallingThrough(t *testing.T) {
-	// Both occurrences trim-match "<li>dup</li>" (one with 2-space, one with
-	// 4-space indentation) — ambiguous at tier 2. Tier 3 would ALSO match
-	// both (collapsing whitespace doesn't disambiguate two identical lines),
-	// so this can't accidentally pass by falling through either.
+	// Both occurrences trim-match "<li>dup</li>"; tier 3 would ALSO match both, so this
+	// can't accidentally pass by falling through either.
 	content := "<ul>\n  <li>dup</li>\n    <li>dup</li>\n</ul>\n"
 	_, _, count, err := applyEdits(content, []Edit{{OldString: "<li>dup</li>", NewString: "<li>x</li>"}})
 	if err == nil {
@@ -130,9 +118,8 @@ func TestApplyEdits_Tier2AmbiguousFailsRatherThanFallingThrough(t *testing.T) {
 	}
 }
 
-// TestApplyEdits_AllThreeTiersZeroFails confirms a genuinely absent
-// old_string fails cleanly (not a panic, not a false match) when none of
-// the three tiers find anything at all.
+// TestApplyEdits_AllThreeTiersZeroFails checks a genuinely absent old_string fails
+// cleanly, not a panic or false match, when none of the three tiers find anything.
 func TestApplyEdits_AllThreeTiersZeroFails(t *testing.T) {
 	_, tier, count, err := applyEdits("<p>hello</p>\n", []Edit{{OldString: "<p>goodbye</p>", NewString: "x"}})
 	if err == nil {
@@ -146,11 +133,8 @@ func TestApplyEdits_AllThreeTiersZeroFails(t *testing.T) {
 	}
 }
 
-// TestApplyEdits_WhitespaceOnlyOldStringDoesNotMatchEveryBlankLine is the
-// degenerate-input guard: a purely-whitespace old_string must not resolve
-// against an arbitrary blank line under trimmed comparison (every blank
-// line trims to "", so without this guard tier 2 would treat the file as
-// having exactly one blank line whenever it happens to have exactly one).
+// TestApplyEdits_WhitespaceOnlyOldStringDoesNotMatchEveryBlankLine checks a purely-whitespace
+// old_string doesn't resolve against an arbitrary blank line under trimmed comparison.
 func TestApplyEdits_WhitespaceOnlyOldStringDoesNotMatchEveryBlankLine(t *testing.T) {
 	content := "line one\n\nline three\n" // exactly one blank line
 	_, _, _, err := applyEdits(content, []Edit{{OldString: "   ", NewString: "x"}})
@@ -159,11 +143,8 @@ func TestApplyEdits_WhitespaceOnlyOldStringDoesNotMatchEveryBlankLine(t *testing
 	}
 }
 
-// TestApplyEdits_ByteOffsetCorrectnessInLargeMixedIndentFile is the
-// off-by-N regression guard the task specifically calls for: a tier-2 edit
-// late in a file with mixed (2-space vs 4-space) indentation must splice
-// at exactly the right place — nothing before or after the match may be
-// truncated, duplicated, or shifted.
+// TestApplyEdits_ByteOffsetCorrectnessInLargeMixedIndentFile checks a tier-2 edit late in a
+// large, mixed-indent file splices at exactly the right place — nothing else may shift.
 func TestApplyEdits_ByteOffsetCorrectnessInLargeMixedIndentFile(t *testing.T) {
 	var b strings.Builder
 	for i := 0; i < 200; i++ {
@@ -177,10 +158,8 @@ func TestApplyEdits_ByteOffsetCorrectnessInLargeMixedIndentFile(t *testing.T) {
 	}
 	content := before + target + after.String()
 
-	// old_string uses MORE leading spaces (6) than the target line's real 4
-	// — deliberately not fewer, since a shorter indent would still be a
-	// literal byte substring of the real line and let tier 1 match by
-	// accident (see TestApplyEdits_Tier2MatchesWrongIndentation).
+	// old_string uses MORE leading spaces (6) than the target's real 4, so it can't
+	// accidentally be a substring that lets tier 1 match instead.
 	got, tier, _, err := applyEdits(content, []Edit{
 		{OldString: "      <li>TARGET LINE</li>", NewString: "      <li>REPLACED</li>"},
 	})
@@ -221,17 +200,11 @@ func snippet(s string, at int) string {
 	return s[start:end]
 }
 
-// TestReindentToMatch_PreservesRelativeNesting is the re-indentation rule
-// spelled out: only the DELTA between inserted's own first line and each
-// subsequent line is preserved on top of the file's real target
-// indentation — a line nested one level deeper than new_string's first
-// line stays one level deeper than the target, it isn't flattened to the
-// target uniformly.
+// TestReindentToMatch_PreservesRelativeNesting checks only the DELTA between inserted's own
+// first line and subsequent lines is preserved on top of the target — not flattened uniformly.
 func TestReindentToMatch_PreservesRelativeNesting(t *testing.T) {
-	// File's real indentation is 4 spaces; the model wrote new_string
-	// against what it thought was 6-space indentation, with a nested child
-	// one level (+2 spaces) deeper than its own first line, and a closing
-	// tag realigned back to the first line's level — ordinary HTML nesting.
+	// File's real indentation is 4 spaces; new_string was written against 6-space
+	// indentation with a nested child +2 deeper, closing tag realigned back.
 	content := "<div>\n  <ul>\n    <li>old</li>\n  </ul>\n</div>\n"
 	newString := "      <li>new\n        <span>nested</span>\n      </li>"
 	got, tier, _, err := applyEdits(content, []Edit{{OldString: "      <li>old</li>", NewString: newString}})
@@ -241,22 +214,16 @@ func TestReindentToMatch_PreservesRelativeNesting(t *testing.T) {
 	if tier != tierTrimmed {
 		t.Fatalf("expected tier %s, got %s", tierTrimmed, tier)
 	}
-	// First line lands at the file's real 4-space indentation; the nested
-	// line keeps its own +2-space delta on top of that (6 spaces, not
-	// flattened to 4), and the closing tag realigns back to 4 with the
-	// opening tag, exactly as it was relative to it in new_string.
+	// First line lands at the target's 4-space indentation; the nested line keeps its own
+	// +2-space delta (6, not flattened to 4); the closing tag realigns back to 4.
 	want := "<div>\n  <ul>\n    <li>new\n      <span>nested</span>\n    </li>\n  </ul>\n</div>\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
-// TestReindentToMatch_ClosingCascade is the case that motivated the switch
-// from strip-and-prepend to a signed delta: new_string dedents across
-// several lines as it closes nested elements (8/6/4 spaces), completely
-// normal Liquid/HTML. The old rule flattened every line but the first
-// because only the first line's exact indentation prefix was recognized;
-// the delta rule shifts every line by the same signed amount instead.
+// TestReindentToMatch_ClosingCascade checks new_string dedenting across several lines as it
+// closes nested elements shifts every line by the same signed delta, not flattened to the first.
 func TestReindentToMatch_ClosingCascade(t *testing.T) {
 	matched := "    <div>old</div>"                                           // target: 4 spaces
 	inserted := "        <p>Powered By FlowPOS</p>\n      </div>\n    </div>" // 8/6/4
@@ -267,9 +234,8 @@ func TestReindentToMatch_ClosingCascade(t *testing.T) {
 	}
 }
 
-// TestReindentToMatch_DeeperNestingStillWorks is the pre-existing
-// behaviour the delta rule must not regress: a child line indented deeper
-// than new_string's first line keeps that extra depth on top of the shift.
+// TestReindentToMatch_DeeperNestingStillWorks checks a child line indented deeper than
+// new_string's first line keeps that extra depth on top of the shift.
 func TestReindentToMatch_DeeperNestingStillWorks(t *testing.T) {
 	matched := "    <li>old</li>"                                         // target: 4 spaces
 	inserted := "      <li>new\n        <span>nested</span>\n      </li>" // 6/8/6
@@ -280,10 +246,8 @@ func TestReindentToMatch_DeeperNestingStillWorks(t *testing.T) {
 	}
 }
 
-// TestReindentToMatch_ClampsNegativeDeltaToZero confirms a delta steep
-// enough to push a shallow line negative lands at column 0 rather than
-// panicking (a negative strings.Repeat count) or producing a negative
-// slice index.
+// TestReindentToMatch_ClampsNegativeDeltaToZero checks a delta steep enough to push a
+// shallow line negative lands at column 0, rather than panicking on a negative Repeat count.
 func TestReindentToMatch_ClampsNegativeDeltaToZero(t *testing.T) {
 	matched := "<div>old</div>"                             // target: 0 spaces
 	inserted := "        <p>deep</p>\n    <p>less deep</p>" // delta = 0-8 = -8; both lines clamp to 0
@@ -317,12 +281,8 @@ func TestReindentToMatch_BlankLinesStayBlank(t *testing.T) {
 	}
 }
 
-// TestReindentToMatch_TabTargetZeroDeltaEmitsSpacesNotFourTabs is the
-// regression this task exists for: indentWidth measures a tab as
-// reindentTabWidth (4) columns for the delta ARITHMETIC, but the old
-// implementation then emitted that many literal TAB characters back out —
-// one tab of real indentation becoming four tabs at zero delta. Output
-// must be four columns of plain spaces, never repeated tab characters.
+// TestReindentToMatch_TabTargetZeroDeltaEmitsSpacesNotFourTabs checks output is always
+// plain spaces, never literal tab characters, even at zero delta on a tab-indented target.
 func TestReindentToMatch_TabTargetZeroDeltaEmitsSpacesNotFourTabs(t *testing.T) {
 	matched := "\t<div>old</div>" // target: 1 tab = width 4
 	inserted := "\t<p>new</p>"    // source: 1 tab = width 4, so delta = 0
@@ -333,10 +293,8 @@ func TestReindentToMatch_TabTargetZeroDeltaEmitsSpacesNotFourTabs(t *testing.T) 
 	}
 }
 
-// TestReindentToMatch_TabTargetClosingCascade is the tab-indented
-// equivalent of the space-indented closing-cascade test: widths still
-// shift by the same signed delta and relative structure is still
-// preserved, just expressed in spaces on the way out.
+// TestReindentToMatch_TabTargetClosingCascade is the tab-indented equivalent of the
+// space-indented closing-cascade test; widths still shift by the same signed delta.
 func TestReindentToMatch_TabTargetClosingCascade(t *testing.T) {
 	matched := "\t<div>old</div>" // target: 1 tab = width 4
 	// source (new_string's first line): 2 tabs = width 8; delta = 4-8 = -4
@@ -348,9 +306,8 @@ func TestReindentToMatch_TabTargetClosingCascade(t *testing.T) {
 	}
 }
 
-// TestReindentToMatch_MixedTabAndSpaceInsertedNormalizesToSpaces confirms
-// a new_string that itself mixes tabs and spaces re-indents to plain
-// spaces at the correct computed widths against a space-indented target.
+// TestReindentToMatch_MixedTabAndSpaceInsertedNormalizesToSpaces checks a new_string that
+// mixes tabs and spaces re-indents to plain spaces at correct computed widths.
 func TestReindentToMatch_MixedTabAndSpaceInsertedNormalizesToSpaces(t *testing.T) {
 	matched := "    <div>old</div>" // target: 4 spaces = width 4
 	// line0 "\t  " = 1 tab (4) + 2 spaces = width 6; delta = 4-6 = -2
@@ -363,11 +320,8 @@ func TestReindentToMatch_MixedTabAndSpaceInsertedNormalizesToSpaces(t *testing.T
 	}
 }
 
-// TestApplyEdits_ExactTierNeverReindents confirms tier 1 splices new_string
-// byte-for-byte with no re-indentation at all — new_string's deliberately
-// "wrong" 2-space indent (the file elsewhere uses 4) must survive
-// untouched, since an exact old_string match means the model already
-// copied the file's real current indentation verbatim.
+// TestApplyEdits_ExactTierNeverReindents checks tier 1 splices new_string byte-for-byte
+// with no re-indentation, since an exact match means the model already copied real indentation.
 func TestApplyEdits_ExactTierNeverReindents(t *testing.T) {
 	content := "<ul>\n    <li>old</li>\n</ul>\n"
 	got, tier, _, err := applyEdits(content, []Edit{
@@ -385,15 +339,11 @@ func TestApplyEdits_ExactTierNeverReindents(t *testing.T) {
 	}
 }
 
-// TestApplyEdits_CRLFFileMatchesAtTier2AndPreservesLineEndingsElsewhere
-// covers the CRLF edge case: the theme store's own line endings are
-// preserved everywhere outside the matched region — this only splices the
-// matched bytes, it never rewrites the whole file's line endings to
-// whatever the model's old_string/new_string happened to use.
+// TestApplyEdits_CRLFFileMatchesAtTier2AndPreservesLineEndingsElsewhere checks the file's
+// CRLF line endings outside the matched region are preserved, never rewritten wholesale.
 func TestApplyEdits_CRLFFileMatchesAtTier2AndPreservesLineEndingsElsewhere(t *testing.T) {
-	// old_string uses 6 spaces against the file's real 4 — more, not fewer,
-	// so it can't accidentally be a literal byte substring of the real line
-	// (see TestApplyEdits_Tier2MatchesWrongIndentation on why that matters).
+	// old_string uses 6 spaces against the file's real 4, so it can't accidentally be a
+	// literal byte substring of the real line.
 	content := "<ul>\r\n    <li>keep</li>\r\n    <li>old</li>\r\n</ul>\r\n"
 	got, tier, _, err := applyEdits(content, []Edit{{OldString: "      <li>old</li>", NewString: "      <li>new</li>"}})
 	if err != nil {
@@ -408,8 +358,7 @@ func TestApplyEdits_CRLFFileMatchesAtTier2AndPreservesLineEndingsElsewhere(t *te
 	}
 }
 
-// fixedFileReader is a FileReader backed by a fixed map — "" (not present)
-// means "doesn't exist", matching FileReader's own convention.
+// fixedFileReader is a FileReader backed by a fixed map; "" means "doesn't exist".
 func fixedFileReader(files map[string]string) FileReader {
 	return func(_ context.Context, path string) (string, error) {
 		return files[path], nil
@@ -451,10 +400,8 @@ func TestMaterializeEdits_UnmaterializedFilesUnaffected(t *testing.T) {
 	}
 }
 
-// TestMaterializeEdits_SetsOriginalActionToEdit confirms materializeEdits
-// captures what the model actually submitted (see GeneratedFile.OriginalAction's
-// own doc comment) before overwriting Action — the write side of the fix that
-// lets recapAssistantTurn show the model its own real last turn.
+// TestMaterializeEdits_SetsOriginalActionToEdit checks materializeEdits captures what the
+// model submitted before overwriting Action, so recapAssistantTurn can show its real last turn.
 func TestMaterializeEdits_SetsOriginalActionToEdit(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "components/footer.liquid", Action: "edit", Edits: []Edit{{OldString: "old", NewString: "new"}}},
@@ -470,9 +417,8 @@ func TestMaterializeEdits_SetsOriginalActionToEdit(t *testing.T) {
 	}
 }
 
-// TestMaterializeEdits_NeverEditLeavesOriginalActionEmpty confirms a file
-// that was never an "edit" never has OriginalAction set — the empty value a
-// reader (recapAssistantTurn) is expected to treat as "same as Action".
+// TestMaterializeEdits_NeverEditLeavesOriginalActionEmpty checks a file that was never
+// "edit" never has OriginalAction set — empty means "same as Action" to readers.
 func TestMaterializeEdits_NeverEditLeavesOriginalActionEmpty(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "pages/new.liquid", Action: "create", Content: "hello"},
@@ -557,10 +503,8 @@ func TestMaterializeEdits_TwoFailuresFallsBackToUpdateAdvice(t *testing.T) {
 	}
 }
 
-// TestMaterializeEdits_DuplicatePathsTwiceFailsGeneration confirms the
-// duplicate-paths failure is strike-limited too — it used to return before
-// any counting at all, so a model repeating the same mistake had no bound
-// on how many propose_changes round trips it could burn.
+// TestMaterializeEdits_DuplicatePathsTwiceFailsGeneration checks the duplicate-paths
+// failure is strike-limited, bounding how many propose_changes round trips it can burn.
 func TestMaterializeEdits_DuplicatePathsTwiceFailsGeneration(t *testing.T) {
 	result := func() *Result {
 		return &Result{Files: []GeneratedFile{
@@ -580,18 +524,14 @@ func TestMaterializeEdits_DuplicatePathsTwiceFailsGeneration(t *testing.T) {
 	if !strings.Contains(secondMsg, "fail the generation") {
 		t.Errorf("expected the SECOND duplicate-paths failure in a row to warn the generation will fail, got: %q", secondMsg)
 	}
-	// The original guidance must still be there — the correct fix (merge
-	// the entries) never changes, unlike the edit-vs-update case.
+	// The original merge guidance must still be there — the correct fix never changes.
 	if !strings.Contains(secondMsg, "combine every change to one file into a single files[] entry") {
 		t.Errorf("expected the original merge guidance to still be present at the limit, got: %q", secondMsg)
 	}
 }
 
-// TestMaterializeEdits_NonexistentFileTwiceFailsGeneration confirms the
-// file-not-found failure is strike-limited too — it was deliberately never
-// counted (the comment explained the escape is "create", not "update"), but
-// nothing bounded how many times a model could keep proposing "edit" for a
-// path that doesn't exist.
+// TestMaterializeEdits_NonexistentFileTwiceFailsGeneration checks the file-not-found
+// failure is strike-limited, bounding how many times a model can propose "edit" for a missing path.
 func TestMaterializeEdits_NonexistentFileTwiceFailsGeneration(t *testing.T) {
 	result := func() *Result {
 		return &Result{Files: []GeneratedFile{
@@ -618,12 +558,8 @@ func TestMaterializeEdits_NonexistentFileTwiceFailsGeneration(t *testing.T) {
 	}
 }
 
-// TestMaterializeEdits_NoMatchIncludesContentWhenUnderCap is the fix for the
-// expensive path observed in production: a no_match failure with no content
-// in the retry message left the model with no way to correct itself except
-// re-reading the file — exactly what it did, at real cost (~148s, 7 tool
-// calls in one observed repair round). Under noMatchContentCap, the file's
-// real content goes straight into the message instead.
+// TestMaterializeEdits_NoMatchIncludesContentWhenUnderCap checks a no_match failure under
+// noMatchContentCap includes the file's real content directly, instead of forcing a re-read.
 func TestMaterializeEdits_NoMatchIncludesContentWhenUnderCap(t *testing.T) {
 	content := "line one\nline two\nline three\n"
 	result := &Result{Files: []GeneratedFile{
@@ -640,9 +576,8 @@ func TestMaterializeEdits_NoMatchIncludesContentWhenUnderCap(t *testing.T) {
 	}
 }
 
-// TestMaterializeEdits_NoMatchOverCapShowsNearMissWindow confirms a file too
-// large to inline whole still gets a bounded, useful window when a cheap
-// anchor (the edit's first line) is found nearby — not the entire file.
+// TestMaterializeEdits_NoMatchOverCapShowsNearMissWindow checks a file too large to inline
+// whole still gets a bounded window around a cheap anchor, not the entire file.
 func TestMaterializeEdits_NoMatchOverCapShowsNearMissWindow(t *testing.T) {
 	anchor := "TARGET LINE"
 	big := strings.Repeat("filler ", 2000) + anchor + strings.Repeat(" more filler", 2000)
@@ -664,9 +599,8 @@ func TestMaterializeEdits_NoMatchOverCapShowsNearMissWindow(t *testing.T) {
 	}
 }
 
-// TestMaterializeEdits_NoMatchOverCapNoAnchorSaysReRead confirms a file too
-// large to inline, with no cheap anchor found either, falls back to a plain
-// instruction to re-read that one file — never silently drops the failure.
+// TestMaterializeEdits_NoMatchOverCapNoAnchorSaysReRead checks a file too large to inline
+// with no cheap anchor falls back to a plain re-read instruction, never silently drops the failure.
 func TestMaterializeEdits_NoMatchOverCapNoAnchorSaysReRead(t *testing.T) {
 	big := strings.Repeat("x", noMatchContentCap+1000)
 	result := &Result{Files: []GeneratedFile{
@@ -684,11 +618,8 @@ func TestMaterializeEdits_NoMatchOverCapNoAnchorSaysReRead(t *testing.T) {
 	}
 }
 
-// overlayReader mirrors themebuild's repairFileReader (a map checked first,
-// falling back to base) without depending on that package — this file
-// tests materializeEdits' own behavior when given such a reader, which is
-// the actual mechanism repairFileReader's tests (in themebuild) rely on;
-// this test proves it end to end at the materializeEdits level.
+// overlayReader mirrors themebuild's repairFileReader (a map checked first, falling back to
+// base) without depending on that package.
 func overlayReader(overlay map[string]string, base FileReader) FileReader {
 	return func(ctx context.Context, path string) (string, error) {
 		if content, ok := overlay[path]; ok {
@@ -698,13 +629,8 @@ func overlayReader(overlay map[string]string, base FileReader) FileReader {
 	}
 }
 
-// TestMaterializeEdits_SucceedsAgainstOverlayOnlyFile is the Run B case:
-// a file that only exists in a rejected proposal's own overlay (nothing
-// staged to the real store yet) must still materialize an "edit" — the
-// mechanism repairFileReader (themebuild) supplies during a repair round.
-// The plain base reader alone (no overlay — the initial generation's own
-// path, see TestMaterializeEdits_NonexistentFileFails) still fails exactly
-// as before this fix.
+// TestMaterializeEdits_SucceedsAgainstOverlayOnlyFile checks a file that only exists in a
+// rejected proposal's own overlay (nothing staged to the real store yet) still materializes.
 func TestMaterializeEdits_SucceedsAgainstOverlayOnlyFile(t *testing.T) {
 	base := fixedFileReader(nil) // nothing in the store
 	reader := overlayReader(map[string]string{"components/home-bestsellers.liquid": "<div>old</div>"}, base)
@@ -722,9 +648,8 @@ func TestMaterializeEdits_SucceedsAgainstOverlayOnlyFile(t *testing.T) {
 	}
 }
 
-// TestMaterializeEdits_NoReExploreInstructionAppearsOnceForBatch is the Run
-// B edge case: three failures at once (mixed types) must carry the
-// no-re-explore instruction exactly once, not once per failure.
+// TestMaterializeEdits_NoReExploreInstructionAppearsOnceForBatch checks three failures at
+// once carry the no-re-explore instruction exactly once, not once per failure.
 func TestMaterializeEdits_NoReExploreInstructionAppearsOnceForBatch(t *testing.T) {
 	result := &Result{Files: []GeneratedFile{
 		{Path: "a.liquid", Action: "edit", Edits: []Edit{{OldString: "nope-a", NewString: "y"}}},

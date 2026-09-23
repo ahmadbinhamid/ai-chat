@@ -15,11 +15,7 @@ func TestValidateProposal_EditModeAllowsLiquidFiles(t *testing.T) {
 }
 
 func TestValidateProposal_EditModeAllowsDefaultsJSON(t *testing.T) {
-	// defaults.json is a known, singular config file (see
-	// themefs.allowedGeneratedFullPaths) — a brand/color/font request must
-	// work in the default edit mode every chat actually runs in, not just
-	// the brand mode nothing currently sets automatically (see
-	// GenerateInput.Mode's doc comment).
+	// defaults.json must work in edit mode (brand mode is future).
 	r := &ai.Result{Files: []ai.GeneratedFile{{Path: "defaults.json", Action: "update", Content: "{}"}}}
 	if err := validateProposal(r, ""); err != nil {
 		t.Errorf("expected defaults.json update to be allowed in edit mode, got: %v", err)
@@ -57,13 +53,7 @@ func TestValidateProposal_BrandModeRejectsPageRegistration(t *testing.T) {
 	}
 }
 
-// A files[] entry targeting layout-start.liquid (or layout-end.liquid)
-// directly is allowed now — the AI theme builder can edit every real theme
-// file, including these two (a deliberate decision; see
-// pathsafety.go/writeplan.go's own doc comments for the history and the
-// safety net that replaced the old outright rejection tested here before:
-// buildWritePlan's hasDirectEdit guard, covered separately in
-// service_test.go, not this function at all anymore).
+// Direct layout edits now allowed; safety net guards against splice duplication.
 func TestValidateProposal_EditModeAllowsDirectLayoutStartEdit(t *testing.T) {
 	r := &ai.Result{
 		Files:            []ai.GeneratedFile{{Path: pathLayoutStart, Action: "update", Content: "<html></html>"}},
@@ -81,10 +71,7 @@ func TestValidateProposal_EditModeAllowsDirectLayoutEndEdit(t *testing.T) {
 	}
 }
 
-// The legitimate mechanism (layout_links_to_add/layout_scripts_to_add,
-// with no files[] entry for the layout file itself) must still pass —
-// otherwise the fix above would break the normal "register a new
-// stylesheet" flow it's meant to leave alone.
+// Layout links without direct edit must still work.
 func TestValidateProposal_EditModeAllowsLayoutLinksToAddWithoutDirectEdit(t *testing.T) {
 	r := &ai.Result{
 		Files:            []ai.GeneratedFile{{Path: "pages/offers.liquid", Action: "create", Content: "hi"}},

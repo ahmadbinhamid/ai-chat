@@ -8,13 +8,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// DraftHandler exposes a chat's effective file map (real theme + pending
-// draft overlay) for the frontend's LiquidJS preview — see
-// themebuild.Service.DraftFiles. Deliberately its own route, not folded
-// into GET /chat: that payload is already tens of KB (full transcript +
-// every generated file's before/after content), and this one can be
-// dozens of whole files on top of that for no benefit to a caller that
-// only wants the transcript.
+// DraftHandler exposes a chat's effective file map (real theme + pending draft overlay)
+// for the LiquidJS preview. Deliberately its own route, not folded into GET /chat's payload.
 type DraftHandler struct {
 	builder *themebuild.Service
 }
@@ -38,11 +33,8 @@ type saveManualEditRequest struct {
 	Content  string `json:"content"`
 }
 
-// SaveManualEdit handles POST /chats/:chatId/draft/edit — a merchant editing
-// static template text directly in the preview (see
-// themebuild.Service.SaveManualEdit), not a generation turn. Text only for
-// now — see SaveManualEdit's own doc comment on why an image edit can't go
-// through this same path yet.
+// SaveManualEdit handles POST /chats/:chatId/draft/edit — a merchant editing static
+// template text directly in the preview, not a generation turn. Text only for now.
 func (h *DraftHandler) SaveManualEdit(c *gin.Context) {
 	var in saveManualEditRequest
 	if err := c.ShouldBindJSON(&in); err != nil {

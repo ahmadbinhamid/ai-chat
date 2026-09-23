@@ -6,9 +6,7 @@ import (
 	"testing"
 )
 
-// TestOverlayStore_WriteFileReturnsError is item 11: applying a draft must
-// always be an explicit, deliberate call (Service.ApplyDraft), never a side
-// effect of code that thinks it's writing to a theme through an overlay.
+// TestOverlayStore_WriteFileReturnsError: applying a draft must be an explicit call, never a side effect of writing through an overlay.
 func TestOverlayStore_WriteFileReturnsError(t *testing.T) {
 	o := NewOverlayStore(nil, map[string]string{})
 	if err := o.WriteFile(context.Background(), RequestAuth{}, "pages/home.liquid", "x", nil); !errors.Is(err, ErrOverlayIsReadOnly) {
@@ -23,9 +21,7 @@ func TestOverlayStore_DeleteFileReturnsError(t *testing.T) {
 	}
 }
 
-// fakeBaseStore is a minimal in-memory ThemeStore for overlay tests that
-// don't need a real HTTP round trip — OverlayStore only ever calls base's
-// exported ThemeStore methods, so a fake satisfying just those is enough.
+// fakeBaseStore is a minimal in-memory ThemeStore for overlay tests that don't need a real HTTP round trip.
 type fakeBaseStore struct {
 	tree  []FileTreeEntry
 	files map[string]string
@@ -70,10 +66,7 @@ func TestOverlayStore_ReadFile_FallsThroughToBaseOnMiss(t *testing.T) {
 	}
 }
 
-// TestOverlayStore_ListFiles_MergesDraftOnlyPaths confirms a draft-created
-// file (and its brand-new parent directory) shows up in ListFiles even
-// though the base tree has never heard of it — required so
-// list_theme_files/buildSnapshot's render-target-exists check can see it.
+// TestOverlayStore_ListFiles_MergesDraftOnlyPaths confirms a draft-created file and its new parent directory show up in ListFiles even though base never heard of it.
 func TestOverlayStore_ListFiles_MergesDraftOnlyPaths(t *testing.T) {
 	base := &fakeBaseStore{
 		tree: []FileTreeEntry{

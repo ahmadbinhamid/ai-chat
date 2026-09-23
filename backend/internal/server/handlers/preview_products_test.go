@@ -14,10 +14,7 @@ import (
 	"ai-chat/internal/themefs"
 )
 
-// fakeFlowposProductsServer serves GET /products with a fixed JSON payload
-// (and /store, if storeName is non-empty, so a test can confirm the
-// existing store overlay still works unaffected alongside the new products
-// one) — every other path 404s, exactly like the real fetch failing.
+// fakeFlowposProductsServer serves GET /products (and /store, if storeName is non-empty); every other path 404s.
 func fakeFlowposProductsServer(t *testing.T, storeName string, productsBody []byte) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,12 +32,7 @@ func fakeFlowposProductsServer(t *testing.T, storeName string, productsBody []by
 	}))
 }
 
-// currentPage is always 1 and perPage always matches the preview's own cap
-// (3, FixtureProducts()' own item count — see buildPreviewContext): every
-// test here simulates fetching the preview's one and only page at that same
-// size, so neither is a parameter — see
-// TestBuildPreviewContext_PaginationNeverAdvertisesANextPage for the test
-// that specifically covers a real catalogue with more pages than that.
+// current_page is always 1 and per_page always 3 (FixtureProducts()' item count) since every test here simulates that one page.
 func rawProductsResponse(t *testing.T, lastPage, total int, products []map[string]any) []byte {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
@@ -70,10 +62,7 @@ func sampleRealProduct(id int, name, slug string) map[string]any {
 	}
 }
 
-// assertPreviewContextKeySet confirms buildPreviewContext's response shape
-// never changes regardless of whether products came back real or fixture —
-// the frontend's LiquidJS preview consumes this key set unchanged (see
-// buildPreviewContext's own doc comment).
+// assertPreviewContextKeySet confirms the response key set never changes regardless of whether products came back real or fixture.
 func assertPreviewContextKeySet(t *testing.T, ctx map[string]any) {
 	t.Helper()
 	want := []string{
@@ -97,10 +86,7 @@ func assertPreviewContextKeySet(t *testing.T, ctx map[string]any) {
 	}
 }
 
-// TestBuildPreviewContext_RealProductsFetched covers the happy path: real
-// products overlay products, store overlays independently and correctly
-// alongside it (proving the new fetch doesn't interfere with the existing
-// ones), and everything else (product, category, ...) stays fixture.
+// TestBuildPreviewContext_RealProductsFetched covers the happy path: real products and store overlay independently, everything else stays fixture.
 func TestBuildPreviewContext_RealProductsFetched(t *testing.T) {
 	body := rawProductsResponse(t, 1, 1, []map[string]any{sampleRealProduct(1, "Real Widget", "real-widget")})
 	ts := fakeFlowposProductsServer(t, "Fleure", body)
@@ -140,23 +126,19 @@ func TestBuildPreviewContext_RealProductsFetched(t *testing.T) {
 		t.Errorf("expected on_sale true (compare_price 15.0 > price 12.5), got %v", item["on_sale"])
 	}
 
-	// product (the detail-page singular) must stay on the fixture — see
-	// buildPreviewContext's own doc comment on why.
+	// product (the detail-page singular) must stay on the fixture.
 	product, _ := ctx["product"].(map[string]any)
 	if product["name"] != "Sample Product" {
 		t.Errorf("expected product to stay on the fixture, got %+v", product)
 	}
-	// category/categories untouched by this change at all.
+	// category/categories untouched by this change.
 	category, _ := ctx["category"].(map[string]any)
 	if category["name"] != "Sample Category" {
 		t.Errorf("expected category to stay on the fixture, got %+v", category)
 	}
 }
 
-// TestBuildPreviewContext_ProductsFetchErrorKeepsFixture covers the first
-// fail-open case: a hard fetch failure (every path 404s here) must never
-// surface as an error to the caller — buildPreviewContext has no error
-// return at all, so this is really "keeps rendering with fixture data."
+// TestBuildPreviewContext_ProductsFetchErrorKeepsFixture: a hard fetch failure must never surface as an error — it falls back to fixture data.
 func TestBuildPreviewContext_ProductsFetchErrorKeepsFixture(t *testing.T) {
 	ts := fakeFlowposProductsServer(t, "", nil) // /products 404s
 	defer ts.Close()
@@ -176,11 +158,7 @@ func TestBuildPreviewContext_ProductsFetchErrorKeepsFixture(t *testing.T) {
 	}
 }
 
-// TestBuildPreviewContext_ZeroProductsKeepsFixture covers the second,
-// more important fail-open case: the fetch SUCCEEDS but the tenant's real
-// catalogue is empty. A merchant with no products yet must still see a
-// populated-looking shop page, not a blank one they'd mistake for a broken
-// theme (see buildPreviewContext's own doc comment).
+// TestBuildPreviewContext_ZeroProductsKeepsFixture: the fetch succeeds but the catalogue is empty — a merchant with no products should still see a populated-looking page.
 func TestBuildPreviewContext_ZeroProductsKeepsFixture(t *testing.T) {
 	body := rawProductsResponse(t, 1, 0, []map[string]any{})
 	ts := fakeFlowposProductsServer(t, "", body)
@@ -197,11 +175,7 @@ func TestBuildPreviewContext_ZeroProductsKeepsFixture(t *testing.T) {
 	}
 }
 
-// TestBuildPreviewContext_CapsProductsAtFixtureLength confirms the cap is
-// enforced even if flowpos-backend ignores the "limit" query param and
-// returns more items than asked for — a merchant with a huge catalogue
-// must not blow up this response (see themefs.Store.FetchProducts' own
-// doc comment on the defensive re-cap).
+// TestBuildPreviewContext_CapsProductsAtFixtureLength confirms the cap is enforced even if flowpos-backend ignores the "limit" query param.
 func TestBuildPreviewContext_CapsProductsAtFixtureLength(t *testing.T) {
 	var raw []map[string]any
 	for i := 1; i <= 5; i++ {
@@ -223,13 +197,8 @@ func TestBuildPreviewContext_CapsProductsAtFixtureLength(t *testing.T) {
 	}
 }
 
-// TestBuildPreviewContext_PaginationNeverAdvertisesANextPage locks in the
-// actual fix for a real reported bug: flowpos-backend's paginator response
-// here claims a real second page exists (last_page: 3), but the preview
-// only ever fetches one page and has no mechanism to fetch or render
-// another — reporting has_next: true drew a live-looking "Next" button that
-// did nothing when a merchant clicked it. Pagination must always claim
-// exactly one page, regardless of what the real catalogue's page count is.
+// TestBuildPreviewContext_PaginationNeverAdvertisesANextPage: pagination must always claim exactly one page (has_next false),
+// even when the real catalogue's paginator reports more (last_page: 3 here) — the preview can't fetch or render another page.
 func TestBuildPreviewContext_PaginationNeverAdvertisesANextPage(t *testing.T) {
 	body := rawProductsResponse(t, 3, 9, []map[string]any{
 		sampleRealProduct(1, "Product One", "product-one"),

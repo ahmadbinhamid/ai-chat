@@ -1,8 +1,5 @@
-// Package migrator is the migration engine: the registry plus the run/fresh
-// logic. It holds no migrations itself — the files in database/migrations
-// register themselves here via init(). Keeping the engine separate means a
-// future "squash" command can wipe database/migrations and drop in a single
-// schema file without touching this package.
+// Package migrator is the migration engine (registry plus run/fresh logic); it holds no migrations itself.
+// Migrations self-register via init() in database/migrations, kept separate so a future "squash" command can replace that package alone.
 package migrator
 
 import (

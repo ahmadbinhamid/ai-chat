@@ -23,16 +23,8 @@ const (
 	bearerPrefix   = "Bearer "
 )
 
-// Middleware authenticates every request by delegating to FlowPOS — see the
-// package doc comment. It never mints its own token or session; the cache
-// TTL is the only revocation window this service has.
-//
-// Order matters here: the cache lookup only ever stands in for the
-// introspection call. is_active and tenant resolution run on every request,
-// cache hit or miss — never cached themselves — because the same token can
-// legitimately arrive with a different X-Tenant-Id across requests (a
-// tenant switcher), and caching the resolved tenant would silently keep
-// serving the first one for the rest of the TTL.
+// Middleware authenticates every request via FlowPOS. The cache lookup only stands in for
+// the introspection call — tenant resolution runs fresh every request, or a switch would silently keep serving the old tenant.
 func Middleware(client *Client, cache Cache, positiveTTL, negativeTTL time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token, ok := extractBearerToken(c.GetHeader("Authorization"))
@@ -43,15 +35,7 @@ func Middleware(client *Client, cache Cache, positiveTTL, negativeTTL time.Durat
 
 		entry, err := lookupOrIntrospect(c.Request.Context(), client, cache, token, positiveTTL, negativeTTL)
 		if err != nil {
-			// Upstream unreachable/erroring and nothing usable was cached —
-			// this must never look like an invalid token (401), or an
-			// upstream blip logs out every user. The client only ever gets
-			// the generic message below (never err.Error(), which could
-			// echo upstream response detail) — but without logging err
-			// somewhere, a real outage is undiagnosable from server logs
-			// alone. err is safe to log verbatim: Client.Introspect never
-			// wraps the raw token or a /user response body into it, only
-			// network/status detail (see internal/auth/client.go).
+			// Must not look like an invalid token (401), or an upstream blip logs out every user.
 			slog.Default().Error("identity provider unavailable", "error", err.Error(), "request_id", c.GetString("request_id"))
 			httpresponse.Error(c, http.StatusServiceUnavailable, "identity provider unavailable, try again shortly", "IDENTITY_UNAVAILABLE")
 			c.Abort()
@@ -94,10 +78,8 @@ func respondUnauthenticated(c *gin.Context, msg string) {
 	c.Abort()
 }
 
-// lookupOrIntrospect returns the cached entry for token if present — a
-// cache error is treated the same as a miss (never surfaced to the caller;
-// a cache outage must degrade to a live call, not a 500) — otherwise calls
-// FlowPOS and caches the outcome, positive or negative, before returning it.
+// lookupOrIntrospect returns the cached entry for token if present — a cache error is
+// treated as a miss, never surfaced, so a cache outage degrades to a live call, not a 500.
 func lookupOrIntrospect(ctx context.Context, client *Client, cache Cache, token string, positiveTTL, negativeTTL time.Duration) (CacheEntry, error) {
 	key := cacheKey(token)
 
@@ -144,22 +126,14 @@ func extractBearerToken(header string) (string, bool) {
 	return token, true
 }
 
-// resolveTenant picks which tenant this request acts as. An explicit
-// X-Tenant-Id must be one of the user's own tenants — this is what prevents
-// cross-tenant access via a forged header (an IDOR), so it's never trusted
-// on its own. A malformed header (not a valid uint64) is the caller's
-// mistake, distinct from a well-formed id that just isn't theirs — 400, not
-// 403. Absent, it falls back to defaultTenant, itself re-validated against
-// the same list.
+// resolveTenant picks which tenant this request acts as. An explicit X-Tenant-Id must be
+// one of the user's own tenants — this prevents cross-tenant access via a forged header (IDOR).
 func resolveTenant(c *gin.Context, entry CacheEntry) (Tenant, int, bool) {
 	return resolveTenantID(c.GetHeader(hdrTenantID), entry)
 }
 
-// resolveTenantID is resolveTenant's header-independent core, shared with
-// WebSocketAuth (see websocket.go), which has no X-Tenant-Id header to read
-// — its caller-supplied tenant ID comes from a WebSocket subprotocol
-// instead. Same validation either way: an explicit ID must be one of the
-// user's own tenants (rawTenantID == "" falls back to DefaultTenantID).
+// resolveTenantID is resolveTenant's header-independent core, shared with WebSocketAuth,
+// which reads the tenant ID from a subprotocol instead of a header. Same validation either way.
 func resolveTenantID(rawTenantID string, entry CacheEntry) (Tenant, int, bool) {
 	if rawTenantID != "" {
 		id, err := strconv.ParseUint(rawTenantID, 10, 64)
@@ -208,11 +182,7 @@ func FromContext(c *gin.Context) (Identity, bool) {
 	return identity, ok
 }
 
-// TenantID, UserID, and UserName are thin shims over FromContext, kept with
-// these exact names and signatures so the existing handler call sites (see
-// server/handlers/message.go, chat.go) only needed a new import, not a
-// rewrite, when this package replaced the old placeholder identity
-// middleware. New code should prefer FromContext directly.
+// TenantID, UserID, and UserName are thin shims over FromContext. New code should prefer FromContext directly.
 func TenantID(c *gin.Context) uint64 {
 	identity, _ := FromContext(c)
 	return identity.TenantID
@@ -237,13 +207,8 @@ func Email(c *gin.Context) string {
 	return identity.Email
 }
 
-// Token returns the raw bearer token this request was authenticated with —
-// for the rare caller that needs to forward the caller's own identity to
-// another FlowPOS-authenticated API on their behalf (see
-// internal/themefs.Store, which calls flowpos-backend's theme-file API as
-// the same user). Prefer FromContext/TenantID/UserID for anything else —
-// this exists only for that one forwarding use case, not as a general
-// convenience accessor.
+// Token returns the raw bearer token, for the rare caller that forwards the user's own
+// identity to another FlowPOS-authenticated API. Prefer FromContext/TenantID/UserID otherwise.
 func Token(c *gin.Context) string {
 	v, _ := c.Get(ctxTokenKey)
 	token, _ := v.(string)

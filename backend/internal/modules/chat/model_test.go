@@ -6,11 +6,8 @@ import (
 	"testing"
 )
 
-// TestMessage_JSON_OmitsAttachmentContent is the regression test for "never
-// ship a turn's attached bytes to the browser": MessageAttachment.Content
-// is json:"-" (see its own doc comment), so a marshaled Message must expose
-// only metadata (id/kind/filename/media_type/size_bytes/position) for each
-// attachment, never Content, no matter how it's set.
+// TestMessage_JSON_OmitsAttachmentContent checks a turn's attached bytes never ship to the
+// browser: a marshaled Message exposes only attachment metadata, never Content.
 func TestMessage_JSON_OmitsAttachmentContent(t *testing.T) {
 	imageContent := []byte("this exact image byte sequence must never appear in the JSON output")
 	htmlContent := []byte("<h1>this exact HTML byte sequence must never appear in the JSON output</h1>")

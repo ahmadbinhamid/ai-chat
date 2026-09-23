@@ -5,11 +5,7 @@ import (
 	"strings"
 )
 
-// AddStylesheetLink inserts a <link rel="stylesheet"> for assetPath into
-// layout-start.liquid's content, right before </head>. Idempotent: if a link
-// for this exact asset path is already present, the content is returned
-// unchanged and changed is false — so re-applying an already-applied action
-// (e.g. a retried request) never duplicates the tag.
+// AddStylesheetLink inserts a <link rel="stylesheet"> for assetPath before </head>. Idempotent — a retried request never duplicates the tag.
 func AddStylesheetLink(layoutStartContent, assetPath string) (updated string, changed bool, err error) {
 	href := fmt.Sprintf("{{ '%s' | asset_url }}", assetPath)
 	if strings.Contains(layoutStartContent, href) {
@@ -27,9 +23,7 @@ func AddStylesheetLink(layoutStartContent, assetPath string) (updated string, ch
 	return updated, true, nil
 }
 
-// AddDeferredScript inserts a <script defer> for assetPath into
-// layout-end.liquid's content, right before </body>. Same idempotency
-// guarantee as AddStylesheetLink.
+// AddDeferredScript inserts a <script defer> for assetPath before </body>. Same idempotency guarantee as AddStylesheetLink.
 func AddDeferredScript(layoutEndContent, assetPath string) (updated string, changed bool, err error) {
 	src := fmt.Sprintf("{{ '%s' | asset_url }}", assetPath)
 	if strings.Contains(layoutEndContent, src) {

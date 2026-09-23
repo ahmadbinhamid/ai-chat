@@ -21,10 +21,8 @@ func NewRepository(db *sql.DB) *Repository {
 	return &Repository{db: db}
 }
 
-// encodePageMeta/decodePageMeta convert PageMeta to/from the JSON this
-// table's page_meta column stores it as — a nil PageMeta encodes to a nil
-// []byte, which the MySQL driver writes as a real SQL NULL, not the string
-// "null" (see database/sql's handling of a nil []byte parameter).
+// encodePageMeta/decodePageMeta convert PageMeta to/from JSON; a nil PageMeta encodes to a nil
+// []byte, which the driver writes as a real SQL NULL, not the string "null".
 func encodePageMeta(m *themefs.PageMeta) ([]byte, error) {
 	if m == nil {
 		return nil, nil
@@ -56,10 +54,8 @@ func (r *Repository) CreateFile(ctx context.Context, f GeneratedFile) error {
 	return err
 }
 
-// generatedFileColumns is the column list scanGeneratedFile expects, in
-// order — shared by every SELECT in this file for the same reason
-// generation.go's generationColumns is: one place a column can't be added
-// to one query and silently missed by another's positional Scan.
+// generatedFileColumns is the column list scanGeneratedFile expects, in order — shared by every
+// SELECT here so a column can't be added to one query and missed by another's Scan.
 const generatedFileColumns = `
 	id, message_id, chat_id, file_path, action, kind, language, content, previous_content, page_meta, created_at, updated_at
 `
@@ -79,10 +75,8 @@ func scanGeneratedFile(row interface{ Scan(dest ...any) error }) (GeneratedFile,
 	return f, nil
 }
 
-// ListFilesByChat returns every generated file ever written in a chat, in
-// one query — used to hydrate a chat's full history (GET /chat) without an
-// N+1 query per message. Relies on chat_id being denormalized onto
-// chat_generated_files for exactly this reason.
+// ListFilesByChat returns every generated file in a chat in one query, hydrating GET /chat
+// without an N+1 per message.
 func (r *Repository) ListFilesByChat(ctx context.Context, chatID string) ([]GeneratedFile, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT `+generatedFileColumns+`
@@ -104,24 +98,8 @@ func (r *Repository) ListFilesByChat(ctx context.Context, chatID string) ([]Gene
 	return files, rows.Err()
 }
 
-// DraftFiles returns the chat's unsaved overlay: latest content per
-// file_path across every generated-file row whose message is still
-// apply_status = 'pending'. Later turns win — a merchant's second prompt
-// editing a file the first prompt just created should read (and the draft
-// should show) the second prompt's version. kind='layout' rows are
-// included here (unlike PendingGeneration-facing lists elsewhere): the
-// overlay is about file CONTENT for reading, and a turn that spliced a new
-// <link> into layout-start.liquid needs later turns' reads of that path to
-// see the spliced draft version, not the stale saved one — otherwise a
-// third turn's own layout splice would compute its diff against the wrong
-// "current" content and could silently drop the second turn's link.
-//
-// Ordering is (m.created_at, f.created_at, f.id) — id is the tie-break for
-// the same reason DequeueNext's ORDER BY needs one (see generation.go):
-// created_at is a DATETIME with only second-level precision, and two turns
-// (or two files within one turn) landing in the same wall-clock second
-// would otherwise tie non-deterministically. revert.go already documents
-// this exact hazard for created_at ordering; this does not reintroduce it.
+// DraftFiles returns the chat's unsaved overlay: latest content per file_path across every
+// still-pending row, later turns winning. Ordered by (m.created_at, f.created_at, f.id), id as tie-break.
 func (r *Repository) DraftFiles(ctx context.Context, chatID string) (map[string]string, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT f.file_path, f.content
@@ -146,10 +124,8 @@ func (r *Repository) DraftFiles(ctx context.Context, chatID string) (map[string]
 	return draft, rows.Err()
 }
 
-// PendingFiles returns every generated-file row (proposed and layout alike
-// — see GeneratedFileKind) belonging to a still-'pending' message, oldest
-// first — what Service.ApplyDraft folds into a writePlan. Same ordering
-// rationale as DraftFiles.
+// PendingFiles returns every generated-file row of a still-pending message, oldest first — what
+// Service.ApplyDraft folds into a writePlan.
 func (r *Repository) PendingFiles(ctx context.Context, chatID string) ([]GeneratedFile, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT `+generatedFileColumnsPrefixed("f")+`
@@ -174,10 +150,8 @@ func (r *Repository) PendingFiles(ctx context.Context, chatID string) ([]Generat
 	return files, rows.Err()
 }
 
-// generatedFileColumnsPrefixed is generatedFileColumns with every column
-// qualified by alias — needed once DraftFiles/PendingFiles' queries join
-// chat_messages, whose own columns (id, created_at, ...) would otherwise
-// collide with chat_generated_files' identically-named ones.
+// generatedFileColumnsPrefixed is generatedFileColumns qualified by alias, needed once a query
+// joins chat_messages, whose columns would otherwise collide by name.
 func generatedFileColumnsPrefixed(alias string) string {
 	cols := []string{"id", "message_id", "chat_id", "file_path", "action", "kind", "language", "content", "previous_content", "page_meta", "created_at", "updated_at"}
 	out := ""
@@ -190,11 +164,8 @@ func generatedFileColumnsPrefixed(alias string) string {
 	return out
 }
 
-// MarkMessagesApplied stamps every still-'pending' message in chatID as
-// 'applied' with AppliedAt = at — called once, after Service.ApplyDraft has
-// successfully written every pending file to the real theme. Deliberately
-// chat-wide, not per-message: a draft is applied as a whole (see
-// chat.ApplyStatus's doc comment), there is no partial-apply concept.
+// MarkMessagesApplied stamps every pending message as applied. Chat-wide, not per-message — a
+// draft is applied as a whole, there is no partial-apply concept.
 func (r *Repository) MarkMessagesApplied(ctx context.Context, chatID string, at time.Time) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE chat_messages SET apply_status = ?, applied_at = ?
@@ -203,11 +174,8 @@ func (r *Repository) MarkMessagesApplied(ctx context.Context, chatID string, at 
 	return err
 }
 
-// ListAppliedFilesByChat returns every generated-file row belonging to an
-// 'applied' message, oldest first — what revertAppliedHistory computes
-// "what does the live theme currently look like" from. Deliberately
-// excludes 'pending'/'discarded' rows: those were never written to
-// FlowPOS, so they say nothing true about the live theme's history.
+// ListAppliedFilesByChat returns applied-message rows only, oldest first, for computing what the
+// live theme looks like; pending/discarded rows were never written, so they don't count.
 func (r *Repository) ListAppliedFilesByChat(ctx context.Context, chatID string) ([]GeneratedFile, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT `+generatedFileColumnsPrefixed("f")+`
@@ -232,20 +200,8 @@ func (r *Repository) ListAppliedFilesByChat(ctx context.Context, chatID string) 
 	return files, rows.Err()
 }
 
-// DiscardMessagesAfter marks every still-'pending' message in chatID
-// created after `after` as 'discarded', returning the distinct
-// (non-layout — see GeneratedFileKind) file paths those messages had
-// staged, for revertWithinDraft's RevertResult. The SELECT runs before the
-// UPDATE deliberately: once a message is marked 'discarded' its rows drop
-// out of anything scoped to apply_status = 'pending', including a query
-// trying to report what just got discarded.
-//
-// Both statements run inside one transaction, the SELECT with FOR UPDATE:
-// without that, a concurrent write landing between the two (e.g. another
-// request enqueuing a new message for this chat right as this call runs)
-// could make the returned paths not exactly match what the UPDATE actually
-// marked discarded — the FOR UPDATE lock on the matched chat_messages rows
-// closes that gap by holding them until this transaction commits.
+// DiscardMessagesAfter marks pending messages after `after` as discarded, returning their staged
+// file paths. The SELECT (FOR UPDATE, same transaction) runs first, before discard drops rows out of scope.
 func (r *Repository) DiscardMessagesAfter(ctx context.Context, chatID string, after time.Time) ([]string, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -291,11 +247,8 @@ func (r *Repository) DiscardMessagesAfter(ctx context.Context, chatID string, af
 	return paths, nil
 }
 
-// MarkMessagesDiscarded stamps every still-'pending' message in chatID as
-// 'discarded' — called by Service.DiscardDraft. Messages themselves are
-// never deleted (see chat.ApplyStatusDiscarded's doc comment): the
-// transcript should still show a discarded turn happened, just struck
-// through/greyed on the frontend, not vanished.
+// MarkMessagesDiscarded stamps pending messages as discarded. Messages are never deleted — the
+// transcript should still show the turn happened, just struck through on the frontend.
 func (r *Repository) MarkMessagesDiscarded(ctx context.Context, chatID string) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE chat_messages SET apply_status = ?

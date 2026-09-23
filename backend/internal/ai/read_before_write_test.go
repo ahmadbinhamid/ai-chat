@@ -15,11 +15,8 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
-// captureWarnLogs redirects slog's default logger to a buffer for the
-// duration of fn, restoring the original default afterward, and returns
-// every non-empty line written — used to assert on
-// warnReadBeforeWriteViolations' output without threading a logger through
-// Generate's own signature (it has none today, and this change doesn't add one).
+// captureWarnLogs redirects slog's default logger to a buffer for fn, restoring the original
+// afterward, and returns every non-empty line written.
 func captureWarnLogs(t *testing.T, fn func()) []string {
 	t.Helper()
 	var buf bytes.Buffer
@@ -66,11 +63,7 @@ func TestWarnReadBeforeWriteViolations_CreateNeverWarns(t *testing.T) {
 	}
 }
 
-// TestWarnReadBeforeWriteViolations_PreSuppliedFilesNeverWarn is the case
-// this exclusion exists for: pages.json and defaults.json are already in
-// every request's context (§0) and the model is explicitly told never to
-// read_theme_file them, so writing either without a prior read in this loop
-// is correct behavior, not a violation.
+// TestWarnReadBeforeWriteViolations_PreSuppliedFilesNeverWarn checks pages.json/defaults.json
 func TestWarnReadBeforeWriteViolations_PreSuppliedFilesNeverWarn(t *testing.T) {
 	files := []GeneratedFile{
 		{Path: "defaults.json", Action: "update"},
@@ -83,10 +76,8 @@ func TestWarnReadBeforeWriteViolations_PreSuppliedFilesNeverWarn(t *testing.T) {
 	}
 }
 
-// TestWarnReadBeforeWriteViolations_LayoutFilesStillWarn confirms the
-// exclusion is narrow: liquid/layout-start.liquid and layout-end.liquid are
-// NOT on §0's pre-supplied list (a direct edit to either must read the
-// whole file first per §0's own wording), so writing one unread must still warn.
+// TestWarnReadBeforeWriteViolations_LayoutFilesStillWarn checks the exclusion is narrow:
+// layout-start/end.liquid are NOT pre-supplied, so writing one unread still warns.
 func TestWarnReadBeforeWriteViolations_LayoutFilesStillWarn(t *testing.T) {
 	files := []GeneratedFile{
 		{Path: "liquid/layout-start.liquid", Action: "update"},
@@ -110,9 +101,8 @@ func TestWarnReadBeforeWriteViolations_LayoutFilesStillWarn(t *testing.T) {
 	}
 }
 
-// TestWarnReadBeforeWriteViolations_OrdinaryFileStillWarns confirms the
-// exclusion is scoped to exactly the two pre-supplied names — an unrelated
-// unread update still warns exactly as before this change.
+// TestWarnReadBeforeWriteViolations_OrdinaryFileStillWarns checks the exclusion is scoped
+// to exactly the two pre-supplied names.
 func TestWarnReadBeforeWriteViolations_OrdinaryFileStillWarns(t *testing.T) {
 	files := []GeneratedFile{{Path: "components/footer.liquid", Action: "update"}}
 	known := map[string]bool{}
@@ -143,9 +133,8 @@ func TestRegisterReadPaths_AllBatchedPathsRegister(t *testing.T) {
 	}
 }
 
-// TestGenerate_NoWarningWhenUpdatedFileWasRead is the end-to-end version of
-// TestWarnReadBeforeWriteViolations_ReadFileProducesNoWarning — through the
-// real tool loop, a file read_theme_file actually fetched must not warn.
+// TestGenerate_NoWarningWhenUpdatedFileWasRead is the end-to-end version: through the real
+// tool loop, a file read_theme_file actually fetched must not warn.
 func TestGenerate_NoWarningWhenUpdatedFileWasRead(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -191,11 +180,8 @@ func TestGenerate_NoWarningWhenUpdatedFileWasRead(t *testing.T) {
 	}
 }
 
-// TestGenerate_WarnsOnUpdateToFileOnlyGrepped is the grep_theme edge case —
-// a file matched by grep_theme (which returns matching lines, not the
-// file) but never read via read_theme_file must still warn, and the
-// proposal must come back completely unchanged: no rejection, no retry,
-// no extra API call.
+// TestGenerate_WarnsOnUpdateToFileOnlyGrepped checks a file only matched by grep_theme
+// (never read_theme_file) still warns, and the proposal comes back completely unchanged.
 func TestGenerate_WarnsOnUpdateToFileOnlyGrepped(t *testing.T) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

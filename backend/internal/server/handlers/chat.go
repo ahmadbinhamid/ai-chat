@@ -22,44 +22,26 @@ func NewChatHandler(chats *chat.Service, builder *themebuild.Service) *ChatHandl
 	return &ChatHandler{chats: chats, builder: builder}
 }
 
-// messageWithFiles attaches a turn's generated files (if any) inline —
-// assembled at the handler level since chat.Message deliberately doesn't
-// know about themebuild.GeneratedFile (that dependency runs the other way).
+// messageWithFiles attaches a turn's generated files inline, assembled here since chat.Message doesn't depend on themebuild.
 type messageWithFiles struct {
 	chat.Message
 	GeneratedFiles []themebuild.GeneratedFile `json:"generated_files"`
 }
 
-// chatDetail is the chat plus its full message log. Chat is a pointer so a
-// tenant with no chat yet gets the same shape back (chat: null, messages:
-// []) instead of a differently-shaped response the frontend would need to
-// special-case. Generating/GenerationError are how the caller learns the
-// outcome of a POST /chats/messages call after the fact — that endpoint now
-// returns as soon as the prompt is accepted, not once Claude has replied
-// (see themebuild.Service.Generate) — so the frontend polls this endpoint
-// until Generating flips back to false.
+// chatDetail is the chat plus its full message log. Chat is a pointer so a tenant with no chat yet gets the same response shape.
+// Generating/GenerationError let the frontend poll a send-message call's outcome, since that endpoint returns before generation finishes.
 type chatDetail struct {
 	Chat            *chat.Chat         `json:"chat"`
 	Messages        []messageWithFiles `json:"messages"`
 	Generating      bool               `json:"generating"`
 	GenerationError string             `json:"generation_error,omitempty"`
-	// Queue is the running generation (if any) plus every generation still
-	// queued behind it, oldest first — see
-	// themebuild.Service.ListPendingGenerations. Always [] rather than null
-	// for a chat with nothing pending, same convention as Messages.
+	// Queue is the running generation (if any) plus everything queued behind it, oldest first. Always [], never null.
 	Queue []themebuild.PendingGeneration `json:"queue"`
-	// PendingChanges reports the chat's unapplied draft, if any — see
-	// themebuild.Service.DraftSummary. Never includes file CONTENT (that's
-	// GET /chats/:chatId/draft, its own route — see DraftHandler's doc
-	// comment on why this payload shouldn't grow by dozens of whole files).
+	// PendingChanges reports the unapplied draft, if any. File content lives at GET /chats/:chatId/draft to keep this payload small.
 	PendingChanges themebuild.DraftSummaryResult `json:"pending_changes"`
 }
 
-// Get returns the tenant's one chat and its full transcript, with each
-// turn's generated files attached so reopening the page still shows every
-// past "Generated files" card, not just the most recent one. A tenant that
-// hasn't sent a first message yet has no chat row — that's a normal state
-// (200 with a null chat), not a 404.
+// Get returns the tenant's one chat with its full transcript and each turn's generated files. No chat yet is a normal 200 with a null chat, not 404.
 func (h *ChatHandler) Get(c *gin.Context) {
 	ch, err := h.chats.GetChatForTenant(c.Request.Context(), auth.TenantID(c), themebuild.ChatType)
 	if errors.Is(err, chat.ErrNotFound) {
@@ -117,20 +99,13 @@ func (h *ChatHandler) Get(c *gin.Context) {
 	})
 }
 
-// chatStatus is just the two fields a caller needs to know whether a
-// generation is still running — the frontend's WebSocket-unavailable poll
-// fallback (see ai-chat-stream.ts's streamGeneration / index.tsx's
-// statusQuery) hits this instead of Get so it isn't re-fetching the full
-// transcript and every generated file's before/after content every 3s.
+// chatStatus is a lightweight poll response so the frontend's WebSocket-fallback poll isn't re-fetching the full transcript every few seconds.
 type chatStatus struct {
 	Generating      bool   `json:"generating"`
 	GenerationError string `json:"generation_error,omitempty"`
 }
 
-// Status returns {generating, generation_error} for the tenant's one chat.
-// A tenant with no chat yet reports generating: false rather than 404,
-// mirroring Get's own null-chat handling — there's nothing generating for
-// a chat that doesn't exist, that's not an error condition here.
+// Status returns {generating, generation_error} for the tenant's one chat; no chat yet reports generating: false, not 404.
 func (h *ChatHandler) Status(c *gin.Context) {
 	ch, err := h.chats.GetChatForTenant(c.Request.Context(), auth.TenantID(c), themebuild.ChatType)
 	if errors.Is(err, chat.ErrNotFound) {

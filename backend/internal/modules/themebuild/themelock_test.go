@@ -8,11 +8,7 @@ import (
 	"testing"
 )
 
-// TestStripedMutex_MemoryBoundedRegardlessOfKeyCount is the fix this type
-// exists for: historySummaryLocks used to grow one permanent *sync.Mutex
-// entry per distinct chat ID for the life of the process (see
-// stripedMutex's own doc comment) — locking a huge number of distinct keys
-// must never grow the underlying storage past the fixed stripe count.
+// Locking a huge number of distinct keys must never grow storage past the fixed stripe count.
 func TestStripedMutex_MemoryBoundedRegardlessOfKeyCount(t *testing.T) {
 	s := newStripedMutex(8)
 	for i := 0; i < 10_000; i++ {
@@ -27,9 +23,7 @@ func TestStripedMutex_MemoryBoundedRegardlessOfKeyCount(t *testing.T) {
 	}
 }
 
-// TestStripedMutex_SerializesTheSameKey confirms the actual locking
-// guarantee still holds: two concurrent Lock calls for the SAME key must
-// never both be "in the critical section" at once.
+// Two concurrent Lock calls for the SAME key must never both be in the critical section at once.
 func TestStripedMutex_SerializesTheSameKey(t *testing.T) {
 	s := newStripedMutex(8)
 	var inCriticalSection atomic.Int32
@@ -59,14 +53,7 @@ func TestStripedMutex_SerializesTheSameKey(t *testing.T) {
 	}
 }
 
-// TestThemeLockKey_DifferentTenantsNeverCollide is the fix for a real
-// cross-tenant contention bug: themeLocks used to be locked by theme slug
-// alone (service.go, apply.go), so two different tenants whose slugs
-// happened to match (plausible — slugs read as human-chosen, e.g. "shop")
-// would serialize against each other's completely unrelated writes.
-// themeLockKey must produce a different key per tenant even for the exact
-// same slug, and a stable, identical key for the same (tenant, slug) pair
-// every time (so the lock still actually works for its own intended case).
+// themeLockKey must differ per tenant for the same slug, but stay stable for the same (tenant, slug) pair.
 func TestThemeLockKey_DifferentTenantsNeverCollide(t *testing.T) {
 	a := themeLockKey(1, "shop")
 	b := themeLockKey(2, "shop")

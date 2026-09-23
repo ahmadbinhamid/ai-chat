@@ -7,10 +7,7 @@ import (
 
 const ruleIDRenderTargetExists = "render-target-exists"
 
-// checkRenderTargetExists enforces rule 4: every {% render 'x' %} path must
-// start with 'liquid/' or 'components/' and resolve to a file that already
-// exists in the theme or is itself part of this same proposal (a page can
-// legitimately render a component created in the same turn).
+// checkRenderTargetExists enforces rule 4: every render path must start with 'liquid/' or 'components/' and resolve to an existing or in-proposal file.
 func checkRenderTargetExists(p Proposal, snap Snapshot) []Finding {
 	var findings []Finding
 	for _, f := range p.Files {

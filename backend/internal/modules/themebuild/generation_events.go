@@ -12,9 +12,8 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// GenerationEvent is one entry in a generation's durable progress log —
-// what a WebSocket client replays on (re)connect and what Redis publishes
-// live to any replica other than the one running the generation.
+// GenerationEvent is one entry in a generation's durable progress log, replayed on reconnect
+// and published live to other replicas via Redis.
 type GenerationEvent struct {
 	ID           string
 	GenerationID string
@@ -32,90 +31,43 @@ const (
 	EventTypeRepairing   = "repairing"
 	EventTypeDone        = "done"
 	EventTypeFailed      = "failed"
-	// EventTypeQueued is emitted once, from Generate, when a new prompt
-	// loses the race to claim the running slot — payload:
-	// {position, prompt_preview}.
+	// EventTypeQueued: a new prompt lost the race to claim the running slot. Payload: {position, prompt_preview}.
 	EventTypeQueued = "queued"
-	// EventTypeDequeued is emitted at the top of each drain-loop iteration
-	// (see Service.runGeneration) — this generation is now the one running.
-	// No payload: a reconnecting client only needs to know *that* it
-	// started, everything else (prompt, etc.) it already has from the
-	// earlier "queued" event for this same generation_id.
+	// EventTypeDequeued: this generation is now running. No payload; the client already has the
+	// prompt from the earlier "queued" event for this generation_id.
 	EventTypeDequeued = "dequeued"
-	// EventTypeCancelled is emitted once a generation has actually stopped
-	// as the result of a merchant's cancel request — whether it was still
-	// queued (stopped immediately, see Service.CancelQueuedGeneration's
-	// queued branch) or was already running (stopped once its own
-	// goroutine noticed EventTypeCancelRequested — see
-	// runOneQueuedGeneration). Payload: {"generation_id": "..."}.
+	// EventTypeCancelled: a generation stopped due to a cancel request, whether it was queued or
+	// running. Payload: {"generation_id": "..."}.
 	EventTypeCancelled = "cancelled"
-	// EventTypeCancelRequested is a live-only signal (published straight
-	// to eventBus, never through emit/emitLive — see
-	// Service.CancelQueuedGeneration's running branch) asking whichever
-	// replica's goroutine actually owns generationID to stop. Purely
-	// internal plumbing between backend processes: stream.go filters it
-	// out of what gets relayed to a connected client, since a merchant's
-	// client only ever needs to see the terminal EventTypeCancelled once
-	// the generation has actually stopped, not the request to stop it.
-	// Payload: {"generation_id": "..."}.
+	// EventTypeCancelRequested is live-only internal plumbing asking the owning replica to stop;
+	// stream.go filters it from what's relayed to the client. Payload: {"generation_id": "..."}.
 	EventTypeCancelRequested = "cancel_requested"
-	// EventTypeToolCall is emitted just before a read-only theme tool runs —
-	// payload: {"tool": "read_theme_file", "path": "pages/home.liquid"} (or
-	// "pattern" for grep_theme; list_theme_files carries just {"tool": ...}).
+	// EventTypeToolCall is emitted just before a read-only theme tool runs. Payload:
+	// {"tool": "...", "path"/"pattern": "..."}.
 	EventTypeToolCall = "tool_call"
-	// EventTypeToolResult is emitted just after — payload: {"summary": "..."},
-	// a short (<~40 char) human-readable outcome (line count, match count,
-	// file count). Emitted even when the tool errors, so the step list never
-	// gets stuck showing a call with no result.
+	// EventTypeToolResult is emitted just after, even on tool error, so the step list never gets
+	// stuck. Payload: {"summary": "..."}.
 	EventTypeToolResult = "tool_result"
-	// EventTypeProposing is emitted from doGenerate the moment the model's
-	// propose_changes call comes back with a non-empty proposal — payload:
-	// {"file_count": N}.
+	// EventTypeProposing fires when the model's propose_changes call returns non-empty. Payload: {"file_count": N}.
 	EventTypeProposing = "proposing"
-	// EventTypeStaged is emitted once the write plan for an accepted
-	// proposal is built (before it's committed to the real theme) — payload:
-	// {"paths": [...]}.
+	// EventTypeStaged fires once the write plan is built, before it's committed. Payload: {"paths": [...]}.
 	EventTypeStaged = "staged"
-	// EventTypeFetchingLink is emitted from doGenerate right before it
-	// fetches a URL found in the merchant's prompt (see the reference-URL
-	// feature) — payload: {"url": "https://..."}. The merchant-facing
-	// equivalent of EventTypeToolCall for this one step, which isn't itself
-	// a model tool call (it happens before the model is even invoked).
+	// EventTypeFetchingLink fires right before fetching a URL found in the prompt. Payload: {"url": "..."}.
 	EventTypeFetchingLink = "fetching_link"
-	// EventTypeFetchedLink is EventTypeFetchingLink's counterpart, emitted
-	// once the reference URL's HTML fetched successfully AND its digest
-	// (see urlfetch.BuildDigest) was built — payload: {"title": "...",
-	// "stylesheet_count": N}. Not emitted on a fetch failure or an
-	// empty-after-digest result (see ReferenceURLFetchFailed/
-	// ReferenceURLEmptyAfterSanitize) — those already get their own
-	// merchant-facing explanation via the eventual chat reply, and this
-	// event exists purely as narration that something real was actually
-	// read, not as another failure signal. title may be "" (a cache hit
-	// doesn't re-surface it — see fetchReferenceURL's own doc comment) and
-	// stylesheet_count is 0 on both a cache hit and a page with no
-	// stylesheets found/reachable — a merchant reading the step list
-	// shouldn't read either as an error.
+	// EventTypeFetchedLink fires once the URL's HTML fetched and digested successfully; not
+	// emitted on failure. title/stylesheet_count may be empty/0 on a cache hit — not an error.
 	EventTypeFetchedLink = "fetched_link"
-	// EventTypeThinking is EPHEMERAL — see emitLive. Never pass this to
-	// emit(): it would durably persist every streamed text chunk of every
-	// generation, and worse, burn a seq number per chunk, breaking
-	// GetEventsSince's replay window for every other event type sharing
-	// this chat's seq counter (see eventEmitter's doc comment). Payload:
-	// {"text": "..."}, one coalesced chunk at a time — see
-	// internal/ai.Generate's onDelta coalescing.
+	// EventTypeThinking is EPHEMERAL — see emitLive. Never pass to emit(): it would durably
+	// persist every chunk and burn a seq number per chunk, breaking the replay window.
 	EventTypeThinking = "thinking"
 )
 
-// maxPromptPreviewChars bounds EventTypeQueued's prompt_preview field.
-// AppendGenerationEvent runs a trim DELETE with a correlated subquery after
-// every insert (see its doc comment) — a full prompt in every queued event
-// would make that scan heavier for no benefit, since the full prompt is
-// already durably stored on the generations row itself (see generation.go).
+// maxPromptPreviewChars bounds EventTypeQueued's prompt_preview field; the full prompt is
+// already durably stored on the generations row, so this event doesn't need it too.
 const maxPromptPreviewChars = 80
 
-// PromptPreview truncates prompt to maxPromptPreviewChars runes (not
-// bytes — a prompt can contain multi-byte characters, and slicing by byte
-// count risks cutting one in half) for EventTypeQueued's payload.
+// PromptPreview truncates prompt to maxPromptPreviewChars runes, not bytes, to avoid splitting
+// a multi-byte character.
 func PromptPreview(prompt string) string {
 	r := []rune(prompt)
 	if len(r) <= maxPromptPreviewChars {
@@ -124,17 +76,12 @@ func PromptPreview(prompt string) string {
 	return string(r[:maxPromptPreviewChars])
 }
 
-// maxGenerationEventsPerChat is "keep the last 200 per chat" — trimmed
-// after every insert. Generations emit a handful of events each, so this
-// stays cheap in practice; correctness (never growing unbounded) matters
-// more here than shaving one query off the common case.
+// maxGenerationEventsPerChat caps this chat's event log, trimmed after every insert — never
+// growing unbounded matters more here than shaving one query off the common case.
 const maxGenerationEventsPerChat = 200
 
-// AppendGenerationEvent inserts one event, then trims chatID's log back to
-// the most recent maxGenerationEventsPerChat rows. updated_at is set to
-// ev.CreatedAt at insert (this table is still an append-only durable log —
-// see the 20260909000005 migration's own doc comment for why it has the
-// column anyway).
+// AppendGenerationEvent inserts one event, then trims chatID's log back to the most recent
+// maxGenerationEventsPerChat rows.
 func (r *Repository) AppendGenerationEvent(ctx context.Context, ev GenerationEvent) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO generation_events (id, generation_id, chat_id, seq, type, payload, created_at, updated_at)
@@ -155,15 +102,8 @@ func (r *Repository) AppendGenerationEvent(ctx context.Context, ev GenerationEve
 	return err
 }
 
-// GetEventsSince returns chatID's events with seq > sinceSeq, in order —
-// what a WebSocket client passing {"last_seq": N} on connect gets replayed
-// before it subscribes to the live Redis channel. Scoped to chat_id, not
-// generation_id: seq is chat-wide monotonic (see eventEmitter's doc
-// comment), and a client's last_seq is meant to span every generation
-// that's ever run on this chat, not just the latest one — a reconnect that
-// landed exactly as one generation finished and the next started must still
-// see any tail events of the first one it missed, which a generation_id
-// filter tied to only the latest generation would silently drop.
+// GetEventsSince returns chatID's events with seq > sinceSeq, replayed on reconnect before
+// subscribing live. Scoped to chat_id, not generation_id, since a reconnect can straddle two generations.
 func (r *Repository) GetEventsSince(ctx context.Context, chatID string, sinceSeq int64) ([]GenerationEvent, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, generation_id, chat_id, seq, type, payload, created_at
@@ -189,12 +129,8 @@ func (r *Repository) GetEventsSince(ctx context.Context, chatID string, sinceSeq
 	return events, rows.Err()
 }
 
-// GetMaxSeqForChat returns the highest seq ever recorded for chatID (0 if
-// none exist yet) — what newEventEmitter uses to continue a chat's seq
-// counter across generations instead of restarting it at 1 (see
-// eventEmitter's doc comment). Uses idx_generation_events_chat_seq
-// (chat_id, seq), so this is an index-only lookup even once retention has
-// trimmed most of a chat's history away.
+// GetMaxSeqForChat returns the highest seq recorded for chatID (0 if none), so newEventEmitter
+// can continue the seq counter across generations instead of restarting at 1.
 func (r *Repository) GetMaxSeqForChat(ctx context.Context, chatID string) (int64, error) {
 	var maxSeq sql.NullInt64
 	err := r.db.QueryRowContext(ctx, `
@@ -206,70 +142,28 @@ func (r *Repository) GetMaxSeqForChat(ctx context.Context, chatID string) (int64
 	return maxSeq.Int64, nil
 }
 
-// redisChannelForChat is the Redis pub/sub channel a generation's events
-// "gen:{chat_id}".
+// redisChannelForChat is the Redis pub/sub channel for a chat's generation events.
 func redisChannelForChat(chatID string) string { return "gen:" + chatID }
 
-// eventEmitter emits one generation's progress events: durably to
-// generation_events (always) and live to bus (best-effort — see eventBus's
-// doc comment). A publish failure is logged and otherwise ignored — the bus
-// is the live-delivery fast path, never the system of record; a WebSocket
-// that missed a live update still catches up via GetEventsSince on
-// (re)connect.
-//
-// seq is monotonic per chat_id, not per generation_id: a WebSocket client
-// stays connected across multiple generations on one chat and tracks a
-// single last_seq for the whole chat (see stream.go's Stream handler), so a
-// second generation restarting at seq 1 would collide with the first
-// generation's seq numbers and be indistinguishable from events already
-// displayed. newEventEmitter therefore continues from the chat's current
-// max seq (see Repository.GetMaxSeqForChat) rather than always starting at
-// 1. This read-then-use is safe without extra locking because
-// StartGeneration already guarantees at most one generation — and so at
-// most one eventEmitter — runs per chat at a time (see
-// ErrGenerationInProgress).
+// eventEmitter emits one generation's progress events: durably to generation_events, and live to
+// bus best-effort. seq is monotonic per chat_id, continued from GetMaxSeqForChat, not restarted at 1.
 type eventEmitter struct {
 	repo         *Repository
 	bus          eventBus
 	generationID string
 	chatID       string
 	nextSeq      int64
-	// lastHeartbeat is when this emitter last wrote last_heartbeat_at (see
-	// updateHeartbeatThrottled) — shared by emit and emitLive so the two
-	// paths' liveness signal lands in the same place instead of double-
-	// writing when they fire close together (e.g. a tool_result event
-	// immediately after a thinking delta). Same single-goroutine assumption
-	// as nextSeq above applies here, and for the same reason: onDelta and
-	// ToolProgress (see tool_progress.go) are both only ever called from
-	// doGenerate's own goroutine for the lifetime of one generation, never
-	// concurrently with each other or with a second doGenerate call sharing
-	// this emitter — this type is never shared across generations (see
-	// newEventEmitter, called fresh per call site) or handed to a second
-	// goroutine anywhere in this package. Confirmed by inspection, not
-	// merely assumed: Generate's tool loop (internal/ai/generator.go) has
-	// no `go` statement of its own, and runOneQueuedGeneration calls
-	// doGenerate synchronously from the one runGeneration goroutine started
-	// per chat. No mutex here would be needed even if it were added —
-	// match the existing nextSeq convention rather than introducing one
-	// field guarded differently from the other.
+	// lastHeartbeat is shared by emit/emitLive so both land in the same place instead of double-
+	// writing. No mutex needed: both are only ever called from doGenerate's single goroutine per generation.
 	lastHeartbeat time.Time
 }
 
-// heartbeatThrottle bounds how often emit/emitLive write last_heartbeat_at.
-// Liveness is the point, not precision: a coalesced thinking delta alone
-// can fire several times a second (see deltaCoalescer), and turning every
-// one of those into a DB write would be pure waste for a value the reaper
-// only ever compares against a 5-minute threshold (generationHeartbeatTimeout
-// — see generation.go). 30s is comfortably under that budget so a healthy
-// generation's heartbeat never comes close to going stale, while still
-// being far enough above emit's actual call frequency to keep this a
-// liveness signal rather than a write-amplification problem.
+// heartbeatThrottle bounds how often emit/emitLive write last_heartbeat_at — a coalesced
+// thinking delta can fire several times a second, so this trades precision for write volume.
 const heartbeatThrottle = 30 * time.Second
 
-// updateHeartbeatThrottled stamps last_heartbeat_at, skipping the write if
-// the last one landed within heartbeatThrottle — see its own doc comment.
-// A no-op if repo is nil, the same test-construction convenience emit/
-// emitLive already extend to their other repo-dependent work.
+// updateHeartbeatThrottled stamps last_heartbeat_at, skipping if the last write was within
+// heartbeatThrottle. No-op if repo is nil (test-construction convenience).
 func (e *eventEmitter) updateHeartbeatThrottled(ctx context.Context) {
 	if e.repo == nil {
 		return
@@ -278,19 +172,14 @@ func (e *eventEmitter) updateHeartbeatThrottled(ctx context.Context) {
 		return
 	}
 	e.lastHeartbeat = time.Now()
-	// Best-effort and never fails the generation (see UpdateGenerationHeartbeat's
-	// doc comment) — a cheap indexed single-row UPDATE, not a reason to slow
-	// down or abort a turn that's otherwise making real progress.
+	// Best-effort: never fails or slows down a turn that's otherwise making real progress.
 	if err := e.repo.UpdateGenerationHeartbeat(ctx, e.generationID); err != nil {
 		slog.Error("failed to update generation heartbeat", "generation_id", e.generationID, "error", err)
 	}
 }
 
-// newEventEmitter looks up chatID's current max seq (0 if this chat has
-// never emitted an event) and starts nextSeq one past it. repo may be nil
-// in tests that don't care about persistence (see emit's nil-repo doc
-// comment) — GetMaxSeqForChat is skipped in that case since there's
-// nothing to look up against.
+// newEventEmitter starts nextSeq one past chatID's current max seq. repo may be nil in tests
+// that don't care about persistence, in which case the lookup is skipped.
 func newEventEmitter(ctx context.Context, repo *Repository, bus eventBus, generationID, chatID string) *eventEmitter {
 	var nextSeq int64 = 1
 	if repo != nil {
@@ -304,9 +193,7 @@ func newEventEmitter(ctx context.Context, repo *Repository, bus eventBus, genera
 	return &eventEmitter{repo: repo, bus: bus, generationID: generationID, chatID: chatID, nextSeq: nextSeq}
 }
 
-// emit is a no-op (never blocks the generation, never fails it) if repo is
-// nil — the same test-construction convenience already used for attempts
-// tracking (see checkAndRepair).
+// emit is a no-op if repo is nil (test-construction convenience).
 func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) {
 	if e == nil || e.repo == nil {
 		return
@@ -334,33 +221,8 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 	}
 }
 
-// emitLive publishes an event to the live bus only — never to
-// generation_events, and never consuming a seq number (always published
-// with Seq: 0). For high-frequency, disposable progress (streamed model
-// text): a client that reconnects mid-generation simply doesn't see what it
-// missed, which is correct for narration but would be wrong for anything
-// structural. See emit for the durable path, and AppendGenerationEvent's
-// doc comment for why volume matters here (an insert plus a trim DELETE per
-// call, unaffordable at one call per token).
-//
-// Also stamps the heartbeat (throttled — see updateHeartbeatThrottled),
-// unconditionally on whether bus is set: thinking deltas are the only
-// signal that arrives DURING a model call rather than at a tool-loop
-// iteration boundary (see emit's call sites — tool_call/tool_result/
-// checking/repairing), so on a slow-but-healthy turn with adaptive thinking
-// on a large context, this is what keeps the heartbeat from going stale
-// mid-call and getting reaped out from under a generation that's actually
-// fine — see the 20260813000002 migration and generationHeartbeatTimeout.
-// This liveness signal has nothing to do with whether anyone is watching
-// live, so it must not be skipped just because bus (or a subscriber) is
-// absent.
-//
-// The rest of this method — the publish itself — is still a no-op if bus
-// is nil (no REDIS_URL and no in-process subscriber — see NewService) or
-// if this generation has no live subscriber at all: unlike emit, there's
-// no durable fallback to fall back to, so the ephemeral text is simply
-// never seen. That's fine — a merchant not actively watching the stream
-// never sees "thinking" narration either way.
+// emitLive publishes to the live bus only, never generation_events, consuming no seq number.
+// Always stamps the heartbeat first — thinking deltas are the only signal during a model call, so this keeps it from going stale mid-call.
 func (e *eventEmitter) emitLive(ctx context.Context, eventType string, payload any) {
 	if e == nil {
 		return
@@ -382,12 +244,8 @@ func (e *eventEmitter) emitLive(ctx context.Context, eventType string, payload a
 	e.bus.Publish(ctx, e.chatID, ev)
 }
 
-// NewRedisClient parses redisURL (e.g. "redis://127.0.0.1:6379") into a
-// client, or returns (nil, nil) if redisURL is empty — the caller (server
-// wiring) treats a nil client as "Redis not configured", not an error; see
-// config.Config.RedisURL's doc comment on why that's a degrade, not a
-// startup failure. A non-empty but malformed URL IS a startup error —
-// that's a config mistake, not an absent-Redis deployment.
+// NewRedisClient returns (nil, nil) if redisURL is empty (Redis not configured, a degrade, not
+// an error); a non-empty but malformed URL IS a startup error.
 func NewRedisClient(redisURL string) (*redis.Client, error) {
 	if redisURL == "" {
 		return nil, nil

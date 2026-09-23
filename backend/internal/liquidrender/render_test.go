@@ -80,8 +80,7 @@ func TestRender_IfElsifElse(t *testing.T) {
 }
 
 func TestRender_NestedIfInsideSkippedBranch(t *testing.T) {
-	// The skipped branch contains its own nested if/endif — skipBlock must
-	// not mistake the inner endif for the outer one's boundary.
+	// skipBlock must not mistake the nested if's endif for the outer one's boundary.
 	tpl := "{% if false %}{% if true %}inner{% endif %}skipped{% else %}shown{% endif %}"
 	files := map[string]string{"pages/home.liquid": tpl}
 	html, errs := render(t, files, "pages/home.liquid", map[string]any{"false": false, "true": true})
@@ -154,8 +153,7 @@ func TestRender_RenderPartialWithExplicitParams(t *testing.T) {
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
-	// "unrelated" must NOT leak into the partial's scope (§1: only explicit
-	// params are visible) — it renders as empty, not "should-not-leak".
+	// "unrelated" must not leak into the partial's scope; renders as empty.
 	if html != "Hi Sam! " {
 		t.Errorf("got %q", html)
 	}

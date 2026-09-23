@@ -14,9 +14,7 @@ import (
 )
 
 // --- fake FlowPOS /user response builders ---
-// Named types distinct from wireResponse — tests only need to produce JSON
-// text a real Client parses the same way a real FlowPOS response would,
-// not to reuse the client's own unmarshal target.
+// Named types distinct from wireResponse; tests only need to produce matching JSON text.
 
 type jsonRole struct {
 	ID          uint64   `json:"id"`
@@ -321,11 +319,8 @@ func TestMiddleware_ExpiredCacheEntryTriggersFreshCall(t *testing.T) {
 	}
 }
 
-// TestMiddleware_TenantSwitcherOneUpstreamCallTwoTenants is the regression
-// test for the caching bug caught in review: a resolved Identity must never
-// be cached, only the introspection result, because one token legitimately
-// resolves to different tenants across requests (the dashboard's tenant
-// switcher). A single upstream call must still serve both tenants correctly.
+// TestMiddleware_TenantSwitcherOneUpstreamCallTwoTenants checks a resolved Identity is never
+// cached (only the introspection result), so one token can resolve to different tenants.
 func TestMiddleware_TenantSwitcherOneUpstreamCallTwoTenants(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(introspectHandler(&calls, activeUser(testTenants), tenantPtr(384)))
@@ -354,9 +349,8 @@ func TestMiddleware_TenantSwitcherOneUpstreamCallTwoTenants(t *testing.T) {
 	}
 }
 
-// TestMiddleware_CachedTokenUnownedTenantStill403s is the other half of the
-// same regression test: a cached (positive) token must still enforce the
-// tenant-ownership guard on every request, not just on the first, uncached one.
+// TestMiddleware_CachedTokenUnownedTenantStill403s checks a cached token still enforces
+// tenant-ownership on every request, not just the first uncached one.
 func TestMiddleware_CachedTokenUnownedTenantStill403s(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(introspectHandler(&calls, activeUser(testTenants), tenantPtr(384)))
@@ -394,8 +388,7 @@ func TestMiddleware_CacheErrorFallsBackToLiveCall(t *testing.T) {
 	}
 }
 
-// alwaysErrorCache simulates a cache backend that's down — Get/Set always
-// error, and Middleware must still succeed by falling through to a live call.
+// alwaysErrorCache simulates a down cache backend; Middleware must still succeed via a live call.
 type alwaysErrorCache struct{}
 
 func (alwaysErrorCache) Get(context.Context, string) (CacheEntry, bool, error) {

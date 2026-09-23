@@ -42,14 +42,7 @@ func TestSanitizeHTMLAttachment(t *testing.T) {
 			wantIn: []string{`<div class="hero" onclick="doThing()">`, "<h1>Real Title</h1>", "Some real text content."},
 		},
 		{
-			// A "bundled" single-file HTML export (see e.g. a downloaded
-			// Claude Artifact) stores its actual page content inside
-			// non-executable <script type="..."> data islands, read by
-			// its own unpacking script rather than run by the browser —
-			// stripping every <script> regardless of type used to delete
-			// this along with real executable scripts, leaving nothing
-			// but the export's loading-screen markup for the model to
-			// read.
+			// A bundled single-file HTML export stores real page content in non-executable script data islands.
 			name: "keeps a non-executable script type's content (JSON/template data island)",
 			in: `<div id="loading">Unpacking...</div>` +
 				`<script type="application/json">{"title":"Real Homepage Title","price":"£29.95"}</script>` +
@@ -65,13 +58,7 @@ func TestSanitizeHTMLAttachment(t *testing.T) {
 			wantNotIn: []string{"doEvil", "alsoEvil"},
 		},
 		{
-			// The real-world case that broke: a kept non-executable script
-			// block (an asset manifest) is exactly where a "bundled" export
-			// puts its embedded fonts/JS libraries as raw base64 — no
-			// data: URI prefix for dataURIRe to key off. Left alone, that
-			// payload alone runs into the hundreds of KB and blows straight
-			// through MaxHTMLAttachmentBytes, turning "the model can now
-			// read this file" back into an outright rejected attachment.
+			// A kept non-executable script can carry raw base64 with no data: URI prefix for dataURIRe to key off.
 			name: "strips a long base64 asset blob inside a kept non-executable script even without a data: URI prefix",
 			in: `<script type="__bundler/manifest">{"font-uuid":{"mime":"font/woff2","data":"` +
 				strings.Repeat("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5", 40) +

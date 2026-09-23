@@ -8,9 +8,7 @@ import (
 	"ai-chat/internal/ai"
 )
 
-// fakeGeneratorErr wraps fakeGenerator to additionally support returning a
-// hard error from Generate on a given call — fakeGenerator (see
-// check_and_repair_test.go) only ever returns results, never an error.
+// fakeGeneratorErr supports hard errors in addition to results.
 type fakeGeneratorErr struct {
 	fakeGenerator
 	errOnCall int // 1-indexed call number to fail on; 0 means never
@@ -102,9 +100,7 @@ func TestGenerateValidProposal_HardGenerateErrorIsNotRetried(t *testing.T) {
 	}
 }
 
-// hallucinatedEmptyResult mimics the production bug this task exists to
-// fix: needs_clarification false, an empty files array, and zero
-// exploration tool calls — the model describing work it never did.
+// hallucinatedEmptyResult: the production bug (false + no files + no exploration).
 func hallucinatedEmptyResult(summary string) *ai.Result {
 	return &ai.Result{Summary: summary, NeedsClarification: false, ExplorationToolCalls: 0}
 }
@@ -119,11 +115,7 @@ func clarificationResult(summary string) *ai.Result {
 	return &ai.Result{Summary: summary, NeedsClarification: true, ExplorationToolCalls: 0}
 }
 
-// answeredQuestionResult mimics a genuine Q&A reply per theme_engine_spec.md
-// §0's third case — a question or read-only request, answered directly,
-// legitimately needing zero exploration and zero proposed changes. This is
-// exactly the shape that used to be indistinguishable from
-// hallucinatedEmptyResult and got retried into unwanted exploration.
+// answeredQuestionResult: genuine Q&A reply (was indistinguishable from hallucination).
 func answeredQuestionResult(summary string) *ai.Result {
 	return &ai.Result{Summary: summary, AnsweredQuestion: true, NeedsClarification: false, ExplorationToolCalls: 0}
 }
@@ -151,11 +143,8 @@ func TestGenerateValidProposal_UnexploredEmptyProposalRetriesThenSucceeds(t *tes
 	}
 }
 
-// TestGenerateValidProposal_UnexploredEmptyProposalExhaustsRetriesFallbackMessage
-// is the exact production bug: the model claims a redesign, proposes
-// nothing, explores nothing, and does it again on retry. The generation
-// must still succeed (fail-open) with an honest fallback message, not the
-// model's fabricated summary and not a hard failure.
+// Production bug: claims redesign, proposes/explores nothing, retries with same.
+// Must fallback gracefully, not use model's fabricated summary.
 func TestGenerateValidProposal_UnexploredEmptyProposalExhaustsRetriesFallbackMessage(t *testing.T) {
 	fg := &fakeGenerator{results: []*ai.Result{
 		hallucinatedEmptyResult("Redesigned the page with a new animated hero and sticky sidebar."),
@@ -179,10 +168,7 @@ func TestGenerateValidProposal_UnexploredEmptyProposalExhaustsRetriesFallbackMes
 	}
 }
 
-// TestGenerateValidProposal_NeedsClarificationEmptyProposalAcceptedImmediately
-// confirms the untouched edge case: needs_clarification:true with an empty
-// files array is already the correct, valid shape — no retry, no summary
-// replacement, even though ExplorationToolCalls is 0 here too.
+// needs_clarification:true with empty files is valid (not a hallucination).
 func TestGenerateValidProposal_NeedsClarificationEmptyProposalAcceptedImmediately(t *testing.T) {
 	fg := &fakeGenerator{results: []*ai.Result{clarificationResult("I can't do that here — it's outside theme editing.")}}
 	svc := &Service{gen: fg}
@@ -200,12 +186,7 @@ func TestGenerateValidProposal_NeedsClarificationEmptyProposalAcceptedImmediatel
 	}
 }
 
-// TestGenerateValidProposal_LegitimateEmptyAnswerAfterExplorationAcceptedImmediately
-// is the case the distinguishing rule exists to protect: a model that
-// explored real files before concluding there's nothing to change (the
-// out_of_scope/unrelated_technical_question eval shape) must be accepted
-// as-is, its own summary preserved — never replaced with the generic
-// fallback message.
+// Legitimate empty answer after exploration (e.g., unrelated_technical_question).
 func TestGenerateValidProposal_LegitimateEmptyAnswerAfterExplorationAcceptedImmediately(t *testing.T) {
 	fg := &fakeGenerator{results: []*ai.Result{legitimateEmptyResult("The footer already matches your request — no change needed.")}}
 	svc := &Service{gen: fg}
@@ -223,13 +204,7 @@ func TestGenerateValidProposal_LegitimateEmptyAnswerAfterExplorationAcceptedImme
 	}
 }
 
-// TestGenerateValidProposal_AnsweredQuestionAcceptedImmediately is the exact
-// live-production regression this flag was added to fix: a genuine
-// "read this file and tell me what's in it" reply — answered_question:true,
-// zero exploration, zero proposed changes — was previously indistinguishable
-// from hallucinatedEmptyResult and got retried into unwanted file
-// exploration on every single message of this shape. It must be accepted
-// immediately, exactly like needs_clarification:true is above.
+// Live regression fix: answered_question:true was indistinguishable from hallucination.
 func TestGenerateValidProposal_AnsweredQuestionAcceptedImmediately(t *testing.T) {
 	fg := &fakeGenerator{results: []*ai.Result{answeredQuestionResult("The attached file's homepage template includes a hero, a product grid, and a footer.")}}
 	svc := &Service{gen: fg}

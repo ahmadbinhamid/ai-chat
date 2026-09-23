@@ -7,15 +7,8 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
-// TestCurrentText_SkipsUnrecognizedBlockType is item 7: a content block
-// whose Type this SDK version doesn't recognize (a future Anthropic
-// addition, or a provider-specific variant via DeepSeek's Anthropic-compat
-// endpoint — see currentText's own doc comment) must be silently skipped,
-// never a panic. block.AsAny() returns nil for an unmatched Type (see the
-// SDK's own ContentBlockUnion.AsAny), which currentText's type switch
-// simply doesn't match — this test is the regression guard for that
-// contract holding, not an implementation detail worth re-deriving by hand
-// at every call site.
+// TestCurrentText_SkipsUnrecognizedBlockType checks a content block with an unrecognized
+// Type (a future SDK addition, or a DeepSeek-specific variant) is silently skipped, never a panic.
 func TestCurrentText_SkipsUnrecognizedBlockType(t *testing.T) {
 	message := anthropic.Message{
 		Content: []anthropic.ContentBlockUnion{
@@ -29,12 +22,7 @@ func TestCurrentText_SkipsUnrecognizedBlockType(t *testing.T) {
 	}
 }
 
-// TestCurrentText_MixedKnownAndUnrecognizedBlocks confirms an unrecognized
-// block alongside real text/thinking blocks doesn't disturb them — skip
-// only the one block, not abort the whole message. Built via json.Unmarshal
-// (not struct literals) because ContentBlockUnion.AsText()/AsThinking()
-// decode from their own captured raw JSON, not from directly-set struct
-// fields — the same path a real streamed response takes.
+// TestCurrentText_MixedKnownAndUnrecognizedBlocks checks skipping one unrecognized block
 func TestCurrentText_MixedKnownAndUnrecognizedBlocks(t *testing.T) {
 	raw := `[
 		{"type": "text", "text": "hello "},

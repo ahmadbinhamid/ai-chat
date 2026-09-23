@@ -1,9 +1,5 @@
-// Command migration is the CLI for creating and applying database
-// migrations: create <name> scaffolds a new migration file, run applies
-// every migration that hasn't run yet, fresh drops every table and re-runs
-// them all from scratch. The server itself never auto-migrates — this is
-// the only thing that changes the schema, run explicitly (see backend
-// README / Makefile).
+// Command migration creates and applies database migrations (create/run/fresh).
+// The server never auto-migrates; this is the only thing that changes the schema.
 package main
 
 import (
@@ -20,8 +16,7 @@ import (
 
 	"github.com/joho/godotenv"
 
-	// Imported for its side effect: each migration file's init() registers
-	// itself with the migrator. The migrations package is otherwise unused here.
+	// Imported for its side effect: each migration file's init() registers with the migrator.
 	_ "ai-chat/database/migrations"
 )
 

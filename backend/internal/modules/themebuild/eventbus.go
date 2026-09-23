@@ -11,42 +11,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// eventBus is the live (non-durable) fan-out path for a generation's
-// progress events — generation_events (see generation_events.go) is always
-// the system of record; this is only ever the fast path a connected
-// WebSocket rides. Two implementations: redisEventBus (cross-replica, used
-// whenever REDIS_URL is configured) and inProcessEventBus (same-process
-// only, the fallback when it isn't — see NewService). Either way, Stream
-// must never treat "no live bus" as a reason to close the connection: a
-// client that misses a live event still catches up via EventsSince on
-// (re)connect.
+// Live fan-out; generation_events is system of record, so missed events are fine (catch up via EventsSince).
 type eventBus interface {
-	// Publish best-effort delivers ev to every current subscriber of
-	// chatID — never blocks the caller waiting on a slow/absent
-	// subscriber, and never returns an error the generation itself should
-	// care about (durability is generation_events' job, not this one's).
 	Publish(ctx context.Context, chatID string, ev GenerationEvent)
-	// Subscribe returns a channel of chatID's live events plus a cancel
-	// func the caller must call exactly once when done (releases the
-	// subscription; does not close ch itself to the caller — reading from
-	// ch after cancel simply yields no more events).
 	Subscribe(ctx context.Context, chatID string) (ch <-chan GenerationEvent, cancel func())
 }
 
-// subscriberBufferSize is how many undelivered events a single subscriber
-// channel holds before Publish starts dropping for it — generous relative
-// to maxGenerationEventsPerChat's "keep the last 200", since one connection
-// falling behind by more than this within one generation's lifetime is
-// already well past the point where EventsSince on reconnect is the right
-// recovery path anyway.
 const subscriberBufferSize = 32
 
-// inProcessEventBus fans events out to every subscriber currently held in
-// this process's memory — the fallback when REDIS_URL isn't set (see
-// NewService). A subscriber on a different replica than the one publishing
-// simply never sees anything from this bus; that's the known, accepted
-// limitation of running without Redis on more than one replica (see
-// config.Config.RedisURL's doc comment), not a bug in this type.
+// In-process only; cross-replica isolation is an accepted limitation without Redis.
 type inProcessEventBus struct {
 	mu   sync.Mutex
 	subs map[string][]chan GenerationEvent
@@ -63,8 +36,7 @@ func (b *inProcessEventBus) Publish(_ context.Context, chatID string, ev Generat
 		select {
 		case ch <- ev:
 		default:
-			// Slow consumer: drop rather than block emit — see
-			// subscriberBufferSize's doc comment.
+			// Slow consumer: drop rather than block emit.
 			slog.Warn("in-process event bus: dropped event, subscriber buffer full", "chat_id", chatID, "type", ev.Type)
 		}
 	}
@@ -93,11 +65,7 @@ func (b *inProcessEventBus) Subscribe(_ context.Context, chatID string) (<-chan 
 	return ch, cancel
 }
 
-// redisEventBus is the cross-replica implementation, backed by the same
-// redis.Client eventEmitter used to publish directly before this type
-// existed — same wire format (JSON-encoded GenerationEvent), same channel
-// naming (redisChannelForChat), so a redisEventBus subscriber and a raw
-// rdb.Subscribe caller (e.g. an existing test) are wire-compatible.
+// Cross-replica implementation using rdb.Subscribe.
 type redisEventBus struct {
 	rdb *redis.Client
 }
@@ -117,10 +85,6 @@ func (b *redisEventBus) Publish(ctx context.Context, chatID string, ev Generatio
 	}
 }
 
-// Subscribe opens a Redis PubSub and relays decoded messages to ch in a
-// background goroutine until cancel is called (which closes the PubSub,
-// ending that goroutine) — the caller only ever sees GenerationEvent, never
-// the underlying *redis.PubSub or its raw JSON payload.
 func (b *redisEventBus) Subscribe(ctx context.Context, chatID string) (<-chan GenerationEvent, func()) {
 	sub := b.rdb.Subscribe(ctx, redisChannelForChat(chatID))
 	ch := make(chan GenerationEvent, subscriberBufferSize)
@@ -128,10 +92,7 @@ func (b *redisEventBus) Subscribe(ctx context.Context, chatID string) (<-chan Ge
 	go func() {
 		defer close(ch)
 		for msg := range sub.Channel() {
-			// Wrapped per-message (not once for the whole relay): this
-			// goroutine is meant to keep running for the subscription's
-			// entire lifetime, so one bad message recovering shouldn't end
-			// delivery for every message after it too.
+			// Per-message recovery: one bad message doesn't kill delivery.
 			func() {
 				defer safego.Recover("themebuild.eventBusSubscribe")
 				var ev GenerationEvent

@@ -3,8 +3,7 @@ package auth
 import "testing"
 
 func TestCan_SuperAdminWildcard(t *testing.T) {
-	// Ships with an empty Permissions slice — a naive contains-check would
-	// deny it every action. This is the case the task explicitly calls out.
+	// Ships with an empty Permissions slice; a naive contains-check would deny it every action.
 	identity := Identity{RoleName: "super-admin", Permissions: []string{}}
 
 	for _, permission := range []string{"dashboard.view", "orders.view", "anything.at.all"} {

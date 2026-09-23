@@ -10,11 +10,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// TestToolProgressEmitter_ToolStarted_EmitsToolCallWithPathOrPattern is
-// item 3: each of the three theme tools' ToolStarted call must emit a
-// tool_call event carrying enough detail to narrate — the path for
-// read_theme_file, the pattern for grep_theme, nothing extra for
-// list_theme_files (it has no interesting input to show).
+// Emits tool_call events with path (read), pattern (grep), or nothing (list).
 func TestToolProgressEmitter_ToolStarted_EmitsToolCallWithPathOrPattern(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -69,10 +65,7 @@ func TestToolProgressEmitter_ToolStarted_EmitsToolCallWithPathOrPattern(t *testi
 	}
 }
 
-// TestToolProgressEmitter_ToolStarted_TruncatesLongPattern confirms the
-// "truncate and sanitise the grep pattern" requirement: model-generated
-// text landing in a payload the merchant's browser renders must be capped
-// server-side, not trusted to be well-behaved.
+// Server-side truncation/sanitization for model-generated text.
 func TestToolProgressEmitter_ToolStarted_TruncatesLongPattern(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
@@ -107,10 +100,7 @@ func TestToolProgressEmitter_ToolStarted_TruncatesLongPattern(t *testing.T) {
 	}
 }
 
-// TestToolProgressEmitter_ToolFinished_EmitsEvenOnError is item 4:
-// tool_result must always be emitted, including when the tool itself
-// failed — the step list should show the failure, not a step that
-// silently never resolves.
+// tool_result emitted even on tool failure.
 func TestToolProgressEmitter_ToolFinished_EmitsEvenOnError(t *testing.T) {
 	conn := openTestDB(t)
 	repo := NewRepository(conn)
