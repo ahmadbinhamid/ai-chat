@@ -65,6 +65,15 @@ type Result struct {
 	OutputTokens       int64              `json:"-"`
 	// ExplorationToolCalls: distinguishes hallucinated empty from explored-and-empty via isUnexploredEmptyProposal.
 	ExplorationToolCalls int `json:"-"`
+	conversation         *Conversation
+}
+
+// Conversation returns this result's resumable conversation, or nil (fake mode, or not produced by Generate).
+func (r *Result) Conversation() *Conversation {
+	if r == nil {
+		return nil
+	}
+	return r.conversation
 }
 
 // GenerationMode restricts what a turn is allowed to touch.
@@ -83,6 +92,8 @@ type ThemeContext struct {
 	FileTree       []themefs.FileTreeEntry // supplied up front to avoid initial list_theme_files cost
 	Manifest       *themefs.Manifest       // component param signatures; nil if unavailable
 	GenerationMode string                  // restricts what this turn may touch; empty = GenerationModeEdit
+	// Continue resumes a prior call's conversation (history and images are then ignored); nil = fresh call.
+	Continue *Conversation
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -479,36 +490,13 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	editFailureCounts := make(map[string]int)
 	// knownPaths: every path with grounding (read_theme_file or "create" action). Backs warnReadBeforeWriteViolations.
 	knownPaths := make(map[string]bool)
-	// Anthropic rejects empty text blocks; skip empty turns (defense in depth).
-	messages := make([]anthropic.MessageParam, 0, len(history)+1)
-	for _, t := range history {
-		if strings.TrimSpace(t.Content) == "" {
-			continue
-		}
-		if strings.EqualFold(t.Role, "assistant") {
-			messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(t.Content)))
-		} else {
-			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(t.Content)))
-		}
-	}
-	// Mark end of replayed history as cache breakpoint (byte-identical across turns).
-	if last := len(messages) - 1; last >= 0 {
-		lastBlock := messages[last].Content[len(messages[last].Content)-1]
-		if lastBlock.OfText != nil && lastBlock.OfText.Text != "" {
-			cacheControl := anthropic.NewCacheControlEphemeralParam()
-			cacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
-			lastBlock.OfText.CacheControl = cacheControl
-		}
-	}
-	if len(images) > 0 {
-		blocks := make([]anthropic.ContentBlockParamUnion, 0, len(images)+1)
-		for _, img := range images {
-			blocks = append(blocks, anthropic.NewImageBlockBase64(img.MediaType, img.Base64))
-		}
-		blocks = append(blocks, anthropic.NewTextBlock(prompt))
-		messages = append(messages, anthropic.NewUserMessage(blocks...))
+	var messages []anthropic.MessageParam
+	if tc.Continue != nil {
+		// Images already sit in the resumed history's first prompt; re-attaching would duplicate them.
+		callModel = tc.Continue.model
+		messages = tc.Continue.resumeMessages(prompt)
 	} else {
-		messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)))
+		messages = freshMessages(history, prompt, images)
 	}
 
 	tools := toolsForMode(tc.GenerationMode)
@@ -622,6 +610,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		var toolUses []anthropic.ContentBlockUnion
 		var proposeInput json.RawMessage
+		var proposeID string
 		// Count text blocks/chars off accumulated message (not SSE deltas); no double-counting on retried attempts.
 		textBlockCount := 0
 		textChars := 0
@@ -644,6 +633,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			toolUses = append(toolUses, block)
 			if block.Name == toolNameProposeChanges {
 				proposeInput = block.Input
+				proposeID = block.ID
 			}
 		}
 
@@ -705,6 +695,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				result.InputTokens = totalInputTokens
 				result.OutputTokens = totalOutputTokens
 				result.ExplorationToolCalls = explorationToolCalls
+				result.conversation = newConversation(messages, message, proposeID, callModel)
 				return &result, nil
 			}
 			slog.Warn("ai: propose_changes edit materialization failed, retrying", "iteration", iteration)
@@ -769,6 +760,42 @@ func toolResultBlock(toolUseID, text string, isError bool) anthropic.ContentBloc
 		text = "ERROR: " + text
 	}
 	return anthropic.NewToolResultBlock(toolUseID, text, isError)
+}
+
+// freshMessages builds a first call's messages from flat history; must stay byte-identical (prefix caching).
+func freshMessages(history []Turn, prompt string, images []Image) []anthropic.MessageParam {
+	// Anthropic rejects empty text blocks; skip empty turns (defense in depth).
+	messages := make([]anthropic.MessageParam, 0, len(history)+1)
+	for _, t := range history {
+		if strings.TrimSpace(t.Content) == "" {
+			continue
+		}
+		if strings.EqualFold(t.Role, "assistant") {
+			messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(t.Content)))
+		} else {
+			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(t.Content)))
+		}
+	}
+	// Mark end of replayed history as cache breakpoint (byte-identical across turns).
+	if last := len(messages) - 1; last >= 0 {
+		lastBlock := messages[last].Content[len(messages[last].Content)-1]
+		if lastBlock.OfText != nil && lastBlock.OfText.Text != "" {
+			cacheControl := anthropic.NewCacheControlEphemeralParam()
+			cacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
+			lastBlock.OfText.CacheControl = cacheControl
+		}
+	}
+	if len(images) > 0 {
+		blocks := make([]anthropic.ContentBlockParamUnion, 0, len(images)+1)
+		for _, img := range images {
+			blocks = append(blocks, anthropic.NewImageBlockBase64(img.MediaType, img.Base64))
+		}
+		blocks = append(blocks, anthropic.NewTextBlock(prompt))
+		messages = append(messages, anthropic.NewUserMessage(blocks...))
+	} else {
+		messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)))
+	}
+	return messages
 }
 
 // readThemeFileToolInput: mirrors read_theme_file's "paths" field; independent from themebuild (package boundary).
@@ -902,7 +929,9 @@ Rules for every request:
    full rewrite is genuinely smaller than expressing it as edits.
 10. Use list_theme_files/read_theme_file/grep_theme as needed to explore the theme before you
     finalize anything. Call propose_changes exactly once, when you're done, with the complete,
-    final set of changes for this request — not a partial draft.`, themeEngineSpec),
+    final set of changes for this request — not a partial draft.
+11. You can only create or write %s — never an image (.svg, .png, .jpg, ...) or any other
+    file type, even though a theme may contain them. Reference an existing image, or put SVG inline in a .liquid file.`, themeEngineSpec, themefs.GeneratedFileTypes()),
 		CacheControl: cacheControl,
 	}
 }

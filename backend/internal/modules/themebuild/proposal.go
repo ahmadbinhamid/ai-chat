@@ -128,6 +128,9 @@ func (s *Service) generateValidProposal(
 	in GenerateInput,
 ) (*ai.Result, []ai.Turn, error) {
 	nextPrompt := prompt
+	// Retries resume the prior call's tool loop (as checkAndRepair does); nil = fresh call or flat-turns fallback.
+	var conversation *ai.Conversation
+	var continuePrompt string
 	// emit is nil-safe, but direct field read on nil *eventEmitter is not.
 	chatID := ""
 	if emitter != nil {
@@ -136,7 +139,12 @@ func (s *Service) generateValidProposal(
 
 	// Counts total calls (maxThemeCheckRetries+1); shared budget for both invalid and empty retries.
 	for attempt := 1; ; attempt++ {
-		result, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(nextPrompt, in), imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, readFile)
+		genTC, genPrompt := tc, promptWithHTMLAttachment(nextPrompt, in)
+		if conversation != nil {
+			// The correction is the resumed turn's prompt; the attachment is already in the conversation.
+			genTC.Continue, genPrompt = conversation, continuePrompt
+		}
+		result, genErr := s.gen.Generate(ctx, genTC, turns, genPrompt, imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, readFile)
 		if genErr != nil {
 			// Hard API/transport error; handled by caller/reaper, not retried here.
 			return nil, turns, genErr
@@ -153,17 +161,19 @@ func (s *Service) generateValidProposal(
 			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
 				"attempt": attempt, "message": "invalid model proposal: " + err.Error(),
 			})
+			correction := fmt.Sprintf(
+				"That reply wasn't valid: %s. Resubmit a corrected, complete proposal (not a diff), "+
+					"following the earlier instructions exactly. Never invent a placeholder path or "+
+					"partial content — if you don't have a complete, verified proposal ready, call "+
+					"propose_changes with needs_clarification: true, files: [], and explain why instead "+
+					"of guessing. Action \"edit\" is fine for this — it isn't a diff, it still produces the "+
+					"complete corrected file, just via old_string/new_string instead of retyping it whole.", err)
 			turns = append(turns,
 				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
-				ai.Turn{Role: "user", Content: fmt.Sprintf(
-					"That reply wasn't valid: %s. Resubmit a corrected, complete proposal (not a diff), "+
-						"following the earlier instructions exactly. Never invent a placeholder path or "+
-						"partial content — if you don't have a complete, verified proposal ready, call "+
-						"propose_changes with needs_clarification: true, files: [], and explain why instead "+
-						"of guessing. Action \"edit\" is fine for this — it isn't a diff, it still produces the "+
-						"complete corrected file, just via old_string/new_string instead of retyping it whole.", err)},
+				ai.Turn{Role: "user", Content: correction},
 			)
 			nextPrompt = "Please resubmit a corrected, complete proposal as instructed above."
+			conversation, continuePrompt = result.Conversation().WithProposalRecap(recapAssistantTurn(result)), correction
 			continue
 		}
 
@@ -180,16 +190,19 @@ func (s *Service) generateValidProposal(
 			emitter.emit(ctx, EventTypeCheckFailed, map[string]any{
 				"attempt": attempt, "message": "proposal described changes but made no changes and explored no files",
 			})
+			correction := "Your last reply described a change but proposed an empty files array " +
+				"without reading or exploring any theme files first. If you have a real change to make, read the " +
+				"relevant files (or use grep_theme/list_theme_files to find them) and propose it fully. If there " +
+				"is genuinely nothing to change for this request, call propose_changes again with " +
+				"needs_clarification: true, files: [], and a summary explaining why — never describe changes " +
+				"that were not made."
 			turns = append(turns,
 				ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)},
-				ai.Turn{Role: "user", Content: "Your last reply described a change but proposed an empty files array " +
-					"without reading or exploring any theme files first. If you have a real change to make, read the " +
-					"relevant files (or use grep_theme/list_theme_files to find them) and propose it fully. If there " +
-					"is genuinely nothing to change for this request, call propose_changes again with " +
-					"needs_clarification: true, files: [], and a summary explaining why — never describe changes " +
-					"that were not made."},
+				ai.Turn{Role: "user", Content: correction},
 			)
 			nextPrompt = "Please try again as instructed above."
+			// Even with zero exploration there's a real propose_changes tool_use to pair, so this resumes too.
+			conversation, continuePrompt = result.Conversation().WithProposalRecap(recapAssistantTurn(result)), correction
 			continue
 		}
 
@@ -214,6 +227,8 @@ func (s *Service) checkAndRepair(
 ) (*ai.Result, []themecheck.Finding, error) {
 	turns := append([]ai.Turn(nil), history...)
 	totalInput, totalOutput := result.InputTokens, result.OutputTokens
+	// Resumes the real tool loop (tool_use/tool_result intact); nil falls back to the flat turns + recap path.
+	conversation := result.Conversation()
 
 	for attempt := 1; ; attempt++ {
 		// Best-effort: recorded for measurable retry frequency (never fails generation). s.repo is nil in tests.
@@ -288,9 +303,18 @@ func (s *Service) checkAndRepair(
 		turns = append(turns, ai.Turn{Role: "assistant", Content: recapAssistantTurn(result)})
 		repair := repairPrompt(errorFindings)
 
+		repairTC := tc
+		repairText := promptWithHTMLAttachment(repair, in)
+		if conversation != nil {
+			// Recap goes in the proposal's tool_result: auto-fixers may have changed content since the model's tool_use.
+			repairTC.Continue = conversation.WithProposalRecap(recapAssistantTurn(result))
+			// The attachment is already in the resumed conversation's first prompt.
+			repairText = repair
+		}
+
 		// repairFileReader lets "edit" resolve against materialized files before falling back to readFile.
 		repairStart := time.Now()
-		retried, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(repair, in), imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, repairFileReader(readFile, result))
+		retried, genErr := s.gen.Generate(ctx, repairTC, turns, repairText, imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, repairFileReader(readFile, result))
 		repairElapsed := time.Since(repairStart)
 		if genErr != nil {
 			// Distinct log for repair timeout (ctx canceled mid-call).
@@ -303,12 +327,15 @@ func (s *Service) checkAndRepair(
 		totalInput += retried.InputTokens
 		totalOutput += retried.OutputTokens
 		turns = append(turns, ai.Turn{Role: "user", Content: repair})
+		conversation = retried.Conversation()
 
 		clearIfNoChangesIntended(retried)
 		if err := validateProposal(retried, tc.GenerationMode); err != nil {
 			// Malformed repair (garbled path, corrupted JSON) shares retry budget with themecheck rejections.
 			slog.Warn("repair produced an invalid proposal, discarding and retrying if budget remains",
 				"tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempt", attempt, "error", err)
+			// The resumed conversation now ends on the discarded proposal; fall back to flat turns for the rest.
+			conversation = nil
 			if attempt >= maxThemeCheckRetries {
 				return nil, nil, fmt.Errorf("invalid model proposal (retry %d): %w", attempt, err)
 			}

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"ai-chat/internal/themefs"
+
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 )
@@ -152,5 +154,15 @@ func TestGenerate_ToolExecErrorPrefixedSuccessUnchanged(t *testing.T) {
 	texts := toolResultTexts(t, thirdBody)
 	if len(texts) != 2 || texts[1] != "components/footer.liquid:1: <footer>" {
 		t.Fatalf("expected the successful result unchanged, got %q", texts)
+	}
+}
+
+// The model must learn the allowed create targets before proposing, from the same source the rejection uses.
+func TestStaticSystemPrompt_StatesAllowedFileTypes(t *testing.T) {
+	text := staticSystemPromptBlock().Text
+	for _, want := range []string{themefs.GeneratedFileTypes(), "never an image (.svg"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("static system prompt missing %q", want)
+		}
 	}
 }
