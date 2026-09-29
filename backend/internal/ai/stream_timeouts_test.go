@@ -60,10 +60,9 @@ func TestConsumeStream_IdleTimeoutFiresOnStalledConnection(t *testing.T) {
 
 	stream := newStreamingTestStream(ts)
 	var message anthropic.Message
-	coalescer := newDeltaCoalescer(func(string) {})
 
 	start := time.Now()
-	err := consumeStream(context.Background(), stream, &message, coalescer, 50*time.Millisecond, time.Second)
+	err := consumeStream(context.Background(), stream, &message, 50*time.Millisecond, time.Second)
 	elapsed := time.Since(start)
 	_ = stream.Close()
 
@@ -87,9 +86,8 @@ func TestConsumeStream_FirstTokenTimeoutFiresWhenNothingEverArrives(t *testing.T
 
 	stream := newStreamingTestStream(ts)
 	var message anthropic.Message
-	coalescer := newDeltaCoalescer(func(string) {})
 
-	err := consumeStream(context.Background(), stream, &message, coalescer, time.Second, 50*time.Millisecond)
+	err := consumeStream(context.Background(), stream, &message, time.Second, 50*time.Millisecond)
 	_ = stream.Close()
 
 	if !errors.Is(err, errStreamFirstToken) {
@@ -127,11 +125,10 @@ func TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress(t *testing.T) {
 
 	stream := newStreamingTestStream(ts)
 	var message anthropic.Message
-	coalescer := newDeltaCoalescer(func(string) {})
 
 	// firstToken shorter than idle: if tool_use bytes didn't count as progress, this
 	// would return errStreamFirstToken at ~40ms instead.
-	err := consumeStream(context.Background(), stream, &message, coalescer, 150*time.Millisecond, 40*time.Millisecond)
+	err := consumeStream(context.Background(), stream, &message, 150*time.Millisecond, 40*time.Millisecond)
 	_ = stream.Close()
 
 	if !errors.Is(err, errStreamIdle) {
@@ -164,7 +161,7 @@ func TestGenerate_RetriesOnIdleTimeout(t *testing.T) {
 	g.streamTimeouts.Idle = 50 * time.Millisecond
 	g.streamTimeouts.FirstTokenEdit = time.Second
 
-	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, nil, nil, nil)
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("Generate returned an error: %v", err)
 	}

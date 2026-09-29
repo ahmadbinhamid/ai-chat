@@ -25,7 +25,7 @@ type capturingGenerator struct {
 	firstImages     []ai.Image
 }
 
-func (g *capturingGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, prompt string, images []ai.Image, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
+func (g *capturingGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, prompt string, images []ai.Image, _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
 	g.mu.Lock()
 	if !g.captured {
 		g.captured = true
@@ -55,7 +55,7 @@ type allCallsCapturingGenerator struct {
 	prompts []string
 }
 
-func (g *allCallsCapturingGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, prompt string, _ []ai.Image, _ func(string), _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
+func (g *allCallsCapturingGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, prompt string, _ []ai.Image, _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
 	g.mu.Lock()
 	g.prompts = append(g.prompts, prompt)
 	g.mu.Unlock()

@@ -93,7 +93,7 @@ func heartbeatTickerInterval() time.Duration { return time.Duration(heartbeatTic
 
 // Subset of *ai.Generator for testability; lets tests substitute fake without real AI provider.
 type generator interface {
-	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, images []ai.Image, onDelta func(string), progress ai.ToolProgress, toolExec ai.ToolExecutor, readFile ai.FileReader) (*ai.Result, error)
+	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, images []ai.Image, progress ai.ToolProgress, toolExec ai.ToolExecutor, readFile ai.FileReader) (*ai.Result, error)
 	SupportsVision() bool
 	Summarize(ctx context.Context, turns []ai.Turn) (string, error)
 }

@@ -136,7 +136,7 @@ func (s *Service) generateValidProposal(
 
 	// Counts total calls (maxThemeCheckRetries+1); shared budget for both invalid and empty retries.
 	for attempt := 1; ; attempt++ {
-		result, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(nextPrompt, in), imagesFromInput(in), onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, readFile)
+		result, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(nextPrompt, in), imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, readFile)
 		if genErr != nil {
 			// Hard API/transport error; handled by caller/reaper, not retried here.
 			return nil, turns, genErr
@@ -290,7 +290,7 @@ func (s *Service) checkAndRepair(
 
 		// repairFileReader lets "edit" resolve against materialized files before falling back to readFile.
 		repairStart := time.Now()
-		retried, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(repair, in), imagesFromInput(in), onThinkingDelta(ctx, emitter), toolProgressFor(ctx, emitter), toolExec, repairFileReader(readFile, result))
+		retried, genErr := s.gen.Generate(ctx, tc, turns, promptWithHTMLAttachment(repair, in), imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, repairFileReader(readFile, result))
 		repairElapsed := time.Since(repairStart)
 		if genErr != nil {
 			// Distinct log for repair timeout (ctx canceled mid-call).

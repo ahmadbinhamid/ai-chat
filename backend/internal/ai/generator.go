@@ -404,10 +404,8 @@ func consumeStream(
 	ctx context.Context,
 	stream *ssestream.Stream[anthropic.MessageStreamEventUnion],
 	message *anthropic.Message,
-	coalescer *deltaCoalescer,
 	idleTimeout, firstTokenTimeout time.Duration,
 ) error {
-	emitted := 0
 	sawProgress := false
 
 	idleTimer := time.NewTimer(idleTimeout)
@@ -443,10 +441,6 @@ func consumeStream(
 				sawProgress = true
 				firstTokenTimer.Stop()
 			}
-			if full := currentText(*message); len(full) > emitted {
-				coalescer.add(full[emitted:])
-				emitted = len(full)
-			}
 			// Drain idleTimer if Stop() returned false; reset and read next.
 			if !idleTimer.Stop() {
 				select {
@@ -467,7 +461,8 @@ const defaultMaxTokens = 64000
 var errMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
 
 // Generate orchestrates tool loop: execute tools until propose_changes; materialize edits before re...
-func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, images []Image, onDelta func(string), progress ToolProgress, toolExec ToolExecutor, readFile FileReader) (*Result, error) {
+// Model text/thinking is never streamed to the merchant (it leaked reasoning and text-written tool calls); ToolProgress is the only feed.
+func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Turn, prompt string, images []Image, progress ToolProgress, toolExec ToolExecutor, readFile FileReader) (*Result, error) {
 	if g.fake {
 		return g.fakeGenerate(ctx, prompt)
 	}
@@ -590,11 +585,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			attemptsUsed = attempt
 			stream := g.client.Messages.NewStreaming(ctx, params)
 			message = anthropic.Message{}
-			// Fresh per attempt; coalescer.flush() empties before next attempt. Retries re-emit onDelta from start (acceptable).
-			coalescer := newDeltaCoalescer(onDelta)
-			streamErr := consumeStream(ctx, stream, &message, coalescer, g.idleTimeout(), firstTokenTimeout)
-			// Flush remaining buffered text; close immediately (timeouts may abandon mid-read).
-			coalescer.flush()
+			streamErr := consumeStream(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout)
+			// Close immediately (timeouts may abandon mid-read).
 			_ = stream.Close()
 			if streamErr == nil {
 				if err := stream.Err(); err != nil {
@@ -633,10 +625,17 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// Count text blocks/chars off accumulated message (not SSE deltas); no double-counting on retried attempts.
 		textBlockCount := 0
 		textChars := 0
+		thinkingBlockCount := 0
+		thinkingChars := 0
 		for _, block := range message.Content {
 			if block.Type == "text" {
 				textBlockCount++
 				textChars += len(block.Text)
+				continue
+			}
+			if block.Type == "thinking" {
+				thinkingBlockCount++
+				thinkingChars += len(block.Thinking)
 				continue
 			}
 			if block.Type != "tool_use" {
@@ -668,6 +667,13 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			"text_block_count", textBlockCount,
 			"text_chars", textChars,
 			"tool_use_count", len(toolUses))
+		// Lengths only, never content: this output is withheld from the merchant and may contain spec/theme internals.
+		slog.Debug("ai: model output withheld from chat",
+			"iteration", iteration,
+			"text_block_count", textBlockCount,
+			"text_chars", textChars,
+			"thinking_block_count", thinkingBlockCount,
+			"thinking_chars", thinkingChars)
 
 		// Flag thrash pattern (exploration-only, high output): diagnostic only, no behavior change.
 		if allExplorationTools(toolNames) && message.Usage.OutputTokens > thrashOutputTokenThreshold {
@@ -725,7 +731,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		for _, tu := range toolUses {
 			// propose_changes already handled above; here it receives failure description if materialization failed.
 			if tu.Name == toolNameProposeChanges {
-				resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, materializeFailureMsg, true))
+				resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, materializeFailureMsg, true))
 				continue
 			}
 			if tu.Name == toolNameReadThemeFile {
@@ -749,12 +755,20 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			if err != nil {
 				output = err.Error()
 			}
-			resultBlocks = append(resultBlocks, anthropic.NewToolResultBlock(tu.ID, output, isError))
+			resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, output, isError))
 		}
 		messages = append(messages, anthropic.NewUserMessage(resultBlocks...))
 	}
 
 	return nil, fmt.Errorf("model did not call propose_changes within %d tool-loop iterations", maxToolIterations)
+}
+
+// toolResultBlock prefixes failures with "ERROR:" and keeps is_error: DeepSeek ignores is_error, so the flag alone is invisible.
+func toolResultBlock(toolUseID, text string, isError bool) anthropic.ContentBlockParamUnion {
+	if isError {
+		text = "ERROR: " + text
+	}
+	return anthropic.NewToolResultBlock(toolUseID, text, isError)
 }
 
 // readThemeFileToolInput: mirrors read_theme_file's "paths" field; independent from themebuild (package boundary).
@@ -824,12 +838,25 @@ func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error)
 		Model:     g.model,
 		MaxTokens: summarizeMaxTokens,
 		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(instruction))},
+		// Explicit: DeepSeek thinks by default, which would eat the 1024-token budget.
+		Thinking: anthropic.ThinkingConfigParamUnion{OfDisabled: &anthropic.ThinkingConfigDisabledParam{}},
 	}
 	message, err := g.client.Messages.New(ctx, params)
 	if err != nil {
 		return "", fmt.Errorf("summarize turns: %w", err)
 	}
-	return currentText(*message), nil
+	return textOnly(*message), nil
+}
+
+// textOnly ignores thinking blocks; the summary is replayed as history, so reasoning must never leak into it.
+func textOnly(message anthropic.Message) string {
+	var text strings.Builder
+	for _, block := range message.Content {
+		if b, ok := block.AsAny().(anthropic.TextBlock); ok {
+			text.WriteString(b.Text)
+		}
+	}
+	return text.String()
 }
 
 // staticSystemPromptBlock: theme engine spec + fixed rules (byte-identical across calls); cache_control for 1h reuse.
@@ -951,45 +978,6 @@ func writeFileTree(b *strings.Builder, entries []themefs.FileTreeEntry, depth in
 			writeFileTree(b, e.Children, depth+1)
 		}
 	}
-}
-
-// coalesceInterval/coalesceMaxChars: bound onDelta fire rate to avoid per-token volume (keep live < 200ms).
-const (
-	coalesceInterval = 200 * time.Millisecond
-	coalesceMaxChars = 80
-)
-
-// deltaCoalescer batches onDelta per-token chunks. NOT safe for concurrent use (single goroutine only).
-type deltaCoalescer struct {
-	onDelta   func(string)
-	buf       strings.Builder
-	lastFlush time.Time
-}
-
-func newDeltaCoalescer(onDelta func(string)) *deltaCoalescer {
-	return &deltaCoalescer{onDelta: onDelta, lastFlush: time.Now()}
-}
-
-// add appends chunk; flushes if limit hit. No-op if onDelta nil (caller needs no nil check).
-func (c *deltaCoalescer) add(chunk string) {
-	if c.onDelta == nil {
-		return
-	}
-	c.buf.WriteString(chunk)
-	if c.buf.Len() >= coalesceMaxChars || time.Since(c.lastFlush) >= coalesceInterval {
-		c.flush()
-	}
-}
-
-// flush: sends buffered text (no-op if empty). Called from add() and by Generate after streaming ends.
-func (c *deltaCoalescer) flush() {
-	if c.buf.Len() == 0 {
-		return
-	}
-	text := c.buf.String()
-	c.buf.Reset()
-	c.lastFlush = time.Now()
-	c.onDelta(text)
 }
 
 // currentText concatenates text and thinking blocks (with adaptive thinking, narration in ThinkingBlock).

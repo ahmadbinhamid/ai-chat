@@ -168,7 +168,7 @@ func TestGenerate_NoWarningWhenUpdatedFileWasRead(t *testing.T) {
 	var genErr error
 	lines := captureWarnLogs(t, func() {
 		_, genErr = g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil,
-			"update the footer", nil, nil, nil, toolExec, nil)
+			"update the footer", nil, nil, toolExec, nil)
 	})
 	if genErr != nil {
 		t.Fatalf("Generate returned an error: %v", genErr)
@@ -220,7 +220,7 @@ func TestGenerate_WarnsOnUpdateToFileOnlyGrepped(t *testing.T) {
 	var genErr error
 	lines := captureWarnLogs(t, func() {
 		result, genErr = g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil,
-			"update the footer", nil, nil, nil, toolExec, nil)
+			"update the footer", nil, nil, toolExec, nil)
 	})
 	if genErr != nil {
 		t.Fatalf("Generate returned an error: %v", genErr)
