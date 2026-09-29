@@ -18,7 +18,7 @@ import (
 // path makes zero model calls, not just that the returned *ai.Result looks right.
 type neverCalledGenerator struct{ t *testing.T }
 
-func (g neverCalledGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, string, []ai.Image, func(string), ai.ToolProgress, ai.ToolExecutor, ai.FileReader) (*ai.Result, error) {
+func (g neverCalledGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, string, []ai.Image, ai.ToolProgress, ai.ToolExecutor, ai.FileReader) (*ai.Result, error) {
 	g.t.Fatal("the model must not be called for a deterministic register/diagnose-existing-page request")
 	return nil, nil
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/modules/chat"
 )
 
 // summarizingFakeGenerator has a Summarize call independently controllable from fakeGenerator's
@@ -160,7 +161,7 @@ func TestSummarizeOldTurnsCached_ExactlyAtThresholdUnchanged(t *testing.T) {
 func TestSummarizeOldTurnsCached_SameChatOneSummarizeCall(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	svc := newCachedTestService(fg, true)
-	turns := turnsOf(summarizeHistoryThreshold + 5)
+	turns := turnsOf(summarizeHistoryThreshold + summaryBlockSize)
 
 	first := svc.summarizeOldTurnsCached(context.Background(), "chat-1", turns)
 	second := svc.summarizeOldTurnsCached(context.Background(), "chat-1", turns)
@@ -179,7 +180,7 @@ func TestSummarizeOldTurnsCached_RecentChurnKeepsCacheHit(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	svc := newCachedTestService(fg, true)
 
-	shared := turnsOf(5) // the shared 5-turn older prefix in a 25-turn chat
+	shared := turnsOf(summaryBlockSize) // the shared one-block older prefix
 	recentA := make([]ai.Turn, summarizeHistoryThreshold)
 	recentB := make([]ai.Turn, summarizeHistoryThreshold)
 	for i := range recentA {
@@ -200,24 +201,24 @@ func TestSummarizeOldTurnsCached_RecentChurnKeepsCacheHit(t *testing.T) {
 	}
 }
 
-// A changed older-turn count (grown or shrunk via discard/revert) always misses the cache and regenerates.
+// A changed older-turn bucket (grown or shrunk via discard/revert) always misses the cache and regenerates.
 func TestSummarizeOldTurnsCached_ChangedOlderSetRegenerates(t *testing.T) {
 	fg := &summarizingFakeGenerator{}
 	svc := newCachedTestService(fg, true)
 
-	svc.summarizeOldTurnsCached(context.Background(), "chat-3", turnsOf(summarizeHistoryThreshold+5))
+	svc.summarizeOldTurnsCached(context.Background(), "chat-3", turnsOf(summarizeHistoryThreshold+10))
 	if fg.summarizeCalls != 1 {
 		t.Fatalf("expected the first call to summarize, got %d calls", fg.summarizeCalls)
 	}
 
-	svc.summarizeOldTurnsCached(context.Background(), "chat-3", turnsOf(summarizeHistoryThreshold+10))
+	svc.summarizeOldTurnsCached(context.Background(), "chat-3", turnsOf(summarizeHistoryThreshold+20))
 	if fg.summarizeCalls != 2 {
-		t.Fatalf("expected a grown older-turn set (5 -> 10 older turns) to miss the cache and regenerate, got %d Summarize calls", fg.summarizeCalls)
+		t.Fatalf("expected a grown older-turn set (10 -> 20 older turns) to miss the cache and regenerate, got %d Summarize calls", fg.summarizeCalls)
 	}
 
-	svc.summarizeOldTurnsCached(context.Background(), "chat-3", turnsOf(summarizeHistoryThreshold+3))
+	svc.summarizeOldTurnsCached(context.Background(), "chat-3", turnsOf(summarizeHistoryThreshold+13))
 	if fg.summarizeCalls != 3 {
-		t.Fatalf("expected a shrunk older-turn set (10 -> 3 older turns, e.g. after a revert) to also miss the cache and regenerate, got %d Summarize calls", fg.summarizeCalls)
+		t.Fatalf("expected a shrunk older-turn set (20 -> 10 older turns, e.g. after a revert) to also miss the cache and regenerate, got %d Summarize calls", fg.summarizeCalls)
 	}
 }
 
@@ -225,7 +226,7 @@ func TestSummarizeOldTurnsCached_ChangedOlderSetRegenerates(t *testing.T) {
 func TestSummarizeOldTurnsCached_ErrorNotCached(t *testing.T) {
 	fg := &summarizingFakeGenerator{summarizeErr: errors.New("boom")}
 	svc := newCachedTestService(fg, true)
-	turns := turnsOf(summarizeHistoryThreshold + 5)
+	turns := turnsOf(summarizeHistoryThreshold + summaryBlockSize)
 
 	first := svc.summarizeOldTurnsCached(context.Background(), "chat-4", turns)
 	if len(first) != len(turns) {
@@ -258,5 +259,148 @@ func TestSummarizeOldTurnsCached_DisabledNeverSummarizes(t *testing.T) {
 	}
 	if len(got) != len(turns) {
 		t.Fatalf("expected full unsummarized history when disabled, got len %d want %d", len(got), len(turns))
+	}
+}
+
+func TestBucketedOlderCount(t *testing.T) {
+	tests := []struct {
+		turns int
+		want  int
+	}{
+		{0, 0},
+		{summarizeHistoryThreshold, 0},
+		{summarizeHistoryThreshold + 1, 0},
+		{summarizeHistoryThreshold + summaryBlockSize - 1, 0},
+		{summarizeHistoryThreshold + summaryBlockSize, summaryBlockSize},
+		{summarizeHistoryThreshold + 2*summaryBlockSize - 1, summaryBlockSize},
+		{summarizeHistoryThreshold + 2*summaryBlockSize, 2 * summaryBlockSize},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d turns", tt.turns), func(t *testing.T) {
+			if got := bucketedOlderCount(tt.turns); got != tt.want {
+				t.Errorf("bucketedOlderCount(%d) = %d, want %d", tt.turns, got, tt.want)
+			}
+		})
+	}
+}
+
+// Consecutive turns past the threshold within one block must reuse one summary, byte-identical.
+func TestSummarizeOldTurnsCached_ConsecutiveTurnsOneSummarizeCall(t *testing.T) {
+	fg := &summarizingFakeGenerator{}
+	svc := newCachedTestService(fg, true)
+	all := turnsOf(summarizeHistoryThreshold + 2*summaryBlockSize)
+
+	var first string
+	for n := summarizeHistoryThreshold + summaryBlockSize; n < summarizeHistoryThreshold+2*summaryBlockSize; n++ {
+		got := svc.summarizeOldTurnsCached(context.Background(), "chat-block", all[:n])
+		if n == summarizeHistoryThreshold+summaryBlockSize {
+			first = got[0].Content
+		} else if got[0].Content != first {
+			t.Fatalf("turn count %d: summary turn changed within a block: %q vs %q", n, got[0].Content, first)
+		}
+		if want := n - summaryBlockSize + 1; len(got) != want {
+			t.Fatalf("turn count %d: got %d turns, want %d", n, len(got), want)
+		}
+		if got[len(got)-1] != all[n-1] {
+			t.Fatalf("turn count %d: latest turn not preserved", n)
+		}
+	}
+	if fg.summarizeCalls != 1 {
+		t.Fatalf("expected 1 Summarize call across a whole block of turns, got %d", fg.summarizeCalls)
+	}
+	if want := fmt.Sprintf("summary of %d turns", summaryBlockSize); !strings.Contains(first, want) {
+		t.Errorf("expected summary of exactly the bucketed older turns (%q), got %q", want, first)
+	}
+
+	got := svc.summarizeOldTurnsCached(context.Background(), "chat-block", all)
+	if fg.summarizeCalls != 2 {
+		t.Fatalf("expected crossing a block boundary to trigger exactly one new Summarize, got %d total", fg.summarizeCalls)
+	}
+	if want := fmt.Sprintf("%d turns condensed", 2*summaryBlockSize); !strings.Contains(got[0].Content, want) {
+		t.Errorf("expected new summary turn to use the bucketed count (%q), got %q", want, got[0].Content)
+	}
+}
+
+// Past the threshold but short of one full block, nothing is summarized yet.
+func TestSummarizeOldTurnsCached_PartialFirstBlockUnchanged(t *testing.T) {
+	fg := &summarizingFakeGenerator{}
+	svc := newCachedTestService(fg, true)
+	turns := turnsOf(summarizeHistoryThreshold + summaryBlockSize - 1)
+
+	got := svc.summarizeOldTurnsCached(context.Background(), "chat-partial", turns)
+
+	if fg.summarizeCalls != 0 {
+		t.Fatalf("expected no Summarize call before the first full block, got %d", fg.summarizeCalls)
+	}
+	if len(got) != len(turns) {
+		t.Fatalf("expected full history, got len %d want %d", len(got), len(turns))
+	}
+}
+
+// A shrink back across a block boundary summarizes the lower block's exact prefix.
+func TestSummarizeOldTurnsCached_ShrinkAcrossBoundary(t *testing.T) {
+	fg := &summarizingFakeGenerator{}
+	svc := newCachedTestService(fg, true)
+	all := turnsOf(summarizeHistoryThreshold + 2*summaryBlockSize)
+	svc.summarizeOldTurnsCached(context.Background(), "chat-shrink", all)
+
+	n := summarizeHistoryThreshold + summaryBlockSize + 3
+	got := svc.summarizeOldTurnsCached(context.Background(), "chat-shrink", all[:n])
+
+	if fg.summarizeCalls != 2 {
+		t.Fatalf("expected the shrink to miss and re-summarize, got %d calls", fg.summarizeCalls)
+	}
+	if want := fmt.Sprintf("summary of %d turns", summaryBlockSize); !strings.Contains(got[0].Content, want) {
+		t.Errorf("expected summary of the lower block (%q), got %q", want, got[0].Content)
+	}
+	if len(got) != 1+n-summaryBlockSize || got[1] != all[summaryBlockSize] {
+		t.Errorf("expected recent window to start right after the lower block")
+	}
+}
+
+// An evicted entry just re-summarizes to the same content.
+func TestSummarizeOldTurnsCached_EvictedEntryResummarizes(t *testing.T) {
+	fg := &summarizingFakeGenerator{}
+	svc := newCachedTestService(fg, true)
+	turns := turnsOf(summarizeHistoryThreshold + summaryBlockSize)
+
+	first := svc.summarizeOldTurnsCached(context.Background(), "chat-evict", turns)
+	svc.historySummaries.mu.Lock()
+	delete(svc.historySummaries.entries, "chat-evict")
+	svc.historySummaries.mu.Unlock()
+	second := svc.summarizeOldTurnsCached(context.Background(), "chat-evict", turns)
+
+	if fg.summarizeCalls != 2 {
+		t.Fatalf("expected an evicted entry to re-summarize, got %d calls", fg.summarizeCalls)
+	}
+	if first[0].Content != second[0].Content {
+		t.Errorf("expected identical summary turn after eviction, got %q vs %q", first[0].Content, second[0].Content)
+	}
+}
+
+// A Summarize error on the bucketed path falls back to full history and isn't cached.
+func TestSummarizeOldTurnsCached_BucketedErrorFailsOpen(t *testing.T) {
+	fg := &summarizingFakeGenerator{summarizeErr: errors.New("boom")}
+	svc := newCachedTestService(fg, true)
+	turns := turnsOf(summarizeHistoryThreshold + summaryBlockSize + 4)
+
+	got := svc.summarizeOldTurnsCached(context.Background(), "chat-err", turns)
+	if len(got) != len(turns) {
+		t.Fatalf("expected full history on error, got len %d want %d", len(got), len(turns))
+	}
+	if _, ok := svc.historySummaries.get("chat-err", summaryBlockSize); ok {
+		t.Fatalf("expected a failed Summarize never to be cached")
+	}
+}
+
+// The summary cache relies on replayed history being append-only: a discard/revert only stamps
+// apply_status, so the turn must still be replayed, or the older-turn set would shift under a cached summary.
+func TestToTurns_DiscardedMessagesStillReplayed(t *testing.T) {
+	msgs := []chat.Message{
+		{Role: chat.RoleUser, Content: "make it blue", ApplyStatus: chat.ApplyStatusDiscarded},
+		{Role: chat.RoleAssistant, Content: "Made it blue.", Status: chat.MessageStatusCompleted, ApplyStatus: chat.ApplyStatusDiscarded},
+	}
+	if got := toTurns(msgs); len(got) != 2 {
+		t.Fatalf("expected discarded messages still replayed, got %d turns", len(got))
 	}
 }

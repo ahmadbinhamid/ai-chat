@@ -13,6 +13,19 @@ import (
 // Beyond this turn count, older turns collapse into one summary turn.
 const summarizeHistoryThreshold = 20
 
+// Older-turn count is floored to a multiple of this so the cache key and summary text hold for a whole block;
+// a rolling key re-summarizes every turn and shifts the prefix, defeating both this cache and DeepSeek prefix matching.
+const summaryBlockSize = 10
+
+// Recent window floats between summarizeHistoryThreshold and threshold+summaryBlockSize-1 turns; 0 means don't summarize.
+func bucketedOlderCount(turnCount int) int {
+	older := turnCount - summarizeHistoryThreshold
+	if older <= 0 {
+		return 0
+	}
+	return older - older%summaryBlockSize
+}
+
 // Shared by cached/uncached paths for byte-identical content (required for prefix-caching hit).
 func summaryTurnContent(olderCount int, summary string) string {
 	return "[Earlier conversation summary, " + strconv.Itoa(olderCount) + " turns condensed]: " + summary
@@ -58,7 +71,7 @@ type historySummaryCacheEntry struct {
 	summary        string
 }
 
-// In-process best-effort cache; fixed older-turn sets never go stale (size-capped map enough).
+// Never stale: replayed history is append-only (revert/discard only update apply_status, which toTurns ignores).
 type historySummaryCache struct {
 	mu      sync.Mutex
 	entries map[string]historySummaryCacheEntry
@@ -94,12 +107,15 @@ func (c *historySummaryCache) set(chatID string, olderTurnCount int, summary str
 // summarizeOldTurnsCached is summarizeOldTurns plus a per-chat cache — what doGenerate actually
 // calls. Matters because DeepSeek caches on exact request-prefix match, so a regenerated summary would defeat that cache every call. Fails open and is never cached, so a transient error can't poison it.
 func (s *Service) summarizeOldTurnsCached(ctx context.Context, chatID string, turns []ai.Turn) []ai.Turn {
-	if !s.historySummarizationEnabled || len(turns) <= summarizeHistoryThreshold {
+	if !s.historySummarizationEnabled {
 		return turns
 	}
-
-	recent := turns[len(turns)-summarizeHistoryThreshold:]
-	olderCount := len(turns) - summarizeHistoryThreshold
+	// Computed once from turns, so the key checked inside and outside the lock is always the same.
+	olderCount := bucketedOlderCount(len(turns))
+	if olderCount == 0 {
+		return turns
+	}
+	recent := turns[olderCount:]
 
 	if s.historySummaries != nil {
 		if summary, ok := s.historySummaries.get(chatID, olderCount); ok {
@@ -124,7 +140,7 @@ func (s *Service) summarizeOldTurnsCached(ctx context.Context, chatID string, tu
 	}
 
 	start := time.Now()
-	summary, _, err := summarizeOlderTurns(ctx, s.gen, turns)
+	summary, err := s.gen.Summarize(ctx, turns[:olderCount])
 	elapsed := time.Since(start)
 	if err != nil {
 		slog.Warn("history summarization failed; falling back to full unsummarized history",

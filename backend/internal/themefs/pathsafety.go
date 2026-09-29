@@ -4,6 +4,7 @@ package themefs
 import (
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -70,9 +71,24 @@ func ValidateGeneratedFilePath(relPath string) error {
 	}
 	ext := path.Ext(path.Clean(relPath))
 	if !allowedGeneratedExtensions[ext] {
-		return fmt.Errorf("file extension %q is not allowed for a generated file (only .liquid, .css, .js): %q", ext, preview(relPath))
+		return fmt.Errorf("file extension %q is not allowed for a generated file (only %s): %q", ext, GeneratedFileTypes(), preview(relPath))
 	}
 	return nil
+}
+
+// GeneratedFileTypes describes the allowlists above; the model's prompt and the rejection message both use it so they can't drift.
+func GeneratedFileTypes() string {
+	exts := make([]string, 0, len(allowedGeneratedExtensions))
+	for ext := range allowedGeneratedExtensions {
+		exts = append(exts, ext)
+	}
+	sort.Strings(exts)
+	paths := make([]string, 0, len(allowedGeneratedFullPaths))
+	for p := range allowedGeneratedFullPaths {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	return strings.Join(exts, ", ") + ", or exactly " + strings.Join(paths, ", ") + " at the theme root"
 }
 
 // ValidateThemeSlug guards the other half of a theme-relative path — the slug must be a plain directory-name-safe token.

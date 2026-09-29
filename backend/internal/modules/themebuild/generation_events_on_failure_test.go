@@ -17,7 +17,7 @@ import (
 // alwaysFailGenerator always errors; this tests doGenerate's defer, not a real AI provider call.
 type alwaysFailGenerator struct{}
 
-func (alwaysFailGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, string, []ai.Image, func(string), ai.ToolProgress, ai.ToolExecutor, ai.FileReader) (*ai.Result, error) {
+func (alwaysFailGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, string, []ai.Image, ai.ToolProgress, ai.ToolExecutor, ai.FileReader) (*ai.Result, error) {
 	return nil, context.Canceled
 }
 

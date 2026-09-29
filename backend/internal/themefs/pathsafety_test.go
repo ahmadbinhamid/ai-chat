@@ -1,6 +1,9 @@
 package themefs
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestValidatePathSafety_Allowed(t *testing.T) {
 	for _, p := range []string{
@@ -84,5 +87,36 @@ func TestValidateThemeSlug(t *testing.T) {
 		if err := ValidateThemeSlug(slug); err == nil {
 			t.Errorf("expected slug %q to be rejected, got no error", slug)
 		}
+	}
+}
+
+// The observed production rejection: an image asset must fail with the specific extension message, listing what is allowed.
+func TestValidateGeneratedFilePath_ImageRejectedWithSpecificMessage(t *testing.T) {
+	tests := []struct {
+		path string
+		ext  string
+	}{
+		{"images/coffee-hero.svg", `".svg"`},
+		{"images/banner.png", `".png"`},
+		{"images/photo.jpg", `".jpg"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			err := ValidateGeneratedFilePath(tt.path)
+			if err == nil {
+				t.Fatalf("expected %q to be rejected", tt.path)
+			}
+			for _, want := range []string{tt.ext, "is not allowed for a generated file", GeneratedFileTypes()} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q missing %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestGeneratedFileTypes(t *testing.T) {
+	if got, want := GeneratedFileTypes(), ".css, .js, .json, .liquid, or exactly robots.txt at the theme root"; got != want {
+		t.Errorf("GeneratedFileTypes() = %q, want %q", got, want)
 	}
 }

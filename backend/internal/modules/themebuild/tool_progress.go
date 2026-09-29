@@ -46,14 +46,6 @@ func (p toolProgressEmitter) ToolFinished(_ string, summary string, _ error) {
 	p.emitter.emit(p.ctx, EventTypeToolResult, map[string]string{"summary": summary})
 }
 
-// onThinkingDelta routes each coalesced chunk to emitLive, never emit — durably storing every
-// streamed chunk (and burning a seq number per chunk) is the mistake this avoids.
-func onThinkingDelta(ctx context.Context, emitter *eventEmitter) func(string) {
-	return func(text string) {
-		emitter.emitLive(ctx, EventTypeThinking, map[string]string{"text": text})
-	}
-}
-
 // toolProgressFor builds a toolProgressEmitter for one Generate call.
 func toolProgressFor(ctx context.Context, emitter *eventEmitter) ai.ToolProgress {
 	return toolProgressEmitter{ctx: ctx, emitter: emitter}

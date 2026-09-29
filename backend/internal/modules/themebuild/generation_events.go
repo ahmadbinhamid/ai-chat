@@ -222,7 +222,7 @@ func (e *eventEmitter) emit(ctx context.Context, eventType string, payload any) 
 }
 
 // emitLive publishes to the live bus only, never generation_events, consuming no seq number.
-// Always stamps the heartbeat first — thinking deltas are the only signal during a model call, so this keeps it from going stale mid-call.
+// Always stamps the heartbeat first. No production caller since model output stopped streaming; the heartbeat ticker covers model calls.
 func (e *eventEmitter) emitLive(ctx context.Context, eventType string, payload any) {
 	if e == nil {
 		return
