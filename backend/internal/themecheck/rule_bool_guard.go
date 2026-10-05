@@ -11,6 +11,7 @@ const ruleIDBoolGuard = "bool-guard"
 // Keyed on the final dotted segment so both "product.on_sale" and aliased "item.active" match.
 var boolIshLastSegments = map[string]bool{
 	"active": true, "on_sale": true, "has_choices": true, "has_variants": true, "is_available": true,
+	"can_quick_add": true, "show_add_to_cart": true, "has_addons": true, "is_required": true, "is_active": true,
 }
 
 // checkBoolGuard enforces rule 9: a bare {% if x %} on a bool-ish field must

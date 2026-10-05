@@ -48,3 +48,16 @@ func TestCheckBoolGuard_IgnoresNonLiquidFiles(t *testing.T) {
 		t.Errorf("expected non-.liquid files to be ignored, got %+v", got)
 	}
 }
+
+func TestCheckBoolGuard_ZeroOneFields(t *testing.T) {
+	for _, field := range []string{"product.can_quick_add", "item.show_add_to_cart", "product.has_addons", "group.is_required", "addon.is_active"} {
+		p := Proposal{Files: []ProposedFile{{Path: "pages/product.liquid", Content: "{% if " + field + " %}x{% endif %}"}}}
+		if got := checkBoolGuard(p, Snapshot{}); len(got) != 1 {
+			t.Errorf("%s: expected a bare truthy check to be flagged, got %+v", field, got)
+		}
+		guarded := Proposal{Files: []ProposedFile{{Path: "pages/product.liquid", Content: "{% if " + field + " == true or " + field + " == 1 %}x{% endif %}"}}}
+		if got := checkBoolGuard(guarded, Snapshot{}); len(got) != 0 {
+			t.Errorf("%s: expected the guarded form to pass, got %+v", field, got)
+		}
+	}
+}

@@ -7,9 +7,8 @@ import (
 
 const ruleIDDraftReversion = "draft-reversion"
 
-// A proposal counts as undoing earlier unsaved work only when it drops at least draftReversionMinDropped lines that
-// earlier turns added AND at least draftReversionMinShare of all of them. An edit replacing one line drops at most one,
-// and a targeted fix touching a few added lines stays under half; a whole-file rewrite that reverts the draft trips both.
+// Fires only when a proposal drops at least 3 earlier-added lines AND half of them: a one-line edit or a targeted fix
+// stays under, while a whole-file rewrite that reverts the draft trips both.
 const (
 	draftReversionMinDropped = 3
 	draftReversionMinShare   = 0.5
