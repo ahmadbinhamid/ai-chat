@@ -59,31 +59,13 @@ type productsPageEnvelope struct {
 // FetchProducts calls GET /products filtered to published/active products, capped at limit via the query param.
 // Items is defensively re-capped at limit in case that isn't honoured server-side. First page only.
 func (s *Store) FetchProducts(ctx context.Context, auth RequestAuth, limit int) (ProductsPage, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+"/products", nil)
-	if err != nil {
-		return ProductsPage{}, fmt.Errorf("build products request: %w", err)
-	}
-	q := req.URL.Query()
-	q.Set("limit", strconv.Itoa(limit))
-	q.Set("is_published_online", "1")
-	q.Set("is_active", "1")
-	req.URL.RawQuery = q.Encode()
-	req.Header.Set("Authorization", "Bearer "+auth.Token)
-	req.Header.Set("TID", strconv.FormatUint(auth.TenantID, 10))
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return ProductsPage{}, fmt.Errorf("fetch products: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return ProductsPage{}, fmt.Errorf("fetch products: %s", statusErr(resp))
-	}
-
+	query := url.Values{}
+	query.Set("limit", strconv.Itoa(limit))
+	query.Set("is_published_online", "1")
+	query.Set("is_active", "1")
 	var out productsPageEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return ProductsPage{}, fmt.Errorf("fetch products: decode response: %w", err)
+	if err := s.getJSON(ctx, auth, "/products", query, &out); err != nil {
+		return ProductsPage{}, fmt.Errorf("fetch products: %w", err)
 	}
 
 	items := out.Data.Products.Data
@@ -97,6 +79,31 @@ func (s *Store) FetchProducts(ctx context.Context, auth RequestAuth, limit int) 
 		PerPage:     out.Data.Products.PerPage,
 		Total:       out.Data.Products.Total,
 	}, nil
+}
+
+// StorefrontPerPage is §7's page size: products/categories pagination and filters.per_page are always 15.
+const StorefrontPerPage = 15
+
+// FlattenAddonGroups builds §7's flat addons[] from addon_groups: each add-on once, carrying its group's id and name.
+func FlattenAddonGroups(groups []any) []any {
+	flat := []any{}
+	seen := map[any]bool{}
+	for _, g := range groups {
+		group := g.(map[string]any)
+		for _, a := range group["addons"].([]any) {
+			addon := a.(map[string]any)
+			if seen[addon["id"]] {
+				continue
+			}
+			seen[addon["id"]] = true
+			withGroup := map[string]any{"group_id": group["id"], "group_name": group["name"]}
+			for k, v := range addon {
+				withGroup[k] = v
+			}
+			flat = append(flat, withGroup)
+		}
+	}
+	return flat
 }
 
 // ProductDetail is the subset of GET /products/{slug} the preview's product page needs. That admin endpoint loads each
@@ -163,8 +170,11 @@ func (s *Store) FetchProductDetail(ctx context.Context, auth RequestAuth, slug s
 			Product ProductDetail `json:"product"`
 		} `json:"data"`
 	}
-	if err := s.getJSON(ctx, auth, "/products/"+url.PathEscape(slug), &out); err != nil {
+	if err := s.getJSON(ctx, auth, "/products/"+url.PathEscape(slug), nil, &out); err != nil {
 		return ProductDetail{}, fmt.Errorf("fetch product detail: %w", err)
+	}
+	if out.Data.Product.ID == 0 {
+		return ProductDetail{}, fmt.Errorf("fetch product detail: response has no product")
 	}
 	return out.Data.Product, nil
 }
@@ -176,16 +186,20 @@ func (s *Store) FetchAddOnGroup(ctx context.Context, auth RequestAuth, id int) (
 			AddOnGroup AddOnGroup `json:"addOnGroup"`
 		} `json:"data"`
 	}
-	if err := s.getJSON(ctx, auth, "/addon-groups/"+strconv.Itoa(id), &out); err != nil {
+	if err := s.getJSON(ctx, auth, "/addon-groups/"+strconv.Itoa(id), nil, &out); err != nil {
 		return AddOnGroup{}, fmt.Errorf("fetch add-on group %d: %w", id, err)
 	}
 	return out.Data.AddOnGroup, nil
 }
 
-func (s *Store) getJSON(ctx context.Context, auth RequestAuth, path string, out any) error {
+// getJSON is the shared authenticated GET to flowpos-backend: TID/bearer headers, non-200 as an error, JSON-decoded into out.
+func (s *Store) getJSON(ctx context.Context, auth RequestAuth, path string, query url.Values, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+path, nil)
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
+	}
+	if len(query) > 0 {
+		req.URL.RawQuery = query.Encode()
 	}
 	req.Header.Set("Authorization", "Bearer "+auth.Token)
 	req.Header.Set("TID", strconv.FormatUint(auth.TenantID, 10))

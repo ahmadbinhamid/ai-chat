@@ -106,8 +106,8 @@ func previewProductItem(p themefs.Product) map[string]any {
 		"title":                      p.Name,
 		"id":                         strconv.Itoa(p.ID),
 		"slug":                       p.Slug,
-		"sku":                        stringOr(p.SKU, ""),
-		"barcode":                    stringOr(p.Barcode, ""),
+		"sku":                        derefString(p.SKU),
+		"barcode":                    derefString(p.Barcode),
 		"description":                p.Description,
 		"image_url":                  imageURL,
 		"images":                     images,
@@ -211,7 +211,7 @@ func previewProductDetail(p themefs.ProductDetail) map[string]any {
 		"has_choices":                boolInt(len(choices) > 0),
 		"addon_groups":               addonGroups,
 		"add_on_groups":              addonGroups,
-		"addons":                     flattenAddonGroups(addonGroups),
+		"addons":                     themefs.FlattenAddonGroups(addonGroups),
 		"has_addons":                 boolInt(len(addonGroups) > 0),
 	}
 }
@@ -336,28 +336,6 @@ func previewAddonGroups(variants []themefs.ProductVariant) []any {
 	return groups
 }
 
-// flattenAddonGroups builds §7's flat addons[] from the groups, each add-on once, carrying its group id and name.
-func flattenAddonGroups(groups []any) []any {
-	flat := []any{}
-	seen := map[int]bool{}
-	for _, g := range groups {
-		group := g.(map[string]any)
-		for _, a := range group["addons"].([]any) {
-			addon := a.(map[string]any)
-			if seen[addon["id"].(int)] {
-				continue
-			}
-			seen[addon["id"].(int)] = true
-			withGroup := map[string]any{"group_id": group["id"], "group_name": group["name"]}
-			for k, v := range addon {
-				withGroup[k] = v
-			}
-			flat = append(flat, withGroup)
-		}
-	}
-	return flat
-}
-
 func attachmentImages(attachments []themefs.ProductAttachment) []any {
 	images := []any{}
 	for _, a := range attachments {
@@ -386,7 +364,7 @@ func boolInt(b bool) int {
 // render a second page, so a real has_next would draw a "Next" button that silently does nothing when clicked.
 func previewProductsPagination(itemCount int) map[string]any {
 	return map[string]any{
-		"page": 1, "last_page": 1, "total": itemCount, "per_page": 15,
+		"page": 1, "last_page": 1, "total": itemCount, "per_page": themefs.StorefrontPerPage,
 		"has_prev": false, "has_next": false, "prev_page": nil, "next_page": nil,
 	}
 }
@@ -394,13 +372,6 @@ func previewProductsPagination(itemCount int) map[string]any {
 // formatGBP assumes GBP, the platform's only supported currency across every theme and tenant today.
 func formatGBP(amount float64) string {
 	return fmt.Sprintf("£%.2f", amount)
-}
-
-func stringOr(s *string, fallback string) string {
-	if s == nil {
-		return fallback
-	}
-	return *s
 }
 
 // PreviewHandler renders a theme page against fixture data so a merchant can preview without saving to the real theme.

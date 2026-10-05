@@ -44,6 +44,10 @@ func categorizeError(err error) string {
 		}
 	}
 
+	if errors.Is(err, errStuckInTextReplies) {
+		return "I wasn't able to work out how to do that — could you rephrase it, or add a bit more detail about what you'd like to change?"
+	}
+
 	if errors.Is(err, errMaxTokensTruncated) {
 		return "the response was too large to complete — please try a smaller request"
 	}

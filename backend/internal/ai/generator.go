@@ -471,6 +471,13 @@ func consumeStream(
 // defaultMaxTokens: used when AI_MAX_TOKENS is unset; above 32000 to avoid truncating large proposals.
 const defaultMaxTokens = 64000
 
+// maxConsecutiveTextOnlyRounds: one or two text-only replies are normal on DeepSeek; three in a row means it's stuck,
+// and nudging on to maxToolIterations only burns minutes before failing anyway.
+const maxConsecutiveTextOnlyRounds = 3
+
+// errStuckInTextReplies is deliberately not a "too complex" failure: it fires on two-word messages too.
+var errStuckInTextReplies = errors.New("model kept replying in plain text without calling a tool")
+
 // errMaxTokensTruncated: returned when StopReason==max_tokens to prevent parsing partial JSON.
 var errMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
 
@@ -534,6 +541,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			"total_reasoning_tokens", totalReasoningTokens,
 			"reasoning_tokens_reported", reasoningTokensReported)
 	}()
+	// Counts consecutive rounds with no tool call that text recovery also couldn't rescue; any real call resets it.
+	consecutiveTextOnly := 0
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
 		iterationsUsed = iteration + 1
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
@@ -679,11 +688,24 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			return nil, errMaxTokensTruncated
 		}
 
+		// DeepSeek sometimes writes propose_changes as text instead of a tool_use block; recover it rather than nudge.
+		recovered := false
+		if len(toolUses) == 0 {
+			if args, ok := recoverProposeFromText(message); ok {
+				proposeInput, recovered = args, true
+				slog.Warn("ai: recovered a propose_changes call written as text", "iteration", iteration)
+			}
+		}
+
+		if len(toolUses) > 0 || recovered {
+			consecutiveTextOnly = 0
+		}
+
 		// materializeFailureMsg: fed back as tool_result (isError: true) on failure; loop continues for correction.
 		var materializeFailureMsg string
 		if proposeInput != nil {
-			var result Result
-			if err := json.Unmarshal(proposeInput, &result); err != nil {
+			result, err := decodeProposeInput(proposeInput)
+			if err != nil {
 				return nil, fmt.Errorf("could not parse propose_changes input: %w", err)
 			}
 			// Register creates even if materialization fails (grounding for later edits).
@@ -698,14 +720,30 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				result.InputTokens = totalInputTokens
 				result.OutputTokens = totalOutputTokens
 				result.ExplorationToolCalls = explorationToolCalls
-				result.conversation = newConversation(messages, message, proposeID, callModel)
+				// A recovered call has no tool_use ID to pair a resumed tool_result with, so repair uses the flat-recap fallback.
+				if !recovered {
+					result.conversation = newConversation(messages, message, proposeID, callModel)
+				}
 				return &result, nil
 			}
-			slog.Warn("ai: propose_changes edit materialization failed, retrying", "iteration", iteration)
+			slog.Warn("ai: propose_changes edit materialization failed, retrying", "iteration", iteration, "recovered_from_text", recovered)
 			materializeFailureMsg = retryMsg
 		}
 
+		if recovered {
+			messages = append(messages, message.ToParam())
+			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(recoveredMaterializeFailure(materializeFailureMsg))))
+			continue
+		}
+
 		if len(toolUses) == 0 {
+			// Never turn the text into an answer: that would need answered_question: true, which bypasses the
+			// fake-success guard, so a plain-text "Done!" would reach the merchant with nothing changed.
+			consecutiveTextOnly++
+			if consecutiveTextOnly >= maxConsecutiveTextOnlyRounds {
+				slog.Warn("ai: model stuck replying in text, stopping", "iteration", iteration, "consecutive_text_rounds", consecutiveTextOnly)
+				return nil, errStuckInTextReplies
+			}
 			slog.Warn("ai: tool-loop nudge fired (zero tool calls despite forced tool_choice)", "iteration", iteration)
 			// DeepSeek does NOT honor ToolChoice: OfAny (Anthropic does). Nudge instead of failing.
 			messages = append(messages, message.ToParam())

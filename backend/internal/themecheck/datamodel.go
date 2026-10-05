@@ -59,9 +59,18 @@ var addonGroupFields = map[string]*fieldSpec{
 	"addons": arr(addonFields),
 }
 
-var flatAddonFields = map[string]*fieldSpec{
-	"id": leaf(), "name": leaf(), "price_amount": leaf(), "price_formatted": leaf(),
-	"max_quantity": leaf(), "is_active": leaf(), "group_id": leaf(), "group_name": leaf(),
+var flatAddonFields = withFields(addonFields, map[string]*fieldSpec{"group_id": leaf(), "group_name": leaf()})
+
+// withFields returns base plus extra as a new map, leaving both inputs untouched.
+func withFields(base, extra map[string]*fieldSpec) map[string]*fieldSpec {
+	out := make(map[string]*fieldSpec, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }
 
 var categoryFields = map[string]*fieldSpec{

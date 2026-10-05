@@ -757,34 +757,47 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
-	tc, err := s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)
-	if err != nil {
-		return fmt.Errorf("load theme context: %w", err)
-	}
-	tc.GenerationMode = in.Mode
-	tc.DraftPaths = make([]string, 0, len(draft))
-	for path := range draft {
-		tc.DraftPaths = append(tc.DraftPaths, path)
+	// Greetings skip FlowPOS, the history summary and the model; the values below only feed generation and repair,
+	// and protectPages reads tc.PagesJSON only for proposed files, which a greeting never has.
+	result, deterministic := smallTalkReply(in, priorMessages)
+	var (
+		tc       ai.ThemeContext
+		snapBase themecheck.Snapshot
+		toolExec ai.ToolExecutor
+		readFile ai.FileReader
+		turns    []ai.Turn
+	)
+	if !deterministic {
+		tc, err = s.buildThemeContext(ctx, store, storeAuth, in.ThemeSlug)
+		if err != nil {
+			return fmt.Errorf("load theme context: %w", err)
+		}
+		tc.GenerationMode = in.Mode
+		tc.DraftPaths = make([]string, 0, len(draft))
+		for path := range draft {
+			tc.DraftPaths = append(tc.DraftPaths, path)
+		}
+
+		snapBase, err = s.buildSnapshotBase(ctx, store, storeAuth)
+		if err != nil {
+			return fmt.Errorf("build snapshot base: %w", err)
+		}
+
+		toolExec = s.buildToolExecutor(store, storeAuth)
+		readFile = s.buildFileReader(store, storeAuth)
+
+		// Fails open: the file-history line is a memory aid, never worth failing a generation over.
+		fileChanges, fcErr := s.repo.FileChangesByChat(ctx, c.ID)
+		if fcErr != nil {
+			slog.Warn("load per-turn file changes failed; replaying history without them", "chat_id", c.ID, "error", fcErr)
+			fileChanges = nil
+		}
+		turns = s.summarizeOldTurnsCached(ctx, c.ID, toTurnsWithFileChanges(priorMessages, fileChanges))
+
+		// Deterministic page-lifecycle ops (register existing page, diagnose failures).
+		result, deterministic = s.tryDeterministicPageOp(ctx, store, storeAuth, in.Prompt)
 	}
 
-	snapBase, err := s.buildSnapshotBase(ctx, store, storeAuth)
-	if err != nil {
-		return fmt.Errorf("build snapshot base: %w", err)
-	}
-
-	toolExec := s.buildToolExecutor(store, storeAuth)
-	readFile := s.buildFileReader(store, storeAuth)
-
-	// Fails open: the file-history line is a memory aid, never worth failing a generation over.
-	fileChanges, err := s.repo.FileChangesByChat(ctx, c.ID)
-	if err != nil {
-		slog.Warn("load per-turn file changes failed; replaying history without them", "chat_id", c.ID, "error", err)
-		fileChanges = nil
-	}
-	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurnsWithFileChanges(priorMessages, fileChanges))
-
-	// Deterministic page-lifecycle ops (register existing page, diagnose failures).
-	result, deterministic := s.tryDeterministicPageOp(ctx, store, storeAuth, in.Prompt)
 	if !deterministic {
 		var err error
 		result, turns, err = s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
@@ -961,6 +974,7 @@ func (s *Service) FetchPreviewProductDetail(ctx context.Context, storeAuth theme
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			defer safego.Recover("themebuild.fetchAddOnGroup")
 			group, err := fetcher.FetchAddOnGroup(ctx, storeAuth, id)
 			if err != nil {
 				slog.Warn("preview: add-on group fetch failed", "group_id", id, "error", err)

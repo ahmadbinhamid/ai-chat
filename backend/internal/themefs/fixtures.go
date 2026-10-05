@@ -64,26 +64,10 @@ func FixtureProduct() map[string]any {
 		"has_addons":         true,
 		"addon_groups":       addonGroups,
 		"add_on_groups":      addonGroups,
-		"addons":             flattenAddons(addonGroups),
+		"addons":             FlattenAddonGroups(addonGroups),
 		// Singular "product/", not "products/" — matches flowpos-backend's hardcoded PageResolver::RESOURCE_ROUTES pattern exactly, fixed for every theme.
 		"url": "/product/sample-product",
 	}
-}
-
-// flattenAddons builds §7's flat addons[] from the groups so the two lists can't disagree.
-func flattenAddons(groups []any) []any {
-	var flat []any
-	for _, g := range groups {
-		group := g.(map[string]any)
-		for _, a := range group["addons"].([]any) {
-			addon := map[string]any{"group_id": group["id"], "group_name": group["name"]}
-			for k, v := range a.(map[string]any) {
-				addon[k] = v
-			}
-			flat = append(flat, addon)
-		}
-	}
-	return flat
 }
 
 // FixtureProducts returns a list-context products object (the shape used by home/category/search grids).
@@ -92,7 +76,7 @@ func FixtureProducts() map[string]any {
 	return map[string]any{
 		"items": []any{item, item, item},
 		"pagination": map[string]any{
-			"page": 1, "last_page": 1, "total": 3, "per_page": 15,
+			"page": 1, "last_page": 1, "total": 3, "per_page": StorefrontPerPage,
 			"has_prev": false, "has_next": false, "prev_page": nil, "next_page": nil,
 		},
 	}
@@ -113,7 +97,7 @@ func FixtureCategories() map[string]any {
 	return map[string]any{
 		"items": []any{item, item},
 		"pagination": map[string]any{
-			"page": 1, "last_page": 1, "total": 2, "per_page": 15,
+			"page": 1, "last_page": 1, "total": 2, "per_page": StorefrontPerPage,
 			"has_prev": false, "has_next": false, "prev_page": nil, "next_page": nil,
 		},
 	}
@@ -187,7 +171,7 @@ func FixtureContext() map[string]any {
 			map[string]any{"slug": "sample-category-2", "name": "Sample Category 2"},
 		},
 		"filters": map[string]any{
-			"search": "", "sort": "", "category": "", "min_price": "", "max_price": "", "per_page": 15,
+			"search": "", "sort": "", "category": "", "min_price": "", "max_price": "", "per_page": StorefrontPerPage,
 		},
 		"filter_price_range": map[string]any{"min": 0, "max": 100},
 		"basket":             FixtureBasket(),
