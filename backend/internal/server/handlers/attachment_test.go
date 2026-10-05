@@ -32,7 +32,7 @@ func TestAttachmentHandler_ServesBytesForOwnAttachment(t *testing.T) {
 	userID := uint64(1)
 	imageBytes := "fake-png-bytes"
 	msg, err := chatSvc.RecordUserMessage(ctx, c, &userID, "", "", "look at this",
-		[]chat.MessageImage{{Base64: "ZmFrZS1wbmctYnl0ZXM=", MediaType: "image/png"}}, nil, nil) // base64("fake-png-bytes")
+		[]chat.MessageImage{{Base64: "ZmFrZS1wbmctYnl0ZXM=", MediaType: "image/png"}}, nil, nil, nil) // base64("fake-png-bytes")
 	if err != nil {
 		t.Fatalf("RecordUserMessage failed: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestAttachmentHandler_SetsPrivateCacheControl(t *testing.T) {
 	}
 	userID := uint64(1)
 	msg, err := chatSvc.RecordUserMessage(ctx, c, &userID, "", "", "look at this",
-		[]chat.MessageImage{{Base64: "QUFBQQ==", MediaType: "image/png"}}, nil, nil)
+		[]chat.MessageImage{{Base64: "QUFBQQ==", MediaType: "image/png"}}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("RecordUserMessage failed: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestAttachmentHandler_OtherTenantGets404(t *testing.T) {
 	}
 	userID := uint64(1)
 	msg, err := chatSvc.RecordUserMessage(ctx, c, &userID, "", "", "look at this",
-		[]chat.MessageImage{{Base64: "QUFBQQ==", MediaType: "image/png"}}, nil, nil)
+		[]chat.MessageImage{{Base64: "QUFBQQ==", MediaType: "image/png"}}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("RecordUserMessage failed: %v", err)
 	}

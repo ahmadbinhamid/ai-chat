@@ -8,6 +8,7 @@ import (
 	"ai-chat/internal/httpresponse"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/modules/themebuild"
+	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/ratelimit"
 	"ai-chat/internal/themefs"
 
@@ -36,6 +37,19 @@ type sendMessageRequest struct {
 	Images []imageAttachment `json:"images" binding:"omitempty,max=5,dive"`
 	// HTMLAttachment allows at most one reference HTML file, unlike Images.
 	HTMLAttachment *htmlAttachment `json:"html_attachment" binding:"omitempty"`
+	// Browser errors captured from the preview (max=20 is previewerrors.MaxEntries; gin needs a literal).
+	// Binding rejects an unknown type; previewerrors.Sanitize does the rest, since the frontend isn't a trust boundary.
+	PreviewErrors []previewError `json:"preview_errors" binding:"omitempty,max=20,dive"`
+}
+
+type previewError struct {
+	Type string `json:"type" binding:"required,oneof=error rejection console resource render"`
+	// No max: an over-long message is truncated, not rejected, so it never costs the merchant their message.
+	Message string `json:"message" binding:"required"`
+	Source  string `json:"source"`
+	Line    int    `json:"line" binding:"omitempty,min=1"`
+	Column  int    `json:"column" binding:"omitempty,min=1"`
+	Count   int    `json:"count" binding:"omitempty,min=1"`
 }
 
 type htmlAttachment struct {
@@ -95,6 +109,13 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		htmlContent = &in.HTMLAttachment.Content
 	}
 
+	previewErrors := make([]previewerrors.Entry, len(in.PreviewErrors))
+	for i, e := range in.PreviewErrors {
+		previewErrors[i] = previewerrors.Entry{
+			Type: e.Type, Message: e.Message, Source: e.Source, Line: e.Line, Column: e.Column, Count: e.Count,
+		}
+	}
+
 	tenantID := auth.TenantID(c)
 	if !h.limiter.Allow(tenantID) {
 		httpresponse.Error(c, http.StatusTooManyRequests, "generation rate limit exceeded for this tenant, try again shortly", "RATE_LIMITED")
@@ -113,6 +134,7 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		Images:                 images,
 		HTMLAttachmentFilename: htmlFilename,
 		HTMLAttachmentContent:  htmlContent,
+		PreviewErrors:          previewErrors,
 	})
 	if err != nil {
 		respondErr(c, err)

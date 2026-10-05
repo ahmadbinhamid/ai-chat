@@ -178,7 +178,7 @@ func TestService_RecordUserMessage_ListReturnsAttachmentMetadataNoContent(t *tes
 		{Base64: "aW1hZ2UtdHdv", MediaType: "image/jpeg"}, // "image-two"
 	}
 
-	created, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "redesign this", images, &filename, &htmlContent)
+	created, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "redesign this", images, &filename, &htmlContent, nil)
 	if err != nil {
 		t.Fatalf("RecordUserMessage failed: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestRepository_ListMessagesByChat_NoImagesFieldOnlyAttachments(t *testing.T
 	userID := uint64(42)
 	images := []MessageImage{{Base64: "aGVsbG8=", MediaType: "image/png"}} // "hello"
 
-	if _, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "look at this", images, nil, nil); err != nil {
+	if _, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "look at this", images, nil, nil, nil); err != nil {
 		t.Fatalf("RecordUserMessage failed: %v", err)
 	}
 
@@ -282,7 +282,7 @@ func TestRepository_GetAttachmentsContent_ReturnsDecodedBytes(t *testing.T) {
 	// "hello world" base64-encoded, WITH padding — proves stored bytes are decoded plaintext.
 	images := []MessageImage{{Base64: "aGVsbG8gd29ybGQ=", MediaType: "image/png"}}
 
-	created, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "look at this", images, nil, nil)
+	created, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "look at this", images, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("RecordUserMessage failed: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestRepository_GetMessageByID_OmitsAttachments(t *testing.T) {
 	htmlContent := "<h1>Reference</h1>"
 	images := []MessageImage{{Base64: "AAAA", MediaType: "image/png"}}
 
-	created, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "redesign this", images, &filename, &htmlContent)
+	created, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "redesign this", images, &filename, &htmlContent, nil)
 	if err != nil {
 		t.Fatalf("RecordUserMessage failed: %v", err)
 	}

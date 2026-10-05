@@ -134,7 +134,7 @@ func filenameForImage(mediaType string, position int) string {
 
 // buildAttachments decodes wire-format images/HTML into raw-bytes MessageAttachment rows,
 // once, at the write boundary.
-func buildAttachments(images []MessageImage, htmlAttachmentFilename, htmlAttachmentContent *string) ([]MessageAttachment, error) {
+func buildAttachments(images []MessageImage, htmlAttachmentFilename, htmlAttachmentContent *string, previewErrorsJSON []byte) ([]MessageAttachment, error) {
 	var attachments []MessageAttachment
 	now := time.Now().UTC()
 
@@ -173,6 +173,21 @@ func buildAttachments(images []MessageImage, htmlAttachmentFilename, htmlAttachm
 		})
 	}
 
+	if len(previewErrorsJSON) > 0 {
+		sum := sha256.Sum256(previewErrorsJSON)
+		attachments = append(attachments, MessageAttachment{
+			ID:        uuid.NewString(),
+			Kind:      AttachmentKindConsole,
+			Filename:  "preview-errors.json",
+			MediaType: "application/json",
+			SizeBytes: int64(len(previewErrorsJSON)),
+			Checksum:  hex.EncodeToString(sum[:]),
+			Position:  0,
+			Content:   previewErrorsJSON,
+			CreatedAt: now,
+		})
+	}
+
 	return attachments, nil
 }
 
@@ -180,7 +195,7 @@ func buildAttachments(images []MessageImage, htmlAttachmentFilename, htmlAttachm
 // the tenant, userName/userEmail attribute the turn to a person.
 func (s *Service) RecordUserMessage(
 	ctx context.Context, c Chat, userID *uint64, userName, userEmail, content string,
-	images []MessageImage, htmlAttachmentFilename, htmlAttachmentContent *string,
+	images []MessageImage, htmlAttachmentFilename, htmlAttachmentContent *string, previewErrorsJSON []byte,
 ) (Message, error) {
 	now := time.Now().UTC()
 	var namePtr *string
@@ -204,7 +219,7 @@ func (s *Service) RecordUserMessage(
 		ApplyStatus: ApplyStatusNotApplicable,
 		CreatedAt:   now,
 	}
-	attachments, err := buildAttachments(images, htmlAttachmentFilename, htmlAttachmentContent)
+	attachments, err := buildAttachments(images, htmlAttachmentFilename, htmlAttachmentContent, previewErrorsJSON)
 	if err != nil {
 		return Message{}, fmt.Errorf("build attachments: %w", err)
 	}

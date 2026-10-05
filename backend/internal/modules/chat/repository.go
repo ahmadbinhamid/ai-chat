@@ -197,7 +197,7 @@ func (r *Repository) listAttachmentMetadata(ctx context.Context, messageIDs []st
 			return nil, err
 		}
 		k := AttachmentKind(kind)
-		if k != AttachmentKindImage && k != AttachmentKindHTML {
+		if !k.known() {
 			// An unknown kind must not crash a transcript read — skip it, but log it.
 			slog.Warn("chat_message_attachments: skipping row with unknown kind", "kind", kind, "attachment_id", a.ID)
 			continue
@@ -231,7 +231,7 @@ func (r *Repository) GetAttachmentsContent(ctx context.Context, messageID string
 			return nil, err
 		}
 		k := AttachmentKind(kind)
-		if k != AttachmentKindImage && k != AttachmentKindHTML {
+		if !k.known() {
 			slog.Warn("chat_message_attachments: skipping row with unknown kind", "kind", kind, "attachment_id", a.ID)
 			continue
 		}
