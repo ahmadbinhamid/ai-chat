@@ -16,6 +16,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/safego"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
@@ -70,6 +71,10 @@ var attachmentLimits = map[chat.AttachmentKind]attachmentKindLimit{
 		MaxCount:          1,
 		MaxBytes:          MaxHTMLUploadBytes,
 		PostStripMaxBytes: MaxHTMLAttachmentBytes,
+	},
+	chat.AttachmentKindConsole: {
+		MaxCount: 1,
+		MaxBytes: previewerrors.MaxTotalBytes,
 	},
 }
 
@@ -236,6 +241,8 @@ type GenerateInput struct {
 	UserMessageID *string
 	// Restricts turn scope (brand-only, copy-only, or full edit); must be explicit, not inferred.
 	Mode string
+	// Browser errors captured from the preview; this turn only, never carried forward (they're stale once a fix is attempted).
+	PreviewErrors []previewerrors.Entry
 }
 
 // Synchronous result of accepting prompt; AssistantMessage/Files always nil.
@@ -297,12 +304,19 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		in.HTMLAttachmentContent = &sanitized
 	}
 
+	// Persisted, not just held in memory: generation runs later from the queue and re-reads it there.
+	var previewErrorsJSON []byte
+	if errs := previewerrors.Sanitize(in.PreviewErrors); len(errs) > 0 {
+		// Marshal can't fail on a slice of plain structs.
+		previewErrorsJSON, _ = json.Marshal(errs)
+	}
+
 	c, err := s.chats.GetOrCreateChat(ctx, in.TenantID, ChatType)
 	if err != nil {
 		return GenerateOutcome{}, err
 	}
 
-	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt, in.Images, in.HTMLAttachmentFilename, in.HTMLAttachmentContent)
+	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt, in.Images, in.HTMLAttachmentFilename, in.HTMLAttachmentContent, previewErrorsJSON)
 	if err != nil {
 		return GenerateOutcome{}, fmt.Errorf("record user message: %w", err)
 	}
@@ -654,6 +668,14 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 					in.HTMLAttachmentIsExternalLink = looksLikeFetchedLink(filename)
 					// Tolerance range, not exact-cap check (see looksTruncatedByStoredLength).
 					in.HTMLAttachmentTruncated = looksTruncatedByStoredLength(filename, int64(len(content)))
+				case chat.AttachmentKindConsole:
+					// Diagnostic only: a corrupt row costs this turn its errors, never the generation.
+					errs, perr := previewerrors.Parse(a.Content)
+					if perr != nil {
+						slog.Warn("doGenerate: unreadable preview errors, skipping", "attachment_id", a.ID, "error", perr)
+						continue
+					}
+					in.PreviewErrors = errs
 				default:
 					slog.Warn("doGenerate: unknown attachment kind, skipping", "kind", a.Kind, "attachment_id", a.ID)
 				}

@@ -76,7 +76,14 @@ type AttachmentKind string
 const (
 	AttachmentKindImage AttachmentKind = "image"
 	AttachmentKindHTML  AttachmentKind = "html"
+	// AttachmentKindConsole holds browser errors captured from the preview, as JSON; used for its own turn only, never carried forward.
+	AttachmentKindConsole AttachmentKind = "console"
 )
+
+// known reports whether k is a kind this code understands; reads skip any other row rather than mis-handle it.
+func (k AttachmentKind) known() bool {
+	return k == AttachmentKindImage || k == AttachmentKindHTML || k == AttachmentKindConsole
+}
 
 // MessageAttachment is one file attached to a user-role turn's prompt (an image or one
 type MessageAttachment struct {

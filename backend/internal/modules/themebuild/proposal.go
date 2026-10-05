@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
 )
@@ -21,6 +22,16 @@ func imagesFromInput(in GenerateInput) []ai.Image {
 		images[i] = ai.Image{Base64: img.Base64, MediaType: img.MediaType}
 	}
 	return images
+}
+
+// promptWithAttachments is the user-message text for this turn: the prompt plus its HTML reference and preview errors.
+// Both blocks go in the user message, never the system prompt, so the cached prefix stays untouched.
+func promptWithAttachments(prompt string, in GenerateInput) string {
+	text := promptWithHTMLAttachment(prompt, in)
+	if block := previewerrors.FormatBlock(in.PreviewErrors); block != "" {
+		text += "\n\n" + block
+	}
+	return text
 }
 
 // Frames attached HTML as untrusted reference, never instructions.
@@ -139,7 +150,7 @@ func (s *Service) generateValidProposal(
 
 	// Counts total calls (maxThemeCheckRetries+1); shared budget for both invalid and empty retries.
 	for attempt := 1; ; attempt++ {
-		genTC, genPrompt := tc, promptWithHTMLAttachment(nextPrompt, in)
+		genTC, genPrompt := tc, promptWithAttachments(nextPrompt, in)
 		if conversation != nil {
 			// The correction is the resumed turn's prompt; the attachment is already in the conversation.
 			genTC.Continue, genPrompt = conversation, continuePrompt
@@ -304,7 +315,7 @@ func (s *Service) checkAndRepair(
 		repair := repairPrompt(errorFindings)
 
 		repairTC := tc
-		repairText := promptWithHTMLAttachment(repair, in)
+		repairText := promptWithAttachments(repair, in)
 		if conversation != nil {
 			// Recap goes in the proposal's tool_result: auto-fixers may have changed content since the model's tool_use.
 			repairTC.Continue = conversation.WithProposalRecap(recapAssistantTurn(result))
