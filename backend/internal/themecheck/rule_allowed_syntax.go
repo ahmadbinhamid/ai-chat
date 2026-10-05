@@ -2,6 +2,7 @@ package themecheck
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -15,6 +16,9 @@ var allowedTags = map[string]bool{
 	"assign":  true,
 	"capture": true, "endcapture": true,
 	"comment": true, "endcomment": true,
+	// FlowPOS platform injection points (merchant analytics in the layout files; the cart's pay-later form). Allowed so
+	// existing ones survive edits, but deliberately left out of the §1 rejection message so the model never introduces them.
+	"content_for_header": true, "content_for_body": true, "content_for_footer": true, "pay_later": true,
 }
 
 // explicitlyForbiddenTags get a specific rejection message instead of the generic unknown-tag one — real Shopify constructs the model may reach for out of habit.
@@ -46,13 +50,13 @@ func checkAllowedSyntax(p Proposal, _ Snapshot) []Finding {
 				continue
 			}
 			if explicitlyForbiddenTags[t.Name] {
-				findings = append(findings, syntaxFinding(f.Path, fmt.Sprintf(
+				findings = append(findings, syntaxFinding(f.Path, t.Line, t.Start, fmt.Sprintf(
 					"'{%% %s %%}' is not part of this theme's Liquid dialect — this is a real Shopify theme-editor "+
 						"construct, but this engine has no theme-editor/schema layer. Remove it; compose the page from "+
 						"'{%% render %%}' calls instead (§1/§2).", t.Name)))
 				continue
 			}
-			findings = append(findings, syntaxFinding(f.Path, fmt.Sprintf(
+			findings = append(findings, syntaxFinding(f.Path, t.Line, t.Start, fmt.Sprintf(
 				"'{%% %s %%}' is not one of this dialect's allowed tags (§1: render, if/elsif/else/endif, for/endfor, "+
 					"assign, capture/endcapture, comment/endcomment). Remove or replace it.", t.Name)))
 		}
@@ -62,15 +66,25 @@ func checkAllowedSyntax(p Proposal, _ Snapshot) []Finding {
 				if allowedFilters[filt] {
 					continue
 				}
-				findings = append(findings, syntaxFinding(f.Path, fmt.Sprintf(
-					"filter '%s' (in '{{ %s }}') is not one of this dialect's allowed filters (§1: default, asset_url, "+
-						"plus, size, slice, strip, upcase). Remove or replace it.", filt, expr.Raw)))
+				findings = append(findings, syntaxFinding(f.Path, expr.Line, expr.Start, fmt.Sprintf(
+					"filter '%s' (in '{{ %s }}') is not one of this dialect's allowed filters (§1: %s). Remove or replace it.",
+					filt, expr.Raw, allowedFilterList())))
 			}
 		}
 	}
 	return findings
 }
 
-func syntaxFinding(path, message string) Finding {
-	return Finding{Path: path, Rule: ruleIDAllowedSyntax, Severity: SeverityError, Message: message}
+// allowedFilterList renders allowedFilters for the rejection message so the two can't drift.
+func allowedFilterList() string {
+	names := make([]string, 0, len(allowedFilters))
+	for name := range allowedFilters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+func syntaxFinding(path string, line, offset int, message string) Finding {
+	return Finding{Path: path, Rule: ruleIDAllowedSyntax, Severity: SeverityError, Message: message, Line: line, Offset: offset}
 }

@@ -26,6 +26,33 @@ func bucketedOlderCount(turnCount int) int {
 	return older - older%summaryBlockSize
 }
 
+// Character budget for one Summarize input. Sized against DeepSeek's smallest shipped window (128K tokens): theme
+// turns are HTML/Liquid-heavy at ~3 chars/token, so 200K chars is ~67K tokens, leaving room for the instruction and output.
+const summarizeMaxInputChars = 200_000
+
+// summaryWindow keeps the newest older turns that fit summarizeMaxInputChars, always at least one. Depends only on
+// older, which is fixed within a summaryBlockSize block, so the Summarize input stays byte-identical across the block.
+func summaryWindow(older []ai.Turn) []ai.Turn {
+	total := 0
+	start := len(older)
+	for start > 0 {
+		size := len(older[start-1].Content)
+		if total+size > summarizeMaxInputChars && start < len(older) {
+			break
+		}
+		total += size
+		start--
+	}
+	return older[start:]
+}
+
+func logSummaryCap(chatID string, olderCount, summarizedCount int) {
+	if summarizedCount < olderCount {
+		slog.Info("ai: history summary input capped", "chat_id", chatID, "older_turn_count", olderCount,
+			"summarized_turn_count", summarizedCount, "max_input_chars", summarizeMaxInputChars)
+	}
+}
+
 // Shared by cached/uncached paths for byte-identical content (required for prefix-caching hit).
 func summaryTurnContent(olderCount int, summary string) string {
 	return "[Earlier conversation summary, " + strconv.Itoa(olderCount) + " turns condensed]: " + summary
@@ -38,8 +65,10 @@ func summaryTurn(olderCount int, summary string) ai.Turn {
 // Core for both summarizeOldTurns and summarizeOldTurnsCached paths.
 func summarizeOlderTurns(ctx context.Context, gen generator, turns []ai.Turn) (summary string, olderCount int, err error) {
 	older := turns[:len(turns)-summarizeHistoryThreshold]
-	summary, err = gen.Summarize(ctx, older)
-	return summary, len(older), err
+	window := summaryWindow(older)
+	logSummaryCap("", len(older), len(window))
+	summary, err = gen.Summarize(ctx, window)
+	return summary, len(window), err
 }
 
 // Uncached; fails open (returns full history on Summarize error).
@@ -116,11 +145,12 @@ func (s *Service) summarizeOldTurnsCached(ctx context.Context, chatID string, tu
 		return turns
 	}
 	recent := turns[olderCount:]
+	window := summaryWindow(turns[:olderCount])
 
 	if s.historySummaries != nil {
 		if summary, ok := s.historySummaries.get(chatID, olderCount); ok {
 			slog.Info("ai: history summarization", "chat_id", chatID, "ran", false, "cache_hit", true, "older_turn_count", olderCount)
-			return append([]ai.Turn{summaryTurn(olderCount, summary)}, recent...)
+			return append([]ai.Turn{summaryTurn(len(window), summary)}, recent...)
 		}
 	}
 
@@ -134,13 +164,14 @@ func (s *Service) summarizeOldTurnsCached(ctx context.Context, chatID string, tu
 		if s.historySummaries != nil {
 			if summary, ok := s.historySummaries.get(chatID, olderCount); ok {
 				slog.Info("ai: history summarization", "chat_id", chatID, "ran", false, "cache_hit", true, "older_turn_count", olderCount)
-				return append([]ai.Turn{summaryTurn(olderCount, summary)}, recent...)
+				return append([]ai.Turn{summaryTurn(len(window), summary)}, recent...)
 			}
 		}
 	}
 
+	logSummaryCap(chatID, olderCount, len(window))
 	start := time.Now()
-	summary, err := s.gen.Summarize(ctx, turns[:olderCount])
+	summary, err := s.gen.Summarize(ctx, window)
 	elapsed := time.Since(start)
 	if err != nil {
 		slog.Warn("history summarization failed; falling back to full unsummarized history",
@@ -155,5 +186,5 @@ func (s *Service) summarizeOldTurnsCached(ctx context.Context, chatID string, tu
 	}
 	slog.Info("ai: history summarization", "chat_id", chatID, "ran", true, "cache_hit", false,
 		"older_turn_count", olderCount, "elapsed_ms", elapsed.Milliseconds(), "error", false)
-	return append([]ai.Turn{summaryTurn(olderCount, summary)}, recent...)
+	return append([]ai.Turn{summaryTurn(len(window), summary)}, recent...)
 }

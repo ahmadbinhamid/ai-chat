@@ -10,28 +10,104 @@ const ruleIDKnownFields = "known-fields"
 // resolvePathNode resolves a dotted path against lookupRoot (the §7 model plus in-scope for-loop aliases).
 // An unrecognized root returns no message — component render params (e.g. "variant") are never §7 objects.
 func resolvePathNode(path string, lookupRoot func(string) (*fieldSpec, bool)) (*fieldSpec, string) {
-	segments := strings.Split(path, ".")
-	cur, known := lookupRoot(segments[0])
+	segments := splitPathSegments(path)
+	rootName, rootSubs := splitSubscripts(segments[0])
+	cur, known := lookupRoot(rootName)
 	if !known {
 		return nil, ""
 	}
+	cur, msg := applySubscripts(path, rootName, cur, rootSubs, lookupRoot)
+	if msg != "" {
+		return nil, msg
+	}
 
 	for i, seg := range segments[1:] {
+		name, subs := splitSubscripts(seg)
+		prefix := strings.Join(segments[:i+1], ".")
 		if cur.children == nil {
 			return nil, fmt.Sprintf(
 				"'%s' treats '%s' as having sub-fields, but '%s' has none in the §7 data model.",
-				path, strings.Join(segments[:i+2], "."), strings.Join(segments[:i+1], "."))
+				path, prefix+"."+name, prefix)
 		}
-		next, ok := cur.children[seg]
+		next, ok := cur.children[name]
 		if !ok {
 			return nil, fmt.Sprintf(
 				"'%s' references '%s', which is not in the §7 data model for '%s'. Only listed fields may be used — "+
 					"if new data is genuinely needed, say so instead of inventing a field.",
-				path, strings.Join(segments[:i+2], "."), segments[0])
+				path, prefix+"."+name, rootName)
 		}
-		cur = next
+		if cur, msg = applySubscripts(path, prefix+"."+name, next, subs, lookupRoot); msg != "" {
+			return nil, msg
+		}
 	}
 	return cur, ""
+}
+
+// applySubscripts resolves `[key]` accesses on node: an array yields its element, a childless leaf (an opaque map such as
+// variants[].options) stays a leaf so no .field can follow, and an object with named fields must use dotted access.
+func applySubscripts(path, at string, node *fieldSpec, subs []string, lookupRoot func(string) (*fieldSpec, bool)) (*fieldSpec, string) {
+	for _, key := range subs {
+		if keyPath := ParseExpression(key).Path; keyPath != "" {
+			if _, msg := resolvePathNode(keyPath, lookupRoot); msg != "" {
+				return nil, msg
+			}
+		}
+		switch {
+		case node.array:
+			node = &fieldSpec{children: node.children}
+		case node.children != nil:
+			return nil, fmt.Sprintf(
+				"'%s' uses '[%s]' on '%s', which has named fields in the §7 data model — use dotted access to a listed field instead.",
+				path, key, at)
+		}
+	}
+	return node, ""
+}
+
+// splitPathSegments splits path on dots outside brackets, so "a.b[c.d].e" yields "a", "b[c.d]", "e".
+func splitPathSegments(path string) []string {
+	var segments []string
+	depth, start := 0, 0
+	for i := 0; i < len(path); i++ {
+		switch path[i] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+		case '.':
+			if depth == 0 {
+				segments = append(segments, path[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(segments, path[start:])
+}
+
+// splitSubscripts splits one segment like "options[choice.id]" into its name and the trimmed bodies of each top-level [...].
+func splitSubscripts(seg string) (string, []string) {
+	idx := strings.IndexByte(seg, '[')
+	if idx < 0 {
+		return seg, nil
+	}
+	name := seg[:idx]
+	var subs []string
+	depth, start := 0, 0
+	for i := idx; i < len(seg); i++ {
+		switch seg[i] {
+		case '[':
+			if depth == 0 {
+				start = i + 1
+			}
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				subs = append(subs, strings.TrimSpace(seg[start:i]))
+			}
+		}
+	}
+	return name, subs
 }
 
 // checkKnownFields enforces rule 12: every object.field reference must resolve against §7, or a for-loop alias one hop deep.

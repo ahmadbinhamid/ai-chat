@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"strconv"
 	"time"
 
@@ -81,9 +80,15 @@ func previewProductItem(p themefs.Product) map[string]any {
 	if p.DefaultVariant != nil {
 		defaultVariantID = strconv.Itoa(p.DefaultVariant.ID)
 	}
+	// §7: addable straight from a listing only when there's no option to pick and a variant to add.
+	quickAdd := 0
+	if !p.HasVariants && p.DefaultVariant != nil {
+		quickAdd = 1
+	}
 
 	return map[string]any{
 		"name":                       p.Name,
+		"title":                      p.Name,
 		"id":                         strconv.Itoa(p.ID),
 		"slug":                       p.Slug,
 		"sku":                        stringOr(p.SKU, ""),
@@ -92,13 +97,15 @@ func previewProductItem(p themefs.Product) map[string]any {
 		"image_url":                  imageURL,
 		"images":                     images,
 		"price_formatted":            formatGBP(p.Price),
-		"price_amount":               priceAmountPence(p.Price),
+		"price_amount":               p.Price,
 		"compare_at_price_formatted": compareFormatted,
 		"on_sale":                    onSale,
 		// Not eager-loaded by the list endpoint; false/empty (not omitted) so a "no choices" branch still renders correctly.
 		"has_choices":        false,
 		"choices":            []any{},
 		"has_variants":       p.HasVariants,
+		"can_quick_add":      quickAdd,
+		"show_add_to_cart":   quickAdd,
 		"variants":           []any{},
 		"default_variant_id": defaultVariantID,
 		"variants_json":      "[]",
@@ -110,7 +117,7 @@ func previewProductItem(p themefs.Product) map[string]any {
 // render a second page, so a real has_next would draw a "Next" button that silently does nothing when clicked.
 func previewProductsPagination(itemCount int) map[string]any {
 	return map[string]any{
-		"page": 1, "last_page": 1, "total": itemCount, "per_page": itemCount,
+		"page": 1, "last_page": 1, "total": itemCount, "per_page": 15,
 		"has_prev": false, "has_next": false, "prev_page": nil, "next_page": nil,
 	}
 }
@@ -118,11 +125,6 @@ func previewProductsPagination(itemCount int) map[string]any {
 // formatGBP assumes GBP, the platform's only supported currency across every theme and tenant today.
 func formatGBP(amount float64) string {
 	return fmt.Sprintf("£%.2f", amount)
-}
-
-// priceAmountPence converts pounds-and-pence to the integer pence FixtureProduct's price_amount uses (e.g. 19.99 -> 1999).
-func priceAmountPence(amount float64) int {
-	return int(math.Round(amount * 100))
 }
 
 func stringOr(s *string, fallback string) string {

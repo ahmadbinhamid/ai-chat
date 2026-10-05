@@ -404,3 +404,154 @@ func TestToTurns_DiscardedMessagesStillReplayed(t *testing.T) {
 		t.Fatalf("expected discarded messages still replayed, got %d turns", len(got))
 	}
 }
+
+// recordingSummarizer records every Summarize input so tests can assert on exactly what was sent.
+type recordingSummarizer struct {
+	fakeGenerator
+	inputs [][]ai.Turn
+}
+
+func (r *recordingSummarizer) Summarize(_ context.Context, turns []ai.Turn) (string, error) {
+	r.inputs = append(r.inputs, append([]ai.Turn(nil), turns...))
+	return fmt.Sprintf("summary of %d turns", len(turns)), nil
+}
+
+// bigTurnsOf returns n turns, each turnChars long and tagged with its index so position is checkable.
+func bigTurnsOf(n, turnChars int) []ai.Turn {
+	turns := make([]ai.Turn, n)
+	for i := range turns {
+		tag := fmt.Sprintf("turn-%04d:", i)
+		turns[i] = ai.Turn{Role: "user", Content: tag + strings.Repeat("x", turnChars-len(tag))}
+	}
+	return turns
+}
+
+func inputChars(turns []ai.Turn) int {
+	total := 0
+	for _, t := range turns {
+		total += len(t.Content)
+	}
+	return total
+}
+
+func TestSummaryWindow(t *testing.T) {
+	tests := []struct {
+		name      string
+		turns     []ai.Turn
+		wantCount int
+	}{
+		{"empty", nil, 0},
+		{"under budget keeps all", bigTurnsOf(30, 1_000), 30},
+		{"exactly at budget keeps all", bigTurnsOf(20, summarizeMaxInputChars/20), 20},
+		{"over budget keeps newest that fit", bigTurnsOf(1_000, 1_000), summarizeMaxInputChars / 1_000},
+		{"single oversized turn is still kept", bigTurnsOf(3, summarizeMaxInputChars+1), 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := summaryWindow(tt.turns)
+			if len(got) != tt.wantCount {
+				t.Fatalf("expected %d turns, got %d", tt.wantCount, len(got))
+			}
+			if len(got) > 0 && got[len(got)-1] != tt.turns[len(tt.turns)-1] {
+				t.Errorf("expected the window to end at the newest older turn")
+			}
+		})
+	}
+}
+
+// A long chat must send Summarize at most summarizeMaxInputChars, keeping the newest older turns and reporting the real count.
+func TestSummarizeOldTurnsCached_CapsSummarizeInput(t *testing.T) {
+	rec := &recordingSummarizer{}
+	svc := newCachedTestService(rec, true)
+	turns := bigTurnsOf(1_000, 2_000)
+	olderCount := bucketedOlderCount(len(turns))
+
+	got := svc.summarizeOldTurnsCached(context.Background(), "chat-cap", turns)
+
+	if len(rec.inputs) != 1 {
+		t.Fatalf("expected 1 Summarize call, got %d", len(rec.inputs))
+	}
+	input := rec.inputs[0]
+	if n := inputChars(input); n > summarizeMaxInputChars {
+		t.Errorf("Summarize input is %d chars, over the %d budget", n, summarizeMaxInputChars)
+	}
+	if input[len(input)-1] != turns[olderCount-1] {
+		t.Errorf("expected the newest older turn to be kept, got last input turn %q", input[len(input)-1].Content[:10])
+	}
+	if input[0] != turns[olderCount-len(input)] || input[0] == turns[0] {
+		t.Errorf("expected the oldest turns to be dropped, got first input turn %q", input[0].Content[:10])
+	}
+	want := fmt.Sprintf("%d turns condensed]: summary of %d turns", len(input), len(input))
+	if !strings.Contains(got[0].Content, want) {
+		t.Errorf("expected summary turn to report the summarized count %q, got %q", want, got[0].Content)
+	}
+	if len(got) != 1+len(turns)-olderCount {
+		t.Errorf("expected recent turns untouched: got %d turns, want %d", len(got), 1+len(turns)-olderCount)
+	}
+
+	again := svc.summarizeOldTurnsCached(context.Background(), "chat-cap", turns)
+	if len(rec.inputs) != 1 || again[0].Content != got[0].Content {
+		t.Errorf("expected a cache hit with an identical summary turn, got %d calls, %q vs %q", len(rec.inputs), again[0].Content, got[0].Content)
+	}
+}
+
+// Every turn count within one block must produce a byte-identical Summarize input, even past the cap.
+func TestSummarizeOldTurnsCached_CappedInputStableWithinBlock(t *testing.T) {
+	rec := &recordingSummarizer{}
+	svc := &Service{gen: rec, historySummarizationEnabled: true}
+	all := bigTurnsOf(1_000+summaryBlockSize, 2_000)
+
+	base := 1_000 - (1_000-summarizeHistoryThreshold)%summaryBlockSize
+	for n := base; n < base+summaryBlockSize; n++ {
+		svc.summarizeOldTurnsCached(context.Background(), "chat-stable", all[:n])
+	}
+
+	if len(rec.inputs) != summaryBlockSize {
+		t.Fatalf("expected %d uncached Summarize calls, got %d", summaryBlockSize, len(rec.inputs))
+	}
+	first := fmt.Sprintf("%v", rec.inputs[0])
+	for i, in := range rec.inputs[1:] {
+		if fmt.Sprintf("%v", in) != first {
+			t.Errorf("call %d in the same block sent a different Summarize input", i+1)
+		}
+	}
+}
+
+// The uncached helper must apply the same cap as the production path.
+func TestSummarizeOldTurns_CapsSummarizeInput(t *testing.T) {
+	rec := &recordingSummarizer{}
+	turns := bigTurnsOf(1_000, 2_000)
+
+	got := summarizeOldTurns(context.Background(), rec, turns)
+
+	if len(rec.inputs) != 1 {
+		t.Fatalf("expected 1 Summarize call, got %d", len(rec.inputs))
+	}
+	input := rec.inputs[0]
+	if n := inputChars(input); n > summarizeMaxInputChars {
+		t.Errorf("Summarize input is %d chars, over the %d budget", n, summarizeMaxInputChars)
+	}
+	if input[len(input)-1] != turns[len(turns)-summarizeHistoryThreshold-1] {
+		t.Errorf("expected the newest older turn to be kept")
+	}
+	if want := fmt.Sprintf("%d turns condensed]", len(input)); !strings.Contains(got[0].Content, want) {
+		t.Errorf("expected %q in summary turn, got %q", want, got[0].Content)
+	}
+}
+
+// Below the cap, both paths still summarize every older turn.
+func TestSummarizeOldTurnsCached_BelowCapUnchanged(t *testing.T) {
+	rec := &recordingSummarizer{}
+	svc := newCachedTestService(rec, true)
+	turns := turnsOf(summarizeHistoryThreshold + 3*summaryBlockSize)
+	olderCount := bucketedOlderCount(len(turns))
+
+	got := svc.summarizeOldTurnsCached(context.Background(), "chat-small", turns)
+
+	if len(rec.inputs) != 1 || len(rec.inputs[0]) != olderCount {
+		t.Fatalf("expected all %d older turns summarized, got %+v", olderCount, rec.inputs)
+	}
+	if want := summaryTurnContent(olderCount, fmt.Sprintf("summary of %d turns", olderCount)); got[0].Content != want {
+		t.Errorf("expected unchanged summary turn %q, got %q", want, got[0].Content)
+	}
+}

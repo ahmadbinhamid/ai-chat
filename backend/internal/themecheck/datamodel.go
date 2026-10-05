@@ -31,11 +31,37 @@ var productFields = map[string]*fieldSpec{
 	"has_variants": leaf(),
 	"variants": arr(map[string]*fieldSpec{
 		"id": leaf(), "label": leaf(), "price_amount": leaf(), "price_formatted": leaf(),
-		"image_url": leaf(), "sku": leaf(), "is_available": leaf(),
+		"image_url": leaf(), "sku": leaf(), "barcode": leaf(), "is_available": leaf(),
+		"images": arr(map[string]*fieldSpec{"url": leaf()}),
+		// options is a choice_type_id -> choice_item_id map with numeric keys; a leaf admits only subscript access, never .field.
+		"options": leaf(),
 	}),
 	"default_variant_id": leaf(),
 	"variants_json":      leaf(),
 	"url":                leaf(),
+	"title":              leaf(),
+	"can_quick_add":      leaf(),
+	"show_add_to_cart":   leaf(),
+	"variant_count":      leaf(),
+	"has_addons":         leaf(),
+	"addon_groups":       arr(addonGroupFields),
+	"add_on_groups":      arr(addonGroupFields),
+	"addons":             arr(flatAddonFields),
+}
+
+var addonFields = map[string]*fieldSpec{
+	"id": leaf(), "name": leaf(), "price_amount": leaf(), "price_formatted": leaf(),
+	"max_quantity": leaf(), "is_active": leaf(),
+}
+
+var addonGroupFields = map[string]*fieldSpec{
+	"id": leaf(), "name": leaf(), "min_selection": leaf(), "max_selection": leaf(), "is_required": leaf(),
+	"addons": arr(addonFields),
+}
+
+var flatAddonFields = map[string]*fieldSpec{
+	"id": leaf(), "name": leaf(), "price_amount": leaf(), "price_formatted": leaf(),
+	"max_quantity": leaf(), "is_active": leaf(), "group_id": leaf(), "group_name": leaf(),
 }
 
 var categoryFields = map[string]*fieldSpec{
@@ -68,13 +94,23 @@ var dataModel = map[string]*fieldSpec{
 	"category":               obj(categoryFields),
 	"categories":             obj(map[string]*fieldSpec{"items": arr(categoryFields), "pagination": obj(paginationFields)}),
 	"filter_categories":      arr(map[string]*fieldSpec{"slug": leaf(), "name": leaf()}),
-	"filters":                obj(map[string]*fieldSpec{"search": leaf(), "sort": leaf(), "category": leaf(), "min_price": leaf(), "max_price": leaf()}),
+	"filters":                obj(map[string]*fieldSpec{"search": leaf(), "sort": leaf(), "category": leaf(), "min_price": leaf(), "max_price": leaf(), "per_page": leaf()}),
 	"filter_price_range":     obj(map[string]*fieldSpec{"min": leaf(), "max": leaf()}),
 	"basket": obj(map[string]*fieldSpec{
 		"items": arr(map[string]*fieldSpec{
-			"variant_id": leaf(), "name": leaf(), "quantity": leaf(), "price_formatted": leaf(), "total_formatted": leaf(),
+			"id": leaf(), "variant_id": leaf(), "product_slug": leaf(), "name": leaf(), "note": leaf(),
+			"quantity": leaf(), "price": leaf(), "sub_total": leaf(), "total_discount": leaf(), "total": leaf(),
+			"image_url": leaf(),
+			"variant": obj(map[string]*fieldSpec{
+				"id":    leaf(),
+				"items": arr(map[string]*fieldSpec{"id": leaf(), "name": leaf(), "choice_type_label": leaf()}),
+			}),
+			"extensions_data": obj(map[string]*fieldSpec{
+				"addons": arr(map[string]*fieldSpec{"id": leaf(), "name": leaf(), "price": leaf(), "quantity": leaf()}),
+			}),
 		}),
-		"subtotal_formatted": leaf(),
+		"item_count": leaf(), "sub_total": leaf(), "total": leaf(), "total_discount": leaf(), "shipping_charges": leaf(),
+		"customer_name": leaf(), "customer_email": leaf(), "customer_phone": leaf(),
 	}),
 	"forloop": obj(map[string]*fieldSpec{"first": leaf(), "last": leaf()}),
 }
