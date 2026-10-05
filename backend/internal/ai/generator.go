@@ -395,16 +395,17 @@ func streamRetryReason(err error) string {
 }
 
 // streamProgressBytes: text + thinking + tool_use count (tool_use alone can be real progress without narration).
+// Reads union fields, not AsAny(): AsAny re-decodes the content_block_start JSON, so deltas stay invisible until block stop.
 func streamProgressBytes(message anthropic.Message) int {
 	n := 0
 	for _, block := range message.Content {
-		switch b := block.AsAny().(type) {
-		case anthropic.TextBlock:
-			n += len(b.Text)
-		case anthropic.ThinkingBlock:
-			n += len(b.Thinking)
-		case anthropic.ToolUseBlock:
-			n += len(b.Name) + len(b.Input)
+		switch block.Type {
+		case "text":
+			n += len(block.Text)
+		case "thinking":
+			n += len(block.Thinking)
+		case "tool_use":
+			n += len(block.Name) + len(block.Input)
 		}
 	}
 	return n

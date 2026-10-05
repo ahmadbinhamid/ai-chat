@@ -136,6 +136,60 @@ func TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress(t *testing.T) {
 	}
 }
 
+// TestConsumeStream_DeltasCountAsFirstTokenProgress checks thinking/text arriving only as deltas on
+// a still-open block counts as progress — a long think must not be killed as "no first token".
+func TestConsumeStream_DeltasCountAsFirstTokenProgress(t *testing.T) {
+	cases := []struct {
+		name  string
+		start map[string]any
+		delta map[string]any
+	}{
+		{
+			name:  "thinking",
+			start: map[string]any{"type": "thinking", "thinking": "", "signature": ""},
+			delta: map[string]any{"type": "thinking_delta", "thinking": "planning the redesign"},
+		},
+		{
+			name:  "text",
+			start: map[string]any{"type": "text", "text": ""},
+			delta: map[string]any{"type": "text_delta", "text": "Here is the plan"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var b strings.Builder
+			sseEvent(&b, "message_start", map[string]any{
+				"type": "message_start",
+				"message": map[string]any{
+					"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
+					"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+					"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
+				},
+			})
+			sseEvent(&b, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": c.start})
+			sseEvent(&b, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": c.delta})
+			events := b.String()
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				flush(w, events)
+				<-r.Context().Done()
+			}))
+			defer ts.Close()
+
+			stream := newStreamingTestStream(ts)
+			var message anthropic.Message
+
+			err := consumeStream(context.Background(), stream, &message, 150*time.Millisecond, 40*time.Millisecond)
+			_ = stream.Close()
+
+			if !errors.Is(err, errStreamIdle) {
+				t.Fatalf("expected errStreamIdle (delta counted as first-token progress), got %v", err)
+			}
+		})
+	}
+}
+
 // TestGenerate_RetriesOnIdleTimeout checks a stalled first attempt is retried, ending in a
 // successful Result once a later attempt completes normally.
 func TestGenerate_RetriesOnIdleTimeout(t *testing.T) {
