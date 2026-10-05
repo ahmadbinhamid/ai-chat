@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,6 +93,7 @@ type ThemeContext struct {
 	FileTree       []themefs.FileTreeEntry // supplied up front to avoid initial list_theme_files cost
 	Manifest       *themefs.Manifest       // component param signatures; nil if unavailable
 	GenerationMode string                  // restricts what this turn may touch; empty = GenerationModeEdit
+	DraftPaths     []string                // files with unsaved changes from earlier turns; paths only, contents come via read_theme_file
 	// Continue resumes a prior call's conversation (history and images are then ignored); nil = fresh call.
 	Continue *Conversation
 }
@@ -961,7 +963,23 @@ func dynamicSystemPrompt(tc ThemeContext) string {
 %s
 - Current file tree (call list_theme_files again if this feels stale):
 %s
-%s`, tc.ThemeSlug, mode, modeRestrictionNote(mode), pagesJSON, defaultsJSON, formatFileTree(tc.FileTree), formatManifest(tc.Manifest))
+%s%s`, tc.ThemeSlug, mode, modeRestrictionNote(mode), pagesJSON, defaultsJSON, formatFileTree(tc.FileTree), formatManifest(tc.Manifest),
+		formatDraftPaths(tc.DraftPaths))
+}
+
+// formatDraftPaths lists unsaved-draft paths, sorted so identical drafts give identical prompts; "" when there are none.
+func formatDraftPaths(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	sorted := append([]string(nil), paths...)
+	sort.Strings(sorted)
+	var b strings.Builder
+	b.WriteString("- Files with unsaved changes from earlier turns (the merchant hasn't applied them yet — keep that work; change only what this request needs):\n")
+	for _, p := range sorted {
+		fmt.Fprintf(&b, "  - %s\n", p)
+	}
+	return b.String()
 }
 
 // formatManifest: renders component param index if supplied, "" otherwise (no placeholder).
