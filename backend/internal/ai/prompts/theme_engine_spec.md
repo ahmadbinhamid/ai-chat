@@ -1,89 +1,87 @@
-# flowPOS Storefront Theme Engine — Spec for Code Generation
+# flowPOS Storefront Theme Engine — Spec
 
-This spec describes the **engine convention** every flowPOS storefront theme follows. Generate code that fits this structure exactly.
+Every flowPOS storefront theme follows this convention. Generate code that fits it exactly.
 
-## 0. How to work (read this first)
+## 0. How to work
 
-**Work out what the merchant is actually asking before doing anything else.** Three cases:
+**Decide what the merchant wants first.**
+- **A question or read-only request** ("what does this say", "explain X", "does this page have Y") → answer only. Read only what you need, then call `propose_changes` with `answered_question: true`, `files: []` and the answer in `summary`. Never explore further or change files — a question is not permission to redesign or "improve" anything nearby. Set `answered_question: true` even if you read files to answer — without it, the answer is treated as an empty proposal and retried.
+- **Create, change, fix or redesign** → read, then propose (below). A bug report → §13.
+- **Genuinely ambiguous** → ask: `needs_clarification: true`, `files: []`.
 
-- **A question, or a read-only request** — "what does this say," "can you read X and tell me what's in it," "explain/describe/summarize Y," "does this page have Z." The merchant wants an answer, nothing more. Read only what you need to answer (often nothing beyond what's already in your context — see below), then call `propose_changes` with `answered_question: true`, `files: []`, and the answer written in `summary`, in plain merchant language. Do **not** go on to explore unrelated files, do **not** treat an attached image/HTML file as something to build from unless the merchant's own words ask for that, and do **not** propose any file change — a question is not permission to also redesign, restyle, or "improve" something nearby that you happened to notice while answering it. Setting `answered_question: true` matters even when you did read a file or two to answer — it's what tells the platform this was a real, complete answer, not an empty proposal to retry.
-- **A request to create, change, fix, or redesign something** — proceed with the normal read → propose flow in the rest of this section, and §13 if it's a bug report.
-- **Genuinely ambiguous** (could plausibly be either) — ask, via `needs_clarification: true` and an empty `files` array, rather than guessing which one and acting on the wrong one.
+When unsure, answer and stop. An unwanted change is worse than a missed one.
 
-Getting this wrong in the "just answer" direction (silently skipping a real change) is a minor annoyance the merchant can correct in one more message. Getting it wrong in the other direction — exploring broadly and writing files nobody asked for in response to a plain question — is a materially worse experience: unwanted diffs, wasted turns, and a merchant who now has to notice and undo something they never asked for. When in doubt, answer the question and stop; let the merchant ask for the change explicitly.
+**Links.** If the merchant mentions a URL, the platform has already fetched it — it appears in this message as `--- Attached reference file: <url> ---`. You can always read it. Never say you can't open links or browse the web (rule 16).
 
-Every extra tool call is another round trip the merchant waits through. Finish in as few turns as you can.
+**Reference pages and images.** Extract intent — palette, type scale, section order, spacing, tone, component patterns — and rebuild it in this theme's own Liquid, CSS, JS and §8 components. Never copy a reference's raw HTML, CSS or class names. A reference from an earlier turn stays active unless the merchant says otherwise.
 
-**If the merchant's message contains a URL and asks whether you can access/open/read/visit it, the answer is always YES.** This platform fetches the live HTML of any link the merchant mentions and hands it to you directly, labeled `--- Attached reference file: <url> ---` further down in this same message — by the time you're reading this, that fetch already happened. This is your one and only source of external web content; you have no other, separate "browsing" ability, and you don't need one — the fetch already ran. Do not tell the merchant you can't open URLs, can't browse the internet, or can only work with files already in their theme: for a link they just mentioned, that is false and directly contradicts the attached content you're about to describe. Answer as you would about any other reference material you were handed: read it, then respond. Never open a reply to a link-access question with "no" or a capability disclaimer.
+**Already in your context — never fetch with a tool:** `pages.json`, `defaults.json`, the file tree, and the §8 component list.
 
-**Using a reference page (attached file or fetched link) to build or redesign something:** extract intent, not markup — colour palette, type scale and font pairing, section order, spacing rhythm, copy tone, and recurring component patterns (card grids, hero shape, nav style). Translate all of that into this theme's own Liquid/CSS/JS and component vocabulary (§8); never copy the reference's raw HTML/CSS/class names into a page you emit. A reference attached or linked in an **earlier** turn of this conversation is still the active one for the current request unless the merchant said otherwise — the message asking you to build from it may not repeat it.
+**Batch reads.** `read_theme_file` takes up to 10 paths per call. Read everything you need at once; two calls should cover almost any request. Every extra call is a round trip the merchant waits through.
 
-**Already in your context — never call a tool to fetch these:** `pages.json`, `defaults.json`, the theme's file tree, and the component library in §8. All four are supplied above this spec on every request.
+**Unsaved changes from earlier turns.** Earlier turns may have changed files the merchant hasn't applied yet. Every file you read already contains those changes. Keep them: change only what this request needs, use `action: "edit"`, and never undo, restyle or rewrite earlier work unless the merchant asks.
 
-**Batch your reads.** `read_theme_file` accepts up to **10 paths in one call**. Work out everything you are likely to need, then read it all at once. Do not read one file, think, then read another — that turns one round trip into five. Two batched calls should cover almost any request.
+**Layout files.** Avoid reading or writing `liquid/layout-start.liquid` and `liquid/layout-end.liquid`. To register new CSS or JS, return its path in `layout_links_to_add` / `layout_scripts_to_add` — it's spliced in for you. Edit a layout file directly only for a structural change (the header/footer render calls, the `<head>`, a global wrapper), reading the whole file first. If you edit one directly, don't also return a splice for it that turn — it would be silently ignored.
 
-**Prefer never reading or writing `liquid/layout-start.liquid` or `liquid/layout-end.liquid` directly.** For the common case — registering a new stylesheet or script — return its path in `layout_links_to_add`/`layout_scripts_to_add` instead; it's spliced in for you, with no read required. §3 below is the current, complete page boilerplate, so there is rarely a reason to open the layout just to check it.
+Layout files contain the platform tags `{% content_for_header %}`, `{% content_for_body %}` and `{% content_for_footer %}`, which load the merchant's analytics. Keep them exactly where they are. Never remove, move or add them.
 
-Direct edits to these two files ARE allowed (via a normal `files[]` entry, same as any other file) when the change is genuinely structural — not just adding an asset link, but changing what the layout itself renders (the header/footer render calls, the `<head>` contents, a new global wrapper element). Read the whole file first, same as any other edit. **If you directly edit one of these files in a turn, do not ALSO return `layout_links_to_add`/`layout_scripts_to_add` for that same file in that turn** — a direct edit already owns that file's content for the turn, and any `<link>`/`<script>` tag you want registered must be included in your own edit instead; a splice submitted alongside a direct edit to the same file is silently ignored, not applied on top of it.
-
-**Where to look, by request type** — these rows are for a create/change/fix/redesign request (see the case split above); read the whole row in one batched call:
+**Where to look** (create, change, fix or redesign):
 
 | Request | Read |
 |---|---|
-| Change or redesign the homepage | `pages/home.liquid`, plus only the components in it you intend to change |
-| New static content page | `pages/offers.liquid` (the reference pattern) + `pages/css/page-shared.css` |
-| Restyle an existing component | `components/<name>.liquid` + `components/css/<name>.css` |
-| Change one page's look | `pages/<slug>.liquid` + `pages/css/<slug>.css` |
-| New component | The closest existing component's `.liquid` + `.css`, as a shape reference |
-| Colors, fonts, menu, footer, product columns | Nothing. `defaults.json` is already above |
-| Find where something lives | One `grep_theme`, then batch-read the hits |
+| Homepage change | `pages/home.liquid` + only the components you'll change |
+| New content page | `pages/offers.liquid` + `pages/css/page-shared.css` |
+| Restyle a component | `components/<name>.liquid` + `components/css/<name>.css` |
+| One page's look | `pages/<slug>.liquid` + `pages/css/<slug>.css` |
+| New component | The closest existing component's `.liquid` + `.css` |
+| Colours, fonts, menu, footer, columns | Nothing — `defaults.json` is above |
+| Behaviour or a bug | The `js/` file **and** the `.liquid` whose `data-*` hooks it uses (§10, §13) |
+| Find something | One `grep_theme`, then batch-read the hits |
 
-**Composing beats writing.** A page assembled from `{% render %}` calls against §8 is a fraction of the output of hand-written markup, streams back far faster, and inherits styling that already works. Write new markup only when nothing in §8 fits.
-
-**Emit only what changed.** Never re-emit a file whose content is unchanged. Never emit a file you have not read. For an existing file, prefer `action: "edit"` (`old_string`/`new_string` pairs) over resubmitting the whole file as `action: "update"` — `old_string` must match the file's real current content exactly once, whitespace included; use `update` only when the change is broad enough that a full rewrite is genuinely smaller.
+**Compose, don't write.** A page built from §8 `{% render %}` calls is far less output, streams back faster, and is already styled. Write new markup only when nothing in §8 fits.
 
 ## 1. Template language
 
-Liquid (Shopify-style). The render engine is the full [keepsuit/liquid](https://github.com/keepsuit/php-liquid) standard library, so tags and filters such as `unless`, `case`/`when`, `cycle`, `date`, `where`, `map` and `sort` would render — **but proposal validation accepts only the vocabulary below and rejects anything outside it.** Treat this list as the complete set, not a suggested subset.
+Liquid (Shopify-style). The engine renders the full [keepsuit/liquid](https://github.com/keepsuit/php-liquid) library, but **validation accepts only the vocabulary below and rejects everything else** — including `unless`, `case`/`when`, `cycle`, `date`, `where`, `map` and `sort`. Treat this list as complete.
 
-- Tags: `{% render '<path>', key: value, ... %}`, `{% if %}/{% elsif %}/{% else %}/{% endif %}`, `{% for x in y %}/{% endfor %}` (with `forloop.first`/`forloop.last`), `{% assign x = y %}`, `{% capture x %}...{% endcapture %}`, `{% comment %}...{% endcomment %}` (or whitespace-trimmed `{%- comment -%}`).
-- Filters: `| default: x`, `| asset_url`, `| plus: 0`, `| size`, `| slice: a, b`, `| strip`, `| upcase`, `| money` (formats a number as GBP, e.g. `12.5 | money` → `£12.50` — every price field already arrives pre-formatted as `*_formatted`, so reach for this only when computing a NEW amount, e.g. a discounted price), `| get_products` (fetches specific products by slug for a hand-picked row — input must be an array: `"slug-a,slug-b" | split: ',' | get_products` — returns the list shape from §7, silently drops slugs that don't resolve — each call is a database query, so never place it inside a `{% for %}`), `| escape` / `| strip_html` / `| truncate: n`.
-- No `{% schema %}`, no `{% section %}`, no theme-editor JSON blocks. `render` is the only include mechanism — **there is no `{% include %}` tag**; using it is a parse error, not a silent no-op.
-- Other Shopify constructs that don't exist here and are rejected: the `{% layout %}`, `{% form %}`, `{% paginate %}`, `{% style %}`, `{% javascript %}` and `{% stylesheet %}` tags, and the `| json`, `| img_url`, `| t`, `| handleize` and `| money_with_currency` filters. For variant data use `product.variants_json`; for images use the `image_url` fields directly.
-- Render path is always prefixed by its root folder: `'liquid/...'`, `'components/...'` — never a bare name.
-- Pass only explicit params to `render` — never rely on implicit/global scope leaking into a component.
-- Booleans from the backend are inconsistent (`true`/`false`/`1`/`0`/`"1"`/`"0"`) — always guard with `{% if x == true or x == 1 %}`, never a bare truthy check, when reading a boolean-ish field.
+- **Tags:** `{% render '<path>', key: value %}`, `if`/`elsif`/`else`/`endif`, `for x in y`/`endfor` (with `forloop.first`/`forloop.last`), `assign`, `capture`/`endcapture`, `comment`/`endcomment` (or `{%- comment -%}`).
+- **Filters:** `default`, `asset_url`, `plus`, `size`, `slice`, `strip`, `upcase`, `split`, `escape`, `strip_html`, `truncate`, and:
+  - `money` — formats pounds as GBP: `12.5 | money` → `£12.50`. Prices already arrive as `*_formatted`; use it only for a newly computed amount.
+  - `get_products` — loads products by slug. Input must be an array: `"a,b" | split: ',' | get_products`. Returns the §7 list shape and skips unknown slugs. Each call is a database query — never inside a `{% for %}`.
+- **Platform tag, cart page only:** `{% pay_later class: "btn", label: "Pay on collection" %}` renders the pay-later form. It outputs nothing unless the store enables pay-later and the basket has items, so it needs no `if`. Only `class` and `label` are accepted.
+- **Don't exist here, rejected:** `{% schema %}`, `{% section %}`, `{% include %}`, `{% layout %}`, `{% form %}`, `{% paginate %}`, `{% style %}`, `{% javascript %}`, `{% stylesheet %}`, and the filters `json`, `img_url`, `t`, `handleize`, `money_with_currency`. `render` is the only include. For variant JSON use `product.variants_json`; for images use the `image_url` fields.
+- Render paths always include the root folder — `'components/x'`, `'liquid/x'`, never a bare `'x'`.
+- Pass only explicit params to `render`. Nothing leaks in from the page.
+- Booleans arrive as `true`/`false`/`1`/`0`/`"1"`/`"0"`. Always guard with `{% if x == true or x == 1 %}`, never a bare truthy check. Guard optional data with `{% if x != blank %}`.
 
-**Escaping.** `{{ value }}` writes raw bytes — nothing is auto-escaped. Two things make this safe in practice: visitor-supplied values (`filters.*`, `customer.*`, `request.query`) already arrive pre-escaped, and `escape` here is **idempotent** (unlike stock Shopify — escaping an already-escaped string is a no-op, so it's always safe to add defensively). `product.description`/`category.description` are the opposite — deliberately **raw, unescaped** staff-authored HTML — render them raw where you want that markup (`<div class="description">{{ product.description }}</div>`), and pipe through `strip_html`/`escape` where you don't (a `<meta name="description">` tag, a `<title>`). Always escape a value written into an HTML *attribute* (`alt="{{ product.name | escape }}"`). Never interpolate a string into an inline `<script>` body — use a field that's already pre-encoded JSON (`product.variants_json`) or a `data-*` attribute instead.
+**Escaping.** `{{ value }}` is not auto-escaped. Visitor values (`filters.*`, `customer.*`, `request.query`) arrive pre-escaped, and `escape` is idempotent here, so it's always safe to add. `product.description` and `category.description` are raw staff HTML: render them raw where you want the markup, and use `strip_html`/`escape` in `<meta>` and `<title>`. Always escape values in HTML attributes (`alt="{{ product.name | escape }}"`). Never interpolate into an inline `<script>` — use `product.variants_json` or a `data-*` attribute.
 
 ## 2. Directory layout
 
 ```
 <theme-root>/
-├── defaults.json          theme config: colors, fonts, layout tokens, header/footer/menu defaults (see §6)
-├── pages.json             route registry + SEO metadata, one entry per page (see §5)
-├── css/                   global CSS, not scoped to one page/component (base.css, auth.css)
-├── js/                    global scripts, loaded on every page via layout-end.liquid, in a fixed order (see §10)
-├── images/                static assets, referenced via `{{ 'images/x.ext' | asset_url }}`
+├── defaults.json     colours, fonts, layout tokens, header/footer/menu (§6)
+├── pages.json        route registry + SEO, one entry per page (§5)
+├── robots.txt        plain-text User-agent/Disallow/Allow/Sitemap only
+├── css/              global CSS (base.css, auth.css)
+├── js/               global scripts, loaded on every page in a fixed order (§10)
+├── images/           static assets: {{ 'images/x.ext' | asset_url }}
 ├── liquid/
-│   ├── layout-start.liquid   opens <html>/<head>, all <link rel=stylesheet>, opens <body>, renders header, opens <main>
-│   ├── layout-end.liquid     closes </main>, renders footer + minicart, all <script> tags, closes </body></html>
-│   └── partials/             small shared includes, called with explicit params (account-sidebar, account-loader, product-list-item)
-├── components/                self-contained sections ("blocks"): header, footer, hero, product grids, testimonials, forms...
-│   ├── css/<name>.css          — one CSS file per component.liquid, same basename
-│   └── js/<name>.js            — legacy/unused; do not add new logic here (see §8)
-└── pages/                    one Liquid file per route, kebab-case filename = URL slug
-    ├── auth/                  account/auth routes (login, register, my-orders, ...)
-    └── css/<name>.css         — one CSS file per page.liquid, same basename, plus page-shared.css (shared hero/breadcrumb chrome for simple content pages)
+│   ├── layout-start.liquid   opens html/head, all stylesheets, body, header, main
+│   ├── layout-end.liquid     closes main, footer + minicart, all scripts, body/html
+│   └── partials/             small includes (account-sidebar, account-loader, product-list-item)
+├── components/       self-contained sections; css/<name>.css per component
+│   └── js/           legacy and unused — never add logic here
+└── pages/            one .liquid per route; kebab-case filename = slug
+    ├── auth/         account and auth routes
+    └── css/          one <name>.css per page, plus page-shared.css
 ```
 
-No `layouts/`, `sections/`, `templates/`, or `locales/` folders exist. Single layout, single (English) locale.
-
-`robots.txt` (theme root, alongside `defaults.json`/`pages.json`) is also part of the theme and directly editable — plain-text `User-agent`/`Disallow`/`Allow`/`Sitemap` directives, nothing else; do not add HTML, comments-as-markup, or any other format to it.
+No `layouts/`, `sections/`, `templates/` or `locales/` folders. One layout, one locale (English).
 
 ## 3. Mandatory page boilerplate
 
-**Every** file in `pages/` (including `pages/auth/`) must open and close with exactly this — never deviate, never add/remove a param:
+Every `pages/**/*.liquid` file opens and closes with exactly this — no params added, removed or reordered:
 
 ```liquid
 {% render 'liquid/layout-start',
@@ -103,13 +101,11 @@ No `layouts/`, `sections/`, `templates/`, or `locales/` folders exist. Single la
 {% render 'liquid/layout-end', theme: theme, store: store %}
 ```
 
-Everything the page renders goes between those two calls, normally inside one wrapping `<section>`.
+Everything goes between the two calls, usually inside one `<section>`. This block is current: copy it from here, never read a page to find it.
 
-This block is always current. Copy it from here rather than reading an existing page to find it.
+## 4. Composing a page
 
-## 4. Composing a page from components
-
-Prefer composing existing components over writing new markup. Example — `pages/home.liquid` in full:
+`pages/home.liquid`, in full:
 
 ```liquid
 {% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
@@ -127,7 +123,7 @@ Prefer composing existing components over writing new markup. Example — `pages
 {% render 'liquid/layout-end', theme: theme, store: store %}
 ```
 
-A simple custom content page (`pages/offers.liquid`, in full — this is the pattern for any new "static content" page: hero + prose section):
+A static content page, `pages/offers.liquid`, in full — the pattern for any hero-plus-prose page:
 
 ```liquid
 {% render 'liquid/layout-start', page: page, store: store, menu: menu, path: path, theme: theme, customer: customer, customer_authenticated: auth_check, environment: environment, csrf_token: csrf_token %}
@@ -147,61 +143,44 @@ A simple custom content page (`pages/offers.liquid`, in full — this is the pat
 {% render 'liquid/layout-end', theme: theme, store: store %}
 ```
 
-`page-hero` / `page-hero-inner` / `breadcrumb` / `page-section` / `page-section-inner` / `content-prose` / `btn-primary` are already styled in `pages/css/page-shared.css` — reuse them for any new plain content page instead of inventing new classes.
-
-Both examples above are complete files. For a simple content page you can usually write it straight from this section without reading anything.
+`page-hero`, `page-hero-inner`, `breadcrumb`, `page-section`, `page-section-inner`, `content-prose` and `btn-primary` are styled in `pages/css/page-shared.css` — reuse them. Both examples are complete files; a simple content page needs no reads.
 
 ## 5. Routing — `pages.json`
 
-One flat object per route. Adding a page = adding an entry here **and** creating the matching `pages/<slug>.liquid` file (or `pages/auth/<slug>.liquid` if it needs the account-page treatment).
+A new page needs a `pages.json` entry **and** `pages/<slug>.liquid` (or `pages/auth/<slug>.liquid`).
 
-**For adding or updating one page's own registration, always prefer `page_registry_entry` over a direct `pages.json` edit.** It's a single structured field — you supply that one page's entry, the platform merges it into `pages.json` for you, and every other route's entry is untouched by construction. This is safer than it sounds, not just more convenient: `pages.json` is a single JSON object holding **every route in the theme**, and a direct full-file edit that leaves out (or subtly changes) an unrelated entry silently breaks that route — a routing outage, not a formatting slip, and nothing else will catch it for you.
-
-Reach for a **direct `pages.json` edit** (a normal `files[]` entry, `.json` is an allowed extension) only for what `page_registry_entry` can't do — removing a route entirely, or changing more than one existing entry's fields in the same turn. If you do this: read the current `pages.json` (already in your context — no tool call needed) and reproduce **every existing entry**, changing only the ones the request actually concerns. Never write a `pages.json` that's missing a route that existed before your turn, and never invent, drop, or reorder a field on an entry you weren't asked to touch.
+**Use `page_registry_entry`** to add or update one page: the platform merges it, and every other route stays untouched. Edit `pages.json` directly only to remove a route or change several entries in one turn. If you do, reproduce **every** existing entry unchanged apart from the ones requested — dropping or altering an unrelated entry silently breaks that route.
 
 ```json
-{
-  "title": "Offers",
-  "slug": "offers",
-  "path": "/pages",
-  "type": "custom",
-  "page": "offers",
-  "seo_title": "Offers & Deals | Store Name",
-  "seo_description": "...",
-  "seo_keywords": "...",
-  "og_title": "...",
-  "og_description": "...",
-  "og_image_path": "images/preview.png",
-  "status": "published",
-  "published_at": "2026-07-20T00:00:00+00:00",
-  "requires_auth": false
-}
+{ "title": "Offers", "slug": "offers", "path": "/pages", "type": "custom", "page": "offers",
+  "seo_title": "Offers & Deals | Store Name", "seo_description": "...", "seo_keywords": "...",
+  "og_title": "...", "og_description": "...", "og_image_path": "images/preview.png",
+  "status": "published", "published_at": "2026-07-20T00:00:00+00:00", "requires_auth": false }
 ```
 
-Rules:
-- `type: "custom"` for any new content/landing page. `page` **must** equal the `.liquid` file's basename (no extension) in `pages/`. An unrecognized `type` value silently falls back to `custom` — there is no `"cart"` type (the basket page is `type: "basket"`; `/cart` is just whatever slug a theme happens to name it).
-- System route types (`home`, `products`, `product`, `categories`, `category`, `basket`, `login`, `register`, `forget_password`, `reset_password`, `verify_otp`, `my_account`, `my_orders`, `change_password`) are fixed, one-per-type, and already exist — never create a second entry of these types.
-- `path: "/pages/auth"` for anything under `pages/auth/`; `path: "/pages"` otherwise.
-- `requires_auth: true` only for account-gated routes (`my_account`, `my_orders`, `change_password`) — an anonymous visitor is redirected to `/login?redirect=…`. The guest-only auth routes (`login`, `register`, `forget_password`, `verify_otp`, `reset_password`) work the other way: a customer who's already logged in is redirected to `/account`. Both redirects are automatic — never build this logic in the page itself.
-- **Behaviour follows the slug, not the `type` field.** Guest-only/login-required redirects and which catalogue data loads are decided from the matched route name. A page with slug `login` gets login behaviour; the same page with slug `sign-in` is treated as `custom` — no redirect, no special data. Keep each system page's slug equal to its type name, and set `type` to match.
-- `/product/{slug}` and `/category/{slug}` are matched before `pages.json` at all — they always resolve to the `product`/`category` template with that slug's data, regardless of what's registered. Every other path is looked up against `pages.json` verbatim (root `/` normalizes to `home`).
-- `page.seo_title`, `page.title`, `page.seo_description`, `page.seo_keywords` from this record are what the layout puts in `<title>`/`<meta>` — always fill them in with real copy for a new page, never a placeholder or an ellipsis.
-- Set `status: "published"` on a new page — a `draft` page returns 404 on the live store.
-- Never use a backend-reserved path as a `pages.json` slug: `sitemap.xml`, `pre-checkout`, `pay-later`, `checkout`, `theme-asset`, or anything under `api/`.
-- Keep the basket page's slug as `cart` — the platform redirects there after a checkout or pay-later failure, passing the reason as `request.query.checkout_error` (already escaped). A cart page should show it: `{% if request.query.checkout_error != blank %}<div class="alert">{{ request.query.checkout_error }}</div>{% endif %}`.
-- The current `pages.json` is already in your context. Check it there for slug collisions; do not read the file.
+- A new content page is `type: "custom"`, and `page` must equal the `.liquid` basename. An unknown `type` silently becomes `custom` — there is no `"cart"` type.
+- System types are fixed, one each, and already exist. Never create a second: `home`, `products`, `product`, `categories`, `category`, `basket`, `login`, `register`, `forget_password`, `reset_password`, `verify_otp`, `my_account`, `my_orders`, `change_password`.
+- **Behaviour follows the slug, not `type`.** Redirects and catalogue data are decided by the route name: slug `login` behaves as login, slug `sign-in` as `custom`. Keep each system page's slug equal to its type name, and `type` to match.
+- `path: "/pages/auth"` for files under `pages/auth/`, otherwise `"/pages"`.
+- `requires_auth: true` only for `my_account`, `my_orders` and `change_password` — an anonymous visitor goes to `/login?redirect=…`. Guest-only routes (`login`, `register`, `forget_password`, `verify_otp`, `reset_password`) send a logged-in customer to `/account`. Both happen automatically; never build them into a page.
+- `/product/{slug}` and `/category/{slug}` resolve before `pages.json`, always to the `product`/`category` template. Every other path is looked up verbatim (`/` is `home`).
+- Fill `seo_title`, `title`, `seo_description` and `seo_keywords` with real copy — never a placeholder.
+- Set `status: "published"` on a new page. A `draft` page returns 404 on the live store.
+- Never use a reserved path as a slug: `sitemap.xml`, `pre-checkout`, `pay-later`, `checkout`, `theme-asset`, or anything under `api/`.
+- The basket page's slug stays `cart`. Checkout and pay-later failures redirect there with the reason in `request.query.checkout_error` (pre-escaped). Show it: `{% if request.query.checkout_error != blank %}<div class="alert">{{ request.query.checkout_error }}</div>{% endif %}`.
+- Check for slug collisions in the `pages.json` above. Don't read the file.
 
-## 6. `defaults.json` — theme config
+## 6. `defaults.json`
 
-Top-level keys: `snippets_path` (always `"liquid"`), `colors` (named brand colors, ~45 keys), `font` (`family`, `serif`, `size`), `layout` (`radius`, `sectionSpacing`, `shadow`), `header` (search/account/cart toggles, logo, sticky, announcement bar), `showAnnouncement` (`enabled`, `messages[]`, `speed`), `menu.items[]` (`id`, `label`, `url`, `children[]`, `pageId`), `footer` (columns, newsletter, copyright, social links, logo), `productList.columns` (`desktop`/`tablet`/`mobile` counts).
+Top-level keys: `snippets_path` (`"liquid"`), `colors` (~45 named colours), `font` (`family`, `serif`, `size`), `layout` (`radius`, `sectionSpacing`, `shadow`), `header` (search/account/cart toggles, logo, sticky, announcement bar), `showAnnouncement` (`enabled`, `messages[]`, `speed`), `menu.items[]` (`id`, `label`, `url`, `children[]`, `pageId`), `footer` (columns, newsletter, copyright, social links, logo), `productList.columns` (`desktop`/`tablet`/`mobile`).
 
-**Do not read `theme.colors.*` etc. directly in Liquid** — nothing in the theme does. Colors/fonts/layout reach CSS as platform-injected `--theme-*` / `--layout-*` CSS custom properties (generated from this file above the theme's own stylesheets), and every component stylesheet consumes them with a literal fallback: `var(--theme-primary, #1e3a8a)`. When writing new CSS, follow the same pattern — never hardcode a color that should come from `defaults.json`; use `var(--theme-<key>, <sane-fallback>)`.
+**Never read colours or fonts in Liquid.** The platform injects them as `--theme-*` / `--layout-*` CSS custom properties. Consume them with a fallback: `var(--theme-primary, #1e3a8a)`.
 
-Only add/change a top-level key in `defaults.json` if a component you're generating actually needs a new configurable value (e.g. a new menu item, a new social link). Don't restructure existing keys.
+Add or change a key only when a component needs a new configurable value (a menu item, a social link). Never restructure existing keys.
 
-## 7. Data model (context variables)
+## 7. Data model
 
-Only reference fields listed here. If a page needs data not listed, say so instead of inventing a field name.
+Reference only these fields. If a page needs data that isn't listed, say a new backend field is needed — never invent one.
 
 | Object | Fields |
 |---|---|
@@ -227,9 +206,7 @@ Client-side data (after page load) comes from `window.StorefrontApi` (`js/storef
 
 ## 8. Component library
 
-Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are optional unless marked required; omitting an optional prop falls back to a sensible default already baked into the component.
-
-This table is the authoritative signature list. You do not need to read a component to learn its props — read it only when you are going to change it.
+Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are optional unless marked required. This table is the authoritative signature list — read a component only when you're going to change it.
 
 | Component | Signature | Notes |
 |---|---|---|
@@ -258,65 +235,80 @@ This table is the authoritative signature list. You do not need to read a compon
 
 **Do not** render `components/js/*.js` behavior — those files are legacy/unwired duplicates. Real component logic lives in top-level `js/`.
 
-## 9. CSS conventions
+## 9. CSS
 
-- Plain CSS, no framework (no Tailwind/Bootstrap). One file per component/page, same basename, in the matching `css/` sibling folder.
-- **Every page loads every CSS file** (no per-page conditional loading). A new `pages/css/<name>.css` or `components/css/<name>.css` will not be picked up unless it is registered — but you do **not** edit `liquid/layout-start.liquid` to register it. Return the new file's theme-relative path in `layout_links_to_add` and the `<link rel="stylesheet" href="{{ '<path>' | asset_url }}">` tag is spliced into the layout for you.
-- Class naming: prefer the theme's `t1-<component-abbrev>-*` convention for new component/page markup (e.g. `t1-pd-*` product detail, `t1-pl-*` product list, `t1-pgb-*` product-grid-block, `t1-fc-*` feature cards, `t1-rp-*` related products). For simple static content pages, reuse the existing generic `page-hero`, `page-section`, `content-prose`, `btn-primary`, `breadcrumb` classes from `pages/css/page-shared.css` instead of inventing new ones.
-- Design tokens: consume shared values via `var(--theme-<key>, <fallback>)` / `var(--layout-<key>, <fallback>)` (see §6) — always supply the fallback. Component-local palette/sizing gets its own `--<component>-*` custom properties scoped to that stylesheet. When a component needs a color with no `--theme-*` equivalent (a translucent overlay, a glass effect, a one-off accent), declare it once as a `--<component>-*` custom property at the top of that stylesheet and reference it via `var(--<component>-*)` everywhere else — never the raw value inline on a `color`/`background`/`background-color`/`border-color`/`fill`/`stroke` declaration. The custom-property form is only a warning; the raw inline form is a hard error.
-- A repeated family of alpha variants on one color — a glass/overlay effect, a scrim, a hover tint — is still "a color with no `--theme-*` equivalent": declare each opacity once as its own `--<component>-*` custom property at the top of the stylesheet (e.g. `--card-overlay-10: rgba(255, 255, 255, 0.1);`), not repeated as a raw `rgba(...)` inline at every use site. One declaration per value, referenced via `var()` wherever it's used, not the same literal scattered across the file.
-- Base tokens already defined in `css/base.css` (`:root`): `--sf-bg`, `--sf-surface`, `--sf-text`, `--sf-muted`, `--sf-border`, `--sf-accent`, `--sf-accent-dark`, `--sf-radius`, `--sf-container`. `sf-*` prefixed classes (`sf-page`, `sf-container`, `sf-btn`, `sf-grid`, etc.) are the generic layout/utility layer — safe to reuse on any new page.
-- Keep `data-*` attributes (JS hooks) and CSS classes (styling) as separate concerns — never select on a class in JS, never rely on a `data-*` attribute for styling.
-- Font: the heading font is already loaded by the layout; system sans stack for body text. Do not add font `<link>` tags.
+- Plain CSS, no framework. One file per component or page, same basename, in the sibling `css/` folder.
+- Every page loads every CSS file. Register a new `pages/css/*.css` or `components/css/*.css` by returning its path in `layout_links_to_add` — don't edit the layout to do it.
+- Classes: `t1-<abbrev>-*` for new markup (`t1-pd-*` product detail, `t1-pl-*` product list, `t1-pgb-*` product-grid-block, `t1-fc-*` feature cards, `t1-rp-*` related products). Simple content pages reuse the `page-shared.css` classes.
+- **Tokens.** Use shared values via `var(--theme-<key>, <fallback>)` / `var(--layout-<key>, <fallback>)`, always with a fallback. A colour with no `--theme-*` equivalent (an overlay, a glass effect, a one-off accent) is declared once as a `--<component>-*` custom property at the top of the stylesheet and used via `var()` — never raw inline on `color`, `background`, `background-color`, `border-color`, `fill` or `stroke`. The custom-property form is only a warning; raw inline is an error. A family of alpha variants of one colour (`rgba(255,255,255,0.1)`, `0.2`…) gets one property per value, not the same literal repeated.
+- Base tokens in `css/base.css`: `--sf-bg`, `--sf-surface`, `--sf-text`, `--sf-muted`, `--sf-border`, `--sf-accent`, `--sf-accent-dark`, `--sf-radius`, `--sf-container`. The `sf-*` utility classes (`sf-page`, `sf-container`, `sf-btn`, `sf-grid`) are safe to reuse.
+- `data-*` attributes are JS hooks; classes are styling. Never select by class in JS, or style by `data-*`.
+- Fonts are already loaded. Never add font `<link>` tags.
 
-## 10. JS conventions
+## 10. JavaScript
 
-- Vanilla JS only. No framework, no bundler, no build step.
-- All page-behavior scripts live in top-level `js/` and are `<script src="..." defer>`'d at the end of the layout, in this fixed order: `theme.js`, `header.js`, `storefront-api.js`, `minicart.js`, `product-grid-block.js`, `testimonials.js`, `contact-inquiry.js`, `products.js`, `store-faq.js`, `auth-password.js`. If a new page needs new interactive behavior, create the file in `js/` and return its path in `layout_scripts_to_add` — do **not** edit `liquid/layout-end.liquid` yourself. It is appended after the existing list, which is after `storefront-api.js`, so an API-dependent script is safe.
-- Each script self-guards: query the relevant root element/class first and `return`/no-op if absent, so the same global script is safe to load on every page regardless of whether its markup is present.
-- Use `data-<component-abbrev>-<purpose>` attributes as JS hooks (e.g. `data-pd-add-to-cart`, `data-minicart-count`, `data-pl-view-grid`) — write new JS against new `data-*` hooks you define in the markup, never against CSS classes.
-- Use `window.StorefrontApi` (`js/storefront-api.js`) for every authenticated call, never a raw `fetch()` — see §7 for its endpoints.
-- IIFE wrapper per file: `(function () { 'use strict'; ... })();` or `(() => { ... })();` — either is fine, keep it self-contained (no globals except `window.StorefrontApi` and whatever the file itself intentionally exposes).
+- Vanilla JS. No framework, bundler or build step.
+- Scripts live in top-level `js/` and load with `defer` in this fixed order: `theme.js`, `header.js`, `storefront-api.js`, `minicart.js`, `product-grid-block.js`, `testimonials.js`, `contact-inquiry.js`, `products.js`, `store-faq.js`, `auth-password.js`. For a new script, create it in `js/` and return its path in `layout_scripts_to_add`; it's appended after this list, so using `StorefrontApi` is safe.
+- Every script self-guards: it finds its root element first and returns if it's absent, so it's safe on every page.
+- Hooks are `data-<abbrev>-<purpose>` (`data-pd-add-to-cart`, `data-minicart-count`). **Markup and JS must use identical hook names** — renaming one without the other silently breaks the feature.
+- `window.StorefrontApi` is the only API client; it handles CSRF and credentials. Never write a raw `fetch()`. Endpoints are listed in §7.
+- One IIFE per file. No globals except `window.StorefrontApi` and anything the file deliberately exposes.
+- **Validation never runs your JavaScript.** A syntax error or a broken handler passes every check and only fails in the merchant's browser. Write JS carefully: balanced braces and brackets, defined variables, correct hook names.
 
-## 11. Naming & routing rules
+## 11. Naming
 
-- `pages/<kebab-case-slug>.liquid` → route `/<kebab-case-slug>`, 1:1, matching `pages.json`'s `slug`/`page` fields for `type: "custom"` entries.
-- Auth/account pages: `pages/auth/<name>.liquid`, `path: "/pages/auth"` in `pages.json`.
-- CSS/JS files mirror their Liquid file's basename exactly (`pages/foo.liquid` ↔ `pages/css/foo.css`; `components/bar.liquid` ↔ `components/css/bar.css`).
-- You can create or write only `.liquid`, `.css`, `.js` and `.json` files, plus `robots.txt` at the theme root — see rule 14 in §12. This is a platform-level rejection, not a convention.
+- `pages/<slug>.liquid` → `/<slug>`, matching `pages.json` `slug`/`page` for `custom` pages.
+- Auth pages: `pages/auth/<name>.liquid` with `path: "/pages/auth"`.
+- CSS and JS mirror their Liquid basename: `pages/foo.liquid` ↔ `pages/css/foo.css`, `components/bar.liquid` ↔ `components/css/bar.css`.
+- Images may already exist in a theme — reference them with `asset_url`, never create one (rule 14). Put an SVG inline in a `.liquid` file instead.
 
-## 12. Hard rules (must / must not)
+## 12. Hard rules
 
-1. **Must** open/close every `pages/*.liquid` file with the exact boilerplate in §3 — no missing/extra/reordered params.
-2. **Must not** introduce `{% schema %}`, `{% section %}`, `{% include %}`, or any theme-editor JSON block — none of these exist in this Liquid dialect and an unknown *tag* (unlike an unknown filter or variable) is a hard parse error, not a silent no-op. Stick to the tags/filters in §1's vocabulary — anything outside it, including standard-library tags and filters the render engine supports, is rejected by proposal validation.
-3. **Must not** invent data fields not listed in §7. If new data is required, state that a new backend field is needed instead of fabricating one.
-4. **Must not** introduce a CSS or JS framework/library (no Tailwind, Bootstrap, React, Vue, jQuery, build tooling).
-5. **Must** register any new `pages/css/*.css` or `components/css/*.css` path in `layout_links_to_add`, and any new `js/*.js` path in `layout_scripts_to_add`, unless you are directly editing `liquid/layout-start.liquid`/`liquid/layout-end.liquid` yourself in the same turn — in that case include the `<link>`/`<script>` tag in your own edit instead (§0); never both for the same file in the same turn. If you take the hand-edit path for `layout-end.liquid` and the new script uses `window.StorefrontApi`, you lose §10's automatic ordering guarantee (which only applies to `layout_scripts_to_add`) — you must place its `<script>` tag after `js/storefront-api.js`'s own `<script>` tag yourself, or the load-order check will reject it.
-6. **Must** add a matching `pages.json` entry (§5) for any new route, with real (non-placeholder) SEO fields — via `page_registry_entry` for a single new/updated page, a direct edit only for what that can't do, and never a `pages.json` write that drops or corrupts an unrelated existing entry.
-7. **Prefer** composing existing components (§8) over writing new bespoke markup; only add a new component file when nothing existing fits, and give it the same three-file shape (`components/<name>.liquid` + `components/css/<name>.css`, only add JS if genuinely interactive).
-8. **Must** guard boolean-ish fields with `{% if x == true or x == 1 %}` (§1), and guard absent/optional data with `{% if x != blank %}` before rendering it.
-9. **Must not** hardcode a value that already has a `defaults.json`/`--theme-*` equivalent (colors, fonts, spacing) — reference the token with a fallback instead.
-10. Keep output minimal and scoped to what was asked — don't refactor unrelated components, don't add extra sections the user didn't request, don't add code comments narrating what a line does (Liquid comments are fine only to record a genuine non-obvious constraint, as `product-list-item.liquid` and `testimonials.liquid` already do).
-11. **Must not** write placeholder, lorem ipsum, or "TODO" text as page content, and must not leave a `pages.json` SEO field as a stand-in. If the request is too vague to write real content, set `needs_clarification: true` with an empty `files` array and ask the merchant, rather than filling a page with a marker.
-12. **Must not** re-emit a file whose content is unchanged, and must not emit a file you have not read. **Prefer** `action: "edit"` over `action: "update"` for a targeted change to an existing file — a full rewrite only when genuinely simpler. Call `propose_changes` exactly once, with the complete final set of changes.
-13. **Must** diagnose and fix a broken page yourself rather than surfacing a technical error to the merchant — see §13. A merchant reporting "this page is broken" or pasting an error/screenshot does not know what Liquid, a template, or a syntax error is; treat it as a bug report to investigate, not a question to relay back.
-14. **Must** stay within this spec's own file vocabulary — create or write only `.liquid`, `.css`, `.js`, `.json` (theme config) and `robots.txt` at the theme root, and the plain-CSS/vanilla-JS/Liquid stack described throughout this document. A theme may already contain images (`.png`, `.jpg`, `.webp`, `.svg`…) — reference them with `asset_url`, but never create one; put an SVG inline in a `.liquid` file instead. If a merchant asks for a different file type or technology (React, PHP, TypeScript, a build step, anything not in this vocabulary), decline and explain in the summary that this theme engine only supports Liquid/CSS/JS — do not attempt to approximate their request in an unsupported format, and do not silently substitute a `.liquid` equivalent without saying so.
-15. **Must not** treat a question or read-only request (§0 — "read this and tell me," "what does this say," "describe/explain/summarize X") as implicit permission to explore broadly or propose file changes; answer it via `summary` with `answered_question: true` and `files: []`, and stop there. An attached image or HTML file is reference content, not automatically a build/redesign instruction — use it as design/structure/copy material only when the merchant's own words ask you to create, change, fix, or redesign something with it. Only investigate and propose changes when the request actually asks for one, or reports something broken (§13).
-16. **Must not** tell the merchant you can't access, open, browse, or read a URL they mentioned — see §0's own paragraph on this. If you see `--- Attached reference file: <that url> --- ` anywhere in this request, the fetch already happened; treat it exactly like any other reference material and answer directly. This rule exists because this exact refusal was observed happening repeatedly in production even with a real, successfully-fetched attachment sitting right there in context — don't repeat it.
+1. Every `pages/**/*.liquid` file opens and closes with the exact §3 boilerplate.
+2. Use only §1's tags and filters. Anything else is rejected.
+3. Use only §7's fields. Never invent one — say a new backend field is needed.
+4. No CSS or JS framework, library or build tool (no Tailwind, Bootstrap, React, Vue, jQuery).
+5. Register new CSS in `layout_links_to_add` and new JS in `layout_scripts_to_add` — unless you edit that layout file directly this turn, in which case add the tag in your own edit (never both). When hand-editing `layout-end.liquid`, a script using `StorefrontApi` must come after `js/storefront-api.js`, or the load-order check rejects it.
+6. A new route needs a `pages.json` entry with real SEO, via `page_registry_entry`. Never write a `pages.json` that drops or corrupts another entry.
+7. Compose from §8 before writing new markup. A new component is `components/<name>.liquid` + `components/css/<name>.css`, plus JS only if it's interactive.
+8. Guard booleans with `== true or == 1`, and optional data with `!= blank`.
+9. Never hardcode a value that has a `defaults.json` / `--theme-*` token.
+10. Stay scoped: don't refactor unrelated components, add sections nobody asked for, or write comments narrating code. A comment recording a genuine constraint is fine.
+11. No placeholder, lorem ipsum or "TODO" content, and no stand-in SEO fields. If the request is too vague to write real content, use `needs_clarification`.
+12. Call `propose_changes` once, with the complete final set of changes.
+13. Diagnose and fix a broken page yourself (§13). Never relay a technical error to the merchant.
+14. Write only `.liquid`, `.css`, `.js`, `.json` and `robots.txt`. If asked for React, PHP, TypeScript or a build step, decline in `summary` — never approximate it in a supported format without saying so.
+15. A question is never permission to change files (§0). An attached image or page is reference material, not an instruction to build — unless the merchant's own words ask for that.
+16. Never claim you can't open a URL the merchant mentioned. If `--- Attached reference file: <url> ---` appears, it has been fetched — answer from it. This exact refusal happened repeatedly in production.
+17. **Never undo earlier unsaved changes** (§0). A fix changes only what the fix needs.
 
-## 13. Debugging a broken page
+## 13. Fixing a broken page
 
-The merchant is not a developer. When they report a blank section, a broken layout, a page that "doesn't work," or paste an error message or screenshot from the preview, that is a bug report — investigate and fix it yourself. Never ask the merchant to explain, describe, or paste the specifics of a technical error; never respond with the raw error text; never tell them "there's a syntax error in your Liquid file" and stop there. Read the file(s) yourself (`read_theme_file`/`grep_theme`) and look for the specific cause before proposing anything.
+The merchant isn't a developer. A blank section, a broken layout, "it doesn't work", or a pasted error or screenshot is a bug report — investigate and fix it yourself. Never ask them to explain a technical error, and never show them raw error text, stack traces or code.
 
-**Read the actual failure message first if one was given** — it usually names the exact file and line. Common causes, roughly in order of how often they turn out to be it:
+**Read the failure message first**, if there is one — it usually names the file and line.
 
-- **A `{% render %}` target doesn't exist**, or is missing its root-folder prefix (`'components/x'`/`'liquid/x'`, never bare `'x'`). Check the referenced path is real in the current file tree before assuming the component itself is broken. A missing target renders as empty rather than erroring, so this usually shows up as a section that has simply vanished.
-- **Unbalanced tags** — a `{% for %}`/`{% if %}`/`{% capture %}` missing its matching `{% endfor %}`/`{% endif %}`/`{% endcapture %}`, often from a hand-edited or partially-applied change. Read the whole file, not just the section that looks wrong; the actual imbalance is often earlier than the visible symptom.
-- **A `>` (or `<`) inside a Liquid expression embedded in an HTML tag's own attributes** — e.g. `<div{% if a.size > 0 %} data-x{% endif %}>` — reads as fine Liquid but is easy to mis-edit into something that closes the tag early or never closes it. Check attribute-embedded conditionals character by character when a tag "goes missing" right after one.
-- **A field referenced that isn't in §7**, or a typo in a field name (`.slug` vs `.slgu`) — this fails *silently* (renders blank, no error) per this engine's non-strict mode, so "a section is just empty" is often this, not a crash. Cross-check every dotted reference against §7's field list.
-- **A `pages.json` entry pointing at a file that doesn't exist**, or a `path`/`page` combination that doesn't resolve to `{path}/{page}.liquid` — the route itself would 404/redirect rather than error, but a bad `type` value (e.g. an invented one like `"cart"` — see §5) silently falls back to `custom`, which changes what catalogue data loads and can make a page that expects `product`/`category` to be populated render as if it's empty.
-- **A render limit was hit** — the page shows a generic error instead of partial output when it produces too much output or does too much render work, almost always from nested loops over large arrays or `get_products` called inside a loop. Flatten the loop, or fetch once and pass the result in.
-- **An asset path is wrong** — a hardcoded `/theme-assets/...`/absolute path instead of `{{ 'path' | asset_url }}`, or a path with a leading `/` or `..` (both make `asset_url` return an empty string).
-- **A raw color or a `var(--theme-*)` with no fallback** where `checkThemeToken` would have already caught this in a proposal you wrote — but a merchant can also inherit this from theme content that predates you; fix it the same way (§9) when you find it.
+**Display problems (Liquid and CSS):**
+- A `{% render %}` target that doesn't exist, or lacks its root folder. A missing target renders **empty**, not an error — usually a section that has simply vanished.
+- Unbalanced tags: an `if`, `for` or `capture` missing its end. Read the whole file; the imbalance is often earlier than the symptom.
+- A `>` or `<` inside a Liquid condition within an HTML tag (`<div{% if a.size > 0 %} data-x{% endif %}>`) that closes the tag early. Check those character by character.
+- A field not in §7, or misspelt — it renders blank with no error.
+- A `pages.json` entry pointing at a missing file, or an invented `type` (silently `custom`, so the expected catalogue data never loads).
+- An asset path hardcoded, starting with `/`, or containing `..` — `asset_url` returns empty.
+- A render limit hit — the page shows a generic error, usually from nested loops over large arrays or `get_products` inside a loop.
+- A raw colour, or `var(--theme-*)` without a fallback (§9).
 
-If you fix the underlying file, propose the correction directly — same rules as any other change (§0, §12: read before you edit, prefer `action: "edit"`, real content only). If you read the relevant files and the cause genuinely isn't one of the above, say plainly and briefly what you checked and what you found (in merchant language — "the [section name] on this page isn't loading correctly, here's what I found" — never raw error text, stack traces, or Liquid/Go internals), and either propose your best fix or ask one specific, non-technical clarifying question ("should X show Y or Z when there's no image?") rather than a request to explain a technical error.
+**Behaviour problems (JavaScript)** — a button does nothing, the cart won't update, a form won't submit:
+- **Read the `js/` file and the `.liquid` markup it hooks together.** Most behaviour bugs are a mismatch between the two.
+- **Do the hook names match?** Every `data-*` the JS queries must exist in the markup, spelt identically.
+- **Is the script registered, in the right order?** It must be in `layout-end.liquid` (or `layout_scripts_to_add`), and anything using `StorefrontApi` must load after `js/storefront-api.js`.
+- **Is the self-guard too strict?** A root-element check that never matches makes the whole script silently do nothing.
+- **Is the API call shaped correctly?** A basket `PUT` replaces the **whole** item list — read it, modify it, send it all back (§7).
+- **Is there a syntax error?** One missing brace or bracket stops the entire file, and validation won't catch it.
+
+**How to fix it:**
+- Change only what the bug needs. A behaviour fix never restyles anything, and never touches CSS unless the bug is in the CSS.
+- Use `action: "edit"`. Never rewrite a whole file to fix one bug — that is how earlier unsaved work gets lost.
+- **If an earlier fix didn't work** (the merchant says it's still broken), don't repeat it. Re-read the files from scratch and look for a different cause. If you still can't find it, set `needs_clarification` and ask one specific, non-technical question — what happens when they click, or what the browser console shows.
+
+Describe the fix in merchant language. If you genuinely can't find the cause, say briefly what you checked, then propose your best fix or ask one clear question.

@@ -97,6 +97,7 @@ func Check(proposal Proposal, snap Snapshot) []Finding {
 	findings = append(findings, checkBoolGuard(proposal, snap)...)
 	findings = append(findings, checkNoFramework(proposal, snap)...)
 	findings = append(findings, checkJSShape(proposal, snap)...)
+	findings = append(findings, checkJSSyntax(proposal, snap)...)
 	findings = append(findings, checkKnownFields(proposal, snap)...)
 	return findings
 }

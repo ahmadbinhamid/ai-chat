@@ -124,6 +124,30 @@ func (r *Repository) DraftFiles(ctx context.Context, chatID string) (map[string]
 	return draft, rows.Err()
 }
 
+// FileChangesByChat returns every generated file's path and action for a chat, grouped by message_id, in one query.
+func (r *Repository) FileChangesByChat(ctx context.Context, chatID string) (map[string][]FileChange, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT message_id, file_path, action
+		FROM chat_generated_files WHERE chat_id = ?
+		ORDER BY created_at, id
+	`, chatID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	changes := make(map[string][]FileChange)
+	for rows.Next() {
+		var messageID string
+		var c FileChange
+		if err := rows.Scan(&messageID, &c.FilePath, &c.Action); err != nil {
+			return nil, err
+		}
+		changes[messageID] = append(changes[messageID], c)
+	}
+	return changes, rows.Err()
+}
+
 // PendingFiles returns every generated-file row of a still-pending message, oldest first — what
 // Service.ApplyDraft folds into a writePlan.
 func (r *Repository) PendingFiles(ctx context.Context, chatID string) ([]GeneratedFile, error) {

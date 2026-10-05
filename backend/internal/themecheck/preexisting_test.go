@@ -146,3 +146,26 @@ func TestDowngradePreExistingFindings_EdgeCases(t *testing.T) {
 		})
 	}
 }
+
+func TestDowngradePreExistingFindings_RemovedBasketFieldOnPreExistingLine(t *testing.T) {
+	line := `<span class="cart-line-price">{{ item.price_formatted }}</span>`
+	baseline := "{% for item in basket.items %}\n" + line + "\n{% endfor %}"
+	proposed := "<h1>Your cart</h1>\n{% for item in basket.items %}\n" + line + "\n{% endfor %}"
+
+	p := Proposal{Files: []ProposedFile{{Path: "pages/cart.liquid", Action: "update", Content: proposed}}}
+	findings := checkKnownFields(p, Snapshot{})
+	if len(findings) != 1 || findings[0].Severity != SeverityError || findings[0].Line != 3 {
+		t.Fatalf("expected 1 error on line 3 for basket.items[].price_formatted, got %+v", findings)
+	}
+
+	got := DowngradePreExistingFindings(findings, p, map[string]string{"pages/cart.liquid": baseline})
+	if len(got) != 1 || got[0].Severity != SeverityWarning {
+		t.Fatalf("expected the pre-existing use to be downgraded to a warning, got %+v", got)
+	}
+
+	newFile := Proposal{Files: []ProposedFile{{Path: "pages/cart.liquid", Action: "update", Content: proposed}}}
+	got = DowngradePreExistingFindings(checkKnownFields(newFile, Snapshot{}), newFile, map[string]string{"pages/cart.liquid": "<h1>Your cart</h1>"})
+	if len(got) != 1 || got[0].Severity != SeverityError {
+		t.Fatalf("expected a newly introduced use to stay an error, got %+v", got)
+	}
+}

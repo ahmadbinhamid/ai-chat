@@ -22,6 +22,12 @@ const (
 	GeneratedFileKindLayout   GeneratedFileKind = "layout"
 )
 
+// FileChange is a generated file's path and persisted action without its content — enough for the model's per-turn history line.
+type FileChange struct {
+	FilePath string
+	Action   FileAction
+}
+
 // Audits one staged file; only persistent copy until ApplyDraft writes it.
 type GeneratedFile struct {
 	ID              string            `json:"id"`

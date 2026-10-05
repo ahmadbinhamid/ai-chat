@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -739,6 +740,10 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return fmt.Errorf("load theme context: %w", err)
 	}
 	tc.GenerationMode = in.Mode
+	tc.DraftPaths = make([]string, 0, len(draft))
+	for path := range draft {
+		tc.DraftPaths = append(tc.DraftPaths, path)
+	}
 
 	snapBase, err := s.buildSnapshotBase(ctx, store, storeAuth)
 	if err != nil {
@@ -748,7 +753,13 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	toolExec := s.buildToolExecutor(store, storeAuth)
 	readFile := s.buildFileReader(store, storeAuth)
 
-	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurns(priorMessages))
+	// Fails open: the file-history line is a memory aid, never worth failing a generation over.
+	fileChanges, err := s.repo.FileChangesByChat(ctx, c.ID)
+	if err != nil {
+		slog.Warn("load per-turn file changes failed; replaying history without them", "chat_id", c.ID, "error", err)
+		fileChanges = nil
+	}
+	turns := s.summarizeOldTurnsCached(ctx, c.ID, toTurnsWithFileChanges(priorMessages, fileChanges))
 
 	// Deterministic page-lifecycle ops (register existing page, diagnose failures).
 	result, deterministic := s.tryDeterministicPageOp(ctx, store, storeAuth, in.Prompt)
@@ -774,6 +785,10 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		if err != nil {
 			return err
 		}
+	}
+
+	if !deterministic && proposalHasChanges(result) {
+		warnings = append(warnings, s.draftReversionWarnings(ctx, storeAuth, c.ID, draft, result)...)
 	}
 
 	// Final gate: never silently delete/unregister protected pages (blog, home).
@@ -877,6 +892,73 @@ func (s *Service) FetchPreviewProducts(ctx context.Context, storeAuth themefs.Re
 	return fetcher.FetchProducts(ctx, storeAuth, limit)
 }
 
+// *themefs.Store-only capability; a product's detail and its add-on groups aren't theme files.
+type productDetailFetcher interface {
+	FetchProductDetail(ctx context.Context, auth themefs.RequestAuth, slug string) (themefs.ProductDetail, error)
+	FetchAddOnGroup(ctx context.Context, auth themefs.RequestAuth, id int) (themefs.AddOnGroup, error)
+}
+
+// maxPreviewAddOnGroups bounds the per-group requests one preview load can fan out to.
+const maxPreviewAddOnGroups = 5
+
+// FetchPreviewProductDetail fetches one product for the preview's product page, filling each variant's add-on groups
+// with their add-ons (the product endpoint omits them). A group whose fetch fails keeps no add-ons rather than failing the page.
+func (s *Service) FetchPreviewProductDetail(ctx context.Context, storeAuth themefs.RequestAuth, slug string) (themefs.ProductDetail, error) {
+	fetcher, ok := s.store.(productDetailFetcher)
+	if !ok {
+		return themefs.ProductDetail{}, fmt.Errorf("theme store does not support product detail fetch")
+	}
+	product, err := fetcher.FetchProductDetail(ctx, storeAuth, slug)
+	if err != nil {
+		return themefs.ProductDetail{}, err
+	}
+
+	variants := make([]*themefs.ProductVariant, 0, len(product.Variants)+1)
+	if product.DefaultVariant != nil {
+		variants = append(variants, product.DefaultVariant)
+	}
+	for i := range product.Variants {
+		variants = append(variants, &product.Variants[i])
+	}
+
+	var ids []int
+	seen := map[int]bool{}
+	for _, v := range variants {
+		for _, g := range v.AddOnGroups {
+			if !seen[g.ID] && len(ids) < maxPreviewAddOnGroups {
+				seen[g.ID] = true
+				ids = append(ids, g.ID)
+			}
+		}
+	}
+
+	addons := make(map[int][]themefs.AddOn, len(ids))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			group, err := fetcher.FetchAddOnGroup(ctx, storeAuth, id)
+			if err != nil {
+				slog.Warn("preview: add-on group fetch failed", "group_id", id, "error", err)
+				return
+			}
+			mu.Lock()
+			addons[id] = group.Addons
+			mu.Unlock()
+		}(id)
+	}
+	wg.Wait()
+
+	for _, v := range variants {
+		for i := range v.AddOnGroups {
+			v.AddOnGroups[i].Addons = addons[v.AddOnGroups[i].ID]
+		}
+	}
+	return product, nil
+}
+
 // Fetches real store settings (name) for preview (instead of sample data).
 func (s *Service) FetchStoreSettings(ctx context.Context, storeAuth themefs.RequestAuth) (themefs.StoreSettings, error) {
 	fetcher, ok := s.store.(storeSettingsFetcher)
@@ -949,6 +1031,34 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 	}, nil
 }
 
+// draftReversionWarnings flags proposed updates that drop much of earlier unsaved work. Warning only, never a rejection;
+// reads the saved theme from s.store (not the overlay), and a failed read skips that file rather than guessing.
+func (s *Service) draftReversionWarnings(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) []themecheck.Finding {
+	saved := make(map[string]string)
+	for _, f := range result.Files {
+		if f.Action != "update" {
+			continue
+		}
+		if _, inDraft := draft[f.Path]; !inDraft {
+			continue
+		}
+		content, err := s.store.ReadFile(ctx, storeAuth, f.Path)
+		if err != nil {
+			slog.Info("draft reversion check skipped: saved file unreadable", "chat_id", chatID, "path", f.Path, "error", err)
+			continue
+		}
+		saved[f.Path] = content
+	}
+
+	var findings []themecheck.Finding
+	for _, r := range themecheck.DetectDraftReversions(toProposal(result), saved, draft) {
+		slog.Warn("proposal may undo earlier unsaved changes", "chat_id", chatID, "path", r.Path,
+			"dropped_lines", r.Dropped, "earlier_added_lines", r.Added)
+		findings = append(findings, r.Finding())
+	}
+	return findings
+}
+
 // Fetches invariant snapshot part: file-path listing + content for files themecheck reads.
 // Split from buildSnapshot for independent testability; lets future callers reuse base.
 func (s *Service) buildSnapshotBase(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth) (themecheck.Snapshot, error) {
@@ -1012,18 +1122,56 @@ func flattenFileTree(entries []themefs.FileTreeEntry, paths map[string]bool) {
 // Replays chat history as turns; skips empty turns (Anthropic rejects empty text blocks).
 // Delegates inclusion to isReplayedMessage to keep carry-forward sync'd.
 func toTurns(messages []chat.Message) []ai.Turn {
+	return toTurnsWithFileChanges(messages, nil)
+}
+
+// toTurnsWithFileChanges appends each assistant turn's changed files for the model only; chat_messages.content is never touched.
+// Messages and generated-file rows are insert-only, so a past turn's line is byte-identical on every later request.
+func toTurnsWithFileChanges(messages []chat.Message, changes map[string][]FileChange) []ai.Turn {
 	turns := make([]ai.Turn, 0, len(messages))
 	for _, m := range messages {
 		if !isReplayedMessage(m) {
 			continue
 		}
 		role := "user"
+		content := m.Content
 		if m.Role == chat.RoleAssistant {
 			role = "assistant"
+			if line := fileChangesLine(changes[m.ID]); line != "" {
+				content += "\n\n" + line
+			}
 		}
-		turns = append(turns, ai.Turn{Role: role, Content: m.Content})
+		turns = append(turns, ai.Turn{Role: role, Content: content})
 	}
 	return turns
+}
+
+// fileChangesLine says "changed", not "update": the stored action can't tell an edit from a rewrite, and replaying
+// "update" would nudge the model toward whole-file rewrites (see recapAssistantTurn).
+func fileChangesLine(changes []FileChange) string {
+	if len(changes) == 0 {
+		return ""
+	}
+	labels := make(map[string]string, len(changes))
+	for _, c := range changes {
+		label := "changed"
+		if c.Action == FileActionCreate {
+			label = "new file"
+		}
+		if _, seen := labels[c.FilePath]; !seen || label == "new file" {
+			labels[c.FilePath] = label
+		}
+	}
+	paths := make([]string, 0, len(labels))
+	for p := range labels {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	parts := make([]string, len(paths))
+	for i, p := range paths {
+		parts[i] = fmt.Sprintf("%s (%s)", p, labels[p])
+	}
+	return "[Files changed this turn: " + strings.Join(parts, ", ") + "]"
 }
 
 // Reports if err looks like a 401 from FlowPOS (matches literal text; no structured status).
