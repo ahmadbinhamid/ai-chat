@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -175,14 +176,14 @@ func TestBuildPreviewContext_ZeroProductsKeepsFixture(t *testing.T) {
 	}
 }
 
-// TestBuildPreviewContext_CapsProductsAtFixtureLength confirms the cap is enforced even if flowpos-backend ignores the "limit" query param.
-func TestBuildPreviewContext_CapsProductsAtFixtureLength(t *testing.T) {
+// TestBuildPreviewContext_CapsProductsAtPreviewLimit confirms the cap is enforced even if flowpos-backend ignores the "limit" query param.
+func TestBuildPreviewContext_CapsProductsAtPreviewLimit(t *testing.T) {
 	var raw []map[string]any
-	for i := 1; i <= 5; i++ {
-		raw = append(raw, sampleRealProduct(i, "Product", "product-"+string(rune('0'+i))))
+	for i := 1; i <= previewProductLimit+2; i++ {
+		raw = append(raw, sampleRealProduct(i, "Product", fmt.Sprintf("product-%d", i)))
 	}
-	// Server misbehaves: reports 5 items on a page it claims is size 3.
-	body := rawProductsResponse(t, 1, 5, raw)
+	// Server misbehaves: returns more items than the requested limit.
+	body := rawProductsResponse(t, 1, len(raw), raw)
 	ts := fakeFlowposProductsServer(t, "", body)
 	defer ts.Close()
 
@@ -192,8 +193,8 @@ func TestBuildPreviewContext_CapsProductsAtFixtureLength(t *testing.T) {
 
 	products, _ := ctx["products"].(map[string]any)
 	items, _ := products["items"].([]any)
-	if len(items) != 3 {
-		t.Fatalf("expected the cap (3, FixtureProducts()' own item count) enforced even though the fake server returned 5, got %d", len(items))
+	if len(items) != previewProductLimit {
+		t.Fatalf("expected the cap (%d) enforced even though the fake server returned %d, got %d", previewProductLimit, len(raw), len(items))
 	}
 }
 

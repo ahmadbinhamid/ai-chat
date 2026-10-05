@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 )
 
@@ -96,4 +97,110 @@ func (s *Store) FetchProducts(ctx context.Context, auth RequestAuth, limit int) 
 		PerPage:     out.Data.Products.PerPage,
 		Total:       out.Data.Products.Total,
 	}, nil
+}
+
+// ProductDetail is the subset of GET /products/{slug} the preview's product page needs. That admin endpoint loads each
+// variant's add-on groups but not their add-ons, so AddOnGroup.Addons is filled separately via FetchAddOnGroup.
+type ProductDetail struct {
+	ID             int                 `json:"id"`
+	Slug           string              `json:"slug"`
+	Name           string              `json:"name"`
+	Description    string              `json:"description"`
+	Price          float64             `json:"price"`
+	ComparePrice   *float64            `json:"compare_price"`
+	SKU            *string             `json:"sku"`
+	Barcode        *string             `json:"barcode"`
+	VariantsCount  int                 `json:"variants_count"`
+	Attachments    []ProductAttachment `json:"attachments"`
+	DefaultVariant *ProductVariant     `json:"default_variant"`
+	Variants       []ProductVariant    `json:"variants"`
+}
+
+// ProductVariant excludes the default variant: flowpos-backend's regular_variants scope keeps it out of Variants.
+type ProductVariant struct {
+	ID          int                 `json:"id"`
+	SKU         *string             `json:"sku"`
+	Barcode     *string             `json:"barcode"`
+	Price       float64             `json:"price"`
+	IsAvailable *bool               `json:"is_available"`
+	Items       []ProductChoiceItem `json:"items"`
+	Attachments []ProductAttachment `json:"attachments"`
+	AddOnGroups []AddOnGroup        `json:"add_on_groups"`
+}
+
+type ProductChoiceItem struct {
+	ID         int    `json:"id"`
+	CtypeID    int    `json:"ctype_id"`
+	Name       string `json:"name"`
+	ChoiceType *struct {
+		ID    int    `json:"id"`
+		Label string `json:"label"`
+	} `json:"choice_type"`
+}
+
+type AddOnGroup struct {
+	ID           int     `json:"id"`
+	Name         string  `json:"name"`
+	IsActive     *bool   `json:"is_active"`
+	MinSelection int     `json:"min_selection"`
+	MaxSelection int     `json:"max_selection"`
+	Addons       []AddOn `json:"addons"`
+}
+
+type AddOn struct {
+	ID          int     `json:"id"`
+	Name        string  `json:"name"`
+	Price       float64 `json:"price"`
+	MaxQuantity *int    `json:"max_quantity"`
+	IsActive    *bool   `json:"is_active"`
+	SortOrder   int     `json:"sort_order"`
+}
+
+// FetchProductDetail calls GET /products/{slug}.
+func (s *Store) FetchProductDetail(ctx context.Context, auth RequestAuth, slug string) (ProductDetail, error) {
+	var out struct {
+		Data struct {
+			Product ProductDetail `json:"product"`
+		} `json:"data"`
+	}
+	if err := s.getJSON(ctx, auth, "/products/"+url.PathEscape(slug), &out); err != nil {
+		return ProductDetail{}, fmt.Errorf("fetch product detail: %w", err)
+	}
+	return out.Data.Product, nil
+}
+
+// FetchAddOnGroup calls GET /addon-groups/{id}, which, unlike the product endpoint, loads the group's add-ons.
+func (s *Store) FetchAddOnGroup(ctx context.Context, auth RequestAuth, id int) (AddOnGroup, error) {
+	var out struct {
+		Data struct {
+			AddOnGroup AddOnGroup `json:"addOnGroup"`
+		} `json:"data"`
+	}
+	if err := s.getJSON(ctx, auth, "/addon-groups/"+strconv.Itoa(id), &out); err != nil {
+		return AddOnGroup{}, fmt.Errorf("fetch add-on group %d: %w", id, err)
+	}
+	return out.Data.AddOnGroup, nil
+}
+
+func (s *Store) getJSON(ctx context.Context, auth RequestAuth, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+path, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+auth.Token)
+	req.Header.Set("TID", strconv.FormatUint(auth.TenantID, 10))
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s", statusErr(resp))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("decode response: %w", err)
+	}
+	return nil
 }

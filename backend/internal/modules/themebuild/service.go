@@ -892,6 +892,73 @@ func (s *Service) FetchPreviewProducts(ctx context.Context, storeAuth themefs.Re
 	return fetcher.FetchProducts(ctx, storeAuth, limit)
 }
 
+// *themefs.Store-only capability; a product's detail and its add-on groups aren't theme files.
+type productDetailFetcher interface {
+	FetchProductDetail(ctx context.Context, auth themefs.RequestAuth, slug string) (themefs.ProductDetail, error)
+	FetchAddOnGroup(ctx context.Context, auth themefs.RequestAuth, id int) (themefs.AddOnGroup, error)
+}
+
+// maxPreviewAddOnGroups bounds the per-group requests one preview load can fan out to.
+const maxPreviewAddOnGroups = 5
+
+// FetchPreviewProductDetail fetches one product for the preview's product page, filling each variant's add-on groups
+// with their add-ons (the product endpoint omits them). A group whose fetch fails keeps no add-ons rather than failing the page.
+func (s *Service) FetchPreviewProductDetail(ctx context.Context, storeAuth themefs.RequestAuth, slug string) (themefs.ProductDetail, error) {
+	fetcher, ok := s.store.(productDetailFetcher)
+	if !ok {
+		return themefs.ProductDetail{}, fmt.Errorf("theme store does not support product detail fetch")
+	}
+	product, err := fetcher.FetchProductDetail(ctx, storeAuth, slug)
+	if err != nil {
+		return themefs.ProductDetail{}, err
+	}
+
+	variants := make([]*themefs.ProductVariant, 0, len(product.Variants)+1)
+	if product.DefaultVariant != nil {
+		variants = append(variants, product.DefaultVariant)
+	}
+	for i := range product.Variants {
+		variants = append(variants, &product.Variants[i])
+	}
+
+	var ids []int
+	seen := map[int]bool{}
+	for _, v := range variants {
+		for _, g := range v.AddOnGroups {
+			if !seen[g.ID] && len(ids) < maxPreviewAddOnGroups {
+				seen[g.ID] = true
+				ids = append(ids, g.ID)
+			}
+		}
+	}
+
+	addons := make(map[int][]themefs.AddOn, len(ids))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			group, err := fetcher.FetchAddOnGroup(ctx, storeAuth, id)
+			if err != nil {
+				slog.Warn("preview: add-on group fetch failed", "group_id", id, "error", err)
+				return
+			}
+			mu.Lock()
+			addons[id] = group.Addons
+			mu.Unlock()
+		}(id)
+	}
+	wg.Wait()
+
+	for _, v := range variants {
+		for i := range v.AddOnGroups {
+			v.AddOnGroups[i].Addons = addons[v.AddOnGroups[i].ID]
+		}
+	}
+	return product, nil
+}
+
 // Fetches real store settings (name) for preview (instead of sample data).
 func (s *Service) FetchStoreSettings(ctx context.Context, storeAuth themefs.RequestAuth) (themefs.StoreSettings, error) {
 	fetcher, ok := s.store.(storeSettingsFetcher)
