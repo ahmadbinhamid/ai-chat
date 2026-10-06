@@ -11,8 +11,9 @@ const ruleIDAssetRegistered = "asset-registered"
 var cssPathRe = regexp.MustCompile(`^(pages|components)/css/[^/]+\.css$`)
 var jsPathRe = regexp.MustCompile(`^js/[^/]+\.js$`)
 
-var linkHrefRe = regexp.MustCompile(`<link[^>]*href="\{\{\s*'([^']+)'\s*\|\s*asset_url\s*\}\}"[^>]*>`)
-var scriptSrcRe = regexp.MustCompile(`<script[^>]*src="\{\{\s*'([^']+)'\s*\|\s*asset_url\s*\}\}"[^>]*>`)
+// The optional (?:\?[^"]*)? accepts a cache-busting query after the asset_url output ("...}}?v=ssr-cats-3").
+var linkHrefRe = regexp.MustCompile(`<link[^>]*href="\{\{\s*'([^']+)'\s*\|\s*asset_url\s*\}\}(?:\?[^"]*)?"[^>]*>`)
+var scriptSrcRe = regexp.MustCompile(`<script[^>]*src="\{\{\s*'([^']+)'\s*\|\s*asset_url\s*\}\}(?:\?[^"]*)?"[^>]*>`)
 
 // registeredAssetPaths returns every asset path referenced by a <link href> or <script src> tag, in source order.
 func registeredAssetPaths(content string, re *regexp.Regexp) []string {
