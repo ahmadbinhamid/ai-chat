@@ -849,7 +849,14 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": plan.paths()})
 
 		// Draft/apply split: nothing reaches FlowPOS here (only staged, not committed).
-		staged = planToStaged(plan)
+		staged = planToStaged(dropUnchangedFiles(plan))
+		// Backstop against fake success: a proposal that changes nothing must never read as "Fixed".
+		if len(staged) == 0 {
+			slog.Warn("proposal changed nothing after staging; reporting no change", "chat_id", c.ID, "proposed_files", len(result.Files))
+			hasChanges = false
+			result.Summary = nothingChangedReply
+			warnings = nil // they describe a change that didn't happen
+		}
 	}
 
 	applyStatus := chat.ApplyStatusNotApplicable

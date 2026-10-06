@@ -124,6 +124,10 @@ func clearIfNoChangesIntended(result *ai.Result) {
 	result.LayoutScriptsToAdd = nil
 }
 
+// nothingChangedReply replaces a summary that claimed a change when staging found nothing to change, so the merchant
+// isn't told "Fixed" over an untouched theme.
+const nothingChangedReply = "I wasn't able to make that change — nothing in your theme was changed. Could you try again, or describe what you'd like a little differently?"
+
 const emptyProposalFallbackSummary = "I wasn't able to make that change — try rephrasing, or be more specific about which page or section you mean."
 
 // Detects hallucination: no clarification, no answer, no changes, zero tools = fabrication.
@@ -366,8 +370,58 @@ func (s *Service) checkAndRepair(
 					"complete corrected file, just via old_string/new_string instead of retyping it whole.", err)})
 			continue
 		}
-		result = retried
+		result = mergeRepairIntoProposal(result, retried)
 	}
+}
+
+// mergeRepairIntoProposal applies a repair on top of the proposal it repairs: a repair is told to fix ONLY the flagged
+// files, so replacing the proposal with it would silently drop every unflagged file. Same path: the repair's version wins.
+// A repair that asks a question or answers instead of changing files replaces the proposal, as before.
+func mergeRepairIntoProposal(original, repair *ai.Result) *ai.Result {
+	if repair.NeedsClarification || repair.AnsweredQuestion {
+		return repair
+	}
+	merged := *repair
+	merged.Summary = original.Summary
+	merged.ExplorationToolCalls = original.ExplorationToolCalls + repair.ExplorationToolCalls
+
+	repaired := make(map[string]ai.GeneratedFile, len(repair.Files))
+	for _, f := range repair.Files {
+		repaired[f.Path] = f
+	}
+	merged.Files = make([]ai.GeneratedFile, 0, len(original.Files)+len(repair.Files))
+	for _, f := range original.Files {
+		if r, ok := repaired[f.Path]; ok {
+			f = r
+			delete(repaired, f.Path)
+		}
+		merged.Files = append(merged.Files, f)
+	}
+	for _, f := range repair.Files {
+		if _, isNew := repaired[f.Path]; isNew {
+			merged.Files = append(merged.Files, f)
+		}
+	}
+
+	if merged.PageRegistryEntry == nil {
+		merged.PageRegistryEntry = original.PageRegistryEntry
+	}
+	merged.LayoutLinksToAdd = unionInOrder(original.LayoutLinksToAdd, repair.LayoutLinksToAdd)
+	merged.LayoutScriptsToAdd = unionInOrder(original.LayoutScriptsToAdd, repair.LayoutScriptsToAdd)
+	return &merged
+}
+
+// unionInOrder returns a's items then b's items not already present, preserving first-seen order.
+func unionInOrder(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	var out []string
+	for _, s := range append(append([]string(nil), a...), b...) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func splitFindings(findings []themecheck.Finding) (errorFindings, warningFindings []themecheck.Finding) {

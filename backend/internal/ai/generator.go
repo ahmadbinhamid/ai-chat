@@ -573,7 +573,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 					"smaller step or retried, instead of guessing.",
 			})
 		}
-		if adaptiveThinkingSupported {
+		switch {
+		case forcingPropose:
+			// DeepSeek rejects a named tool_choice while thinking ("Thinking mode does not support this tool_choice"),
+			// and thinks by default, so the forced call must disable it explicitly.
+			params.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &anthropic.ThinkingConfigDisabledParam{}}
+		case adaptiveThinkingSupported:
 			params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}}
 			params.OutputConfig = anthropic.OutputConfigParam{Effort: g.effort}
 		}
