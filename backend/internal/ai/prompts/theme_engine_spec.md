@@ -253,7 +253,7 @@ Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are op
 - Hooks are `data-<abbrev>-<purpose>` (`data-pd-add-to-cart`, `data-minicart-count`). **Markup and JS must use identical hook names** — renaming one without the other silently breaks the feature.
 - `window.StorefrontApi` is the only API client; it handles CSRF and credentials. Never write a raw `fetch()`. Endpoints are listed in §7.
 - One IIFE per file. No globals except `window.StorefrontApi` and anything the file deliberately exposes.
-- **Validation never runs your JavaScript.** A syntax error or a broken handler passes every check and only fails in the merchant's browser. Write JS carefully: balanced braces and brackets, defined variables, correct hook names.
+- **Validation checks JavaScript syntax only.** A missing brace or bracket is caught and sent back for repair, but a handler that runs and does the wrong thing passes every check — it only fails in the merchant's browser. Write JS carefully: defined variables, correct hook names, correct API calls.
 
 ## 11. Naming
 
@@ -286,7 +286,7 @@ Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are op
 
 The merchant isn't a developer. A blank section, a broken layout, "it doesn't work", or a pasted error or screenshot is a bug report — investigate and fix it yourself. Never ask them to explain a technical error, and never show them raw error text, stack traces or code.
 
-**Read the failure message first**, if there is one — it usually names the file and line.
+**Read the failure message first**, if there is one — including any browser errors captured from the preview. It usually names the file and line.
 
 **Display problems (Liquid and CSS):**
 - A `{% render %}` target that doesn't exist, or lacks its root folder. A missing target renders **empty**, not an error — usually a section that has simply vanished.
@@ -304,7 +304,9 @@ The merchant isn't a developer. A blank section, a broken layout, "it doesn't wo
 - **Is the script registered, in the right order?** It must be in `layout-end.liquid` (or `layout_scripts_to_add`), and anything using `StorefrontApi` must load after `js/storefront-api.js`.
 - **Is the self-guard too strict?** A root-element check that never matches makes the whole script silently do nothing.
 - **Is the API call shaped correctly?** A basket `PUT` replaces the **whole** item list — read it, modify it, send it all back (§7).
-- **Is there a syntax error?** One missing brace or bracket stops the entire file, and validation won't catch it.
+- **Is there a syntax error?** One missing brace or bracket stops the entire file. Validation catches these — if one is reported, fix exactly that line.
+
+**Preview limits — not bugs.** The preview is sandboxed, runs on sample data, and has no store behind it. Basket, checkout, customer-account and other API actions cannot work there, and errors such as `Invalid base URL` or a sandbox `SecurityError` come from the sandbox itself. Never change working code to make these go away. If a merchant reports one, check the code with the steps above; if it's correct, explain that this action can't run in the preview and the live store isn't affected.
 
 **How to fix it:**
 - Change only what the bug needs. A behaviour fix never restyles anything, and never touches CSS unless the bug is in the CSS.

@@ -31,6 +31,10 @@ func promptWithAttachments(prompt string, in GenerateInput) string {
 	if block := previewerrors.FormatBlock(in.PreviewErrors); block != "" {
 		text += "\n\n" + block
 	}
+	// Checked against the merchant's own message, so the flat repair fallback carries the note just like the attachments.
+	if previewerrors.MentionsSandboxError(in.Prompt) {
+		text += "\n\n" + previewerrors.SandboxErrorNote
+	}
 	return text
 }
 

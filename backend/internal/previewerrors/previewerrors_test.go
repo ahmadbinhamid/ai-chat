@@ -111,3 +111,57 @@ func TestFormatBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestMentionsSandboxError(t *testing.T) {
+	tests := []struct {
+		text string
+		want bool
+	}{
+		{"Invalid base URL", true}, // the exact turn-2 message from the test run
+		{"still not working, getting this when i click on add to cart Failed to construct 'URL'; Invalid base URL", true},
+		{"TypeError: Failed to construct 'URL': Invalid base URL", true},
+		{"SecurityError: Failed to read the 'localStorage' property from 'Window': The document is sandboxed and lacks the 'allow-same-origin' flag.", true},
+		{"SecurityError: The operation is insecure.", true},
+		{"TypeError: URL constructor: null is not a valid URL.", true},
+		{"the add to cart button does nothing", false},
+		{"TypeError: Failed to construct 'URL': Invalid URL", false}, // a real bad URL in theme code
+		{"Cannot read properties of null (reading 'addEventListener')", false},
+		{"make the header background dark", false},
+		{"the base URL of my store is wrong", false},
+	}
+	for _, tt := range tests {
+		if got := MentionsSandboxError(tt.text); got != tt.want {
+			t.Errorf("MentionsSandboxError(%q) = %v, want %v", tt.text, got, tt.want)
+		}
+	}
+}
+
+func TestFormatBlock_ReadFileFirst(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []Entry
+		want    string // "" = no read-first line
+	}{
+		{"earliest located error wins", []Entry{
+			{Type: "rejection", Message: "no location", Count: 1},
+			{Type: "error", Message: "SyntaxError", Source: "js/minicart.js", Line: 518, Count: 1},
+			{Type: "error", Message: "later", Source: "js/theme.js", Line: 3, Count: 1},
+		}, "Read js/minicart.js first: the browser stopped at line 518 there."},
+		{"no file and line, no hint", []Entry{
+			{Type: "resource", Message: "Failed to load img", Source: "images/a.png", Count: 1},
+			{Type: "console", Message: "boom", Count: 1},
+		}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FormatBlock(tt.entries)
+			has := strings.Contains(got, "first: the browser stopped at line")
+			if tt.want == "" && has {
+				t.Errorf("expected no read-first line, got:\n%s", got)
+			}
+			if tt.want != "" && !strings.Contains(got, tt.want) {
+				t.Errorf("expected %q in:\n%s", tt.want, got)
+			}
+		})
+	}
+}
