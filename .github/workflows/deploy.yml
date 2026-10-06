@@ -1,0 +1,111 @@
+name: Deploy
+
+# Runs on the self-hosted runner on the server, same as flowpos-backend and
+# tenant-dashboard. The server's existing backend/.env and database are used;
+# no application environment variables are injected.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Never run two deploys at once; a newer push waits for the current one
+# instead of killing it halfway through a migration.
+concurrency:
+  group: deploy-ai-chat
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy ai-chat-api
+    runs-on: [self-hosted, ai-chat]
+
+    env:
+      APP_DIR: /var/www/html/developers/et/ai-chat
+      PM2_NAME: ai-chat-api
+      # Runner steps use `bash --noprofile --norc`, so nothing from .bashrc
+      # (nvm, Go) is on PATH. Point at the same HOME as the manual deploy so
+      # pm2 talks to the existing daemon in ~/.pm2 instead of starting a new one.
+      HOME: /home/tech1
+      PM2_HOME: /home/tech1/.pm2
+      PATH: /home/tech1/.nvm/versions/node/v23.9.0/bin:/usr/local/go/bin:/home/tech1/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: /var/www/html/developers/et/ai-chat
+
+    steps:
+      - name: Check tools
+        run: |
+          go version
+          pm2 --version
+          test -f backend/.env || { echo "backend/.env missing on server"; exit 1; }
+
+      - name: Pull latest code
+        run: git pull --ff-only origin main
+
+      - name: Build
+        working-directory: /var/www/html/developers/et/ai-chat/backend
+        run: make build
+
+      - name: Run database migrations
+        working-directory: /var/www/html/developers/et/ai-chat/backend
+        run: make migrate
+
+      # Copy-then-rename: `cp` straight onto the running binary fails with
+      # "Text file busy". The previous binary is kept for rollback.
+      - name: Install new binary
+        working-directory: /var/www/html/developers/et/ai-chat/backend
+        run: |
+          if [ -f "$PM2_NAME" ]; then cp -f "$PM2_NAME" "$PM2_NAME.prev"; fi
+          install -m 755 tmp/main "$PM2_NAME.new"
+          mv -f "$PM2_NAME.new" "$PM2_NAME"
+
+      - name: Restart with pm2
+        working-directory: /var/www/html/developers/et/ai-chat/backend
+        run: |
+          if pm2 describe "$PM2_NAME" >/dev/null 2>&1; then
+            pm2 restart "$PM2_NAME"
+          else
+            pm2 start "./$PM2_NAME" --name "$PM2_NAME"
+          fi
+          pm2 save
+
+      - name: Health check
+        working-directory: /var/www/html/developers/et/ai-chat/backend
+        run: |
+          PORT=$(grep -E '^PORT=' .env | tail -n1 | cut -d= -f2- | tr -d '"'"'"' \r')
+          PORT=${PORT:-8080}
+          for _ in $(seq 1 15); do
+            if curl -fsS "http://127.0.0.1:${PORT}/health"; then
+              echo
+              echo "Healthy on port ${PORT}"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Health check failed on port ${PORT}"
+          pm2 logs "$PM2_NAME" --lines 50 --nostream || true
+          exit 1
+
+      - name: Roll back binary
+        if: failure()
+        working-directory: /var/www/html/developers/et/ai-chat/backend
+        run: |
+          if [ -f "$PM2_NAME.prev" ] && pm2 describe "$PM2_NAME" >/dev/null 2>&1; then
+            mv -f "$PM2_NAME.prev" "$PM2_NAME"
+            pm2 restart "$PM2_NAME"
+            pm2 save
+            echo "Rolled back to previous binary (database migrations are NOT rolled back)"
+          else
+            echo "Nothing to roll back"
+          fi
+
+      - name: pm2 status
+        if: always()
+        run: pm2 status
