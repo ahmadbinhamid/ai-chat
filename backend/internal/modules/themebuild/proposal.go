@@ -375,10 +375,15 @@ func (s *Service) checkAndRepair(
 			continue
 		}
 		placementRejected := hasRule(errorFindings, ruleIDUseAttachments)
+		placedBefore := len(result.UseAttachments)
 		result = mergeRepairIntoProposal(result, retried)
 		// The repair was told to resubmit use_attachments, so its list (even empty) replaces the rejected one.
 		if placementRejected && !retried.NeedsClarification && !retried.AnsweredQuestion {
 			result.UseAttachments = retried.UseAttachments
+			// A removed placement makes the original "added your image" summary false; the repair's explains why.
+			if len(retried.UseAttachments) < placedBefore && retried.Summary != "" {
+				result.Summary = retried.Summary
+			}
 		}
 	}
 }
@@ -393,7 +398,11 @@ func (s *Service) checkProposal(ctx context.Context, in GenerateInput, result *a
 		return append(findings, themecheck.Finding{Rule: ruleIDUseAttachments, Severity: themecheck.SeverityError,
 			Message: "no attached images are available to place this turn — remove use_attachments"})
 	}
-	return append(findings, in.imageCatalog.findings(ctx, result.UseAttachments, snap)...)
+	texts := make([]string, 0, len(result.Files))
+	for _, f := range result.Files {
+		texts = append(texts, f.Content)
+	}
+	return append(findings, in.imageCatalog.findings(ctx, result.UseAttachments, snap, texts)...)
 }
 
 func hasRule(findings []themecheck.Finding, rule string) bool {

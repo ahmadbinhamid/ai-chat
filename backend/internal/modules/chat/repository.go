@@ -270,6 +270,32 @@ func (r *Repository) GetChatImageAttachment(ctx context.Context, chatID, attachm
 	return a, nil
 }
 
+// ListChatImageHeads returns the first n bytes of every image attachment in chatID, keyed by attachment ID — enough to
+// read dimensions without pulling whole images out of MySQL.
+func (r *Repository) ListChatImageHeads(ctx context.Context, chatID string, n int) (map[string][]byte, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT a.id, SUBSTRING(a.content, 1, ?)
+		FROM chat_message_attachments a
+		JOIN chat_messages m ON m.id = a.message_id
+		WHERE m.chat_id = ? AND a.kind = ? AND a.content IS NOT NULL
+	`, n, chatID, string(AttachmentKindImage))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	heads := make(map[string][]byte)
+	for rows.Next() {
+		var id string
+		var head []byte
+		if err := rows.Scan(&id, &head); err != nil {
+			return nil, err
+		}
+		heads[id] = head
+	}
+	return heads, rows.Err()
+}
+
 // GetMessageByID deliberately does NOT select/join attachment data; its only caller needs
 // just ApplyStatus/CreatedAt. Add a listAttachmentMetadata call if a future caller needs attachments.
 func (r *Repository) GetMessageByID(ctx context.Context, id string) (Message, error) {

@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +33,12 @@ var (
 )
 
 var testUserID uint64 = 42
+
+// heroUsing is a proposed component that uses imagePath, so a placement of it isn't sent back as unused.
+func heroUsing(imagePath string) ai.GeneratedFile {
+	return ai.GeneratedFile{Path: "components/hero.liquid", Action: "create",
+		Content: `<img src="{{ '` + imagePath + `' | asset_url }}" alt="">`}
+}
 
 // recordingThemeServer is a fake FlowPOS theme API that logs every write in order, telling an
 // upload (multipart, raw bytes) apart from a text write (JSON).
@@ -201,6 +209,7 @@ func TestDoGenerate_PlacementIsStagedNotUploaded(t *testing.T) {
 
 	f.generate(t, &fakeGenerator{results: []*ai.Result{{
 		Summary:        "Added your photo to the theme.",
+		Files:          []ai.GeneratedFile{heroUsing("images/hero.jpg")},
 		UseAttachments: []ai.AttachmentPlacement{{Attachment: 1, Path: "images/hero.jpg"}},
 	}}}, msg.Content, msg)
 
@@ -220,14 +229,14 @@ func TestDoGenerate_PlacementIsStagedNotUploaded(t *testing.T) {
 	}
 
 	summary, err := f.svc.DraftSummary(context.Background(), f.chat.ID)
-	if err != nil || !summary.HasChanges || len(summary.FilePaths) != 1 || summary.FilePaths[0] != "images/hero.jpg" {
+	if err != nil || !summary.HasChanges || !slices.Contains(summary.FilePaths, "images/hero.jpg") {
 		t.Errorf("DraftSummary = %+v, %v; want images/hero.jpg listed", summary, err)
 	}
 	changes, err := f.repo.FileChangesByChat(context.Background(), f.chat.ID)
 	if err != nil {
 		t.Fatalf("FileChangesByChat failed: %v", err)
 	}
-	if got := changes[row.MessageID]; len(got) != 1 || got[0].FilePath != "images/hero.jpg" {
+	if got := changes[row.MessageID]; !slices.ContainsFunc(got, func(c FileChange) bool { return c.FilePath == "images/hero.jpg" }) {
 		t.Errorf("file history = %+v, want the placed image", got)
 	}
 	draft, err := f.repo.DraftFiles(context.Background(), f.chat.ID)
@@ -241,7 +250,8 @@ func TestDoGenerate_RejectedPlacementIsRepaired(t *testing.T) {
 	msg, _ := f.sendImage(t, "put this photo on the about page", testJPEG, "image/jpeg")
 
 	gen := &fakeGenerator{results: []*ai.Result{
-		{Summary: "Placed it.", UseAttachments: []ai.AttachmentPlacement{{Attachment: 1, Path: "images/about.png"}}},
+		{Summary: "Placed it.", Files: []ai.GeneratedFile{heroUsing("images/about.jpg")},
+			UseAttachments: []ai.AttachmentPlacement{{Attachment: 1, Path: "images/about.png"}}},
 		{Summary: "Fixed.", UseAttachments: []ai.AttachmentPlacement{{Attachment: 1, Path: "images/about.jpg"}}},
 	}}
 	f.generate(t, gen, msg.Content, msg)
@@ -267,7 +277,7 @@ func TestDoGenerate_ReferenceOnlyRequestPlacesNothing(t *testing.T) {
 	}
 	_, prompt, _ := gen.snapshot()
 	for _, want := range []string{
-		"Attached image 1: image 1 attached to the message above",
+		"Attached image 1: attached to this message",
 		`("make it look like this") is a reference, not a placement`,
 	} {
 		if !strings.Contains(prompt, want) {
@@ -290,6 +300,7 @@ func TestDoGenerate_EarlierPhotoResolvesToEarlierAttachment(t *testing.T) {
 
 	f.generate(t, &fakeGenerator{results: []*ai.Result{{
 		Summary:        "Placed your shop front photo.",
+		Files:          []ai.GeneratedFile{heroUsing("images/shop-front.jpg")},
 		UseAttachments: []ai.AttachmentPlacement{{Attachment: 1, Path: "images/shop-front.jpg"}},
 	}}}, later.Content, later)
 
@@ -410,7 +421,7 @@ func TestReadPreviewAssetBytes_ServesStagedImageFromAttachment(t *testing.T) {
 func TestImageCatalog_Findings(t *testing.T) {
 	images := map[string][]byte{"a-jpeg": testJPEG, "a-svg": testSVG, "a-text": []byte("not an image"),
 		"a-big": append(append([]byte(nil), testJPEG...), make([]byte, imageplacement.DefaultMaxBytes)...)}
-	messages := []chat.Message{{ID: "m1", Attachments: []chat.MessageAttachment{
+	messages := []chat.Message{{ID: "m1", Role: chat.RoleUser, Attachments: []chat.MessageAttachment{
 		{ID: "a-jpeg", Kind: chat.AttachmentKindImage}, {ID: "a-svg", Kind: chat.AttachmentKindImage},
 		{ID: "a-text", Kind: chat.AttachmentKindImage}, {ID: "a-big", Kind: chat.AttachmentKindImage},
 	}}}
@@ -444,7 +455,7 @@ func TestImageCatalog_Findings(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			catalog := newImageCatalog(messages, "m1", draft, load)
-			findings := catalog.findings(context.Background(), []ai.AttachmentPlacement{tt.place}, snap)
+			findings := catalog.findings(context.Background(), []ai.AttachmentPlacement{tt.place}, snap, []string{tt.place.Path})
 			if tt.wantErr == "" {
 				if len(findings) != 0 {
 					t.Fatalf("expected accepted, got %+v", findings)
@@ -461,9 +472,10 @@ func TestImageCatalog_Findings(t *testing.T) {
 
 func TestImageCatalog_NumbersAcrossTurnsAndSkipsNonImages(t *testing.T) {
 	messages := []chat.Message{
-		{ID: "m1", Attachments: []chat.MessageAttachment{{ID: "a1", Kind: chat.AttachmentKindImage, Filename: "shop.jpg", MediaType: "image/jpeg"}}},
-		{ID: "m2", Attachments: []chat.MessageAttachment{{ID: "h1", Kind: chat.AttachmentKindHTML}}},
-		{ID: "m3", Attachments: []chat.MessageAttachment{
+		{ID: "m1", Role: chat.RoleUser, Attachments: []chat.MessageAttachment{{ID: "a1", Kind: chat.AttachmentKindImage, Filename: "shop.jpg", MediaType: "image/jpeg"}}},
+		{ID: "r1", Role: chat.RoleAssistant},
+		{ID: "m2", Role: chat.RoleUser, Attachments: []chat.MessageAttachment{{ID: "h1", Kind: chat.AttachmentKindHTML}}},
+		{ID: "m3", Role: chat.RoleUser, Attachments: []chat.MessageAttachment{
 			{ID: "a2", Kind: chat.AttachmentKindImage, Filename: "logo.png", MediaType: "image/png"},
 			{ID: "a3", Kind: chat.AttachmentKindImage, Filename: "team.webp", MediaType: "image/webp"},
 		}},
@@ -477,9 +489,9 @@ func TestImageCatalog_NumbersAcrossTurnsAndSkipsNonImages(t *testing.T) {
 	}
 	block := catalog.promptBlock()
 	for _, want := range []string{
-		"Attached image 1: from an earlier message (shop.jpg, image/jpeg)",
-		"Attached image 2: image 1 attached to the message above (logo.png, image/png)",
-		"Attached image 3: image 2 attached to the message above (team.webp, image/webp)",
+		"Attached image 1: sent 2 messages ago — shop.jpg — not placed yet",
+		"Attached image 2: attached to this message — logo.png — not placed yet",
+		"Attached image 3: attached to this message (the newest image) — team.webp — not placed yet",
 	} {
 		if !strings.Contains(block, want) {
 			t.Errorf("prompt block missing %q:\n%s", want, block)
@@ -487,6 +499,118 @@ func TestImageCatalog_NumbersAcrossTurnsAndSkipsNonImages(t *testing.T) {
 	}
 	if (*imageCatalog)(nil).promptBlock() != "" || newImageCatalog(nil, "", nil, nil).promptBlock() != "" {
 		t.Error("a chat with no images must add nothing to the prompt")
+	}
+}
+
+func TestImageCatalog_LabelsTimingSizeAndPlacement(t *testing.T) {
+	messages := []chat.Message{
+		{ID: "m1", Role: chat.RoleUser, Attachments: []chat.MessageAttachment{{ID: "live", Kind: chat.AttachmentKindImage, Filename: "image-0.jpg"}}},
+		{ID: "r1", Role: chat.RoleAssistant},
+		{ID: "m2", Role: chat.RoleUser, Attachments: []chat.MessageAttachment{{ID: "staged", Kind: chat.AttachmentKindImage, Filename: "image-0.png"}}},
+		{ID: "r2", Role: chat.RoleAssistant},
+		{ID: "m3", Role: chat.RoleUser, Attachments: []chat.MessageAttachment{{ID: "fresh", Kind: chat.AttachmentKindImage, Filename: "image-0.webp"}}},
+		{ID: "r3", Role: chat.RoleAssistant},
+		{ID: "m4", Role: chat.RoleUser},
+	}
+	catalog := newImageCatalog(messages, "m4", nil, nil)
+	catalog.describe(
+		map[string][]byte{"live": jpegOfSize(t, 1600, 1067)},
+		map[string]PlacedImage{
+			"live":   {Path: "images/hero-main.jpg", Live: true},
+			"staged": {Path: "images/about.png"},
+		},
+	)
+
+	block := catalog.promptBlock()
+	for _, want := range []string{
+		`Images attached to this message are what "this image" and "it" mean.`,
+		"a screenshot or graphic is as valid as a photo. Never refuse or second-guess it.",
+		"Attached image 1: sent 3 messages ago — image-0.jpg — 1600×1067 px — already placed at images/hero-main.jpg (live in the theme)",
+		"Attached image 2: sent 2 messages ago — image-0.png — already placed at images/about.png (staged — goes live when the merchant applies)",
+		"Attached image 3: sent 1 message ago (the newest image) — image-0.webp — not placed yet",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("prompt block missing %q:\n%s", want, block)
+		}
+	}
+}
+
+func jpegOfSize(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, image.NewRGBA(image.Rect(0, 0, w, h)), nil); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestImageCatalog_UnusedPlacementGoesToRepair(t *testing.T) {
+	messages := []chat.Message{{ID: "m1", Role: chat.RoleUser, Attachments: []chat.MessageAttachment{{ID: "a1", Kind: chat.AttachmentKindImage}}}}
+	load := func(context.Context, string) ([]byte, error) { return testJPEG, nil }
+	place := []ai.AttachmentPlacement{{Attachment: 1, Path: "images/x.jpg"}}
+	want := "You placed images/x.jpg but no file uses it. Either reference it where the merchant asked, or remove the " +
+		"placement and tell them images are only added to the theme when a page uses them."
+
+	tests := []struct {
+		name      string
+		draft     map[string]string
+		proposal  []string
+		wantError bool
+	}{
+		{"nothing uses it", nil, []string{"<h1>Hi</h1>"}, true},
+		{"only its own staged reference mentions it", map[string]string{"images/x.jpg": imageplacement.Reference("a1")}, nil, true},
+		{"used by a proposed file", nil, []string{`<img src="{{ 'images/x.jpg' | asset_url }}">`}, false},
+		{"used by CSS in the proposal", nil, []string{`.hero { background: url("{{ 'images/x.jpg' | asset_url }}"); }`}, false},
+		{"used by a draft file", map[string]string{"components/hero.liquid": `{{ 'images/x.jpg' | asset_url }}`}, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			catalog := newImageCatalog(messages, "m1", tt.draft, load)
+			snap := themecheck.Snapshot{Paths: map[string]bool{}}
+			if tt.draft["images/x.jpg"] != "" {
+				snap.Paths["images/x.jpg"] = true
+			}
+			findings := catalog.findings(context.Background(), place, snap, tt.proposal)
+			if !tt.wantError {
+				if len(findings) != 0 {
+					t.Fatalf("expected a used placement to pass, got %+v", findings)
+				}
+				return
+			}
+			if len(findings) != 1 || findings[0].Message != want || findings[0].Severity != themecheck.SeverityError {
+				t.Fatalf("findings = %+v, want one blocking finding %q", findings, want)
+			}
+		})
+	}
+}
+
+func TestDoGenerate_UnusedPlacementRepairedWithHonestSummary(t *testing.T) {
+	f := newPlacementFixture(t)
+	msg, _ := f.sendImage(t, "just add this photo to my images folder", testJPEG, "image/jpeg")
+
+	gen := &fakeGenerator{results: []*ai.Result{
+		{Summary: "Saved your photo to the theme's images folder.",
+			UseAttachments: []ai.AttachmentPlacement{{Attachment: 1, Path: "images/photo.jpg"}}},
+		{Summary: "Images are only added to your theme when a page uses them — tell me where this photo should go."},
+	}}
+	f.generate(t, gen, msg.Content, msg)
+
+	if gen.calls != 2 {
+		t.Fatalf("expected the unused placement to trigger one repair round, got %d calls", gen.calls)
+	}
+	if rows := f.pendingAttachmentRows(t); len(rows) != 0 {
+		t.Fatalf("a placement the repair removed must not be staged, got %+v", rows)
+	}
+	messages, err := f.chatSvc.ListMessagesForVerifiedChat(context.Background(), f.chat.ID)
+	if err != nil {
+		t.Fatalf("ListMessagesForVerifiedChat failed: %v", err)
+	}
+	reply := messages[len(messages)-1]
+	if reply.Role != chat.RoleAssistant || !strings.Contains(reply.Content, "only added to your theme when a page uses them") {
+		t.Fatalf("the merchant must hear why nothing was saved, got %q", reply.Content)
+	}
+	if strings.Contains(reply.Content, "Saved your photo") {
+		t.Fatalf("the original fake-success summary must not survive, got %q", reply.Content)
 	}
 }
 
@@ -625,7 +749,8 @@ func TestDoGenerate_OversizedImageGoesToRepair(t *testing.T) {
 	msg, smallID := f.sendImage(t, "use this image in the hero", testJPEG, "image/jpeg")
 
 	gen := &fakeGenerator{results: []*ai.Result{
-		{Summary: "Placed it.", UseAttachments: []ai.AttachmentPlacement{{Attachment: 1, Path: "images/hero.jpg"}}},
+		{Summary: "Placed it.", Files: []ai.GeneratedFile{heroUsing("images/hero.jpg")},
+			UseAttachments: []ai.AttachmentPlacement{{Attachment: 1, Path: "images/hero.jpg"}}},
 		{Summary: "Placed it.", UseAttachments: []ai.AttachmentPlacement{{Attachment: 2, Path: "images/hero.jpg"}}},
 	}}
 	f.generate(t, gen, msg.Content, msg)

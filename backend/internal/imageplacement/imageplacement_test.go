@@ -2,6 +2,9 @@ package imageplacement
 
 import (
 	"bytes"
+	"image"
+	"image/jpeg"
+	"image/png"
 	"strings"
 	"testing"
 )
@@ -131,6 +134,51 @@ func TestIsReferenced(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := IsReferenced("images/hero.jpg", tt.texts); got != tt.want {
 				t.Errorf("IsReferenced() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func encoded(t *testing.T, w, h int, enc func(*bytes.Buffer, image.Image) error) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := enc(&buf, image.NewRGBA(image.Rect(0, 0, w, h))); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestDimensions(t *testing.T) {
+	pngData := encoded(t, 640, 480, func(b *bytes.Buffer, m image.Image) error { return png.Encode(b, m) })
+	jpegData := encoded(t, 1600, 1067, func(b *bytes.Buffer, m image.Image) error { return jpeg.Encode(b, m, nil) })
+	// VP8X: canvas width-1 and height-1 as 24-bit little-endian at offsets 24 and 27.
+	webpX := append([]byte("RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x00\x00\x00\x00"), 0x3f, 0x06, 0x00, 0x1a, 0x04, 0x00)
+	// VP8L: 14-bit width-1 and height-1 packed after the 0x2f signature at offset 20.
+	vp8l := func(width, height int) []byte {
+		w, h := width-1, height-1
+		return append([]byte("RIFF\x00\x00\x00\x00WEBPVP8L\x00\x00\x00\x00\x2f"),
+			byte(w), byte(w>>8)|byte(h<<6), byte(h>>2), byte(h>>10), 0, 0, 0, 0, 0)
+	}
+
+	tests := []struct {
+		name         string
+		data         []byte
+		wantW, wantH int
+		wantOK       bool
+	}{
+		{"png", pngData, 640, 480, true},
+		{"jpeg", jpegData, 1600, 1067, true},
+		{"webp extended", webpX, 1600, 1051, true},
+		{"webp lossless", vp8l(800, 600), 800, 600, true},
+		{"webp lossless, low byte all ones", vp8l(512, 300), 512, 300, true},
+		{"truncated jpeg", jpegData[:20], 0, 0, false},
+		{"not an image", []byte("hello"), 0, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotW, gotH, ok := Dimensions(tt.data)
+			if ok != tt.wantOK || gotW != tt.wantW || gotH != tt.wantH {
+				t.Errorf("Dimensions() = (%d, %d, %v), want (%d, %d, %v)", gotW, gotH, ok, tt.wantW, tt.wantH, tt.wantOK)
 			}
 		})
 	}

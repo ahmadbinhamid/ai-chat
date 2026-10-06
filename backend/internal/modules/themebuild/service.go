@@ -711,6 +711,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return a.Content, err
 	})
 	in.imageCatalog.maxBytes = s.placedImageLimit()
+	s.describeImages(ctx, c.ID, in.imageCatalog)
 
 	// Generate detected URL; deferred fetch now that generation runs safely in background.
 	// Runs before carry-forward fallback; this turn's reference wins over earlier turn's.

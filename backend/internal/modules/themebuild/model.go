@@ -27,6 +27,12 @@ const (
 	GeneratedFileKindDroppedAttachment GeneratedFileKind = "dropped_attachment"
 )
 
+// PlacedImage is where an attachment sits in the theme: Live once applied, staged in the draft until then.
+type PlacedImage struct {
+	Path string
+	Live bool
+}
+
 // FileChange is a generated file's path and persisted action without its content — enough for the model's per-turn history line.
 type FileChange struct {
 	FilePath string

@@ -4,7 +4,9 @@ package imageplacement
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"image/jpeg"
 	"path"
 	"regexp"
 	"strings"
@@ -72,6 +74,54 @@ func IsReferenced(imagePath string, texts []string) bool {
 		}
 	}
 	return false
+}
+
+// HeadBytes is how much of an image Dimensions needs: enough for PNG/WebP headers and a JPEG's frame header after
+// typical metadata. A JPEG whose frame header comes later reports no dimensions rather than loading the whole file.
+const HeadBytes = 64 * 1024
+
+// Dimensions reads an image's pixel size from its first bytes (see HeadBytes), by format rather than by decoding it.
+func Dimensions(head []byte) (width, height int, ok bool) {
+	format, known := Sniff(head)
+	if !known {
+		return 0, 0, false
+	}
+	switch format {
+	case formatPNG:
+		if len(head) < 24 {
+			return 0, 0, false
+		}
+		return int(binary.BigEndian.Uint32(head[16:20])), int(binary.BigEndian.Uint32(head[20:24])), true
+	case formatJPG:
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(head))
+		if err != nil {
+			return 0, 0, false
+		}
+		return cfg.Width, cfg.Height, true
+	default:
+		return webpDimensions(head)
+	}
+}
+
+// webpDimensions handles the three WebP layouts: lossy (VP8), lossless (VP8L) and extended (VP8X).
+func webpDimensions(head []byte) (int, int, bool) {
+	if len(head) < 30 {
+		return 0, 0, false
+	}
+	switch string(head[12:16]) {
+	case "VP8 ":
+		return int(binary.LittleEndian.Uint16(head[26:28]) & 0x3fff), int(binary.LittleEndian.Uint16(head[28:30]) & 0x3fff), true
+	case "VP8L":
+		b := head[21:25]
+		w := 1 + (int(b[0]) | int(b[1]&0x3f)<<8)
+		h := 1 + (int(b[1]>>6) | int(b[2])<<2 | int(b[3]&0x0f)<<10)
+		return w, h, true
+	case "VP8X":
+		le24 := func(b []byte) int { return int(b[0]) | int(b[1])<<8 | int(b[2])<<16 }
+		return 1 + le24(head[24:27]), 1 + le24(head[27:30]), true
+	default:
+		return 0, 0, false
+	}
 }
 
 // Reference is the draft content standing in for an attachment's bytes until Apply uploads them.

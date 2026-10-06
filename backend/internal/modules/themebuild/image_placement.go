@@ -26,7 +26,11 @@ type chatImage struct {
 	ID        string
 	Filename  string
 	MediaType string
-	Current   bool // attached to the message this turn answers
+	// MessagesAgo counts the merchant's messages since this one was sent; 0 is the message this turn answers.
+	MessagesAgo int
+	// Width and Height are 0 when unknown; Placed is nil when the image isn't in the theme or draft.
+	Width, Height int
+	Placed        *PlacedImage
 }
 
 // imageCatalog resolves use_attachments numbers for one generation. Not safe for concurrent use: only
@@ -44,18 +48,48 @@ type imageCatalog struct {
 func newImageCatalog(priorMessages []chat.Message, currentMessageID string, draft map[string]string,
 	load func(ctx context.Context, attachmentID string) ([]byte, error)) *imageCatalog {
 	c := &imageCatalog{draft: draft, load: load, loaded: make(map[string][]byte), maxBytes: imageplacement.DefaultMaxBytes}
+	// Position among the merchant's own messages; without the current message, the latest one counts as 1 ago.
+	userIndex := make(map[string]int)
+	currentIndex := 0
 	for _, m := range priorMessages {
+		if m.Role != chat.RoleUser {
+			continue
+		}
+		userIndex[m.ID] = currentIndex
+		if m.ID == currentMessageID {
+			break
+		}
+		currentIndex++
+	}
+	for _, m := range priorMessages {
+		idx, isUser := userIndex[m.ID]
+		if !isUser {
+			continue
+		}
 		for _, a := range m.Attachments {
 			if a.Kind != chat.AttachmentKindImage {
 				continue
 			}
 			c.images = append(c.images, chatImage{
 				Number: len(c.images) + 1, ID: a.ID, Filename: a.Filename, MediaType: a.MediaType,
-				Current: m.ID == currentMessageID,
+				MessagesAgo: currentIndex - idx,
 			})
 		}
 	}
 	return c
+}
+
+// describe adds each image's dimensions (from its first bytes) and where it's already placed; either map may be nil.
+func (c *imageCatalog) describe(heads map[string][]byte, placed map[string]PlacedImage) {
+	for i := range c.images {
+		img := &c.images[i]
+		if w, h, ok := imageplacement.Dimensions(heads[img.ID]); ok {
+			img.Width, img.Height = w, h
+		}
+		if p, ok := placed[img.ID]; ok {
+			img.Placed = &p
+		}
+	}
 }
 
 func (c *imageCatalog) byNumber(n int) (chatImage, bool) {
@@ -89,24 +123,53 @@ func (c *imageCatalog) promptBlock() string {
 	}
 	var b strings.Builder
 	b.WriteString("--- Images the merchant has attached in this chat ---\n")
-	b.WriteString("Only place one (in use_attachments) when the merchant's own words ask you to use, place, add or put " +
-		"it in the theme. An image sent to show a look or style (\"make it look like this\") is a reference, not a " +
-		"placement. The platform copies the real file; you only name it and its path.\n")
-	current := 0
+	// Said next to the list, not only in the spec: the model follows a note at the decision point over a distant rule.
+	b.WriteString("Images attached to this message are what \"this image\" and \"it\" mean. If the merchant asks to " +
+		"use an image, use it whatever it shows — a screenshot or graphic is as valid as a photo. Never refuse or " +
+		"second-guess it.\n")
+	b.WriteString("Place one (in use_attachments) only when the merchant's own words ask you to use, place, add or put " +
+		"it in the theme — an image sent to show a look or style (\"make it look like this\") is a reference, not a " +
+		"placement. The platform copies the real file; you only name it and its path, and a file must use it.\n")
+	newest := c.images[len(c.images)-1].Number
 	for _, img := range listed {
-		where := "from an earlier message"
-		if img.Current {
-			current++
-			where = fmt.Sprintf("image %d attached to the message above", current)
-		}
-		fmt.Fprintf(&b, "- Attached image %d: %s (%s, %s)\n", img.Number, where, img.Filename, img.MediaType)
+		fmt.Fprintf(&b, "- Attached image %d: %s\n", img.Number, img.label(img.Number == newest))
 	}
 	b.WriteString("--- end of attached images ---")
 	return b.String()
 }
 
-// findings checks every placement, as themecheck findings so the repair round fixes them. snap.Paths includes the draft.
-func (c *imageCatalog) findings(ctx context.Context, placements []ai.AttachmentPlacement, snap themecheck.Snapshot) []themecheck.Finding {
+// label is one image's line in the list: when it was sent, its name and size, and whether it's already placed.
+func (img chatImage) label(newest bool) string {
+	var when string
+	switch img.MessagesAgo {
+	case 0:
+		when = "attached to this message"
+	case 1:
+		when = "sent 1 message ago"
+	default:
+		when = fmt.Sprintf("sent %d messages ago", img.MessagesAgo)
+	}
+	if newest {
+		when += " (the newest image)"
+	}
+	parts := []string{when, img.Filename}
+	if img.Width > 0 && img.Height > 0 {
+		parts = append(parts, fmt.Sprintf("%d×%d px", img.Width, img.Height))
+	}
+	switch {
+	case img.Placed == nil:
+		parts = append(parts, "not placed yet")
+	case img.Placed.Live:
+		parts = append(parts, "already placed at "+img.Placed.Path+" (live in the theme)")
+	default:
+		parts = append(parts, "already placed at "+img.Placed.Path+" (staged — goes live when the merchant applies)")
+	}
+	return strings.Join(parts, " — ")
+}
+
+// findings checks every placement, as themecheck findings so the repair round fixes them. snap.Paths includes the draft;
+// proposalTexts are the proposed files' contents, which with the draft's must use each placed image.
+func (c *imageCatalog) findings(ctx context.Context, placements []ai.AttachmentPlacement, snap themecheck.Snapshot, proposalTexts []string) []themecheck.Finding {
 	var out []themecheck.Finding
 	seen := make(map[string]bool, len(placements))
 	for _, p := range placements {
@@ -117,12 +180,28 @@ func (c *imageCatalog) findings(ctx context.Context, placements []ai.AttachmentP
 		default:
 			msg = c.checkOne(ctx, p, snap)
 		}
+		// Apply drops an image nothing uses, so a placement that stays unused would read as a fake "saved".
+		if msg == "" && !imageplacement.IsReferenced(p.Path, c.referenceTexts(proposalTexts)) {
+			msg = fmt.Sprintf("You placed %s but no file uses it. Either reference it where the merchant asked, or remove "+
+				"the placement and tell them images are only added to the theme when a page uses them.", p.Path)
+		}
 		seen[p.Path] = true
 		if msg != "" {
 			out = append(out, themecheck.Finding{Path: p.Path, Rule: ruleIDUseAttachments, Severity: themecheck.SeverityError, Message: msg})
 		}
 	}
 	return out
+}
+
+// referenceTexts is every file a placed image could be used from: the proposal plus the draft's other files.
+func (c *imageCatalog) referenceTexts(proposalTexts []string) []string {
+	texts := append([]string(nil), proposalTexts...)
+	for _, content := range c.draft {
+		if _, isRef := imageplacement.ParseReference(content); !isRef {
+			texts = append(texts, content)
+		}
+	}
+	return texts
 }
 
 func (c *imageCatalog) checkOne(ctx context.Context, p ai.AttachmentPlacement, snap themecheck.Snapshot) string {
@@ -263,4 +342,21 @@ func (s *Service) ReadPreviewAssetBytes(ctx context.Context, storeAuth themefs.R
 	}
 	data, _, err := s.loadPlacedImage(ctx, c.ID, attachmentID)
 	return data, err
+}
+
+// describeImages labels the catalog's images with dimensions and placement. Fails open: the labels help the model
+// pick the right image but are never worth failing a generation over.
+func (s *Service) describeImages(ctx context.Context, chatID string, c *imageCatalog) {
+	if len(c.images) == 0 {
+		return
+	}
+	heads, err := s.chats.ListChatImageHeads(ctx, chatID, imageplacement.HeadBytes)
+	if err != nil {
+		slog.Warn("load image dimensions failed; listing images without them", "chat_id", chatID, "error", err)
+	}
+	placed, err := s.repo.PlacedAttachments(ctx, chatID)
+	if err != nil {
+		slog.Warn("load placed images failed; listing images without placement status", "chat_id", chatID, "error", err)
+	}
+	c.describe(heads, placed)
 }

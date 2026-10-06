@@ -150,6 +150,34 @@ func (r *Repository) PendingAttachmentAt(ctx context.Context, chatID, path strin
 	return id, ok, nil
 }
 
+// PlacedAttachments maps each attachment ID to where it is placed: staged (pending) or live (applied). Dropped and
+// discarded placements don't count; a later row for the same attachment wins.
+func (r *Repository) PlacedAttachments(ctx context.Context, chatID string) (map[string]PlacedImage, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT f.file_path, f.content, m.apply_status
+		FROM chat_generated_files f
+		JOIN chat_messages m ON m.id = f.message_id
+		WHERE f.chat_id = ? AND f.kind = ? AND m.apply_status IN (?, ?)
+		ORDER BY m.created_at, f.created_at, f.id
+	`, chatID, string(GeneratedFileKindAttachment), string(chat.ApplyStatusPending), string(chat.ApplyStatusApplied))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	placed := make(map[string]PlacedImage)
+	for rows.Next() {
+		var path, content, status string
+		if err := rows.Scan(&path, &content, &status); err != nil {
+			return nil, err
+		}
+		if id, ok := imageplacement.ParseReference(content); ok {
+			placed[id] = PlacedImage{Path: path, Live: chat.ApplyStatus(status) == chat.ApplyStatusApplied}
+		}
+	}
+	return placed, rows.Err()
+}
+
 // FileChangesByChat returns every generated file's path and action for a chat, grouped by message_id, in one query.
 func (r *Repository) FileChangesByChat(ctx context.Context, chatID string) (map[string][]FileChange, error) {
 	rows, err := r.db.QueryContext(ctx, `
