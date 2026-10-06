@@ -12,6 +12,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/auth"
+	"ai-chat/internal/buildinfo"
 	"ai-chat/internal/config"
 	"ai-chat/internal/logging"
 	"ai-chat/internal/modules/chat"
@@ -114,11 +115,12 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	}
 
 	r.GET("/health", func(c *gin.Context) {
+		build := buildinfo.Get()
 		if err := conn.Ping(); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "db": err.Error()})
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "db": err.Error(), "build": build})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "build": build})
 	})
 
 	api := r.Group("/api/v1")
