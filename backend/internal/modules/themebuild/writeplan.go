@@ -217,3 +217,17 @@ func planToStaged(plan writePlan) []writtenFile {
 	}
 	return staged
 }
+
+// dropUnchangedFiles removes files whose proposed content equals what's already there; one carrying page metadata stays,
+// since registering a page changes pages.json even when the .liquid file itself doesn't change.
+func dropUnchangedFiles(plan writePlan) writePlan {
+	kept := plan.files[:0:0]
+	for _, f := range plan.files {
+		if f.pageMeta == nil && f.previous != nil && *f.previous == f.content {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	plan.files = kept
+	return plan
+}
