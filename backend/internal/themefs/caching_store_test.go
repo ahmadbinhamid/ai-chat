@@ -46,6 +46,10 @@ func (c *countingStore) WriteFile(context.Context, RequestAuth, string, string, 
 	return nil
 }
 
+func (c *countingStore) UploadFile(context.Context, RequestAuth, string, []byte, string) error {
+	return nil
+}
+
 func (c *countingStore) DeleteFile(context.Context, RequestAuth, string) error {
 	atomic.AddInt32(&c.deleteCalls, 1)
 	return nil
@@ -277,4 +281,34 @@ func TestCachingStore_CacheFile_StopsCachingPastEntryCap(t *testing.T) {
 // TestCachingStore_SatisfiesThemeStore is a compile-time-ish guard that *CachingStore satisfies ThemeStore.
 func TestCachingStore_SatisfiesThemeStore(t *testing.T) {
 	var _ ThemeStore = NewCachingStore(newCountingStore())
+}
+
+// TestCachingStore_UploadFile_InvalidatesThatPathAndTree: an upload must drop that path's cached content and the cached tree.
+func TestCachingStore_UploadFile_InvalidatesThatPathAndTree(t *testing.T) {
+	base := newCountingStore()
+	base.files["images/hero.jpg"] = "OLD"
+	base.tree = []FileTreeEntry{}
+	c := NewCachingStore(base)
+
+	if _, err := c.ReadFile(context.Background(), RequestAuth{}, "images/hero.jpg"); err != nil {
+		t.Fatalf("initial ReadFile: %v", err)
+	}
+	if _, err := c.ListFiles(context.Background(), RequestAuth{}); err != nil {
+		t.Fatalf("initial ListFiles: %v", err)
+	}
+	if err := c.UploadFile(context.Background(), RequestAuth{}, "images/hero.jpg", []byte{1}, "image/jpeg"); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	if _, err := c.ReadFile(context.Background(), RequestAuth{}, "images/hero.jpg"); err != nil {
+		t.Fatalf("post-upload ReadFile: %v", err)
+	}
+	if _, err := c.ListFiles(context.Background(), RequestAuth{}); err != nil {
+		t.Fatalf("post-upload ListFiles: %v", err)
+	}
+	if got := base.readCount("images/hero.jpg"); got != 2 {
+		t.Fatalf("expected 2 base ReadFile calls (initial + post-invalidate), got %d", got)
+	}
+	if got := atomic.LoadInt32(&base.listCalls); got != 2 {
+		t.Fatalf("expected 2 base ListFiles calls (initial + post-invalidate), got %d", got)
+	}
 }

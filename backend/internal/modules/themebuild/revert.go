@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/themefs"
 )
@@ -88,6 +89,14 @@ func (s *Service) revertAppliedHistory(ctx context.Context, tenantID uint64, tok
 	var result RevertResult
 	for path := range touchedAfter {
 		if before, ok := latestAtOrBefore[path]; ok {
+			// A placed image's content is only a reference; restoring it means uploading the attachment again.
+			if attachmentID, isRef := imageplacement.ParseReference(before.Content); before.Kind == GeneratedFileKindAttachment && isRef {
+				if err := s.uploadPlacedImage(ctx, storeAuth, chatID, attachmentID, path); err != nil {
+					return result, fmt.Errorf("restore %q: %w", path, err)
+				}
+				result.RestoredFiles = append(result.RestoredFiles, path)
+				continue
+			}
 			if err := s.store.WriteFile(ctx, storeAuth, path, before.Content, nil); err != nil {
 				return result, fmt.Errorf("restore %q: %w", path, err)
 			}

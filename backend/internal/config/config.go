@@ -51,6 +51,8 @@ type Config struct {
 	// HistorySummarizationEnabled gates collapsed-history-turn summarization; the cached
 	// summary also matters for DeepSeek's prefix-match request caching.
 	HistorySummarizationEnabled bool
+	// PlacedImageMaxBytes caps an attached image the AI places in the theme; set it to FlowPOS's PHP upload limit.
+	PlacedImageMaxBytes int
 	// FakeAIMode skips the real AI provider entirely. Never leave this on — nothing gets
 	// written to the theme while it's set.
 	FakeAIMode bool
@@ -112,6 +114,8 @@ func Load() Config {
 		BaseURL:     getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
 
 		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
+
+		PlacedImageMaxBytes: getenvInt("PLACED_IMAGE_MAX_BYTES", 2*1024*1024),
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 

@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +24,8 @@ type ThemeStore interface {
 	WriteFile(ctx context.Context, auth RequestAuth, relPath, content string, meta *PageMeta) error
 	DeleteFile(ctx context.Context, auth RequestAuth, relPath string) error
 	ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntry, error)
+	// UploadFile writes a binary asset (an image) as raw bytes; WriteFile stays text-only.
+	UploadFile(ctx context.Context, auth RequestAuth, relPath string, data []byte, mediaType string) error
 }
 
 // Store reads/writes the active theme's files via flowpos-backend's theme-file API — never touches local disk, so the two
@@ -193,6 +198,48 @@ func (s *Store) DeleteFile(ctx context.Context, auth RequestAuth, relPath string
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("delete %s: %s", relPath, statusErr(resp))
+	}
+	return nil
+}
+
+// UploadFile writes a binary asset as a multipart "file" field, which flowpos-backend stores byte-for-byte. Not
+// retried, like WriteFile: an upload that may have landed must not be resent.
+func (s *Store) UploadFile(ctx context.Context, auth RequestAuth, relPath string, data []byte, mediaType string) error {
+	if err := ValidatePathSafety(relPath); err != nil {
+		return err
+	}
+
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename=%q`, path.Base(relPath)))
+	header.Set("Content-Type", mediaType)
+	part, err := form.CreatePart(header)
+	if err != nil {
+		return fmt.Errorf("upload %s: %w", relPath, err)
+	}
+	if _, err := part.Write(data); err != nil {
+		return fmt.Errorf("upload %s: %w", relPath, err)
+	}
+	if err := form.Close(); err != nil {
+		return fmt.Errorf("upload %s: %w", relPath, err)
+	}
+
+	req, err := s.newRequest(ctx, auth, http.MethodPost, relPath, &body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("upload %s: %w", relPath, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("upload %s: %s", relPath, statusErr(resp))
 	}
 	return nil
 }

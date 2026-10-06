@@ -35,6 +35,9 @@ func promptWithAttachments(prompt string, in GenerateInput) string {
 	if previewerrors.MentionsSandboxError(in.Prompt) {
 		text += "\n\n" + previewerrors.SandboxErrorNote
 	}
+	if block := in.imageCatalog.promptBlock(); block != "" {
+		text += "\n\n" + block
+	}
 	return text
 }
 
@@ -110,7 +113,7 @@ func toProposal(r *ai.Result) themecheck.Proposal {
 
 func proposalHasChanges(result *ai.Result) bool {
 	return len(result.Files) > 0 || result.PageRegistryEntry != nil ||
-		len(result.LayoutLinksToAdd) > 0 || len(result.LayoutScriptsToAdd) > 0
+		len(result.LayoutLinksToAdd) > 0 || len(result.LayoutScriptsToAdd) > 0 || len(result.UseAttachments) > 0
 }
 
 // Drops changes if NeedsClarification or AnsweredQuestion (requires empty files).
@@ -122,6 +125,7 @@ func clearIfNoChangesIntended(result *ai.Result) {
 	result.PageRegistryEntry = nil
 	result.LayoutLinksToAdd = nil
 	result.LayoutScriptsToAdd = nil
+	result.UseAttachments = nil
 }
 
 // nothingChangedReply replaces a summary that claimed a change when staging found nothing to change, so the merchant
@@ -258,7 +262,7 @@ func (s *Service) checkAndRepair(
 		}
 
 		emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": attempt})
-		findings := themecheck.Check(toProposal(result), snap)
+		findings := s.checkProposal(ctx, in, result, snap)
 		// Only raw error COUNT needed to gate auto-fixer; real findings computed after filtering below.
 		rawErrorFindings, _ := splitFindings(findings)
 
@@ -289,7 +293,7 @@ func (s *Service) checkAndRepair(
 				fixedAny = true
 			}
 			if fixedAny {
-				findings = themecheck.Check(toProposal(result), snap)
+				findings = s.checkProposal(ctx, in, result, snap)
 			}
 		}
 
@@ -370,8 +374,44 @@ func (s *Service) checkAndRepair(
 					"complete corrected file, just via old_string/new_string instead of retyping it whole.", err)})
 			continue
 		}
+		placementRejected := hasRule(errorFindings, ruleIDUseAttachments)
+		placedBefore := len(result.UseAttachments)
 		result = mergeRepairIntoProposal(result, retried)
+		// The repair was told to resubmit use_attachments, so its list (even empty) replaces the rejected one.
+		if placementRejected && !retried.NeedsClarification && !retried.AnsweredQuestion {
+			result.UseAttachments = retried.UseAttachments
+			// A removed placement makes the original "added your image" summary false; the repair's explains why.
+			if len(retried.UseAttachments) < placedBefore && retried.Summary != "" {
+				result.Summary = retried.Summary
+			}
+		}
 	}
+}
+
+// checkProposal runs themecheck plus the attached-image placement checks, which need the chat's attachments.
+func (s *Service) checkProposal(ctx context.Context, in GenerateInput, result *ai.Result, snap themecheck.Snapshot) []themecheck.Finding {
+	findings := themecheck.Check(toProposal(result), snap)
+	if len(result.UseAttachments) == 0 {
+		return findings
+	}
+	if in.imageCatalog == nil {
+		return append(findings, themecheck.Finding{Rule: ruleIDUseAttachments, Severity: themecheck.SeverityError,
+			Message: "no attached images are available to place this turn — remove use_attachments"})
+	}
+	texts := make([]string, 0, len(result.Files))
+	for _, f := range result.Files {
+		texts = append(texts, f.Content)
+	}
+	return append(findings, in.imageCatalog.findings(ctx, result.UseAttachments, snap, texts)...)
+}
+
+func hasRule(findings []themecheck.Finding, rule string) bool {
+	for _, f := range findings {
+		if f.Rule == rule {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeRepairIntoProposal applies a repair on top of the proposal it repairs: a repair is told to fix ONLY the flagged
@@ -408,6 +448,9 @@ func mergeRepairIntoProposal(original, repair *ai.Result) *ai.Result {
 	}
 	merged.LayoutLinksToAdd = unionInOrder(original.LayoutLinksToAdd, repair.LayoutLinksToAdd)
 	merged.LayoutScriptsToAdd = unionInOrder(original.LayoutScriptsToAdd, repair.LayoutScriptsToAdd)
+	if len(merged.UseAttachments) == 0 {
+		merged.UseAttachments = original.UseAttachments
+	}
 	return &merged
 }
 
@@ -472,6 +515,9 @@ func recapAssistantTurn(result *ai.Result) string {
 			action = f.Action
 		}
 		fmt.Fprintf(&b, "### %s (%s)\n%s\n\n", f.Path, action, f.Content)
+	}
+	for _, p := range result.UseAttachments {
+		fmt.Fprintf(&b, "### use_attachments: Attached image %d -> %s\n\n", p.Attachment, p.Path)
 	}
 	out := strings.TrimSpace(b.String())
 	if out == "" {
@@ -568,6 +614,9 @@ func validateBrandModeProposal(r *ai.Result) error {
 	}
 	if len(r.LayoutLinksToAdd) > 0 || len(r.LayoutScriptsToAdd) > 0 {
 		return fmt.Errorf("brand mode must not register layout links/scripts")
+	}
+	if len(r.UseAttachments) > 0 {
+		return fmt.Errorf("brand mode must not place attached images")
 	}
 	return nil
 }

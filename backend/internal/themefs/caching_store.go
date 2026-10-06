@@ -122,6 +122,15 @@ func (c *CachingStore) DeleteFile(ctx context.Context, auth RequestAuth, relPath
 	return nil
 }
 
+// UploadFile passes through to base, then drops relPath and the now-stale file tree from the cache, same as WriteFile.
+func (c *CachingStore) UploadFile(ctx context.Context, auth RequestAuth, relPath string, data []byte, mediaType string) error {
+	if err := c.base.UploadFile(ctx, auth, relPath, data, mediaType); err != nil {
+		return err
+	}
+	c.invalidate(relPath)
+	return nil
+}
+
 func (c *CachingStore) cacheFile(relPath, content string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

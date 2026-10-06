@@ -41,6 +41,9 @@ func (s *countingStore) WriteFile(context.Context, themefs.RequestAuth, string, 
 }
 
 func (s *countingStore) DeleteFile(context.Context, themefs.RequestAuth, string) error { return nil }
+func (s *countingStore) UploadFile(context.Context, themefs.RequestAuth, string, []byte, string) error {
+	return nil
+}
 
 func (s *countingStore) counts() (reads, lists int) {
 	s.mu.Lock()

@@ -239,6 +239,16 @@ func (s *Service) GetAttachmentsContent(ctx context.Context, messageID string) (
 	return s.repo.GetAttachmentsContent(ctx, messageID)
 }
 
+// GetChatImageAttachment returns one of chatID's image attachments WITH its bytes, or ErrNotFound.
+func (s *Service) GetChatImageAttachment(ctx context.Context, chatID, attachmentID string) (MessageAttachment, error) {
+	return s.repo.GetChatImageAttachment(ctx, chatID, attachmentID)
+}
+
+// ListChatImageHeads returns the first n bytes of each of chatID's image attachments, keyed by attachment ID.
+func (s *Service) ListChatImageHeads(ctx context.Context, chatID string, n int) (map[string][]byte, error) {
+	return s.repo.ListChatImageHeads(ctx, chatID, n)
+}
+
 // AttachHTMLToMessage attaches an HTML reference to messageID after the fact, once a
 // reference-URL fetch completes during generation. Idempotent: safe to retry after a crash.
 func (s *Service) AttachHTMLToMessage(ctx context.Context, messageID string, tenantID uint64, filename, content string) error {

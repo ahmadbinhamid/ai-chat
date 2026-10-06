@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/safego"
@@ -128,6 +129,21 @@ type Service struct {
 	historySummarizationEnabled bool
 	historySummaries            *historySummaryCache
 	historySummaryLocks         *stripedMutex
+	// Zero (struct-literal tests) means imageplacement.DefaultMaxBytes; see placedImageLimit.
+	placedImageMaxBytes int
+}
+
+// SetPlacedImageMaxBytes sets the largest attached image a turn may place; match it to FlowPOS's PHP upload limit.
+// Call once before serving, like SetHistorySummarizationEnabled.
+func (s *Service) SetPlacedImageMaxBytes(n int) {
+	s.placedImageMaxBytes = n
+}
+
+func (s *Service) placedImageLimit() int {
+	if s.placedImageMaxBytes <= 0 {
+		return imageplacement.DefaultMaxBytes
+	}
+	return s.placedImageMaxBytes
 }
 
 // Call once before serving; not safe to call concurrently with generations reading the field.
@@ -243,6 +259,8 @@ type GenerateInput struct {
 	Mode string
 	// Browser errors captured from the preview; this turn only, never carried forward (they're stale once a fix is attempted).
 	PreviewErrors []previewerrors.Entry
+	// Set by doGenerate; nil in tests that call generation helpers directly, which then place no images.
+	imageCatalog *imageCatalog
 }
 
 // Synchronous result of accepting prompt; AssistantMessage/Files always nil.
@@ -684,6 +702,17 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
+	currentMessageID := ""
+	if in.UserMessageID != nil {
+		currentMessageID = *in.UserMessageID
+	}
+	in.imageCatalog = newImageCatalog(priorMessages, currentMessageID, draft, func(ctx context.Context, id string) ([]byte, error) {
+		a, err := s.chats.GetChatImageAttachment(ctx, c.ID, id)
+		return a.Content, err
+	})
+	in.imageCatalog.maxBytes = s.placedImageLimit()
+	s.describeImages(ctx, c.ID, in.imageCatalog)
+
 	// Generate detected URL; deferred fetch now that generation runs safely in background.
 	// Runs before carry-forward fallback; this turn's reference wins over earlier turn's.
 	if in.HTMLAttachmentContent == nil && in.ReferenceURL != "" && s.links != nil {
@@ -774,8 +803,14 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 		tc.GenerationMode = in.Mode
 		tc.DraftPaths = make([]string, 0, len(draft))
-		for path := range draft {
+		for path, content := range draft {
 			tc.DraftPaths = append(tc.DraftPaths, path)
+			if _, isRef := imageplacement.ParseReference(content); isRef {
+				if tc.StagedImagePaths == nil {
+					tc.StagedImagePaths = make(map[string]bool)
+				}
+				tc.StagedImagePaths[path] = true
+			}
 		}
 
 		snapBase, err = s.buildSnapshotBase(ctx, store, storeAuth)
@@ -846,6 +881,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
+		placed, err := in.imageCatalog.planFiles(ctx, store, storeAuth, result.UseAttachments)
+		if err != nil {
+			return fmt.Errorf("stage attached images: %w", err)
+		}
+		plan.files = append(plan.files, placed...)
 		emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": plan.paths()})
 
 		// Draft/apply split: nothing reaches FlowPOS here (only staged, not committed).
@@ -1239,7 +1279,7 @@ func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID
 			Action:          FileAction(w.generated.Action),
 			Kind:            kind,
 			PageMeta:        w.pageMeta,
-			Language:        languageFor(w.generated.Path),
+			Language:        languageForKind(w.generated.Path, kind),
 			Content:         w.generated.Content,
 			PreviousContent: w.previous,
 			CreatedAt:       now,
@@ -1341,6 +1381,14 @@ func languageFor(path string) string {
 	default:
 		return ""
 	}
+}
+
+// languageForKind leaves a placed image's language empty: its content is a reference, not image data to render.
+func languageForKind(path string, kind GeneratedFileKind) string {
+	if kind == GeneratedFileKindAttachment {
+		return ""
+	}
+	return languageFor(path)
 }
 
 func isEditableImagePath(path string) bool {

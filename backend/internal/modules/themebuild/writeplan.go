@@ -25,6 +25,8 @@ type planFile struct {
 	content  string
 	previous *string
 	pageMeta *themefs.PageMeta
+	// attachmentID marks a placed image: content is only its reference, and commit uploads the attachment's bytes.
+	attachmentID string
 }
 
 // Everything one turn needs to commit, computed in-memory before writing.
@@ -172,9 +174,28 @@ func hasDirectEdit(files []planFile, path string) bool {
 
 // commitWritePlan writes everything in plan. Only plan.files gets an audit trail; layout files
 // are shared, structurally-spliced config, not "generated files" of their own.
-func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.RequestAuth, plan writePlan) ([]writtenFile, error) {
+func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, plan writePlan) ([]writtenFile, error) {
 	written := make([]writtenFile, 0, len(plan.files))
+	// Placed images upload first, so no written file ever references an image the live theme doesn't have yet.
+	var uploaded []string
 	for _, f := range plan.files {
+		if f.attachmentID == "" {
+			continue
+		}
+		if err := s.uploadPlacedImage(ctx, storeAuth, chatID, f.attachmentID, f.path); err != nil {
+			return nil, s.rollBackUploads(ctx, storeAuth, chatID, f.path, err, uploaded)
+		}
+		uploaded = append(uploaded, f.path)
+		written = append(written, writtenFile{
+			generated: ai.GeneratedFile{Path: f.path, Action: string(f.action), Content: f.content},
+			previous:  f.previous,
+			kind:      GeneratedFileKindAttachment,
+		})
+	}
+	for _, f := range plan.files {
+		if f.attachmentID != "" {
+			continue
+		}
 		if err := s.store.WriteFile(ctx, storeAuth, f.path, f.content, f.pageMeta); err != nil {
 			return written, fmt.Errorf("write %q: %w", f.path, err)
 		}
@@ -199,10 +220,14 @@ func (s *Service) commitWritePlan(ctx context.Context, storeAuth themefs.Request
 func planToStaged(plan writePlan) []writtenFile {
 	staged := make([]writtenFile, 0, len(plan.files)+2)
 	for _, f := range plan.files {
+		kind := GeneratedFileKindProposed
+		if f.attachmentID != "" {
+			kind = GeneratedFileKindAttachment
+		}
 		staged = append(staged, writtenFile{
 			generated: ai.GeneratedFile{Path: f.path, Action: string(f.action), Content: f.content},
 			previous:  f.previous,
-			kind:      GeneratedFileKindProposed,
+			kind:      kind,
 			pageMeta:  f.pageMeta,
 		})
 	}
