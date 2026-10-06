@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -159,5 +160,24 @@ func TestMaxBodySize_AllowsBodyUnderLimit(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected a body under the limit to be read fine, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHealth_ReportsBuild confirms /health exposes the build identity so a deploy can be verified with one request.
+func TestHealth_ReportsBuild(t *testing.T) {
+	srv := newTestServer(t, testConfig())
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	var body struct {
+		Build struct {
+			Commit string `json:"commit"`
+		} `json:"build"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode /health: %v (%s)", err, rec.Body.String())
+	}
+	if body.Build.Commit == "" {
+		t.Errorf("expected /health to report a build commit, got %s", rec.Body.String())
 	}
 }
