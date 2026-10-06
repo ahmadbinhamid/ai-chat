@@ -91,8 +91,8 @@ func proposeChangesTool() anthropic.ToolUnionParam {
 	return anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
 		Name: toolNameProposeChanges,
 		Description: param.NewOpt(
-			"Finalizes this turn: the complete set of file changes, page registration, and layout link/script " +
-				"registrations for the merchant's request. Call this exactly once, when you're done exploring/editing — " +
+			"Finalizes this turn: the complete set of file changes, page registration, layout link/script " +
+				"registrations and attached-image placements for the merchant's request. Call this exactly once, when you're done exploring/editing — " +
 				"never before you've read every existing file you're about to modify.",
 		),
 		InputSchema: anthropic.ToolInputSchemaParam{

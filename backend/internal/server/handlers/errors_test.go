@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/modules/themebuild"
 
 	"github.com/gin-gonic/gin"
 )
@@ -92,5 +93,18 @@ func TestRespondErr_SentinelErrorsStillMapCorrectly(t *testing.T) {
 	}
 	if body["code"] != "NOT_FOUND" {
 		t.Fatalf("expected code NOT_FOUND, got %+v", body)
+	}
+}
+
+// A failed image upload must tell the merchant the draft is intact — even when the raw cause looks like an upstream outage.
+func TestRespondErr_ImageUploadFailedGetsDraftSafeMessage(t *testing.T) {
+	err := fmt.Errorf("apply draft: %w: upload \"images/hero.jpg\": unexpected status 521: Web server is down", themebuild.ErrImageUploadFailed)
+	w, body := recordRespondErr(t, err)
+
+	if w.Code != http.StatusBadGateway || body["code"] != "IMAGE_UPLOAD_FAILED" {
+		t.Fatalf("expected 502 IMAGE_UPLOAD_FAILED, got %d %+v", w.Code, body)
+	}
+	if msg, _ := body["error"].(string); msg != themebuild.ErrImageUploadFailed.Error() {
+		t.Fatalf("expected the fixed merchant message, got %q", msg)
 	}
 }

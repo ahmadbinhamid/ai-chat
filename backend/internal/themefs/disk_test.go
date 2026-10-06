@@ -1,7 +1,9 @@
 package themefs
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -86,5 +88,59 @@ func TestStore_ListFiles_NotFound(t *testing.T) {
 	store := NewStore(ts.URL)
 	if _, err := store.ListFiles(context.Background(), RequestAuth{Token: "t", TenantID: 1}); err == nil {
 		t.Fatal("expected an error for a non-200 response")
+	}
+}
+
+// An image upload must reach FlowPOS as raw multipart bytes, never through the text write's JSON body.
+func TestStore_UploadFile_SendsRawBytesAsMultipart(t *testing.T) {
+	data := []byte{0xFF, 0xD8, 0xFF, 0x00, 0x01, 0x80, 0xFE}
+	var gotPath, gotAuth, gotTID, gotName, gotType string
+	var gotData []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth, gotTID = r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("TID")
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			t.Errorf("expected a multipart \"file\" field: %v", err)
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		gotData, _ = io.ReadAll(file)
+		gotName, gotType = header.Filename, header.Header.Get("Content-Type")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer ts.Close()
+
+	err := NewStore(ts.URL).UploadFile(context.Background(), RequestAuth{Token: "tok", TenantID: 7}, "images/hero.jpg", data, "image/jpeg")
+	if err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	if gotPath != "/store/themes/active/files/images/hero.jpg" || gotAuth != "Bearer tok" || gotTID != "7" {
+		t.Errorf("request = %s auth=%q tid=%q", gotPath, gotAuth, gotTID)
+	}
+	if !bytes.Equal(gotData, data) || gotName != "hero.jpg" || gotType != "image/jpeg" {
+		t.Errorf("uploaded %v as %q (%q), want the exact bytes as hero.jpg (image/jpeg)", gotData, gotName, gotType)
+	}
+}
+
+func TestStore_UploadFile_Errors(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	defer ts.Close()
+	store := NewStore(ts.URL)
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{"rejected by FlowPOS", "images/hero.jpg"},
+		{"unsafe path never sent", "../secret.jpg"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := store.UploadFile(context.Background(), RequestAuth{}, tt.path, []byte{1}, "image/jpeg"); err == nil {
+				t.Fatal("expected an error")
+			}
+		})
 	}
 }

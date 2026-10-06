@@ -76,6 +76,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	buildRepo := themebuild.NewRepository(conn)
 	buildSvc := themebuild.NewService(buildRepo, chatSvc, generator, store, rdb)
 	buildSvc.SetHistorySummarizationEnabled(cfg.HistorySummarizationEnabled)
+	buildSvc.SetPlacedImageMaxBytes(cfg.PlacedImageMaxBytes)
 
 	limiter := ratelimit.NewPerTenantLimiter(cfg.GenerationRateLimitPerMinute)
 

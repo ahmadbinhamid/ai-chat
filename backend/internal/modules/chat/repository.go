@@ -246,6 +246,30 @@ func (r *Repository) GetAttachmentsContent(ctx context.Context, messageID string
 	return attachments, rows.Err()
 }
 
+// GetChatImageAttachment returns one image attachment WITH its bytes, only if it belongs to a message in chatID.
+func (r *Repository) GetChatImageAttachment(ctx context.Context, chatID, attachmentID string) (MessageAttachment, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT a.id, a.message_id, a.tenant_id, a.filename, a.media_type, a.size_bytes, a.checksum, a.position, a.content, a.storage_key, a.created_at
+		FROM chat_message_attachments a
+		JOIN chat_messages m ON m.id = a.message_id
+		WHERE a.id = ? AND m.chat_id = ? AND a.kind = ?
+	`, attachmentID, chatID, string(AttachmentKindImage))
+	var a MessageAttachment
+	err := row.Scan(&a.ID, &a.MessageID, &a.TenantID, &a.Filename, &a.MediaType, &a.SizeBytes, &a.Checksum,
+		&a.Position, &a.Content, &a.StorageKey, &a.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MessageAttachment{}, ErrNotFound
+	}
+	if err != nil {
+		return MessageAttachment{}, err
+	}
+	if a.Content == nil {
+		return MessageAttachment{}, fmt.Errorf("attachment %s has no stored content", attachmentID)
+	}
+	a.Kind = AttachmentKindImage
+	return a, nil
+}
+
 // GetMessageByID deliberately does NOT select/join attachment data; its only caller needs
 // just ApplyStatus/CreatedAt. Add a listAttachmentMetadata call if a future caller needs attachments.
 func (r *Repository) GetMessageByID(ctx context.Context, id string) (Message, error) {

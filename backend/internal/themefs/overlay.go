@@ -38,6 +38,10 @@ func (o *OverlayStore) DeleteFile(context.Context, RequestAuth, string) error {
 	return ErrOverlayIsReadOnly
 }
 
+func (o *OverlayStore) UploadFile(context.Context, RequestAuth, string, []byte, string) error {
+	return ErrOverlayIsReadOnly
+}
+
 // ListFiles delegates to base, then merges in any draft path the real tree doesn't have yet — needed so
 // list_theme_files/buildSnapshot's render-target-exists check can see a draft-created file. Synthesized directories match the real endpoint's shape exactly.
 func (o *OverlayStore) ListFiles(ctx context.Context, auth RequestAuth) ([]FileTreeEntry, error) {

@@ -43,6 +43,10 @@ func respondErr(c *gin.Context, err error) {
 		httpresponse.Error(c, http.StatusRequestEntityTooLarge, err.Error(), "HTML_ATTACHMENT_TOO_LARGE")
 	case errors.Is(err, themebuild.ErrLinkFetchFailed):
 		httpresponse.Error(c, http.StatusUnprocessableEntity, err.Error(), "LINK_FETCH_FAILED")
+	// Before isUpstreamUnavailable: the merchant must hear the draft is intact, whatever made the upload fail.
+	case errors.Is(err, themebuild.ErrImageUploadFailed):
+		slog.Default().Error("apply stopped by a failed image upload", "error", err.Error(), "request_id", logging.RequestID(c))
+		httpresponse.Error(c, http.StatusBadGateway, themebuild.ErrImageUploadFailed.Error(), "IMAGE_UPLOAD_FAILED")
 	// Checked before the generic default so a merchant sees an actionable "try again" message
 	// instead of a raw upstream status (e.g. Cloudflare 521) that reads like a bug in this app.
 	case isUpstreamUnavailable(err):

@@ -20,6 +20,11 @@ type GeneratedFileKind string
 const (
 	GeneratedFileKindProposed GeneratedFileKind = "proposed"
 	GeneratedFileKindLayout   GeneratedFileKind = "layout"
+	// GeneratedFileKindAttachment is a placed image: Content is an attachment reference, the bytes stay in
+	// chat_message_attachments until Apply uploads them.
+	GeneratedFileKindAttachment GeneratedFileKind = "attachment"
+	// GeneratedFileKindDroppedAttachment is a placed image Apply skipped because no applied file referenced it.
+	GeneratedFileKindDroppedAttachment GeneratedFileKind = "dropped_attachment"
 )
 
 // FileChange is a generated file's path and persisted action without its content — enough for the model's per-turn history line.

@@ -24,6 +24,9 @@ func (m mapThemeStore) ReadFile(_ context.Context, _ themefs.RequestAuth, p stri
 func (m mapThemeStore) WriteFile(context.Context, themefs.RequestAuth, string, string, *themefs.PageMeta) error {
 	return errors.New("read-only")
 }
+func (m mapThemeStore) UploadFile(context.Context, themefs.RequestAuth, string, []byte, string) error {
+	return errors.New("read-only")
+}
 func (m mapThemeStore) DeleteFile(context.Context, themefs.RequestAuth, string) error {
 	return errors.New("read-only")
 }

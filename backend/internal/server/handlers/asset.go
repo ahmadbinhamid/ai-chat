@@ -51,7 +51,7 @@ func (h *AssetHandler) Get(c *gin.Context) {
 	}
 
 	storeAuth := themefs.RequestAuth{Token: auth.Token(c), TenantID: auth.TenantID(c)}
-	data, err := h.builder.ReadThemeAssetBytes(c.Request.Context(), storeAuth, relPath)
+	data, err := h.builder.ReadPreviewAssetBytes(c.Request.Context(), storeAuth, relPath)
 	if err != nil {
 		respondErr(c, err)
 		return

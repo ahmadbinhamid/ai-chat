@@ -33,6 +33,10 @@ func (f *fakeBaseStore) ReadFile(_ context.Context, _ RequestAuth, relPath strin
 func (f *fakeBaseStore) WriteFile(context.Context, RequestAuth, string, string, *PageMeta) error {
 	return errors.New("unexpected write to base store")
 }
+func (f *fakeBaseStore) UploadFile(context.Context, RequestAuth, string, []byte, string) error {
+	return nil
+}
+
 func (f *fakeBaseStore) DeleteFile(context.Context, RequestAuth, string) error {
 	return errors.New("unexpected delete on base store")
 }
@@ -103,4 +107,38 @@ func TestOverlayStore_ListFiles_MergesDraftOnlyPaths(t *testing.T) {
 			t.Errorf("expected merged tree to contain %q, got %+v", want, found)
 		}
 	}
+}
+
+func TestOverlayStore_UploadFileReturnsError(t *testing.T) {
+	o := NewOverlayStore(nil, map[string]string{})
+	if err := o.UploadFile(context.Background(), RequestAuth{}, "images/hero.jpg", []byte{1}, "image/jpeg"); !errors.Is(err, ErrOverlayIsReadOnly) {
+		t.Fatalf("expected ErrOverlayIsReadOnly, got %v", err)
+	}
+}
+
+// A placed image is staged as a reference row; the preview and the checker must still see the path as present.
+func TestOverlayStore_StagedImageReadsBackAsPresent(t *testing.T) {
+	base := &fakeBaseStore{files: map[string]string{}}
+	o := NewOverlayStore(base, map[string]string{"images/hero.jpg": "attachment:att-1"})
+
+	got, err := o.ReadFile(context.Background(), RequestAuth{}, "images/hero.jpg")
+	if err != nil || got == "" {
+		t.Fatalf("ReadFile = %q, %v; want the staged reference", got, err)
+	}
+	tree, err := o.ListFiles(context.Background(), RequestAuth{})
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if !treeHasPath(tree, "images/hero.jpg") {
+		t.Fatalf("ListFiles must include the staged image, got %+v", tree)
+	}
+}
+
+func treeHasPath(entries []FileTreeEntry, p string) bool {
+	for _, e := range entries {
+		if (e.Type == "file" && e.Path == p) || treeHasPath(e.Children, p) {
+			return true
+		}
+	}
+	return false
 }

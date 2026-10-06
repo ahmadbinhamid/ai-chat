@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/themefs"
 
 	"github.com/google/uuid"
@@ -88,15 +90,25 @@ func (s *Service) ApplyDraft(ctx context.Context, tenantID uint64, token, chatID
 	}
 	defer unlock()
 
-	plan := pendingFilesToPlan(files)
+	plan, droppedPaths := dropUnreferencedImages(pendingFilesToPlan(files))
+	var droppedIDs []string
+	for _, f := range files {
+		if f.Kind == GeneratedFileKindAttachment && droppedPaths[f.FilePath] {
+			droppedIDs = append(droppedIDs, f.ID)
+		}
+	}
+	for path := range droppedPaths {
+		slog.Info("apply: skipping placed image", "chat_id", chatID, "path", path,
+			"reason", "no file being applied references it")
+	}
 
 	storeAuth := themefs.RequestAuth{Token: token, TenantID: tenantID}
-	written, err := s.commitWritePlan(ctx, storeAuth, plan)
+	written, err := s.commitWritePlan(ctx, storeAuth, chatID, plan)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("apply draft: %w", err)
 	}
 
-	if err := s.repo.MarkMessagesApplied(ctx, chatID, time.Now().UTC()); err != nil {
+	if err := s.repo.MarkMessagesAppliedDroppingFiles(ctx, chatID, time.Now().UTC(), droppedIDs); err != nil {
 		return ApplyResult{}, fmt.Errorf("mark draft applied: %w", err)
 	}
 
@@ -126,6 +138,8 @@ func pendingFilesToPlan(files []GeneratedFile) writePlan {
 
 	for _, f := range files {
 		switch f.Kind {
+		case GeneratedFileKindDroppedAttachment:
+			continue
 		case GeneratedFileKindLayout:
 			pf := &planFile{path: f.FilePath, action: f.Action, content: f.Content}
 			switch f.FilePath {
@@ -136,6 +150,9 @@ func pendingFilesToPlan(files []GeneratedFile) writePlan {
 			}
 		default:
 			pf := planFile{path: f.FilePath, action: f.Action, content: f.Content, previous: f.PreviousContent, pageMeta: f.PageMeta}
+			if f.Kind == GeneratedFileKindAttachment {
+				pf.attachmentID, _ = imageplacement.ParseReference(f.Content)
+			}
 			if idx, ok := proposedByPath[f.FilePath]; ok {
 				if pf.pageMeta == nil {
 					pf.pageMeta = plan.files[idx].pageMeta
@@ -151,6 +168,32 @@ func pendingFilesToPlan(files []GeneratedFile) writePlan {
 		}
 	}
 	return plan
+}
+
+// dropUnreferencedImages removes placed images no other file in plan mentions, so a replaced photo never goes live unused.
+func dropUnreferencedImages(plan writePlan) (writePlan, map[string]bool) {
+	var texts []string
+	for _, f := range plan.files {
+		if f.attachmentID == "" {
+			texts = append(texts, f.content)
+		}
+	}
+	for _, f := range []*planFile{plan.layoutStart, plan.layoutEnd} {
+		if f != nil {
+			texts = append(texts, f.content)
+		}
+	}
+	dropped := make(map[string]bool)
+	kept := plan.files[:0:0]
+	for _, f := range plan.files {
+		if f.attachmentID != "" && !imageplacement.IsReferenced(f.path, texts) {
+			dropped[f.path] = true
+			continue
+		}
+		kept = append(kept, f)
+	}
+	plan.files = kept
+	return plan, dropped
 }
 
 func (s *Service) DiscardDraft(ctx context.Context, tenantID uint64, chatID string) (DiscardResult, error) {

@@ -46,6 +46,12 @@ type GeneratedFile struct {
 	OriginalAction string `json:"-"`
 }
 
+// AttachmentPlacement puts "Attached image N" (1-based, numbered across the whole chat) at Path under images/.
+type AttachmentPlacement struct {
+	Attachment int    `json:"attachment"`
+	Path       string `json:"path"`
+}
+
 // Edit is a find/replace pair; old_string must match current content exactly once, new_string may be empty.
 type Edit struct {
 	OldString string `json:"old_string"`
@@ -62,8 +68,10 @@ type Result struct {
 	PageRegistryEntry  *themefs.PageEntry `json:"page_registry_entry"`
 	LayoutLinksToAdd   []string           `json:"layout_links_to_add"`
 	LayoutScriptsToAdd []string           `json:"layout_scripts_to_add"`
-	InputTokens        int64              `json:"-"`
-	OutputTokens       int64              `json:"-"`
+	// UseAttachments places merchant-attached images; the platform copies the real bytes, the model never writes them.
+	UseAttachments []AttachmentPlacement `json:"use_attachments"`
+	InputTokens    int64                 `json:"-"`
+	OutputTokens   int64                 `json:"-"`
 	// ExplorationToolCalls: distinguishes hallucinated empty from explored-and-empty via isUnexploredEmptyProposal.
 	ExplorationToolCalls int `json:"-"`
 	conversation         *Conversation
@@ -94,6 +102,8 @@ type ThemeContext struct {
 	Manifest       *themefs.Manifest       // component param signatures; nil if unavailable
 	GenerationMode string                  // restricts what this turn may touch; empty = GenerationModeEdit
 	DraftPaths     []string                // files with unsaved changes from earlier turns; paths only, contents come via read_theme_file
+	// StagedImagePaths are DraftPaths that are placed images: not in the live theme until the merchant applies.
+	StagedImagePaths map[string]bool
 	// Continue resumes a prior call's conversation (history and images are then ignored); nil = fresh call.
 	Continue *Conversation
 }
@@ -326,6 +336,32 @@ var resultSchema = map[string]any{
 		},
 		"layout_links_to_add":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 		"layout_scripts_to_add": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		// Optional, unlike the rest: most turns place nothing, and a text-recovered call that omits it must still match.
+		// The platform copies the attachment's bytes on Apply; the model only names the image and where it goes.
+		"use_attachments": map[string]any{
+			"type": "array",
+			"description": "Merchant-attached images to place into the theme — only when the merchant asks to use, " +
+				"place, add or put an attached image, never for one sent as a look/style reference. The platform " +
+				"copies the real image file; you never write image bytes. Reference the placed image from your " +
+				"files with {{ 'images/<name>' | asset_url }}. Omit or [] when placing nothing.",
+			"items": map[string]any{
+				"type":                 "object",
+				"additionalProperties": false,
+				"required":             []string{"attachment", "path"},
+				"properties": map[string]any{
+					"attachment": map[string]any{
+						"type":        "integer",
+						"description": "The N from \"Attached image N\" in the attached images list.",
+					},
+					"path": map[string]any{
+						"type": "string",
+						"description": "New file under images/, e.g. 'images/hero-coffee.jpg'. Its extension must " +
+							"match the image's real type (.png, .jpg or .webp — never .jpeg or .svg), and it must " +
+							"not already exist in the theme.",
+					},
+				},
+			},
+		},
 	},
 }
 
@@ -976,8 +1012,13 @@ Rules for every request:
 10. Use list_theme_files/read_theme_file/grep_theme as needed to explore the theme before you
     finalize anything. Call propose_changes exactly once, when you're done, with the complete,
     final set of changes for this request — not a partial draft.
-11. You can only create or write %s — never an image (.svg, .png, .jpg, ...) or any other
-    file type, even though a theme may contain them. Reference an existing image, or put SVG inline in a .liquid file.`, themeEngineSpec, themefs.GeneratedFileTypes()),
+11. In files you can only create or write %s — never an image (.svg, .png, .jpg, ...) or any other
+    file type, even though a theme may contain them. You can never create an image file — except an
+    attached image the merchant asks you to use. Declare it in use_attachments with a path under
+    images/, then reference it with {{ 'images/<name>' | asset_url }}. Only do that when the merchant's
+    own words ask you to use, place, add or put the image; an image sent as a look/style reference
+    ("make it look like this") is not a placement. Otherwise reference an existing image, or put SVG
+    inline in a .liquid file.`, themeEngineSpec, themefs.GeneratedFileTypes()),
 		CacheControl: cacheControl,
 	}
 }
@@ -1007,11 +1048,11 @@ func dynamicSystemPrompt(tc ThemeContext) string {
 - Current file tree (call list_theme_files again if this feels stale):
 %s
 %s%s`, tc.ThemeSlug, mode, modeRestrictionNote(mode), pagesJSON, defaultsJSON, formatFileTree(tc.FileTree), formatManifest(tc.Manifest),
-		formatDraftPaths(tc.DraftPaths))
+		formatDraftPaths(tc.DraftPaths, tc.StagedImagePaths))
 }
 
 // formatDraftPaths lists unsaved-draft paths, sorted so identical drafts give identical prompts; "" when there are none.
-func formatDraftPaths(paths []string) string {
+func formatDraftPaths(paths []string, stagedImages map[string]bool) string {
 	if len(paths) == 0 {
 		return ""
 	}
@@ -1020,6 +1061,10 @@ func formatDraftPaths(paths []string) string {
 	var b strings.Builder
 	b.WriteString("- Files with unsaved changes from earlier turns (the merchant hasn't applied them yet — keep that work; change only what this request needs):\n")
 	for _, p := range sorted {
+		if stagedImages[p] {
+			fmt.Fprintf(&b, "  - %s (staged image — goes live when the merchant applies)\n", p)
+			continue
+		}
 		fmt.Fprintf(&b, "  - %s\n", p)
 	}
 	return b.String()

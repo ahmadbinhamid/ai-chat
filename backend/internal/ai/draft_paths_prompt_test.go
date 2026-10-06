@@ -73,3 +73,16 @@ func TestStaticSystemPrompt_UnaffectedByDraft(t *testing.T) {
 		t.Error("draft section leaked into the static block")
 	}
 }
+
+func TestDynamicSystemPrompt_MarksStagedImages(t *testing.T) {
+	tc := ThemeContext{
+		ThemeSlug:        "shop",
+		DraftPaths:       []string{"images/home-hero.jpg", "components/store-hero-banner.liquid"},
+		StagedImagePaths: map[string]bool{"images/home-hero.jpg": true},
+	}
+	want := "  - components/store-hero-banner.liquid\n" +
+		"  - images/home-hero.jpg (staged image — goes live when the merchant applies)\n"
+	if got := dynamicSystemPrompt(tc); !strings.HasSuffix(got, want) {
+		t.Errorf("expected the staged image marked and the page unmarked, got:\n%s", got)
+	}
+}

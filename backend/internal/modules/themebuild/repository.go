@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
+	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/themefs"
 )
@@ -124,6 +126,30 @@ func (r *Repository) DraftFiles(ctx context.Context, chatID string) (map[string]
 	return draft, rows.Err()
 }
 
+// PendingAttachmentAt returns the attachment staged at path, if the chat's latest pending row for path is a placed image.
+func (r *Repository) PendingAttachmentAt(ctx context.Context, chatID, path string) (string, bool, error) {
+	var kind, content string
+	err := r.db.QueryRowContext(ctx, `
+		SELECT f.kind, f.content
+		FROM chat_generated_files f
+		JOIN chat_messages m ON m.id = f.message_id
+		WHERE f.chat_id = ? AND f.file_path = ? AND m.apply_status = ?
+		ORDER BY m.created_at DESC, f.created_at DESC, f.id DESC
+		LIMIT 1
+	`, chatID, path, string(chat.ApplyStatusPending)).Scan(&kind, &content)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if GeneratedFileKind(kind) != GeneratedFileKindAttachment {
+		return "", false, nil
+	}
+	id, ok := imageplacement.ParseReference(content)
+	return id, ok, nil
+}
+
 // FileChangesByChat returns every generated file's path and action for a chat, grouped by message_id, in one query.
 func (r *Repository) FileChangesByChat(ctx context.Context, chatID string) (map[string][]FileChange, error) {
 	rows, err := r.db.QueryContext(ctx, `
@@ -198,6 +224,36 @@ func (r *Repository) MarkMessagesApplied(ctx context.Context, chatID string, at 
 	return err
 }
 
+// MarkMessagesAppliedDroppingFiles is MarkMessagesApplied plus re-kinding droppedFileIDs, in one transaction so a dropped
+// image can never be left pending.
+func (r *Repository) MarkMessagesAppliedDroppingFiles(ctx context.Context, chatID string, at time.Time, droppedFileIDs []string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if len(droppedFileIDs) > 0 {
+		args := []any{string(GeneratedFileKindDroppedAttachment), at, chatID}
+		for _, id := range droppedFileIDs {
+			args = append(args, id)
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(droppedFileIDs)), ",")
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE chat_generated_files SET kind = ?, updated_at = ? WHERE chat_id = ? AND id IN (`+placeholders+`)
+		`, args...); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE chat_messages SET apply_status = ?, applied_at = ?
+		WHERE chat_id = ? AND apply_status = ?
+	`, string(chat.ApplyStatusApplied), at, chatID, string(chat.ApplyStatusPending)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ListAppliedFilesByChat returns applied-message rows only, oldest first, for computing what the
 // live theme looks like; pending/discarded rows were never written, so they don't count.
 func (r *Repository) ListAppliedFilesByChat(ctx context.Context, chatID string) ([]GeneratedFile, error) {
@@ -205,9 +261,9 @@ func (r *Repository) ListAppliedFilesByChat(ctx context.Context, chatID string) 
 		SELECT `+generatedFileColumnsPrefixed("f")+`
 		FROM chat_generated_files f
 		JOIN chat_messages m ON m.id = f.message_id
-		WHERE f.chat_id = ? AND m.apply_status = ?
+		WHERE f.chat_id = ? AND m.apply_status = ? AND f.kind != ?
 		ORDER BY f.created_at ASC
-	`, chatID, string(chat.ApplyStatusApplied))
+	`, chatID, string(chat.ApplyStatusApplied), string(GeneratedFileKindDroppedAttachment))
 	if err != nil {
 		return nil, err
 	}
