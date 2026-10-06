@@ -93,3 +93,33 @@ func TestCheckAssetRegistered_JSDependsOnAPIButAPIMissing(t *testing.T) {
 		t.Fatalf("expected 1 error finding when storefront-api.js is missing entirely, got %+v", got)
 	}
 }
+
+// A cache-busting ?v= query after the asset_url output must still count as registered, for links and scripts alike.
+func TestCheckAssetRegistered_CacheBusterQuery(t *testing.T) {
+	layoutStart := `<html><head><link rel="stylesheet" href="{{ 'pages/css/offers.css' | asset_url }}?v=ssr-cats-3"></head><body>`
+	layoutEnd := `<main></main>` +
+		`<script src="{{ 'js/storefront-api.js' | asset_url }}?v=ssr-cats-3" defer></script>` +
+		`<script src="{{ 'js/minicart.js' | asset_url }}?v=2&amp;x=1" defer></script></body></html>`
+	snap := Snapshot{Files: map[string]string{"liquid/layout-start.liquid": layoutStart, "liquid/layout-end.liquid": layoutEnd}}
+
+	tests := []struct {
+		name string
+		file ProposedFile
+	}{
+		{"stylesheet with ?v=", ProposedFile{Path: "pages/css/offers.css", Content: ".x{}"}},
+		{"script after a cache-busted storefront-api.js", ProposedFile{Path: "js/minicart.js", Content: "(function(){ window.StorefrontApi.getBasket(); })();"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := checkAssetRegistered(Proposal{Files: []ProposedFile{tt.file}}, snap); len(got) != 0 {
+				t.Errorf("expected no findings, got %+v", got)
+			}
+		})
+	}
+	if got := registeredAssetPaths(layoutEnd, scriptSrcRe); len(got) != 2 || got[0] != "js/storefront-api.js" || got[1] != "js/minicart.js" {
+		t.Errorf("expected both scripts with their paths unchanged, got %v", got)
+	}
+	if links, scripts, any := AutoFixMissingAssetRegistration(Proposal{Files: []ProposedFile{{Path: "js/minicart.js", Content: "x"}}}, snap); any {
+		t.Errorf("auto-fixer must not re-register an already cache-busted script, got links %v scripts %v", links, scripts)
+	}
+}

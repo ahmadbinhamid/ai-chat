@@ -100,8 +100,8 @@ func TestCheckAndRepair_RetriesOnceThenSucceeds(t *testing.T) {
 	if len(warnings) != 0 {
 		t.Errorf("expected no warnings, got %+v", warnings)
 	}
-	if got.Summary != "good" {
-		t.Fatalf("expected the retried (good) result to be returned, got %+v", got)
+	if len(got.Files) != 1 || got.Files[0].Content != goodPageContent || got.Summary != "bad" {
+		t.Fatalf("expected the repaired (good) file content under the original summary, got %+v", got)
 	}
 	// Token usage from first attempt must be folded into totals.
 	if got.InputTokens != 120 || got.OutputTokens != 60 {
@@ -147,8 +147,8 @@ func TestCheckAndRepair_RetriesPastAnInvalidRepairReply(t *testing.T) {
 	if fg.calls != 2 {
 		t.Errorf("expected exactly 2 retry Generate calls (1 invalid + 1 good), got %d", fg.calls)
 	}
-	if got.Summary != "good" {
-		t.Fatalf("expected the eventually-good result to be returned, got %+v", got)
+	if len(got.Files) != 1 || got.Files[0].Content != goodPageContent || got.Summary != "bad" {
+		t.Fatalf("expected the eventually-good file content under the original summary, got %+v", got)
 	}
 }
 
@@ -264,8 +264,8 @@ func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
 	if fg.calls != 1 {
 		t.Fatalf("expected a violation in a brand-new file to trigger exactly 1 repair round-trip, got %d", fg.calls)
 	}
-	if got.Summary != "fixed" {
-		t.Fatalf("expected the repaired result to be returned, got %+v", got)
+	if len(got.Files) != 1 || got.Files[0].Content != fixedNewFooter || got.Summary != "new footer component" {
+		t.Fatalf("expected the repaired file content under the original summary, got %+v", got)
 	}
 }
 
