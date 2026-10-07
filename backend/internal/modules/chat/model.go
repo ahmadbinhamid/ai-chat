@@ -64,6 +64,9 @@ type Message struct {
 	ApplyStatus  ApplyStatus   `json:"apply_status"`
 	AppliedAt    *time.Time    `json:"applied_at"`
 	CreatedAt    time.Time     `json:"created_at"`
+	// ModelID/Effort: the catalogue model and effort that answered (assistant turns only); never in Content.
+	ModelID *string `json:"model_id"`
+	Effort  *string `json:"effort"`
 	// Attachments is only non-empty on a user-role turn with files attached. Normal reads
 	// populate METADATA ONLY (no bytes) — only doGenerate fetches actual content.
 	Attachments []MessageAttachment `json:"attachments,omitempty"`

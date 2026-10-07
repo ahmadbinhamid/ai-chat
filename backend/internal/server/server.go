@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"log/slog"
 	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -53,8 +54,11 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 			"the AI provider is never called, and nothing is ever written to a theme. Do not leave this on.")
 		generator = ai.NewFake(cfg.FakeAIDelay)
 	} else {
-		var err error
-		generator, err = ai.New(cfg.APIKey, cfg.BaseURL, cfg.Model, cfg.Effort, cfg.VisionModel, cfg.MaxTokens, streamTimeouts)
+		catalog, err := cfg.ModelCatalog()
+		if err != nil {
+			return nil, err
+		}
+		generator, err = ai.New(catalog, os.LookupEnv, cfg.MaxTokens, streamTimeouts)
 		if err != nil {
 			return nil, err
 		}
@@ -77,6 +81,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	buildSvc := themebuild.NewService(buildRepo, chatSvc, generator, store, rdb)
 	buildSvc.SetHistorySummarizationEnabled(cfg.HistorySummarizationEnabled)
 	buildSvc.SetPlacedImageMaxBytes(cfg.PlacedImageMaxBytes)
+	buildSvc.SetModelCatalog(generator.Catalog())
 
 	limiter := ratelimit.NewPerTenantLimiter(cfg.GenerationRateLimitPerMinute)
 
@@ -94,6 +99,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	draftHandler := handlers.NewDraftHandler(buildSvc)
 	assetHandler := handlers.NewAssetHandler(buildSvc)
 	attachmentHandler := handlers.NewAttachmentHandler(buildSvc)
+	modelsHandler := handlers.NewModelsHandler(buildSvc)
 
 	r := gin.New()
 	r.Use(gin.Recovery(), logging.Middleware(logger), maxBodySize(cfg.MaxRequestBodyBytes))
@@ -143,6 +149,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	identified.GET("/chats/:chatId/draft", draftHandler.Files)
 	identified.POST("/chats/:chatId/draft/edit", draftHandler.SaveManualEdit)
 	identified.GET("/preview/context", previewHandler.Context)
+	identified.GET("/models", modelsHandler.List)
 	identified.GET("/theme-assets/*path", assetHandler.Get)
 	identified.POST("/themes/:slug/preview", previewHandler.Preview)
 

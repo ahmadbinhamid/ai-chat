@@ -28,6 +28,10 @@ type Generation struct {
 	// ReferenceURL is a URL found in Prompt at enqueue time; the actual fetch happens in
 	// doGenerate once dequeued, not synchronously in the enqueuing HTTP request.
 	ReferenceURL string
+	// ModelID/Effort: the catalogue model and effort resolved at enqueue, so the background run uses exactly the
+	// merchant's choice. Empty on rows queued before the catalogue existed, which then use its default.
+	ModelID string
+	Effort  string
 	// QueuedAt is nil only for a row seeded directly as "running" (existing tests).
 	QueuedAt *time.Time
 	// StartedAt is nil until DequeueNext promotes this row to running.
@@ -50,11 +54,11 @@ type rowScanner interface {
 // Reads from *sql.Row or *sql.Rows; centralizes nullable-column handling.
 func scanGeneration(s rowScanner) (Generation, error) {
 	var g Generation
-	var errMsg, userMessageID, referenceURL sql.NullString
+	var errMsg, userMessageID, referenceURL, modelID, effort sql.NullString
 	var queuedAt, startedAt, finishedAt sql.NullTime
 
 	err := s.Scan(&g.ID, &g.ChatID, &g.TenantID, &g.Status, &errMsg, &g.Attempts,
-		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &queuedAt, &startedAt, &finishedAt)
+		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &queuedAt, &startedAt, &finishedAt)
 	if err != nil {
 		return Generation{}, err
 	}
@@ -67,6 +71,7 @@ func scanGeneration(s rowScanner) (Generation, error) {
 	if userMessageID.Valid {
 		g.UserMessageID = &userMessageID.String
 	}
+	g.ModelID, g.Effort = modelID.String, effort.String
 	if queuedAt.Valid {
 		g.QueuedAt = &queuedAt.Time
 	}

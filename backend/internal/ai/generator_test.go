@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"ai-chat/internal/aicatalog"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -215,7 +216,11 @@ func TestNew_BaseURLReachesFakeServer(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g, err := New("test-key", ts.URL, "test-model", "", "", 0, StreamTimeouts{})
+	cat, err := aicatalog.FromEnv("test-key", ts.URL, "test-model", "low", "")
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	g, err := New(cat, func(string) (string, bool) { return "test-key", true }, 0, StreamTimeouts{})
 	if err != nil {
 		t.Fatalf("New returned an error: %v", err)
 	}

@@ -39,6 +39,8 @@ RUN apk add --no-cache ca-certificates curl \
 
 WORKDIR /app
 COPY --from=build /out/server ./server
+# The model catalogue; used only when AI_MODELS_CONFIG points at it.
+COPY --from=build /src/config ./config
 
 # Non-root: this process only ever needs to listen on one port and make
 # outbound HTTP calls — no reason for it to run as root inside the

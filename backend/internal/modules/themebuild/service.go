@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/aicatalog"
 	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/pageintent"
@@ -117,6 +118,8 @@ type Service struct {
 	repo  *Repository
 	chats *chat.Service
 	gen   generator
+	// nil in struct-literal tests, which then skip model selection and run on the generator's default.
+	models *aicatalog.Catalog
 	// nil in struct-literal tests; Generate treats as no reference link.
 	links linkFetcher
 	// nil in same tests; fetchReferenceURL falls back to uncached call.
@@ -216,6 +219,9 @@ func (p *pendingTokens) discard(generationID string) {
 }
 
 var ErrVisionNotConfigured = errors.New("image attachments aren't enabled on this deployment")
+
+// ErrInvalidModelChoice wraps an aicatalog selection error: an unknown model or an effort it doesn't offer.
+var ErrInvalidModelChoice = errors.New("invalid model choice")
 var ErrTooManyImages = errors.New("too many images attached")
 var ErrImageTooLarge = errors.New("an attached image is too large")
 var ErrHTMLAttachmentTooLarge = errors.New("attached HTML file is too large")
@@ -260,6 +266,11 @@ type GenerateInput struct {
 	Mode string
 	// Browser errors captured from the preview; this turn only, never carried forward (they're stale once a fix is attempted).
 	PreviewErrors []previewerrors.Entry
+	// ModelID/Effort are the merchant's requested choice; empty uses the catalogue's default_model and its effort.
+	ModelID string
+	Effort  string
+	// model is the resolved choice: set by Generate at enqueue, rebuilt from the generation row on dequeue.
+	model aicatalog.Choice
 	// Set by doGenerate; nil in tests that call generation helpers directly, which then place no images.
 	imageCatalog *imageCatalog
 	// Earlier pending turns' files, set by doGenerate; nil skips the draft-reversion check in checkAndRepair.
@@ -293,6 +304,10 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	// Reject before persisting (fails cheaper than dequeued).
 	if len(in.Images) > 0 && !s.gen.SupportsVision() {
 		return GenerateOutcome{}, ErrVisionNotConfigured
+	}
+	selection, err := s.selectModel(in)
+	if err != nil {
+		return GenerateOutcome{}, err
 	}
 	// DecodedLen is cheap arithmetic; HTTP handler already validated base64.
 	for i, img := range in.Images {
@@ -338,6 +353,9 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if err != nil {
 		return GenerateOutcome{}, err
 	}
+	if in.model, err = s.resolveModel(ctx, in, c, selection, len(previewErrorsJSON) > 0); err != nil {
+		return GenerateOutcome{}, err
+	}
 
 	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt, in.Images, in.HTMLAttachmentFilename, in.HTMLAttachmentContent, previewErrorsJSON)
 	if err != nil {
@@ -355,6 +373,8 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		UserMessageID: &userMsg.ID,
 		ThemeSlug:     in.ThemeSlug,
 		Mode:          in.Mode,
+		ModelID:       in.model.ModelID,
+		Effort:        in.model.Effort,
 	})
 	if err != nil {
 		if errors.Is(err, ErrQueueFull) {
@@ -434,6 +454,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		ReferenceURL:  g.ReferenceURL,
 		Mode:          g.Mode,
 		UserMessageID: g.UserMessageID,
+		model:         aicatalog.Choice{ModelID: g.ModelID, Effort: g.Effort},
 	}
 
 	// Fresh timeout per iteration, not shared across queue (prevents starvation).
@@ -639,7 +660,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				message = errSessionExpired.Error()
 			}
 			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
-			if _, err := s.chats.RecordAssistantMessage(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
+			if _, err := s.chats.RecordAssistantMessageFromModel(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable, in.model.ModelID, in.model.Effort); err != nil {
 				slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
 			}
 		} else {
@@ -809,6 +830,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			return fmt.Errorf("load theme context: %w", err)
 		}
 		tc.GenerationMode = in.Mode
+		tc.Model = in.model
 		tc.DraftPaths = make([]string, 0, len(draft))
 		for path, content := range draft {
 			tc.DraftPaths = append(tc.DraftPaths, path)
@@ -928,7 +950,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer commitCancel()
 
-	assistantMsg, err := s.chats.RecordAssistantMessage(commitCtx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
+	assistantMsg, err := s.chats.RecordAssistantMessageFromModel(commitCtx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus, result.ModelID, result.Effort)
 	if err != nil {
 		return fmt.Errorf("record assistant message: %w", err)
 	}

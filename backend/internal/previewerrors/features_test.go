@@ -100,3 +100,37 @@ func TestFeatureNotes_FollowUps(t *testing.T) {
 		})
 	}
 }
+
+func TestIsFixTurn(t *testing.T) {
+	tests := []struct {
+		name          string
+		prompt        string
+		earlier       []string
+		previewErrors bool
+		want          bool
+	}{
+		{name: "the add to cart button does nothing", prompt: "the add to cart button does nothing", want: true},
+		{name: "not working", prompt: "the slider is not working", want: true},
+		{name: "doesn't work", prompt: "search doesn't work on mobile", want: true},
+		{name: "broken", prompt: "the footer links are broken", want: true},
+		{name: "bug", prompt: "there's a bug in the menu", want: true},
+		{name: "error", prompt: "the page shows an error", want: true},
+		{name: "fix", prompt: "fix the newsletter form", want: true},
+		{name: "won't", prompt: "the menu won't open", want: true},
+		{name: "preview errors attached", prompt: "can you look at this", previewErrors: true, want: true},
+		{name: "follow-up after a fix turn", prompt: "still not working", earlier: []string{"the add to cart button does nothing"}, want: true},
+		{name: "second follow-up", prompt: "still broken", earlier: []string{"still not working", "fix the cart"}, want: true},
+		{name: "design request", prompt: "make the header dark"},
+		{name: "styling fix is design", prompt: "fix the padding on the header"},
+		{name: "redesign", prompt: "redesign the header completely"},
+		{name: "follow-up after a design turn", prompt: "still not right", earlier: []string{"make the header dark"}},
+		{name: "follow-up with nothing earlier", prompt: "still not working", want: true}, // reports a malfunction itself
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsFixTurn(tt.prompt, tt.earlier, tt.previewErrors); got != tt.want {
+				t.Errorf("IsFixTurn(%q) = %v, want %v", tt.prompt, got, tt.want)
+			}
+		})
+	}
+}

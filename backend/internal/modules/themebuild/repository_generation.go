@@ -17,7 +17,7 @@ const mysqlDuplicateKeyErrNumber = 1062
 // Shared column list for all Scan calls; prevents drift between queries.
 const generationColumns = `
 	id, chat_id, tenant_id, status, error, attempts,
-	prompt, reference_url, user_message_id, theme_slug, mode, queued_at, started_at, finished_at
+	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, queued_at, started_at, finished_at
 `
 
 // Tests only; enforces "one running per chat" atomically via uniq_generations_running_chat.
@@ -65,11 +65,13 @@ func (r *Repository) EnqueueGeneration(ctx context.Context, g Generation) (posit
 
 	enqueuedAt := time.Now().UTC()
 	referenceURL := sql.NullString{String: g.ReferenceURL, Valid: g.ReferenceURL != ""}
+	modelID := sql.NullString{String: g.ModelID, Valid: g.ModelID != ""}
+	effort := sql.NullString{String: g.Effort, Valid: g.Effort != ""}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO generations
-			(id, chat_id, tenant_id, status, attempts, prompt, reference_url, user_message_id, theme_slug, mode, queued_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, referenceURL, g.UserMessageID, g.ThemeSlug, g.Mode, enqueuedAt, enqueuedAt, enqueuedAt)
+			(id, chat_id, tenant_id, status, attempts, prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, queued_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, referenceURL, g.UserMessageID, g.ThemeSlug, g.Mode, modelID, effort, enqueuedAt, enqueuedAt, enqueuedAt)
 	if err != nil {
 		return 0, err
 	}

@@ -292,6 +292,12 @@ func (s *Service) RecordManualEditMessage(ctx context.Context, c Chat, filePath 
 // RecordAssistantMessage appends the model's reply, rolling token usage into the chat's
 // running totals. Also called for a failed generation (status MessageStatusFailed).
 func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus) (Message, error) {
+	return s.RecordAssistantMessageFromModel(ctx, c, content, status, inputTokens, outputTokens, applyStatus, "", "")
+}
+
+// RecordAssistantMessageFromModel is RecordAssistantMessage plus the catalogue model and effort that answered; empty
+// values store NULL.
+func (s *Service) RecordAssistantMessageFromModel(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) (Message, error) {
 	now := time.Now().UTC()
 	m := Message{
 		ID:           uuid.NewString(),
@@ -304,6 +310,8 @@ func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content st
 		OutputTokens: outputTokens,
 		ApplyStatus:  applyStatus,
 		CreatedAt:    now,
+		ModelID:      nonEmpty(modelID),
+		Effort:       nonEmpty(effort),
 	}
 	if applyStatus == ApplyStatusApplied {
 		m.AppliedAt = &now
@@ -312,4 +320,11 @@ func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content st
 		return Message{}, err
 	}
 	return m, nil
+}
+
+func nonEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

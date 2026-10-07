@@ -88,3 +88,32 @@ func notesFor(text string) []string {
 func isBareFollowUp(text string) bool {
 	return followUpRe.MatchString(text) && isFunctionalityRequest(text) && !stylingRe.MatchString(text)
 }
+
+// IsFixTurn reports whether a turn is fixing broken behaviour rather than designing: it carries preview errors, reports
+// a malfunction or asks for a fix (not a styling fix), or is a bare follow-up to such a turn. earlier holds the earlier
+// user messages, newest first; the walk is the same as FeatureNotes'.
+func IsFixTurn(prompt string, earlier []string, hasPreviewErrors bool) bool {
+	if hasPreviewErrors {
+		return true
+	}
+	// A bare follow-up takes its kind from the turn it follows; its own words count only with nothing earlier.
+	if !isBareFollowUp(prompt) || len(earlier) == 0 {
+		return isFixRequest(prompt)
+	}
+	for i, text := range earlier {
+		if i == maxFollowUpLookback {
+			break
+		}
+		if isFixRequest(text) && !isBareFollowUp(text) {
+			return true
+		}
+		if !isBareFollowUp(text) {
+			break
+		}
+	}
+	return false
+}
+
+func isFixRequest(text string) bool {
+	return isFunctionalityRequest(text) && !stylingRe.MatchString(text)
+}

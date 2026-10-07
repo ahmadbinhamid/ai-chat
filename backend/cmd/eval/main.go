@@ -70,7 +70,11 @@ func main() {
 		FirstTokenPages: cfg.FirstTokenTimeoutPages,
 	}
 
-	generator, err := ai.New(cfg.APIKey, cfg.BaseURL, cfg.Model, cfg.Effort, cfg.VisionModel, cfg.MaxTokens, streamTimeouts)
+	catalog, err := cfg.ModelCatalog()
+	if err != nil {
+		log.Fatalf("model catalogue: %v", err) //nolint:gocritic // process exit reclaims conn's fd either way
+	}
+	generator, err := ai.New(catalog, os.LookupEnv, cfg.MaxTokens, streamTimeouts)
 	if err != nil {
 		// Process exit reclaims conn's fd regardless of the deferred Close.
 		log.Fatalf("ai.New failed: %v", err) //nolint:gocritic // process exit reclaims conn's fd either way

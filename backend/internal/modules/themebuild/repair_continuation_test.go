@@ -62,10 +62,7 @@ func TestCheckAndRepair_ResumesToolLoopConversation(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	gen, err := ai.New("k", ts.URL, "test-model", "medium", "", 0, ai.StreamTimeouts{})
-	if err != nil {
-		t.Fatalf("ai.New: %v", err)
-	}
+	gen := newSingleModelGenerator(t, ts.URL, "test-model", "medium", "")
 	svc := &Service{gen: gen}
 	filename, attachment := "ref.html", "<p>ATTACHMENT-BODY</p>"
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo", HTMLAttachmentFilename: &filename, HTMLAttachmentContent: &attachment}
