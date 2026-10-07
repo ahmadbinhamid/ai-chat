@@ -24,6 +24,19 @@ func resolvePathNode(path string, lookupRoot func(string) (*fieldSpec, bool)) (*
 	for i, seg := range segments[1:] {
 		name, subs := splitSubscripts(seg)
 		prefix := strings.Join(segments[:i+1], ".")
+		// Liquid's built-ins: .first/.last are a list's item, .size is a list's length or a string's.
+		if cur.array && (name == "first" || name == "last") {
+			if cur, msg = applySubscripts(path, prefix+"."+name, &fieldSpec{children: cur.children}, subs, lookupRoot); msg != "" {
+				return nil, msg
+			}
+			continue
+		}
+		if name == "size" && (cur.array || cur.children == nil) {
+			if cur, msg = applySubscripts(path, prefix+"."+name, leaf(), subs, lookupRoot); msg != "" {
+				return nil, msg
+			}
+			continue
+		}
 		if cur.children == nil {
 			return nil, fmt.Sprintf(
 				"'%s' treats '%s' as having sub-fields, but '%s' has none in the §7 data model.",
@@ -171,6 +184,10 @@ func checkKnownFieldsInFile(path, content string) []Finding {
 
 			case "if", "elsif":
 				cond := parseIfCondition(t)
+				if cond.Filtered {
+					findings = append(findings, knownFieldsFinding(path, t.Line, filterInConditionMessage(cond)))
+					continue
+				}
 				for _, ref := range cond.Refs {
 					if _, msg := resolvePathNode(ref, lookupRoot); msg != "" {
 						findings = append(findings, knownFieldsFinding(path, t.Line, msg))
@@ -191,6 +208,16 @@ func checkKnownFieldsInFile(path, content string) []Finding {
 	}
 
 	return findings
+}
+
+// filterInConditionMessage: Liquid ignores filters in an {% if %}, so the condition silently tests the wrong value.
+func filterInConditionMessage(cond IfCondition) string {
+	target := cond.FilteredPath
+	if target == "" {
+		target = "the value"
+	}
+	return fmt.Sprintf("'{%% if %s %%}': filters don't work inside {%% if %%} — use %s.size > 0, or assign the value first",
+		strings.TrimSpace(cond.Raw), target)
 }
 
 func knownFieldsFinding(path string, line int, message string) Finding {

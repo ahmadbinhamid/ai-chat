@@ -183,9 +183,14 @@ type IfCondition struct {
 	// GuardsBoolIsh is true when the condition is exactly `x == true or x
 	// == 1` for a single path x, in either operand order.
 	GuardsBoolIsh bool
+	// FilteredPath is set when the condition pipes a value through a filter, which Liquid doesn't evaluate in an
+	// {% if %}; it holds the filtered path ("" for a literal), and Refs is then empty.
+	FilteredPath string
+	Filtered     bool
 }
 
-var comparisonRe = regexp.MustCompile(`^(\S+)\s*(==|!=)\s*(\S+)$`)
+// comparisonOps is ordered so a two-character operator wins over its one-character prefix.
+var comparisonOps = []string{"==", "!=", "<>", ">=", "<=", ">", "<"}
 
 // ScanIfConditions returns every {% if %} / {% elsif %} tag in content,
 // parsed.
@@ -202,7 +207,19 @@ func ScanIfConditions(content string) []IfCondition {
 
 func parseIfCondition(t Tag) IfCondition {
 	cond := IfCondition{Raw: t.Raw, Line: t.Line}
-	pieces := splitOnWord(t.Raw, "or")
+	if parts := splitTopLevel(t.Raw, '|'); len(parts) > 1 {
+		cond.Filtered = true
+		left := strings.TrimSpace(parts[0])
+		if l, _, _, ok := splitComparison(left); ok {
+			left = l
+		}
+		cond.FilteredPath = ParseExpression(left).Path
+		return cond
+	}
+	var pieces []string
+	for _, p := range splitOnWord(t.Raw, "or") {
+		pieces = append(pieces, splitOnWord(p, "and")...)
+	}
 
 	type comparison struct {
 		path, op, val string
@@ -217,11 +234,12 @@ func parseIfCondition(t Tag) IfCondition {
 	}
 	for _, p := range pieces {
 		p = strings.TrimSpace(p)
-		if m := comparisonRe.FindStringSubmatch(p); m != nil {
-			comparisons = append(comparisons, comparison{path: m[1], op: m[2], val: m[3]})
-			addRef(m[1])
+		if left, op, right, ok := splitComparison(p); ok {
+			comparisons = append(comparisons, comparison{path: left, op: op, val: right})
+			addRef(ParseExpression(left).Path)
+			addRef(ParseExpression(right).Path)
 		} else {
-			addRef(p)
+			addRef(ParseExpression(p).Path)
 		}
 	}
 
@@ -237,6 +255,33 @@ func parseIfCondition(t Tag) IfCondition {
 		}
 	}
 	return cond
+}
+
+// splitComparison splits a single comparison at its first operator outside quotes; ok is false when there is none.
+func splitComparison(s string) (left, op, right string, ok bool) {
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		if c == '\'' || c == '"' {
+			quote = c
+			continue
+		}
+		for _, candidate := range comparisonOps {
+			if strings.HasPrefix(s[i:], candidate) {
+				return strings.TrimSpace(s[:i]), candidate, strings.TrimSpace(s[i+len(candidate):]), true
+			}
+		}
+		if leftBoundary(s, i) && strings.HasPrefix(s[i:], "contains") && rightBoundary(s, i+len("contains")) {
+			return strings.TrimSpace(s[:i]), "contains", strings.TrimSpace(s[i+len("contains"):]), true
+		}
+	}
+	return "", "", "", false
 }
 
 // splitOnWord splits s on whole-word occurrences of word (e.g. "or"),
