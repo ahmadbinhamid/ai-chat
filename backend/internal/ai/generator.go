@@ -382,13 +382,16 @@ const forceProposeAfter = 3 * time.Minute
 // forceProposeWithinLastN: how many rounds below maxToolIterations are forced when the time limit doesn't fire first.
 const forceProposeWithinLastN = maxToolIterations - forceProposeAfterRounds
 
+// forceProposeCauseRule: a forced round once resubmitted a file with only its line endings changed and called it the fix.
+const forceProposeCauseRule = "Only propose a change you can tie to a specific cause you found in the code. If you " +
+	"can't name the cause, change nothing: set `needs_clarification: true` and ask the merchant one specific question."
+
 // forceProposeInstruction: a forced turn that found nothing must ask, never claim a fix it didn't make.
-const forceProposeInstruction = "Stop searching and call propose_changes now. If you found and fixed the problem, " +
-	"include the change. If you didn't find a cause, change nothing: set `needs_clarification: true` and in `summary` " +
-	"say plainly what you checked and ask the merchant one specific question about what happens. Never say something " +
-	"was fixed when no file changed. Only include a file in `files` if you actually read/verified its current content " +
-	"(for an update) or have real, complete content ready (for a create) — never invent a placeholder path or partial " +
-	"content to fill the array."
+const forceProposeInstruction = "Stop searching and call propose_changes now. " + forceProposeCauseRule + " " +
+	"If you did find the cause, include the change. Never say something was fixed when no file changed, and never " +
+	"resubmit a file with only whitespace or line-ending changes as a fix. Only include a file in `files` if you " +
+	"actually read/verified its current content (for an update) or have real, complete content ready (for a create) " +
+	"— never invent a placeholder path or partial content to fill the array."
 
 // shouldForcePropose reports whether this round must propose: past forceProposeAfterRounds or forceProposeAfter.
 func shouldForcePropose(iteration int, elapsed time.Duration) bool {

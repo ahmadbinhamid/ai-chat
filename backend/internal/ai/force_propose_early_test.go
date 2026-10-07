@@ -169,3 +169,15 @@ func TestGenerate_NeverRunsAToolTheRequestDidNotOffer(t *testing.T) {
 		t.Errorf("expected the fixed needs_clarification reply with no files, got %+v", result)
 	}
 }
+
+func TestForceProposeInstruction_RequiresANamedCause(t *testing.T) {
+	for _, want := range []string{
+		"Only propose a change you can tie to a specific cause you found in the code.",
+		"If you can't name the cause, change nothing: set `needs_clarification: true` and ask the merchant one specific question.",
+		"never resubmit a file with only whitespace or line-ending changes as a fix",
+	} {
+		if !strings.Contains(forceProposeInstruction, want) {
+			t.Errorf("forcing instruction missing %q:\n%s", want, forceProposeInstruction)
+		}
+	}
+}
