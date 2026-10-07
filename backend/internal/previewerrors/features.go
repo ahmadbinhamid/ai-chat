@@ -45,3 +45,46 @@ func MentionsCartFeature(text string) bool {
 func isFunctionalityRequest(text string) bool {
 	return malfunctionRe.MatchString(text) || (fixRe.MatchString(text) && !stylingRe.MatchString(text))
 }
+
+// followUpRe marks a message that reports the last fix didn't help without naming what it's about.
+var followUpRe = regexp.MustCompile(`(?i)\b(?:still|again|same (?:issue|problem|thing)|didn'?t (?:work|fix|help|change)|not fixed|no change|nothing changed)\b`)
+
+// maxFollowUpLookback bounds how far back a follow-up looks: a run of "still not working" replies inherits the request
+// they follow, never one from earlier in the conversation.
+const maxFollowUpLookback = 3
+
+// FeatureNotes returns the notes for prompt. A bare follow-up ("still not working") inherits them from the request it
+// follows; earlier holds the earlier user messages, newest first, and the walk stops at the first one that isn't itself
+// a bare follow-up.
+func FeatureNotes(prompt string, earlier []string) []string {
+	if notes := notesFor(prompt); len(notes) > 0 || !isBareFollowUp(prompt) {
+		return notes
+	}
+	for i, text := range earlier {
+		if i == maxFollowUpLookback {
+			break
+		}
+		if notes := notesFor(text); len(notes) > 0 {
+			return notes
+		}
+		if !isBareFollowUp(text) {
+			break
+		}
+	}
+	return nil
+}
+
+func notesFor(text string) []string {
+	var notes []string
+	if MentionsUntestableFeature(text) {
+		notes = append(notes, UntestableFeatureNote)
+	}
+	if MentionsCartFeature(text) {
+		notes = append(notes, CartFeatureNote)
+	}
+	return notes
+}
+
+func isBareFollowUp(text string) bool {
+	return followUpRe.MatchString(text) && isFunctionalityRequest(text) && !stylingRe.MatchString(text)
+}

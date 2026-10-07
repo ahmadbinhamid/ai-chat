@@ -825,6 +825,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, materializeFailureMsg, true))
 				continue
 			}
+			// DeepSeek calls tools the request didn't offer (seen on forced rounds), so the offer is enforced here.
+			if !toolOffered(roundTools, tu.Name) {
+				slog.Warn("ai: model called a tool this request didn't offer; not running it", "iteration", iteration, "tool", tu.Name)
+				resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, toolUnavailableMessage(tu.Name, roundTools), true))
+				continue
+			}
 			if tu.Name == toolNameReadThemeFile {
 				registerReadPaths(tu.Input, knownPaths) // Track read requests for warnReadBeforeWriteViolations.
 			}
@@ -851,7 +857,36 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		messages = append(messages, anthropic.NewUserMessage(resultBlocks...))
 	}
 
-	return nil, fmt.Errorf("model did not call propose_changes within %d tool-loop iterations", maxToolIterations)
+	// Every round from forceProposeAfterRounds on was forced, so the model had its chance; the merchant gets a fixed
+	// question instead of an error, and never the model's own text, which could claim a fix that wasn't made.
+	slog.Warn("ai: no proposal after forced rounds; ending the turn with a clarifying question", "iterations", maxToolIterations)
+	return &Result{
+		Summary:              ExhaustedSearchReply,
+		NeedsClarification:   true,
+		InputTokens:          totalInputTokens,
+		OutputTokens:         totalOutputTokens,
+		ExplorationToolCalls: explorationToolCalls,
+	}, nil
+}
+
+// toolOffered reports whether name is one of the tools this round's request offered.
+func toolOffered(tools []anthropic.ToolUnionParam, name string) bool {
+	for _, t := range tools {
+		if t.OfTool != nil && t.OfTool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func toolUnavailableMessage(name string, tools []anthropic.ToolUnionParam) string {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if t.OfTool != nil {
+			names = append(names, t.OfTool.Name)
+		}
+	}
+	return fmt.Sprintf("%s isn't available in this request, so it wasn't run. Available tools: %s.", name, strings.Join(names, ", "))
 }
 
 // toolResultBlock prefixes failures with "ERROR:" and keeps is_error: DeepSeek ignores is_error, so the flag alone is invisible.

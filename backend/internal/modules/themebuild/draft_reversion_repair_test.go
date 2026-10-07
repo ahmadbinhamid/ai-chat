@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
@@ -141,5 +142,27 @@ func TestCheckAndRepair_UnrepairedReversionIsExplained(t *testing.T) {
 	if !strings.Contains(msg, "I couldn't make this change without undoing your earlier unsaved changes.") ||
 		strings.Contains(msg, "couldn't be validated") {
 		t.Errorf("expected the unsaved-changes message, got %q", msg)
+	}
+}
+
+func TestPromptWithAttachments_FollowUpKeepsCartNote(t *testing.T) {
+	in := GenerateInput{Prompt: "Still not working", earlierPrompts: []string{"The add to cart button does nothing, fix it"}}
+	if got := promptWithAttachments(in.Prompt, in); !strings.Contains(got, previewerrors.CartFeatureNote) {
+		t.Errorf("expected the follow-up to carry the cart note, got %q", got)
+	}
+}
+
+func TestEarlierUserPrompts(t *testing.T) {
+	msgs := []chat.Message{
+		{ID: "1", Role: chat.RoleUser, Content: "make the header dark"},
+		{ID: "2", Role: chat.RoleAssistant, Content: "Done."},
+		{ID: "3", Role: chat.RoleUser, Content: "fix the cart"},
+		{ID: "4", Role: chat.RoleUser, Content: "still not working"},
+		{ID: "5", Role: chat.RoleUser, Content: "Still not working"},
+	}
+	got := earlierUserPrompts(msgs, "5")
+	want := []string{"still not working", "fix the cart", "make the header dark"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("earlierUserPrompts = %q, want %q (newest first, current excluded)", got, want)
 	}
 }

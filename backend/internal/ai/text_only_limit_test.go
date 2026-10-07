@@ -87,7 +87,7 @@ func TestSanitizeError_StuckInTextIsHonest(t *testing.T) {
 		t.Errorf("expected the honest rephrase message, got %q", msg)
 	}
 	exhausted := SanitizeError(fmt.Errorf("model did not call propose_changes within %d tool-loop iterations", maxToolIterations))
-	if !strings.Contains(exhausted, exhaustedSearchMessage) {
+	if !strings.Contains(exhausted, ExhaustedSearchReply) {
 		t.Errorf("expected the honest couldn't-find-the-cause message for the 28-round exhaustion, got %q", exhausted)
 	}
 	if exhausted == msg {

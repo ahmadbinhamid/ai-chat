@@ -264,6 +264,8 @@ type GenerateInput struct {
 	imageCatalog *imageCatalog
 	// Earlier pending turns' files, set by doGenerate; nil skips the draft-reversion check in checkAndRepair.
 	draft map[string]string
+	// Earlier user messages, newest first, set by doGenerate so a bare "still not working" keeps its request's notes.
+	earlierPrompts []string
 }
 
 // Synchronous result of accepting prompt; AssistantMessage/Files always nil.
@@ -710,6 +712,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	if in.UserMessageID != nil {
 		currentMessageID = *in.UserMessageID
 	}
+	in.earlierPrompts = earlierUserPrompts(priorMessages, currentMessageID)
 	in.imageCatalog = newImageCatalog(priorMessages, currentMessageID, draft, func(ctx context.Context, id string) ([]byte, error) {
 		a, err := s.chats.GetChatImageAttachment(ctx, c.ID, id)
 		return a.Content, err
@@ -1118,6 +1121,20 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 		Manifest:     &manifest,
 	}, nil
 }
+
+// earlierUserPrompts returns the user messages before the current one, newest first, capped at maxEarlierPrompts.
+func earlierUserPrompts(messages []chat.Message, currentID string) []string {
+	var out []string
+	for i := len(messages) - 1; i >= 0 && len(out) < maxEarlierPrompts; i-- {
+		if m := messages[i]; m.Role == chat.RoleUser && m.ID != currentID {
+			out = append(out, m.Content)
+		}
+	}
+	return out
+}
+
+// maxEarlierPrompts covers previewerrors.FeatureNotes' lookback; older messages never change a turn's notes.
+const maxEarlierPrompts = 3
 
 // draftReversionWarnings flags proposed updates that drop much of earlier unsaved work. Warning only, never a rejection;
 // reads the saved theme from s.store (not the overlay), and a failed read skips that file rather than guessing.

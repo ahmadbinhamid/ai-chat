@@ -111,3 +111,61 @@ func TestGenerate_ForcedRoundOffersOnlyProposeChanges(t *testing.T) {
 		t.Errorf("expected a needs_clarification question with no files, got %+v", result)
 	}
 }
+
+// DeepSeek calls tools a request didn't offer; none of those may run, on a normal or a forced round, and each gets an
+// error result naming what is available. A model that never proposes ends on the fixed question.
+func TestGenerate_NeverRunsAToolTheRequestDidNotOffer(t *testing.T) {
+	type request struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+		Messages []json.RawMessage `json:"messages"`
+	}
+	var requests []request
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req request
+		if err := json.Unmarshal(body, &req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		requests = append(requests, req)
+		n := len(requests)
+		w.Header().Set("Content-Type", "text/event-stream")
+		name := toolNameGrepTheme // on a forced round this wasn't offered
+		if n == 1 {
+			name = "delete_theme" // never offered on any round
+		}
+		fmt.Fprint(w, toolUseSSEResponse(fmt.Sprintf("msg_%d", n), fmt.Sprintf("toolu_%d", n), name, map[string]any{"pattern": "cart"}, 10, 5))
+	}))
+	defer ts.Close()
+	g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
+	var ran []string
+	toolExec := func(_ context.Context, name string, _ json.RawMessage) (string, error) {
+		ran = append(ran, name)
+		return "match", nil
+	}
+
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "still not working", nil, nil, toolExec, nil)
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if len(requests) != maxToolIterations {
+		t.Fatalf("expected %d calls, got %d", maxToolIterations, len(requests))
+	}
+	// Rounds 1..11 ran grep_theme; round 0's delete_theme and every forced round's grep_theme did not run.
+	if len(ran) != forceProposeAfterRounds-1 {
+		t.Errorf("expected only the %d offered grep_theme calls to run, got %d: %v", forceProposeAfterRounds-1, len(ran), ran)
+	}
+	for _, name := range ran {
+		if name != toolNameGrepTheme {
+			t.Errorf("ran a tool that was never offered: %s", name)
+		}
+	}
+	if second := string(requests[1].Messages[len(requests[1].Messages)-1]); !strings.Contains(second, "delete_theme isn't available in this request") ||
+		!strings.Contains(second, "Available tools: list_theme_files, read_theme_file, grep_theme, propose_changes.") {
+		t.Errorf("expected an error result naming the available tools, got %s", second)
+	}
+	if !result.NeedsClarification || len(result.Files) != 0 || result.Summary != ExhaustedSearchReply {
+		t.Errorf("expected the fixed needs_clarification reply with no files, got %+v", result)
+	}
+}

@@ -36,11 +36,8 @@ func promptWithAttachments(prompt string, in GenerateInput) string {
 	if previewerrors.MentionsSandboxError(in.Prompt) {
 		text += "\n\n" + previewerrors.SandboxErrorNote
 	}
-	if previewerrors.MentionsUntestableFeature(in.Prompt) {
-		text += "\n\n" + previewerrors.UntestableFeatureNote
-	}
-	if previewerrors.MentionsCartFeature(in.Prompt) {
-		text += "\n\n" + previewerrors.CartFeatureNote
+	for _, note := range previewerrors.FeatureNotes(in.Prompt, in.earlierPrompts) {
+		text += "\n\n" + note
 	}
 	if block := in.imageCatalog.promptBlock(); block != "" {
 		text += "\n\n" + block
