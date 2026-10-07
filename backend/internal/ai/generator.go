@@ -371,8 +371,29 @@ const adaptiveThinkingSupported = true
 // maxToolIterations bounds the read/explore loop; real page-creation prompts use full budget gathering context.
 const maxToolIterations = 28
 
-// forceProposeWithinLastN: distance from ceiling where model is forced to commit to a proposal.
-const forceProposeWithinLastN = 3
+// forceProposeAfterRounds: real redesigns propose within 2-8 rounds, so 12 leaves room; a turn past it is searching
+// for a cause it hasn't found, and later rounds of that only get slower (30-45s each seen on DeepSeek).
+const forceProposeAfterRounds = 12
+
+// forceProposeAfter caps search time on one turn: a merchant waiting longer than this for "I couldn't find it" is worse
+// off than getting the question sooner, whatever the round count.
+const forceProposeAfter = 3 * time.Minute
+
+// forceProposeWithinLastN: how many rounds below maxToolIterations are forced when the time limit doesn't fire first.
+const forceProposeWithinLastN = maxToolIterations - forceProposeAfterRounds
+
+// forceProposeInstruction: a forced turn that found nothing must ask, never claim a fix it didn't make.
+const forceProposeInstruction = "Stop searching and call propose_changes now. If you found and fixed the problem, " +
+	"include the change. If you didn't find a cause, change nothing: set `needs_clarification: true` and in `summary` " +
+	"say plainly what you checked and ask the merchant one specific question about what happens. Never say something " +
+	"was fixed when no file changed. Only include a file in `files` if you actually read/verified its current content " +
+	"(for an update) or have real, complete content ready (for a create) — never invent a placeholder path or partial " +
+	"content to fill the array."
+
+// shouldForcePropose reports whether this round must propose: past forceProposeAfterRounds or forceProposeAfter.
+func shouldForcePropose(iteration int, elapsed time.Duration) bool {
+	return iteration >= forceProposeAfterRounds || elapsed >= forceProposeAfter
+}
 
 // thrashOutputTokenThreshold: flags iterations with high output but exploration-only, no propose_changes (diagnostic only).
 const thrashOutputTokenThreshold = 5000
@@ -582,31 +603,28 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
 		iterationsUsed = iteration + 1
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
-		forcingPropose := iteration >= maxToolIterations-forceProposeWithinLastN
+		forcingPropose := shouldForcePropose(iteration, time.Since(generateStart))
+		roundTools := tools
 		if forcingPropose {
-			// Near ceiling: force propose_changes to commit from gathered context, not run out of budget reading.
 			toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
-			slog.Info("ai: forcing propose_changes near tool-loop budget ceiling",
-				"iteration", iteration, "max_tool_iterations", maxToolIterations)
+			// DeepSeek ignores a named tool_choice and keeps reading, so the round offers nothing else to call.
+			// A different tool list misses the prompt cache; forcing is rare enough for that to be acceptable.
+			roundTools = []anthropic.ToolUnionParam{proposeChangesTool()}
+			slog.Info("ai: forcing propose_changes",
+				"iteration", iteration, "max_tool_iterations", maxToolIterations,
+				"elapsed_ms", time.Since(generateStart).Milliseconds())
 		}
 		params := anthropic.MessageNewParams{
 			Model:      callModel,
 			MaxTokens:  g.maxTokens,
 			System:     system,
 			Messages:   messages,
-			Tools:      tools,
+			Tools:      roundTools,
 			ToolChoice: toolChoice,
 		}
 		if forcingPropose {
-			// Nudge: don't invent placeholder paths; use needs_clarification + empty files if not ready.
 			params.System = append(append([]anthropic.TextBlockParam{}, system...), anthropic.TextBlockParam{
-				Text: "You are at the tool-loop budget ceiling and must call propose_changes now. " +
-					"Only include a file in `files` if you actually read/verified its current content " +
-					"(for an update) or have real, complete content ready (for a create) — never invent " +
-					"a placeholder path or partial content to fill the array. If you do not yet have a " +
-					"complete, verified proposal, call propose_changes with needs_clarification: true, " +
-					"files: [], and a summary explaining that the request needs to be split into a " +
-					"smaller step or retried, instead of guessing.",
+				Text: forceProposeInstruction,
 			})
 		}
 		switch {
@@ -1051,6 +1069,9 @@ func dynamicSystemPrompt(tc ThemeContext) string {
 		formatDraftPaths(tc.DraftPaths, tc.StagedImagePaths))
 }
 
+const draftUndoRule = "Never undo earlier changes by rewriting a file — you can't see the originals. " +
+	"If earlier changes should go, tell the merchant to use Undo on that turn."
+
 // formatDraftPaths lists unsaved-draft paths, sorted so identical drafts give identical prompts; "" when there are none.
 func formatDraftPaths(paths []string, stagedImages map[string]bool) string {
 	if len(paths) == 0 {
@@ -1060,6 +1081,8 @@ func formatDraftPaths(paths []string, stagedImages map[string]bool) string {
 	sort.Strings(sorted)
 	var b strings.Builder
 	b.WriteString("- Files with unsaved changes from earlier turns (the merchant hasn't applied them yet — keep that work; change only what this request needs):\n")
+	// At the decision point because the spec's version of this rule didn't hold against repeated failed fixes.
+	b.WriteString("  " + draftUndoRule + "\n")
 	for _, p := range sorted {
 		if stagedImages[p] {
 			fmt.Fprintf(&b, "  - %s (staged image — goes live when the merchant applies)\n", p)

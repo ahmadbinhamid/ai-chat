@@ -199,8 +199,8 @@ func TestPromptWithAttachments_SandboxErrorNote(t *testing.T) {
 		t.Errorf("expected the sandbox note after the exact turn-2 message, got %q", turn2)
 	}
 	plain := promptWithAttachments("add to cart does nothing", GenerateInput{Prompt: "add to cart does nothing"})
-	if plain != "add to cart does nothing" {
-		t.Errorf("a message without a sandbox error must get no note, got %q", plain)
+	if strings.Contains(plain, previewerrors.SandboxErrorNote) {
+		t.Errorf("a message without a sandbox error must get no sandbox note, got %q", plain)
 	}
 	// Repairs pass their own text but the merchant's message is what's checked, so the flat fallback keeps the note.
 	repair := promptWithAttachments("Your last proposal failed validation…", GenerateInput{Prompt: "Invalid base URL"})

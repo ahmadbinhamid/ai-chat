@@ -16,6 +16,15 @@ import (
 // match a recognized, safe-to-summarize category below.
 const genericGenerationError = "something went wrong while generating a response — please try again in a moment"
 
+// exhaustedSearchMessage: running out of rounds means the cause wasn't found, not that the request was too big.
+const exhaustedSearchMessage = "I looked into this but couldn't find the cause. Could you tell me exactly what happens when you try it?"
+
+// ErrDraftReversionUnrepaired: every repair still dropped the merchant's earlier unsaved work, so nothing was staged.
+var ErrDraftReversionUnrepaired = errors.New("proposal kept undoing earlier unsaved changes")
+
+const draftReversionUnrepairedMessage = "I couldn't make this change without undoing your earlier unsaved changes. " +
+	"Apply or discard them first, or tell me to undo them."
+
 // SanitizeError turns any error into a short, vendor-neutral message safe to show a merchant.
 // Callers should still log the original server-side.
 func SanitizeError(err error) string {
@@ -48,6 +57,10 @@ func categorizeError(err error) string {
 		return "I wasn't able to work out how to do that — could you rephrase it, or add a bit more detail about what you'd like to change?"
 	}
 
+	if errors.Is(err, ErrDraftReversionUnrepaired) {
+		return draftReversionUnrepairedMessage
+	}
+
 	if errors.Is(err, errMaxTokensTruncated) {
 		return "the response was too large to complete — please try a smaller request"
 	}
@@ -69,7 +82,7 @@ func categorizeError(err error) string {
 		// for this (its 402 body has no "credit" in it at all).
 		return "the account is out of credits — please contact support"
 	case strings.Contains(lower, "did not call propose_changes within"):
-		return "the task was too complex to finish in one attempt — please try breaking it into smaller requests"
+		return exhaustedSearchMessage
 	case strings.Contains(lower, "didn't pass validation after"):
 		return "the generated changes couldn't be validated after multiple attempts — please try a smaller or more specific request"
 	case strings.Contains(lower, "rate limit") || strings.Contains(lower, "429"):

@@ -17,6 +17,7 @@ import (
 	"ai-chat/internal/ai"
 	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/pageintent"
 	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/safego"
 	"ai-chat/internal/themecheck"
@@ -261,6 +262,8 @@ type GenerateInput struct {
 	PreviewErrors []previewerrors.Entry
 	// Set by doGenerate; nil in tests that call generation helpers directly, which then place no images.
 	imageCatalog *imageCatalog
+	// Earlier pending turns' files, set by doGenerate; nil skips the draft-reversion check in checkAndRepair.
+	draft map[string]string
 }
 
 // Synchronous result of accepting prompt; AssistantMessage/Files always nil.
@@ -651,6 +654,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return fmt.Errorf("load draft overlay: %w", err)
 	}
 	store := themefs.NewCachingStore(themefs.NewOverlayStore(s.store, draft))
+	in.draft = draft
 
 	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
@@ -857,7 +861,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
-	if !deterministic && proposalHasChanges(result) {
+	// Without an undo request checkAndRepair already blocked any reversion, so only an asked-for undo can reach here.
+	if !deterministic && proposalHasChanges(result) && pageintent.DetectUndo(in.Prompt) {
 		warnings = append(warnings, s.draftReversionWarnings(ctx, storeAuth, c.ID, draft, result)...)
 	}
 
@@ -1117,22 +1122,7 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 // draftReversionWarnings flags proposed updates that drop much of earlier unsaved work. Warning only, never a rejection;
 // reads the saved theme from s.store (not the overlay), and a failed read skips that file rather than guessing.
 func (s *Service) draftReversionWarnings(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) []themecheck.Finding {
-	saved := make(map[string]string)
-	for _, f := range result.Files {
-		if f.Action != "update" {
-			continue
-		}
-		if _, inDraft := draft[f.Path]; !inDraft {
-			continue
-		}
-		content, err := s.store.ReadFile(ctx, storeAuth, f.Path)
-		if err != nil {
-			slog.Info("draft reversion check skipped: saved file unreadable", "chat_id", chatID, "path", f.Path, "error", err)
-			continue
-		}
-		saved[f.Path] = content
-	}
-
+	saved := s.savedDraftUpdates(ctx, storeAuth, chatID, draft, result)
 	var findings []themecheck.Finding
 	for _, r := range themecheck.DetectDraftReversions(toProposal(result), saved, draft) {
 		slog.Warn("proposal may undo earlier unsaved changes", "chat_id", chatID, "path", r.Path,
@@ -1140,6 +1130,47 @@ func (s *Service) draftReversionWarnings(ctx context.Context, storeAuth themefs.
 		findings = append(findings, r.Finding())
 	}
 	return findings
+}
+
+// draftReversionBlocking returns blocking findings for proposed updates that drop much of earlier unsaved work, so the
+// repair round restores it; same saved-theme reads and fail-open skips as draftReversionWarnings.
+func (s *Service) draftReversionBlocking(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) []themecheck.Finding {
+	saved := s.savedDraftUpdates(ctx, storeAuth, chatID, draft, result)
+	if len(saved) == 0 {
+		return nil
+	}
+	findings := themecheck.DraftReversionFindings(toProposal(result), saved, draft)
+	for _, f := range findings {
+		slog.Warn("proposal undoes earlier unsaved changes; sending it to repair", "chat_id", chatID, "path", f.Path)
+	}
+	return findings
+}
+
+// savedDraftUpdates reads, in parallel, the saved (not overlay) version of each proposed update to a draft file.
+// A failed read skips that file rather than guessing, so the reversion checks never fail a generation.
+func (s *Service) savedDraftUpdates(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) map[string]string {
+	saved := make(map[string]string)
+	var mu sync.Mutex
+	var g errgroup.Group
+	g.SetLimit(loadThemeFilesConcurrency)
+	for _, f := range result.Files {
+		if _, inDraft := draft[f.Path]; f.Action != "update" || !inDraft {
+			continue
+		}
+		g.Go(func() error {
+			content, err := s.store.ReadFile(ctx, storeAuth, f.Path)
+			if err != nil {
+				slog.Info("draft reversion check skipped: saved file unreadable", "chat_id", chatID, "path", f.Path, "error", err)
+				return nil
+			}
+			mu.Lock()
+			saved[f.Path] = content
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait() // every goroutine returns nil
+	return saved
 }
 
 // Fetches invariant snapshot part: file-path listing + content for files themecheck reads.

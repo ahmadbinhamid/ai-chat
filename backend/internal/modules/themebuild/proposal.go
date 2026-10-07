@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/pageintent"
 	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
@@ -34,6 +35,12 @@ func promptWithAttachments(prompt string, in GenerateInput) string {
 	// Checked against the merchant's own message, so the flat repair fallback carries the note just like the attachments.
 	if previewerrors.MentionsSandboxError(in.Prompt) {
 		text += "\n\n" + previewerrors.SandboxErrorNote
+	}
+	if previewerrors.MentionsUntestableFeature(in.Prompt) {
+		text += "\n\n" + previewerrors.UntestableFeatureNote
+	}
+	if previewerrors.MentionsCartFeature(in.Prompt) {
+		text += "\n\n" + previewerrors.CartFeatureNote
 	}
 	if block := in.imageCatalog.promptBlock(); block != "" {
 		text += "\n\n" + block
@@ -300,6 +307,11 @@ func (s *Service) checkAndRepair(
 		// Downgrade pre-existing findings (after auto-fixers, to preserve raw error count for free fixes).
 		findings = themecheck.DowngradePreExistingFindings(findings, toProposal(result), snap.Files)
 		errorFindings, warningFindings := splitFindings(findings)
+		// Rewriting a draft file from memory drops the merchant's unsaved work; only their own undo request may do that.
+		if len(in.draft) > 0 && !pageintent.DetectUndo(in.Prompt) {
+			storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
+			errorFindings = append(errorFindings, s.draftReversionBlocking(ctx, storeAuth, chatID, in.draft, result)...)
+		}
 
 		if len(errorFindings) == 0 {
 			if attempt > 1 {
@@ -318,6 +330,10 @@ func (s *Service) checkAndRepair(
 		emitter.emit(ctx, EventTypeCheckFailed, map[string]any{"findings": errorFindings, "attempt": attempt})
 
 		if attempt > maxThemeCheckRetries {
+			if hasRule(errorFindings, themecheck.RuleDraftReversion) {
+				return nil, nil, fmt.Errorf("%w after %d attempts: %s", ai.ErrDraftReversionUnrepaired,
+					attempt, summarizeFindings(errorFindings))
+			}
 			return nil, nil, fmt.Errorf("the generated changes didn't pass validation after %d attempts: %s",
 				attempt, summarizeFindings(errorFindings))
 		}
