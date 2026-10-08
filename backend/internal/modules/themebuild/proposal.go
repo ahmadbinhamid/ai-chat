@@ -253,7 +253,7 @@ func (s *Service) checkAndRepair(
 	emitter *eventEmitter,
 ) (*ai.Result, []themecheck.Finding, error) {
 	turns := append([]ai.Turn(nil), history...)
-	totalInput, totalOutput := result.InputTokens, result.OutputTokens
+	totalInput, totalOutput, totalCost := result.InputTokens, result.OutputTokens, result.CostUSD
 	// Resumes the real tool loop (tool_use/tool_result intact); nil falls back to the flat turns + recap path.
 	conversation := result.Conversation()
 
@@ -317,7 +317,7 @@ func (s *Service) checkAndRepair(
 			}
 			// Unconditional log distinguishes first-try from retried success (theory 4 diagnostics).
 			slog.Info("checkAndRepair succeeded", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug, "attempts_used", attempt)
-			result.InputTokens, result.OutputTokens = totalInput, totalOutput
+			result.InputTokens, result.OutputTokens, result.CostUSD = totalInput, totalOutput, totalCost
 			return result, warningFindings, nil
 		}
 
@@ -362,6 +362,7 @@ func (s *Service) checkAndRepair(
 			"attempt", attempt, "elapsed", repairElapsed, "input_tokens", retried.InputTokens, "output_tokens", retried.OutputTokens)
 		totalInput += retried.InputTokens
 		totalOutput += retried.OutputTokens
+		totalCost = addCost(totalCost, retried.CostUSD)
 		turns = append(turns, ai.Turn{Role: "user", Content: repair})
 		conversation = retried.Conversation()
 
@@ -632,4 +633,16 @@ func validateBrandModeProposal(r *ai.Result) error {
 		return fmt.Errorf("brand mode must not place attached images")
 	}
 	return nil
+}
+
+// addCost sums two reported costs; nil means unreported, so it only stays nil when neither call reported one.
+func addCost(a, b *float64) *float64 {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	}
+	sum := *a + *b
+	return &sum
 }

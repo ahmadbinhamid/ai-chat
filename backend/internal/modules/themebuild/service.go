@@ -1022,7 +1022,7 @@ func (s *Service) commitTurn(ctx context.Context, c chat.Chat, genID, summary st
 	defer func() { _ = tx.Rollback() }()
 
 	msg, err := s.chats.RecordAssistantMessageInTx(ctx, tx, c, summary, chat.MessageStatusCompleted,
-		result.InputTokens, result.OutputTokens, applyStatus, result.ModelID, result.Effort)
+		result.InputTokens, result.OutputTokens, applyStatus, result.ModelID, result.Effort, result.CostUSD)
 	if err != nil {
 		return fmt.Errorf("record assistant message: %w", err)
 	}

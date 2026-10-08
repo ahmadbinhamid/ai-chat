@@ -1,0 +1,50 @@
+package ai
+
+import (
+	"strconv"
+
+	"github.com/anthropics/anthropic-sdk-go"
+)
+
+// deltaCost reads OpenRouter's usage.cost (USD) from a message_delta; false when the provider doesn't report it.
+func deltaCost(d anthropic.MessageDeltaEvent) (float64, bool) {
+	// The SDK marks fields it has no type for as not Valid, so the raw value is all there is to go on.
+	field, ok := d.Usage.JSON.ExtraFields["cost"]
+	if !ok {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(field.Raw(), 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// costTotal sums the cost of a turn's calls, remembering whether any call reported one at all.
+type costTotal struct {
+	sum      float64
+	reported bool
+}
+
+func (c *costTotal) add(v float64, reported bool) {
+	if reported {
+		c.sum += v
+		c.reported = true
+	}
+}
+
+// value is nil when no call reported a cost, so "unknown" never reads as "free".
+func (c *costTotal) value() *float64 {
+	if !c.reported {
+		return nil
+	}
+	v := c.sum
+	return &v
+}
+
+func (c *costTotal) log() any {
+	if !c.reported {
+		return nil
+	}
+	return c.sum
+}

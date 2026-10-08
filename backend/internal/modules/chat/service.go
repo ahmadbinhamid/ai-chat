@@ -299,7 +299,7 @@ func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content st
 // RecordAssistantMessageFromModel is RecordAssistantMessage plus the catalogue model and effort that answered; empty
 // values store NULL.
 func (s *Service) RecordAssistantMessageFromModel(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) (Message, error) {
-	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort)
+	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort, nil)
 	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, nil, inputTokens, outputTokens, m.CreatedAt); err != nil {
 		return Message{}, err
 	}
@@ -307,15 +307,16 @@ func (s *Service) RecordAssistantMessageFromModel(ctx context.Context, c Chat, c
 }
 
 // RecordAssistantMessageInTx records the reply inside the caller's transaction; nothing is written until it commits.
-func (s *Service) RecordAssistantMessageInTx(ctx context.Context, tx *sql.Tx, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) (Message, error) {
-	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort)
+// costUSD is nil when the provider doesn't report cost.
+func (s *Service) RecordAssistantMessageInTx(ctx context.Context, tx *sql.Tx, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string, costUSD *float64) (Message, error) {
+	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort, costUSD)
 	if err := s.repo.CreateMessageAndTouchUsageTx(ctx, tx, m, inputTokens, outputTokens, m.CreatedAt); err != nil {
 		return Message{}, err
 	}
 	return m, nil
 }
 
-func assistantMessage(c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) Message {
+func assistantMessage(c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string, costUSD *float64) Message {
 	now := time.Now().UTC()
 	m := Message{
 		ID:           uuid.NewString(),
@@ -330,6 +331,7 @@ func assistantMessage(c Chat, content string, status MessageStatus, inputTokens,
 		CreatedAt:    now,
 		ModelID:      nonEmpty(modelID),
 		Effort:       nonEmpty(effort),
+		CostUSD:      costUSD,
 	}
 	if applyStatus == ApplyStatusApplied {
 		m.AppliedAt = &now

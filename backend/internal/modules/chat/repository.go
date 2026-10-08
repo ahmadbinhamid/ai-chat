@@ -70,9 +70,9 @@ func touchChatUsage(ctx context.Context, e execer, chatID string, inputTokens, o
 
 func createMessage(ctx context.Context, e execer, m Message) error {
 	_, err := e.ExecContext(ctx, `
-		INSERT INTO chat_messages (id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, model_id, effort, apply_status, applied_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, m.ID, m.ChatID, m.TenantID, m.Role, m.UserID, m.UserName, m.UserEmail, m.Content, m.Status, m.InputTokens, m.OutputTokens, m.ModelID, m.Effort, m.ApplyStatus, m.AppliedAt, m.CreatedAt, m.CreatedAt)
+		INSERT INTO chat_messages (id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, model_id, effort, cost_usd, apply_status, applied_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, m.ID, m.ChatID, m.TenantID, m.Role, m.UserID, m.UserName, m.UserEmail, m.Content, m.Status, m.InputTokens, m.OutputTokens, m.ModelID, m.Effort, m.CostUSD, m.ApplyStatus, m.AppliedAt, m.CreatedAt, m.CreatedAt)
 	return err
 }
 

@@ -78,6 +78,8 @@ type Result struct {
 	OutputTokens   int64                 `json:"-"`
 	// ExplorationToolCalls: distinguishes hallucinated empty from explored-and-empty via isUnexploredEmptyProposal.
 	ExplorationToolCalls int `json:"-"`
+	// CostUSD is what the provider charged across this result's calls; nil when it doesn't report cost.
+	CostUSD *float64 `json:"-"`
 	// ModelID/Effort: the catalogue model that produced this result, after any switch to the vision model.
 	ModelID      string `json:"-"`
 	Effort       string `json:"-"`
@@ -538,6 +540,18 @@ func consumeStream(
 	message *anthropic.Message,
 	idleTimeout, firstTokenTimeout time.Duration,
 ) error {
+	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, nil)
+}
+
+// consumeStreamDeltas is consumeStream that also hands each message_delta to onDelta: the accumulated message keeps
+// only the usage fields the SDK knows, not a provider's extras such as OpenRouter's cost.
+func consumeStreamDeltas(
+	ctx context.Context,
+	stream *ssestream.Stream[anthropic.MessageStreamEventUnion],
+	message *anthropic.Message,
+	idleTimeout, firstTokenTimeout time.Duration,
+	onDelta func(anthropic.MessageDeltaEvent),
+) error {
 	sawProgress := false
 
 	idleTimer := time.NewTimer(idleTimeout)
@@ -581,8 +595,12 @@ func consumeStream(
 			if !r.ok {
 				return nil
 			}
-			if err := message.Accumulate(stream.Current()); err != nil {
+			event := stream.Current()
+			if err := message.Accumulate(event); err != nil {
 				return fmt.Errorf("accumulate stream: %w", err)
+			}
+			if onDelta != nil && event.Type == "message_delta" {
+				onDelta(event.AsMessageDelta())
 			}
 			if !sawProgress && streamProgressBytes(*message) > 0 {
 				sawProgress = true
@@ -667,7 +685,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	dynamicBlock.CacheControl = dynamicCacheControl
 	system := []anthropic.TextBlockParam{staticSystemPromptBlock(), dynamicBlock}
 
-	var totalInputTokens, totalOutputTokens int64
+	var totalInputTokens, totalOutputTokens, totalCacheReadTokens int64
+	var cost costTotal
 	// explorationToolCalls: counts list_theme_files/read_theme_file/grep_theme (never propose_changes).
 	explorationToolCalls := 0
 	// Diagnostics: generateStart, modelElapsed, toolElapsed, iterationsUsed (summary log on return).
@@ -685,6 +704,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			"tool_elapsed_ms", totalToolElapsed.Milliseconds(),
 			"total_input_tokens", totalInputTokens,
 			"total_output_tokens", totalOutputTokens,
+			"total_cache_read_tokens", totalCacheReadTokens,
+			"total_cost_usd", cost.log(),
 			"total_reasoning_tokens", totalReasoningTokens,
 			"reasoning_tokens_reported", reasoningTokensReported)
 	}()
@@ -738,12 +759,16 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			attemptsUsed = attempt
 			stream := client.Messages.NewStreaming(ctx, params, reqOpts...)
 			message = anthropic.Message{}
-			streamErr := consumeStream(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout)
+			callCost, callCostReported := 0.0, false
+			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, func(d anthropic.MessageDeltaEvent) {
+				callCost, callCostReported = deltaCost(d)
+			})
 			// Close immediately (timeouts may abandon mid-read).
 			_ = stream.Close()
 			if streamErr == nil {
 				err := stream.Err()
 				if err == nil {
+					cost.add(callCost, callCostReported)
 					break
 				}
 				// "provider" not "claude": serves DeepSeek too (Anthropic-compat endpoint).
@@ -771,6 +796,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		totalModelElapsed += modelElapsed
 		totalInputTokens += message.Usage.InputTokens
 		totalOutputTokens += message.Usage.OutputTokens
+		totalCacheReadTokens += message.Usage.CacheReadInputTokens
 		// ThinkingTokens may be unreported (reasoningTokensValid false) vs. genuinely zero.
 		reasoningTokens := message.Usage.OutputTokensDetails.ThinkingTokens
 		reasoningTokensValid := message.Usage.OutputTokensDetails.JSON.ThinkingTokens.Valid()
@@ -878,6 +904,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				warnReadBeforeWriteViolations(result.Files, knownPaths)
 				result.InputTokens = totalInputTokens
 				result.OutputTokens = totalOutputTokens
+				result.CostUSD = cost.value()
 				result.ExplorationToolCalls = explorationToolCalls
 				result.ModelID, result.Effort = choice.ModelID, choice.Effort
 				// A recovered call has no tool_use ID to pair a resumed tool_result with, so repair uses the flat-recap fallback.
@@ -966,6 +993,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		NeedsClarification:   true,
 		InputTokens:          totalInputTokens,
 		OutputTokens:         totalOutputTokens,
+		CostUSD:              cost.value(),
 		ExplorationToolCalls: explorationToolCalls,
 		ModelID:              choice.ModelID,
 		Effort:               choice.Effort,

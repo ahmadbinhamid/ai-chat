@@ -67,6 +67,8 @@ type Message struct {
 	// ModelID/Effort: the catalogue model and effort that answered (assistant turns only); never in Content.
 	ModelID *string `json:"model_id"`
 	Effort  *string `json:"effort"`
+	// CostUSD is what the provider charged for this reply; nil when it doesn't report cost. Never sent to merchants.
+	CostUSD *float64 `json:"-"`
 	// Attachments is only non-empty on a user-role turn with files attached. Normal reads
 	// populate METADATA ONLY (no bytes) — only doGenerate fetches actual content.
 	Attachments []MessageAttachment `json:"attachments,omitempty"`
