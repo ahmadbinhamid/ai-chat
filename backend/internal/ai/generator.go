@@ -251,6 +251,14 @@ func (g *Generator) model(ch aicatalog.Choice) (aicatalog.Model, anthropic.Clien
 	return m, client, requestFieldOptions(g.catalog.RequestFields(m.ID)), nil
 }
 
+// normalToolChoice is what a model's provider requires on normal rounds: any tool call, or (for "auto") none at all.
+func (g *Generator) normalToolChoice(m aicatalog.Model) anthropic.ToolChoiceUnionParam {
+	if p, _ := g.catalog.Provider(m.Provider); p.ToolChoice == aicatalog.ToolChoiceAuto {
+		return anthropic.ToolChoiceUnionParam{OfAuto: &anthropic.ToolChoiceAutoParam{}}
+	}
+	return anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
+}
+
 // sessionOptions sends the turn's session ID in the header the model's provider names, if it names one.
 func (g *Generator) sessionOptions(m aicatalog.Model, sessionID string) []option.RequestOption {
 	p, _ := g.catalog.Provider(m.Provider)
@@ -723,9 +731,10 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}()
 	// Counts consecutive rounds with no tool call that text recovery also couldn't rescue; any real call resets it.
 	consecutiveTextOnly := 0
+	normalToolChoice := g.normalToolChoice(entry)
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
 		iterationsUsed = iteration + 1
-		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
+		toolChoice := normalToolChoice
 		forcingPropose := shouldForcePropose(iteration, time.Since(generateStart))
 		// The request always lists every tool, keeping the prompt cache intact; a forced round instead refuses any call
 		// but propose_changes, since DeepSeek ignores a named tool_choice and keeps searching.
@@ -945,7 +954,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				slog.Warn("ai: model stuck replying in text, stopping", "iteration", iteration, "consecutive_text_rounds", consecutiveTextOnly)
 				return nil, errStuckInTextReplies
 			}
-			slog.Warn("ai: tool-loop nudge fired (zero tool calls despite forced tool_choice)", "iteration", iteration)
+			slog.Warn("ai: tool-loop nudge fired (no tool call this round)", "iteration", iteration)
 			// DeepSeek does NOT honor ToolChoice: OfAny (Anthropic does). Nudge instead of failing.
 			messages = append(messages, message.ToParam())
 			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(

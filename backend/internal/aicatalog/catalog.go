@@ -13,6 +13,14 @@ import (
 // AutoID is the reserved choice that routes each turn to the design or fix model.
 const AutoID = "auto"
 
+// validToolChoices are a provider's allowed tool_choice values; "" means "any".
+var validToolChoices = []string{"", ToolChoiceAny, ToolChoiceAuto}
+
+const (
+	ToolChoiceAny  = "any"
+	ToolChoiceAuto = "auto"
+)
+
 // validEfforts are the output_config.effort values the provider API accepts.
 var validEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 
@@ -23,6 +31,9 @@ type Provider struct {
 	APIKeyEnv string `json:"api_key_env"`
 	// Options are extra request-body fields sent with every model of this provider (e.g. OpenRouter routing).
 	Options json.RawMessage `json:"options,omitempty"`
+	// ToolChoice is what normal tool-loop rounds require: "any" (the default) or "auto". "auto" lets a router use hosts
+	// that don't honour a required tool call; the loop already copes with a text reply. Forced rounds always name one tool.
+	ToolChoice string `json:"tool_choice,omitempty"`
 	// SessionHeader, when set, is the request header the generator puts each chat's ID in, so the provider can keep a
 	// chat's calls on one host (e.g. OpenRouter's sticky routing, which keeps that host's prompt cache warm).
 	SessionHeader string `json:"session_header,omitempty"`
@@ -138,6 +149,9 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 		}
 		if key, ok := lookupEnv(p.APIKeyEnv); !ok || key == "" {
 			return fmt.Errorf("provider %q: environment variable %s is not set", name, p.APIKeyEnv)
+		}
+		if !slices.Contains(validToolChoices, p.ToolChoice) {
+			return fmt.Errorf("provider %q: tool_choice must be \"any\" or \"auto\", got %q", name, p.ToolChoice)
 		}
 	}
 	if len(c.Models) == 0 {

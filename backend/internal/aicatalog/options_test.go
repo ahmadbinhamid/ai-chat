@@ -149,3 +149,22 @@ func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 		}
 	}
 }
+
+func TestParse_ToolChoice(t *testing.T) {
+	for _, tt := range []struct {
+		value   string
+		wantErr bool
+	}{{"", false}, {"any", false}, {"auto", false}, {"required", true}, {"none", true}} {
+		t.Run(tt.value, func(t *testing.T) {
+			raw := map[string]any{
+				"providers":     map[string]any{"p": map[string]any{"base_url": "https://x", "api_key_env": "AI_API_KEY", "tool_choice": tt.value}},
+				"models":        []any{map[string]any{"id": "m", "label": "M", "provider": "p", "model": "x/m"}},
+				"default_model": "m", "summary_model": "m",
+			}
+			data, _ := json.Marshal(raw)
+			if _, err := Parse(data, withKey); (err != nil) != tt.wantErr {
+				t.Errorf("tool_choice %q: err = %v, wantErr %v", tt.value, err, tt.wantErr)
+			}
+		})
+	}
+}
