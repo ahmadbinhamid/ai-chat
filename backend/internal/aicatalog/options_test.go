@@ -2,6 +2,7 @@ package aicatalog
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -174,5 +175,25 @@ func TestParse_ToolChoice(t *testing.T) {
 				t.Errorf("tool_choice %q: err = %v, wantErr %v", tt.value, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// Wafer cut two tool-loop calls off at 8,192 tokens mid-reasoning and was the slowest host measured, so the DeepSeek
+// models ignore it as well as Cloudflare; a model's ignore list replaces the provider's, so it must repeat Cloudflare.
+func TestOpenRouterCatalogue_DeepSeekIgnoresWafer(t *testing.T) {
+	data, err := os.ReadFile("../../config/ai-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data, withKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range c.Models {
+		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
+		ignore := fmt.Sprint(p["ignore"])
+		if strings.HasPrefix(m.ID, "deepseek-") != strings.Contains(ignore, "wafer") || !strings.Contains(ignore, "cloudflare") {
+			t.Errorf("model %q: ignore = %v", m.ID, p["ignore"])
+		}
 	}
 }
