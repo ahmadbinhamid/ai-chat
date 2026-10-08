@@ -52,7 +52,9 @@ func (g *scriptedGenerator) Generate(ctx context.Context, _ ai.ThemeContext, _ [
 	if r.err != nil {
 		return nil, r.err
 	}
-	return &ai.Result{Summary: "[scripted] " + prompt}, nil
+	// A real no-change answer: without answered_question an empty, unexplored proposal is retried as a likely
+	// fabrication (isUnexploredEmptyProposal), and those retries would eat the queue's scripted calls.
+	return &ai.Result{Summary: "[scripted] " + prompt, AnsweredQuestion: true}, nil
 }
 
 func (g *scriptedGenerator) callCount() int {
@@ -130,7 +132,6 @@ func TestGenerate_SecondPromptQueuesWhileFirstRuns(t *testing.T) {
 }
 
 // Item 6: three prompts all run in order; proves drain loop dequeues entire queue.
-// Known flaky (queue-ordering flake hides ordering bugs; investigate before trusting).
 func TestRunGeneration_DrainsWholeQueueInOrder(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &scriptedGenerator{results: []scriptedResult{
@@ -226,7 +227,6 @@ func TestRunGeneration_FailureDoesNotStopLaterQueuedPrompts(t *testing.T) {
 }
 
 // Item 11: each iteration gets fresh generateTimeout budget; combined time can exceed per-iteration cap.
-// Known flaky (queue-ordering flake hides ordering bugs; investigate before trusting).
 func TestRunGeneration_EachIterationGetsFreshTimeout(t *testing.T) {
 	svc, chatSvc := newQueueTestService(t)
 	gen := &scriptedGenerator{results: []scriptedResult{

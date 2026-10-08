@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"ai-chat/internal/ai"
@@ -13,6 +15,30 @@ import (
 
 // MySQL ER_DUP_ENTRY code; detects already-running via uniq_generations_running_chat index.
 const mysqlDuplicateKeyErrNumber = 1062
+
+// MySQL ER_LOCK_DEADLOCK: an enqueue's locking read and a concurrent dequeue on the same chat can deadlock; MySQL rolls
+// one back whole, so it is safe to run again.
+const mysqlDeadlockErrNumber = 1213
+
+const deadlockRetries = 3
+
+// retryOnDeadlock runs fn again, after a short random pause, while it fails with a deadlock.
+func retryOnDeadlock(ctx context.Context, fn func() error) error {
+	var err error
+	for attempt := 1; ; attempt++ {
+		err = fn()
+		var mysqlErr *mysql.MySQLError
+		if !errors.As(err, &mysqlErr) || mysqlErr.Number != mysqlDeadlockErrNumber || attempt == deadlockRetries {
+			return err
+		}
+		slog.Warn("generation queue deadlock; retrying", "attempt", attempt)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(5+rand.IntN(20)) * time.Millisecond):
+		}
+	}
+}
 
 // Shared column list for all Scan calls; prevents drift between queries.
 const generationColumns = `
@@ -44,6 +70,14 @@ var ErrQueueFull = errors.New("this chat already has the maximum number of pendi
 
 // Runs in transaction with SELECT FOR UPDATE to prevent racing enqueues blowing past cap.
 func (r *Repository) EnqueueGeneration(ctx context.Context, g Generation) (position int, err error) {
+	err = retryOnDeadlock(ctx, func() error {
+		position, err = r.enqueueGenerationOnce(ctx, g)
+		return err
+	})
+	return position, err
+}
+
+func (r *Repository) enqueueGenerationOnce(ctx context.Context, g Generation) (position int, err error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -83,7 +117,15 @@ func (r *Repository) EnqueueGeneration(ctx context.Context, g Generation) (posit
 }
 
 // Promotes oldest queued to running; ties on queued_at break on id.
-func (r *Repository) DequeueNext(ctx context.Context, chatID string) (Generation, error) {
+func (r *Repository) DequeueNext(ctx context.Context, chatID string) (g Generation, err error) {
+	err = retryOnDeadlock(ctx, func() error {
+		g, err = r.dequeueNextOnce(ctx, chatID)
+		return err
+	})
+	return g, err
+}
+
+func (r *Repository) dequeueNextOnce(ctx context.Context, chatID string) (Generation, error) {
 	now := time.Now().UTC()
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE generations

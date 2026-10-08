@@ -516,11 +516,15 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	// Heartbeat ticker: keeps slow-but-healthy generations from being reaped mid-flight (second layer after emitLive).
 	heartbeatTicker := time.NewTicker(heartbeatTickerInterval())
 	defer heartbeatTicker.Stop()
+	heartbeatStop, heartbeatDone := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(heartbeatDone)
 		defer safego.Recover("themebuild.heartbeatLoop")
 		for {
 			select {
 			case <-workCtx.Done():
+				return
+			case <-heartbeatStop:
 				return
 			case <-heartbeatTicker.C:
 				// Per-tick recovery: one bad tick shouldn't end heartbeats for rest of generation.
@@ -543,6 +547,9 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	}()
 
 	err := s.doGenerate(workCtx, in, c, g.ID, &cancelledByUser)
+	// Waited for, not just signalled: a tick already writing could otherwise land after the end is recorded.
+	close(heartbeatStop)
+	<-heartbeatDone
 
 	// Fresh context: workCtx may be expired (timeout or userCancel).
 	endCtx, endCancel := context.WithTimeout(context.Background(), 10*time.Second)
