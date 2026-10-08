@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"ai-chat/internal/modules/chat"
 )
 
 // runTracker counts running generation loops so shutdown can wait for them. The draining flag and the count share
@@ -12,6 +14,33 @@ type runTracker struct {
 	mu       sync.Mutex
 	draining bool
 	running  int
+	// The generation each loop is running now, for re-queuing at the drain limit; bounded by concurrent loops.
+	generations map[string]chat.Chat
+}
+
+func (t *runTracker) track(genID string, c chat.Chat) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.generations == nil {
+		t.generations = make(map[string]chat.Chat)
+	}
+	t.generations[genID] = c
+}
+
+func (t *runTracker) untrack(genID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.generations, genID)
+}
+
+func (t *runTracker) runningGenerations() map[string]chat.Chat {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make(map[string]chat.Chat, len(t.generations))
+	for id, c := range t.generations {
+		out[id] = c
+	}
+	return out
 }
 
 // start registers a loop about to run; false once draining has begun, and the caller must leave the work queued.

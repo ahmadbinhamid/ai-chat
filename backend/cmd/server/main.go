@@ -82,6 +82,10 @@ func main() {
 	logger.Info("draining running generations", "limit", cfg.ShutdownDrain)
 	finished, stillRunning := srv.DrainGenerations(context.Background())
 	logger.Info("generation drain done", "finished", finished, "still_running", stillRunning)
+	if stillRunning > 0 {
+		requeued, failed := srv.RequeueUnfinished(context.Background())
+		logger.Info("cut-off generations re-queued to resume after restart", "requeued", requeued, "failed", failed)
+	}
 
 	logger.Info("shutting down, draining in-flight requests")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

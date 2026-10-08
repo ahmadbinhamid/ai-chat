@@ -137,6 +137,8 @@ type Service struct {
 	placedImageMaxBytes int
 	// Running generation loops, for Drain on shutdown; the zero value is ready to use.
 	runs runTracker
+	// True while a restart left generations waiting for their senders; gates the per-request ResumeForUser check.
+	resumePending atomic.Bool
 }
 
 // SetPlacedImageMaxBytes sets the largest attached image a turn may place; match it to FlowPOS's PHP upload limit.
@@ -213,6 +215,14 @@ func (p *pendingTokens) take(generationID string) (string, bool) {
 	return token, ok
 }
 
+// peek reports whether a token is held for the generation, without taking it.
+func (p *pendingTokens) peek(generationID string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	token, ok := p.tokens[generationID]
+	return token, ok
+}
+
 // Drops token without returning; used when queued generation is cancelled before running.
 func (p *pendingTokens) discard(generationID string) {
 	p.mu.Lock()
@@ -279,6 +289,8 @@ type GenerateInput struct {
 	draft map[string]string
 	// Earlier user messages, newest first, set by doGenerate so a bare "still not working" keeps its request's notes.
 	earlierPrompts []string
+	// resumedAfterUpdate: a restart held this turn until its sender came back; the reply says so.
+	resumedAfterUpdate bool
 }
 
 // Synchronous result of accepting prompt; AssistantMessage/Files always nil.
@@ -389,22 +401,10 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	// never becomes a column on the row EnqueueGeneration just inserted.
 	s.tokens.store(genID, in.Token)
 
-	// Shutting down: leave it queued rather than start work the process is about to stop waiting for.
-	if !s.runs.start() {
-		return GenerateOutcome{Chat: c, UserMessage: userMsg, QueuePosition: position, GenerationID: genID}, nil
-	}
-	next, err := s.repo.DequeueNext(ctx, c.ID)
-	if err != nil {
-		s.runs.done()
-	}
+	// Not started while draining: it stays queued for the next process.
+	_, err = s.startChatQueue(ctx, c)
 	switch {
 	case err == nil:
-		// Detached from request lifecycle, but bounded: each iteration gets its own generateTimeout.
-		go func() {
-			defer s.runs.done()
-			defer safego.Recover("themebuild.runGeneration")
-			s.runGeneration(context.WithoutCancel(ctx), c, next)
-		}()
 	case errors.Is(err, ErrGenerationInProgress):
 		// Already running; its drain loop will dequeue this row when it finishes.
 		emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
@@ -421,7 +421,9 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 // Drains chatID's queue one-at-a-time starting with g; continues on failure (visible chat message).
 func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) {
 	for {
-		s.runOneQueuedGeneration(ctx, c, g)
+		if !s.runOneQueuedGeneration(ctx, c, g) {
+			return
+		}
 
 		// Shutting down: the rest of this chat's queue stays queued for the next process.
 		if s.runs.isDraining() {
@@ -441,24 +443,37 @@ func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) 
 	}
 }
 
-// Runs one already-dequeued (status=running) generation to completion and records outcome.
-func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Generation) {
+// Runs one already-dequeued (status=running) generation to completion and records outcome. false stops the drain
+// loop: the generation went back to the queue to wait for its sender, who restarts the loop on return.
+func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Generation) bool {
+	token, ok := s.tokens.take(g.ID)
+	if !ok && waitingForSender(g) {
+		slog.Info("generation is waiting for its sender after a restart; returning it to the queue", "chat_id", c.ID, "generation_id", g.ID)
+		s.releaseToQueue(ctx, c, g)
+		return false
+	}
+
 	emitter := newEventEmitter(ctx, s.repo, s.bus, g.ID, c.ID)
 	emitter.emit(ctx, EventTypeDequeued, struct{}{})
 
-	token, ok := s.tokens.take(g.ID)
 	if !ok {
 		// Pod restart (between enqueue and dequeue) or reaper-restarted queue has no token.
 		// Expected condition (Warn not Error) but should be visible to catch spurious reaping.
-		slog.Warn("generation has no bearer token available; failing with session-expired", "chat_id", c.ID, "generation_id", g.ID)
-		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
+		failErr := errSessionExpired
+		if g.AwaitingResumeSince != nil {
+			failErr = errResumeExpired
+		}
+		slog.Warn("generation has no bearer token available; failing it", "chat_id", c.ID, "generation_id", g.ID, "error", failErr)
+		s.recordGenerationFailure(ctx, c, g.ID, failErr)
 		endCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := s.repo.EndGeneration(endCtx, c.ID, errSessionExpired); err != nil {
+		if err := s.repo.EndGeneration(endCtx, c.ID, failErr); err != nil {
 			slog.Error("failed to record generation end", "chat_id", c.ID, "error", err)
 		}
-		return
+		return true
 	}
+	s.runs.track(g.ID, c)
+	defer s.runs.untrack(g.ID)
 
 	in := GenerateInput{
 		TenantID:      g.TenantID,
@@ -469,6 +484,8 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		Mode:          g.Mode,
 		UserMessageID: g.UserMessageID,
 		model:         aicatalog.Choice{ModelID: g.ModelID, Effort: g.Effort},
+		// Held by a restart, either queued or cut off mid-run and re-queued by the drain.
+		resumedAfterUpdate: g.AwaitingResumeSince != nil || g.ResumeCount > 0,
 	}
 
 	// Fresh timeout per iteration, not shared across queue (prevents starvation).
@@ -575,7 +592,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	}
 	// Its row was finished, reaped or re-queued by someone else; EndGeneration selects by chat, so it must not run.
 	if errors.Is(err, ErrGenerationNotRunning) {
-		return
+		return true
 	}
 	// err != nil required: flag can flip true after doGenerate committed success.
 	if err != nil && cancelledByUser.Load() {
@@ -585,6 +602,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	} else if endErr := s.repo.EndGeneration(endCtx, c.ID, err); endErr != nil {
 		slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
 	}
+	return true
 }
 
 // Queued generation failure when no bearer token available (see pendingTokens).
@@ -981,6 +999,9 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		summary = "Done."
 	}
 	summary = appendWarningsNote(summary, warnings)
+	if in.resumedAfterUpdate {
+		summary += "\n\n" + resumedAfterUpdateNote
+	}
 	summary = protectedPagesNote(summary, blockedPages)
 
 	// Detached commitCtx: cancel can only stop BEFORE this point, never mid-commit.

@@ -32,6 +32,10 @@ type Generation struct {
 	// merchant's choice. Empty on rows queued before the catalogue existed, which then use its default.
 	ModelID string
 	Effort  string
+	// ResumeCount: times a shutdown drain re-queued this generation; it is re-queued at most once.
+	ResumeCount int
+	// AwaitingResumeSince: set when a restart left this queued without its sender's token; it runs when they return.
+	AwaitingResumeSince *time.Time
 	// QueuedAt is nil only for a row seeded directly as "running" (existing tests).
 	QueuedAt *time.Time
 	// StartedAt is nil until DequeueNext promotes this row to running.
@@ -55,10 +59,10 @@ type rowScanner interface {
 func scanGeneration(s rowScanner) (Generation, error) {
 	var g Generation
 	var errMsg, userMessageID, referenceURL, modelID, effort sql.NullString
-	var queuedAt, startedAt, finishedAt sql.NullTime
+	var queuedAt, startedAt, finishedAt, awaitingSince sql.NullTime
 
 	err := s.Scan(&g.ID, &g.ChatID, &g.TenantID, &g.Status, &errMsg, &g.Attempts,
-		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &queuedAt, &startedAt, &finishedAt)
+		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &g.ResumeCount, &awaitingSince, &queuedAt, &startedAt, &finishedAt)
 	if err != nil {
 		return Generation{}, err
 	}
@@ -74,6 +78,9 @@ func scanGeneration(s rowScanner) (Generation, error) {
 	g.ModelID, g.Effort = modelID.String, effort.String
 	if queuedAt.Valid {
 		g.QueuedAt = &queuedAt.Time
+	}
+	if awaitingSince.Valid {
+		g.AwaitingResumeSince = &awaitingSince.Time
 	}
 	if startedAt.Valid {
 		g.StartedAt = &startedAt.Time
@@ -120,6 +127,7 @@ func (s *Service) reapOnce(ctx context.Context) {
 	}
 
 	s.reapOrphanedQueues(ctx)
+	s.refreshResumePending(ctx)
 }
 
 // Fails chats with queues stranded by dead pod (no drain loop or bearer token).
@@ -152,10 +160,19 @@ func (s *Service) failOrphanedQueue(ctx context.Context, chatID string) {
 
 		// Built from row, not looked up: reaper has no tenant-scoped request.
 		c := chat.Chat{ID: chatID, TenantID: g.TenantID}
+		// Waiting for its sender after a restart (or just given their token): not orphaned, so hand it back.
+		if _, hasToken := s.tokens.peek(g.ID); hasToken || waitingForSender(g) {
+			s.releaseToQueue(ctx, c, g)
+			return
+		}
+		failErr := errSessionExpired
+		if g.AwaitingResumeSince != nil {
+			failErr = errResumeExpired
+		}
 		// Warn: expected, but spike could indicate false staleness detection.
-		slog.Warn("failing an orphaned queued generation with session-expired", "chat_id", chatID, "generation_id", g.ID)
-		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
-		if endErr := s.repo.EndGeneration(ctx, chatID, errSessionExpired); endErr != nil {
+		slog.Warn("failing an orphaned queued generation", "chat_id", chatID, "generation_id", g.ID, "error", failErr)
+		s.recordGenerationFailure(ctx, c, g.ID, failErr)
+		if endErr := s.repo.EndGeneration(ctx, chatID, failErr); endErr != nil {
 			slog.Error("failed to record generation end for an orphaned queue", "chat_id", chatID, "error", endErr)
 		}
 	}

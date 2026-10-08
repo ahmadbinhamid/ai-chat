@@ -43,7 +43,8 @@ func retryOnDeadlock(ctx context.Context, fn func() error) error {
 // Shared column list for all Scan calls; prevents drift between queries.
 const generationColumns = `
 	id, chat_id, tenant_id, status, error, attempts,
-	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, queued_at, started_at, finished_at
+	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, resume_count, awaiting_resume_since,
+	queued_at, started_at, finished_at
 `
 
 // Tests only; enforces "one running per chat" atomically via uniq_generations_running_chat.
@@ -236,8 +237,9 @@ func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr er
 		status = GenerationStatusFailed
 		// Sanitize: never leak AI provider name/URL/request ID; column feeds merchant-visible error.
 		msg := ai.SanitizeError(genErr)
-		if errors.Is(genErr, errSessionExpired) {
-			msg = errSessionExpired.Error()
+		// Already merchant-facing, and more specific than any sanitized category.
+		if errors.Is(genErr, errSessionExpired) || errors.Is(genErr, errResumeExpired) || errors.Is(genErr, errInterruptedTwice) {
+			msg = genErr.Error()
 		}
 		errMsg = &msg
 	}
@@ -246,6 +248,86 @@ func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr er
 		UPDATE generations SET status = ?, error = ?, finished_at = ?, updated_at = ?
 		WHERE chat_id = ? AND status = ?
 	`, status, errMsg, now, now, chatID, GenerationStatusRunning)
+	return err
+}
+
+// RequeueInterrupted puts a generation cut off by a shutdown drain back in the queue, once: false when it was already
+// re-queued before (the caller fails it) or is no longer running.
+func (r *Repository) RequeueInterrupted(ctx context.Context, generationID string) (bool, error) {
+	now := time.Now().UTC()
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE generations
+		SET status = ?, started_at = NULL, last_heartbeat_at = NULL, resume_count = resume_count + 1, updated_at = ?
+		WHERE id = ? AND status = ? AND resume_count = 0
+	`, GenerationStatusQueued, now, generationID, GenerationStatusRunning)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// MarkQueuedAwaitingResume flags every queued generation as waiting for its sender: a restarting process holds none
+// of their tokens. Returns how many are waiting, including ones flagged by an earlier start.
+func (r *Repository) MarkQueuedAwaitingResume(ctx context.Context, at time.Time) (int64, error) {
+	if _, err := r.db.ExecContext(ctx, `
+		UPDATE generations SET awaiting_resume_since = ?, updated_at = ?
+		WHERE status = ? AND awaiting_resume_since IS NULL
+	`, at, at, GenerationStatusQueued); err != nil {
+		return 0, err
+	}
+	var n int64
+	err := r.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM generations WHERE status = ? AND awaiting_resume_since IS NOT NULL
+	`, GenerationStatusQueued).Scan(&n)
+	return n, err
+}
+
+// CountAwaitingResume counts queued generations still waiting for their sender.
+func (r *Repository) CountAwaitingResume(ctx context.Context) (int64, error) {
+	var n int64
+	err := r.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM generations WHERE status = ? AND awaiting_resume_since IS NOT NULL
+	`, GenerationStatusQueued).Scan(&n)
+	return n, err
+}
+
+// AwaitingResume is a queued generation waiting for its sender, with the chat it belongs to.
+type AwaitingResume struct {
+	GenerationID string
+	ChatID       string
+}
+
+// AwaitingResumeForUser lists a tenant's waiting generations sent by userID; only the sender's token may run them.
+func (r *Repository) AwaitingResumeForUser(ctx context.Context, tenantID, userID uint64) ([]AwaitingResume, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT g.id, g.chat_id
+		FROM generations g
+		JOIN chat_messages m ON m.id = g.user_message_id
+		WHERE g.tenant_id = ? AND g.status = ? AND g.awaiting_resume_since IS NOT NULL AND m.user_id = ?
+		ORDER BY g.queued_at, g.id
+	`, tenantID, GenerationStatusQueued, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []AwaitingResume
+	for rows.Next() {
+		var a AwaitingResume
+		if err := rows.Scan(&a.GenerationID, &a.ChatID); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ReleaseClaim returns a just-dequeued generation to the queue, keeping its place (queued_at is unchanged).
+func (r *Repository) ReleaseClaim(ctx context.Context, generationID string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE generations SET status = ?, started_at = NULL, updated_at = ?
+		WHERE id = ? AND status = ?
+	`, GenerationStatusQueued, time.Now().UTC(), generationID, GenerationStatusRunning)
 	return err
 }
 

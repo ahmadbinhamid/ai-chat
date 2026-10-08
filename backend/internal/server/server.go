@@ -37,9 +37,14 @@ type Server struct {
 	builder      *themebuild.Service
 }
 
-// DrainGenerations waits for running generations, up to SHUTDOWN_DRAIN_SECONDS; call after the HTTP server stops.
+// DrainGenerations waits for running generations, up to SHUTDOWN_DRAIN_SECONDS, while HTTP keeps serving.
 func (s *Server) DrainGenerations(ctx context.Context) (finished, stillRunning int) {
 	return s.builder.Drain(ctx, s.cfg.ShutdownDrain)
+}
+
+// RequeueUnfinished re-queues generations still running at the drain limit, to resume after the restart.
+func (s *Server) RequeueUnfinished(ctx context.Context) (requeued, failed int) {
+	return s.builder.RequeueUnfinished(ctx)
 }
 
 // New builds the router and mounts every route. AI generation being unavailable is a
@@ -143,6 +148,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	// internal/auth's package doc comment. There is no local auth system.
 	identified := api.Group("")
 	identified.Use(auth.Middleware(flowposClient, authCache, cfg.AuthCacheTTL, cfg.AuthNegativeCacheTTL))
+	identified.Use(handlers.ResumeAwaitingGenerations(buildSvc))
 
 	identified.GET("/chat", chatHandler.Get)
 	identified.GET("/chat/status", chatHandler.Status)
@@ -166,6 +172,8 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 
 	// Runs immediately and then every minute until Close cancels it — independent of any
 	// single request's lifecycle, so it needs its own long-lived context.
+	// Before the reaper's first sweep, which would otherwise fail queued turns whose tokens died with the old process.
+	buildSvc.PrepareResume(context.Background())
 	reaperCtx, reaperCancel := context.WithCancel(context.Background())
 	go func() {
 		defer safego.Recover("themebuild.RunReaper")
