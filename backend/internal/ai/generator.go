@@ -565,7 +565,7 @@ func consumeStream(
 	message *anthropic.Message,
 	idleTimeout, firstTokenTimeout time.Duration,
 ) error {
-	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, false, nil)
+	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, false, nil, nil)
 }
 
 // consumeStreamDeltas is consumeStream that also hands each message_delta to onDelta: the accumulated message keeps
@@ -578,6 +578,9 @@ func consumeStreamDeltas(
 	// idleAfterContent waits for real output, not just an event, before the idle rule applies: a router can send
 	// message_start before its upstream host has read the prompt, so the prefill silence that follows isn't a stall.
 	idleAfterContent bool,
+	// activity, when non-nil, signals raw bytes from the server (see activityMiddleware); once output has started it
+	// resets the idle timer like an event does, so a host sending only pings isn't mistaken for a stall.
+	activity <-chan struct{},
 	onDelta func(anthropic.MessageDeltaEvent),
 ) error {
 	sawProgress := false
@@ -609,10 +612,29 @@ func consumeStreamDeltas(
 	}
 	go readNext()
 
+	resetIdle := func() {
+		// Drain idleTimer if Stop() returned false, then rearm it for the current phase.
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		if waitingForFirstToken() {
+			idleTimer.Reset(max(idleTimeout, firstTokenTimeout))
+		} else {
+			idleTimer.Reset(idleTimeout)
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-activity:
+			if !waitingForFirstToken() {
+				resetIdle()
+			}
 		case <-idleTimer.C:
 			// Before the first token both timers can fire together; that's the first-token budget running out, not a stall.
 			if waitingForFirstToken() {
@@ -643,18 +665,7 @@ func consumeStreamDeltas(
 				sawProgress = true
 				firstTokenTimer.Stop()
 			}
-			// Drain idleTimer if Stop() returned false; reset and read next.
-			if !idleTimer.Stop() {
-				select {
-				case <-idleTimer.C:
-				default:
-				}
-			}
-			if waitingForFirstToken() {
-				idleTimer.Reset(max(idleTimeout, firstTokenTimeout))
-			} else {
-				idleTimer.Reset(idleTimeout)
-			}
+			resetIdle()
 			go readNext()
 		}
 	}
@@ -801,10 +812,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		attemptsUsed := 0
 		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
 			attemptsUsed = attempt
-			stream := client.Messages.NewStreaming(ctx, params, reqOpts...)
+			activity := make(chan struct{}, 1)
+			attemptOpts := append(append([]option.RequestOption(nil), reqOpts...), option.WithMiddleware(activityMiddleware(activity)))
+			stream := client.Messages.NewStreaming(ctx, params, attemptOpts...)
 			message = anthropic.Message{}
 			callCost, callCostReported := 0.0, false
-			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, idleAfterContent, func(d anthropic.MessageDeltaEvent) {
+			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, idleAfterContent, activity, func(d anthropic.MessageDeltaEvent) {
 				callCost, callCostReported = deltaCost(d)
 			})
 			// Close immediately (timeouts may abandon mid-read).

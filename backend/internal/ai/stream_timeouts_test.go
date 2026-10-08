@@ -469,10 +469,70 @@ func TestConsumeStreamDeltas_IdleAfterContent(t *testing.T) {
 			defer ts.Close()
 			stream := newStreamingTestStream(ts)
 			var message anthropic.Message
-			err := consumeStreamDeltas(context.Background(), stream, &message, 50*time.Millisecond, 400*time.Millisecond, true, nil)
+			err := consumeStreamDeltas(context.Background(), stream, &message, 50*time.Millisecond, 400*time.Millisecond, true, nil, nil)
 			_ = stream.Close()
 			if !errors.Is(err, tt.wantErr) && (tt.wantErr != nil || err != nil) {
 				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// A host that writes a tool call whole sends only ping events meanwhile, which the SDK drops; the bytes still prove
+// the connection is alive, so the call must complete on its first attempt. The same silence without pings is a stall.
+func TestGenerate_PingsKeepAToolCallInProgressAlive(t *testing.T) {
+	var start strings.Builder
+	sseEvent(&start, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
+			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
+		},
+	})
+	sseEvent(&start, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+	sseEvent(&start, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "Writing it now."}})
+	sseEvent(&start, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	full := toolUseSSEResponse("msg_1", "toolu_1", toolNameProposeChanges, emptyAnswer("done"), 10, 5)
+	_, rest, ok := strings.Cut(full, "event: content_block_start")
+	if !ok {
+		t.Fatal("fixture has no content_block_start")
+	}
+	toolPart := strings.ReplaceAll("event: content_block_start"+rest, `"index":0`, `"index":1`)
+
+	for _, pings := range []bool{true, false} {
+		t.Run(fmt.Sprintf("pings=%v", pings), func(t *testing.T) {
+			calls := 0
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "text/event-stream")
+				flush(w, start.String())
+				for i := 0; i < 10; i++ {
+					select {
+					case <-time.After(30 * time.Millisecond):
+					case <-r.Context().Done():
+						return
+					}
+					if pings {
+						flush(w, "event: ping\ndata: {\"type\": \"ping\"}\n\n")
+					}
+				}
+				flush(w, toolPart)
+			}))
+			defer ts.Close()
+			g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
+			g.streamTimeouts.Idle = 100 * time.Millisecond
+			g.streamTimeouts.FirstTokenEdit = 2 * time.Second
+
+			result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, nil, nil)
+			if pings {
+				if err != nil || calls != 1 || result.Summary != "done" {
+					t.Fatalf("want one attempt that completes, got calls=%d err=%v", calls, err)
+				}
+				return
+			}
+			if calls < 2 {
+				t.Fatalf("want 300ms of true silence after output treated as a stall and retried, got %d call(s), err=%v", calls, err)
 			}
 		})
 	}
