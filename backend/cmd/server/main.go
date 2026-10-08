@@ -77,6 +77,12 @@ func main() {
 	<-ctx.Done()
 	stop()
 
+	// Generations run detached from any request, so httpServer.Shutdown never waits for them. Drain them first, with
+	// HTTP still serving (new prompts just queue), so a deploy doesn't take the dashboard down for the drain.
+	logger.Info("draining running generations", "limit", cfg.ShutdownDrain)
+	finished, stillRunning := srv.DrainGenerations(context.Background())
+	logger.Info("generation drain done", "finished", finished, "still_running", stillRunning)
+
 	logger.Info("shutting down, draining in-flight requests")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -85,10 +91,5 @@ func main() {
 		logger.Error("graceful shutdown failed", "error", err)
 		os.Exit(1)
 	}
-
-	// Generations run detached from any request, so Shutdown above never waited for them.
-	logger.Info("draining running generations", "limit", cfg.ShutdownDrain)
-	finished, stillRunning := srv.DrainGenerations(context.Background())
-	logger.Info("generation drain done", "finished", finished, "still_running", stillRunning)
 	logger.Info("shutdown complete")
 }
