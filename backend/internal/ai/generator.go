@@ -492,7 +492,8 @@ var (
 
 // isRetryableStreamErr reports if err is a provider hiccup (timeout or garbled), not a deadline/cancel.
 func isRetryableStreamErr(err error) bool {
-	return isRetryableAccumulateErr(err) || errors.Is(err, errStreamIdle) || errors.Is(err, errStreamFirstToken)
+	return isRetryableAccumulateErr(err) || errors.Is(err, errStreamIdle) || errors.Is(err, errStreamFirstToken) ||
+		isRetryableProviderErr(err)
 }
 
 // streamRetryReason labels err for retry warning log (diagnostic only).
@@ -504,6 +505,10 @@ func streamRetryReason(err error) string {
 		return "first_token_timeout"
 	case isRetryableAccumulateErr(err):
 		return "truncated_stream"
+	case classifyProviderError(err) == providerErrRateLimited:
+		return "rate_limited"
+	case classifyProviderError(err) == providerErrUpstream:
+		return "upstream_failed"
 	default:
 		return "unknown"
 	}
@@ -737,13 +742,19 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			// Close immediately (timeouts may abandon mid-read).
 			_ = stream.Close()
 			if streamErr == nil {
-				if err := stream.Err(); err != nil {
-					// "provider" not "claude": serves DeepSeek too (Anthropic-compat endpoint).
-					return nil, fmt.Errorf("provider stream: %w", err)
+				err := stream.Err()
+				if err == nil {
+					break
 				}
-				break
+				// "provider" not "claude": serves DeepSeek too (Anthropic-compat endpoint).
+				streamErr = fmt.Errorf("provider stream: %w", err)
+				if !isRetryableProviderErr(err) {
+					alertProviderError(err, entry.Model)
+					return nil, streamErr
+				}
 			}
 			if !isRetryableStreamErr(streamErr) || attempt == streamAccumulateMaxAttempts {
+				alertProviderError(streamErr, entry.Model)
 				return nil, streamErr
 			}
 			// Transport/provider hiccup; pause and retry.
@@ -1101,6 +1112,7 @@ func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error)
 	}
 	message, err := client.Messages.New(ctx, params, reqOpts...)
 	if err != nil {
+		alertProviderError(err, entry.Model)
 		return "", fmt.Errorf("summarize turns: %w", err)
 	}
 	return textOnly(*message), nil
