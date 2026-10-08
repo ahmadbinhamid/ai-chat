@@ -95,6 +95,62 @@ func TestConsumeStream_FirstTokenTimeoutFiresWhenNothingEverArrives(t *testing.T
 	}
 }
 
+// TestConsumeStream_SlowFirstEventWithinFirstTokenBudgetSucceeds checks a stream whose first event arrives after
+// longer than idleTimeout, but within firstTokenTimeout, isn't killed as idle: a router sends only SSE comments
+// (dropped by the SDK) while the upstream host queues and prefills.
+func TestConsumeStream_SlowFirstEventWithinFirstTokenBudgetSucceeds(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flush(w, ": OPENROUTER PROCESSING\n\n")
+		select {
+		case <-time.After(150 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		flush(w, toolUseSSEResponse("msg_1", "toolu_1", "propose_changes", emptyAnswer("Done."), 10, 5))
+	}))
+	defer ts.Close()
+
+	stream := newStreamingTestStream(ts)
+	var message anthropic.Message
+
+	err := consumeStream(context.Background(), stream, &message, 50*time.Millisecond, time.Second)
+	_ = stream.Close()
+
+	if err != nil {
+		t.Fatalf("expected the slow first event to be waited for, got %v", err)
+	}
+	if message.StopReason != anthropic.StopReasonToolUse || len(message.Content) != 1 {
+		t.Fatalf("expected the full message once events flowed, got %+v", message)
+	}
+}
+
+// TestConsumeStream_NothingAtAllFailsOnFirstTokenNotIdle checks a stream that never sends an event fails on the
+// first-token budget even when idleTimeout is shorter: the idle rule only applies once events have started.
+func TestConsumeStream_NothingAtAllFailsOnFirstTokenNotIdle(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flush(w, "")
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	stream := newStreamingTestStream(ts)
+	var message anthropic.Message
+
+	start := time.Now()
+	err := consumeStream(context.Background(), stream, &message, 50*time.Millisecond, 200*time.Millisecond)
+	elapsed := time.Since(start)
+	_ = stream.Close()
+
+	if !errors.Is(err, errStreamFirstToken) {
+		t.Fatalf("expected errStreamFirstToken, got %v", err)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("failed after %v, before the 200ms first-token budget", elapsed)
+	}
+}
+
 // TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress checks tool_use-only streaming
 func TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress(t *testing.T) {
 	var b strings.Builder

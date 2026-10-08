@@ -572,8 +572,11 @@ func consumeStreamDeltas(
 	onDelta func(anthropic.MessageDeltaEvent),
 ) error {
 	sawProgress := false
+	sawEvent := false
 
-	idleTimer := time.NewTimer(idleTimeout)
+	// Before the first event only the first-token budget applies: during upstream queue/prefill a router sends only SSE
+	// comments, which the SDK drops, so they never reset this timer. The per-event Reset below restores idleTimeout.
+	idleTimer := time.NewTimer(max(idleTimeout, firstTokenTimeout))
 	defer idleTimer.Stop()
 	firstTokenTimer := time.NewTimer(firstTokenTimeout)
 	defer firstTokenTimer.Stop()
@@ -601,6 +604,10 @@ func consumeStreamDeltas(
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-idleTimer.C:
+			// Before any event both timers can fire together; that's the first-token budget running out, not a stall.
+			if !sawEvent {
+				return errStreamFirstToken
+			}
 			return errStreamIdle
 		case <-firstTokenTimer.C:
 			if !sawProgress {
@@ -614,6 +621,7 @@ func consumeStreamDeltas(
 			if !r.ok {
 				return nil
 			}
+			sawEvent = true
 			event := stream.Current()
 			if err := message.Accumulate(event); err != nil {
 				return fmt.Errorf("accumulate stream: %w", err)
