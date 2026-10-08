@@ -120,3 +120,23 @@ func TestGeneratedFileTypes(t *testing.T) {
 		t.Errorf("GeneratedFileTypes() = %q, want %q", got, want)
 	}
 }
+
+func TestValidateThemeSlug_DotSegments(t *testing.T) {
+	tests := []struct {
+		slug    string
+		wantErr bool
+	}{
+		{".", true},
+		{"..", true},
+		{"...", false}, // not a path segment of its own; treated like any other name
+		{"shop.v2", false},
+		{"..shop", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.slug, func(t *testing.T) {
+			if err := ValidateThemeSlug(tt.slug); (err != nil) != tt.wantErr {
+				t.Errorf("ValidateThemeSlug(%q) error = %v, wantErr %v", tt.slug, err, tt.wantErr)
+			}
+		})
+	}
+}

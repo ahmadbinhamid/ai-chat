@@ -96,7 +96,8 @@ func ValidateThemeSlug(slug string) error {
 	if slug == "" {
 		return fmt.Errorf("theme slug must not be empty")
 	}
-	if slug != path.Clean(slug) || strings.ContainsAny(slug, "/\\") {
+	// path.Clean leaves "." and ".." unchanged, and the slug is joined into FlowPOS URLs, where ".." would climb a level.
+	if slug == "." || slug == ".." || slug != path.Clean(slug) || strings.ContainsAny(slug, "/\\") {
 		return fmt.Errorf("invalid theme slug: %q", preview(slug))
 	}
 	return nil
