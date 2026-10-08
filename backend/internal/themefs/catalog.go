@@ -28,6 +28,8 @@ func (s *Store) FetchProductsPage(ctx context.Context, auth RequestAuth, q Produ
 		query.Set("page", strconv.Itoa(q.Page))
 	}
 	if q.Search != "" {
+		// The tenant API matches name only; live's DataService also matches description and SKU. Widening is a
+		// flowpos-backend change and needs nothing here.
 		query.Set("search", q.Search)
 	}
 	if q.SortBy != "" {
