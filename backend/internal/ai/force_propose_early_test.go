@@ -41,9 +41,9 @@ func TestShouldForcePropose(t *testing.T) {
 	}
 }
 
-// A model that only ever searches: the first forced round is round 12, offers only propose_changes, and the turn ends
-// there with an honest question and no files.
-func TestGenerate_ForcedRoundOffersOnlyProposeChanges(t *testing.T) {
+// A model that only ever searches: the first forced round is round 12, still lists every tool (so the prompt cache holds)
+// but names propose_changes, and the turn ends there with an honest question and no files.
+func TestGenerate_ForcedRoundKeepsEveryToolAndNamesProposeChanges(t *testing.T) {
 	type request struct {
 		Tools []struct {
 			Name string `json:"name"`
@@ -67,7 +67,7 @@ func TestGenerate_ForcedRoundOffersOnlyProposeChanges(t *testing.T) {
 		requests = append(requests, req)
 		n := len(requests)
 		w.Header().Set("Content-Type", "text/event-stream")
-		if len(req.Tools) == 1 && req.Tools[0].Name == toolNameProposeChanges {
+		if req.ToolChoice.Type == "tool" {
 			fmt.Fprint(w, toolUseSSEResponse(fmt.Sprintf("msg_%d", n), fmt.Sprintf("toolu_%d", n), toolNameProposeChanges, map[string]any{
 				"summary": question, "needs_clarification": true, "files": []any{},
 				"page_registry_entry": nil, "layout_links_to_add": []string{}, "layout_scripts_to_add": []string{},
@@ -98,8 +98,8 @@ func TestGenerate_ForcedRoundOffersOnlyProposeChanges(t *testing.T) {
 			}
 			continue
 		}
-		if len(req.Tools) != 1 || req.Tools[0].Name != toolNameProposeChanges || req.ToolChoice.Type != "tool" {
-			t.Errorf("call %d (forced): want only propose_changes offered, got %+v", i, req.Tools)
+		if len(req.Tools) != len(requests[0].Tools) || req.ToolChoice.Type != "tool" {
+			t.Errorf("call %d (forced): want the same full tool list with tool_choice propose_changes, got %+v / %+v", i, req.Tools, req.ToolChoice)
 		}
 		last := req.System[len(req.System)-1].Text
 		if last != forceProposeInstruction || !strings.Contains(last, "needs_clarification: true") {
@@ -112,9 +112,9 @@ func TestGenerate_ForcedRoundOffersOnlyProposeChanges(t *testing.T) {
 	}
 }
 
-// DeepSeek calls tools a request didn't offer; none of those may run, on a normal or a forced round, and each gets an
-// error result naming what is available. A model that never proposes ends on the fixed question.
-func TestGenerate_NeverRunsAToolTheRequestDidNotOffer(t *testing.T) {
+// DeepSeek calls tools a round doesn't allow; none of those may run, on a normal or a forced round, and each gets an
+// error result naming what is allowed. A model that never proposes ends on the fixed question.
+func TestGenerate_NeverRunsAToolTheRoundDoesNotAllow(t *testing.T) {
 	type request struct {
 		Tools []struct {
 			Name string `json:"name"`
@@ -161,8 +161,8 @@ func TestGenerate_NeverRunsAToolTheRequestDidNotOffer(t *testing.T) {
 			t.Errorf("ran a tool that was never offered: %s", name)
 		}
 	}
-	if second := string(requests[1].Messages[len(requests[1].Messages)-1]); !strings.Contains(second, "delete_theme isn't available in this request") ||
-		!strings.Contains(second, "Available tools: list_theme_files, read_theme_file, grep_theme, propose_changes.") {
+	if second := string(requests[1].Messages[len(requests[1].Messages)-1]); !strings.Contains(second, "delete_theme isn't allowed in this round") ||
+		!strings.Contains(second, "Allowed now: list_theme_files, read_theme_file, grep_theme, propose_changes.") {
 		t.Errorf("expected an error result naming the available tools, got %s", second)
 	}
 	if !result.NeedsClarification || len(result.Files) != 0 || result.Summary != ExhaustedSearchReply {

@@ -657,12 +657,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		iterationsUsed = iteration + 1
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
 		forcingPropose := shouldForcePropose(iteration, time.Since(generateStart))
-		roundTools := tools
+		// The request always lists every tool, keeping the prompt cache intact; a forced round instead refuses any call
+		// but propose_changes, since DeepSeek ignores a named tool_choice and keeps searching.
+		allowedTools := tools
 		if forcingPropose {
 			toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
-			// DeepSeek ignores a named tool_choice and keeps reading, so the round offers nothing else to call.
-			// A different tool list misses the prompt cache; forcing is rare enough for that to be acceptable.
-			roundTools = []anthropic.ToolUnionParam{proposeChangesTool()}
+			allowedTools = []anthropic.ToolUnionParam{proposeChangesTool()}
 			slog.Info("ai: forcing propose_changes",
 				"iteration", iteration, "max_tool_iterations", maxToolIterations,
 				"elapsed_ms", time.Since(generateStart).Milliseconds())
@@ -672,7 +672,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			MaxTokens:  g.maxTokens,
 			System:     system,
 			Messages:   messages,
-			Tools:      roundTools,
+			Tools:      tools,
 			ToolChoice: toolChoice,
 		}
 		if forcingPropose {
@@ -883,10 +883,10 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, materializeFailureMsg, true))
 				continue
 			}
-			// DeepSeek calls tools the request didn't offer (seen on forced rounds), so the offer is enforced here.
-			if !toolOffered(roundTools, tu.Name) {
-				slog.Warn("ai: model called a tool this request didn't offer; not running it", "iteration", iteration, "tool", tu.Name)
-				resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, toolUnavailableMessage(tu.Name, roundTools), true))
+			// Enforced here, not by the request: DeepSeek calls tools a round doesn't allow (seen on forced rounds).
+			if !toolOffered(allowedTools, tu.Name) {
+				slog.Warn("ai: model called a tool this round doesn't allow; not running it", "iteration", iteration, "tool", tu.Name)
+				resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, toolUnavailableMessage(tu.Name, allowedTools), true))
 				continue
 			}
 			if tu.Name == toolNameReadThemeFile {
@@ -929,7 +929,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}, nil
 }
 
-// toolOffered reports whether name is one of the tools this round's request offered.
+// toolOffered reports whether name is one of the tools this round allows.
 func toolOffered(tools []anthropic.ToolUnionParam, name string) bool {
 	for _, t := range tools {
 		if t.OfTool != nil && t.OfTool.Name == name {
@@ -946,7 +946,7 @@ func toolUnavailableMessage(name string, tools []anthropic.ToolUnionParam) strin
 			names = append(names, t.OfTool.Name)
 		}
 	}
-	return fmt.Sprintf("%s isn't available in this request, so it wasn't run. Available tools: %s.", name, strings.Join(names, ", "))
+	return fmt.Sprintf("%s isn't allowed in this round, so it wasn't run. Allowed now: %s.", name, strings.Join(names, ", "))
 }
 
 // toolResultBlock prefixes failures with "ERROR:" and keeps is_error: DeepSeek ignores is_error, so the flag alone is invisible.
