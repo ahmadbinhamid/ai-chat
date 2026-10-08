@@ -106,8 +106,13 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 	if p, _ := c.Provider("openrouter"); p.SessionHeader == "" {
 		t.Error("want a session header so each chat stays on one host")
 	}
+	// "only" restricts to hosts that cached well and serve full-precision builds; unlike "order" it keeps stickiness.
+	wantOnly := map[string]int{"deepseek-pro": 2, "deepseek-flash": 2, "deepseek-flash-vision": 1}
 	for _, m := range c.Models {
 		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
+		if only, _ := p["only"].([]any); len(only) != wantOnly[m.ID] {
+			t.Errorf("model %q: want %d allowed hosts, got %v", m.ID, wantOnly[m.ID], p["only"])
+		}
 		ignore, _ := p["ignore"].([]any)
 		if _, ordered := p["order"]; ordered || p["allow_fallbacks"] != true || p["data_collection"] != "allow" || len(ignore) == 0 {
 			t.Errorf("model %q: want no order, fallbacks, ignored hosts and data_collection allow; got %v", m.ID, p)
