@@ -12,8 +12,8 @@ import (
 	"ai-chat/internal/aicatalog"
 )
 
-// modelListGenerator builds a Generator from catalogueFile whose first provider is served at baseURL.
-func modelListGenerator(t *testing.T, catalogueFile, baseURL string, edit func(map[string]any)) *Generator {
+// modelListGenerator builds a Generator from catalogueFile whose providers' model lists are served at listURL.
+func modelListGenerator(t *testing.T, catalogueFile, listURL string, edit func(map[string]any)) *Generator {
 	t.Helper()
 	data, err := os.ReadFile(catalogueFile)
 	if err != nil {
@@ -24,7 +24,9 @@ func modelListGenerator(t *testing.T, catalogueFile, baseURL string, edit func(m
 		t.Fatal(err)
 	}
 	for _, p := range raw["providers"].(map[string]any) {
-		p.(map[string]any)["base_url"] = baseURL
+		if _, has := p.(map[string]any)["models_url"]; has {
+			p.(map[string]any)["models_url"] = listURL + "/api/v1/models"
+		}
 	}
 	if edit != nil {
 		edit(raw)
@@ -42,12 +44,12 @@ func modelListGenerator(t *testing.T, catalogueFile, baseURL string, edit func(m
 	return g
 }
 
-// modelListServer answers GET /v1/models in OpenRouter's shape with ids, counting the calls.
+// modelListServer answers GET /api/v1/models in OpenRouter's own shape with ids, counting the calls.
 func modelListServer(t *testing.T, status int, ids ...string) (*httptest.Server, *int) {
 	calls := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		if r.URL.Path != "/v1/models" {
+		if r.URL.Path != "/api/v1/models" {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -108,11 +110,11 @@ func TestVerifyModels_UnreachableProviderOnlyWarns(t *testing.T) {
 	}
 }
 
-// The DeepSeek rollback catalogue doesn't set verify_models, so it never depends on DeepSeek serving a model list.
+// The DeepSeek rollback catalogue sets no models_url, so it never depends on DeepSeek serving a model list.
 func TestVerifyModels_SkipsProvidersWithoutTheFlag(t *testing.T) {
 	ts, calls := modelListServer(t, http.StatusOK, "something-else")
 	g := modelListGenerator(t, "../../config/ai-models.deepseek.json", ts.URL, nil)
 	if err := g.VerifyModels(context.Background()); err != nil || *calls != 0 {
-		t.Fatalf("want no check for a provider without verify_models, got err=%v calls=%d", err, *calls)
+		t.Fatalf("want no check for a provider without models_url, got err=%v calls=%d", err, *calls)
 	}
 }
