@@ -842,6 +842,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// Model latency/tokens; cache_read_input_tokens > 0 on iteration 2+ confirms caching works.
 		slog.Info("ai: model call timing",
 			"iteration", iteration,
+			"host", servedBy(message),
+			"stop_reason", message.StopReason,
 			"elapsed_ms", modelElapsed.Milliseconds(),
 			"attempts_used", attemptsUsed,
 			"forcing_propose", forcingPropose,

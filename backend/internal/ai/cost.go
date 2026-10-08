@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"encoding/json"
 	"strconv"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -47,4 +48,17 @@ func (c *costTotal) log() any {
 		return nil
 	}
 	return c.sum
+}
+
+// servedBy is the host OpenRouter routed the call to (its message_start "provider" field); "" for other providers.
+func servedBy(m anthropic.Message) string {
+	field, ok := m.JSON.ExtraFields["provider"]
+	if !ok {
+		return ""
+	}
+	var host string
+	if err := json.Unmarshal([]byte(field.Raw()), &host); err != nil {
+		return ""
+	}
+	return host
 }

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/anthropics/anthropic-sdk-go"
+
 	"ai-chat/internal/aicatalog"
 )
 
@@ -112,6 +114,27 @@ func TestGenerate_RecordsTheProvidersCost(t *testing.T) {
 			}
 			if (result.CostUSD == nil) != (tt.want == nil) || (tt.want != nil && fmt.Sprintf("%.10f", *result.CostUSD) != fmt.Sprintf("%.10f", *tt.want)) {
 				t.Errorf("CostUSD = %v, want %v", deref(result.CostUSD), deref(tt.want))
+			}
+		})
+	}
+}
+
+func TestServedBy(t *testing.T) {
+	tests := []struct {
+		name, messageStart, want string
+	}{
+		{"openrouter names the host", `{"id":"m","type":"message","role":"assistant","model":"x","content":[],"provider":"Wafer","usage":{"input_tokens":0,"output_tokens":0}}`, "Wafer"},
+		{"other providers don't", `{"id":"m","type":"message","role":"assistant","model":"x","content":[],"usage":{"input_tokens":0,"output_tokens":0}}`, ""},
+		{"not a string", `{"id":"m","type":"message","role":"assistant","model":"x","content":[],"provider":{"a":1},"usage":{"input_tokens":0,"output_tokens":0}}`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var m anthropic.Message
+			if err := m.UnmarshalJSON([]byte(tt.messageStart)); err != nil {
+				t.Fatal(err)
+			}
+			if got := servedBy(m); got != tt.want {
+				t.Errorf("servedBy = %q, want %q", got, tt.want)
 			}
 		})
 	}
