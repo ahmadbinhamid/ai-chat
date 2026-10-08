@@ -29,6 +29,9 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
+// modelListTimeout bounds the startup model check, so a slow provider only delays startup, never blocks it.
+const modelListTimeout = 15 * time.Second
+
 type Server struct {
 	cfg          config.Config
 	engine       *gin.Engine
@@ -71,6 +74,12 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 			return nil, err
 		}
 		generator, err = ai.New(catalog, os.LookupEnv, cfg.MaxTokens, streamTimeouts)
+		if err != nil {
+			return nil, err
+		}
+		verifyCtx, cancel := context.WithTimeout(context.Background(), modelListTimeout)
+		err = generator.VerifyModels(verifyCtx)
+		cancel()
 		if err != nil {
 			return nil, err
 		}

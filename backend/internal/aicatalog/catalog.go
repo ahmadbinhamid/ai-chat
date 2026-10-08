@@ -23,6 +23,8 @@ type Provider struct {
 	APIKeyEnv string `json:"api_key_env"`
 	// Options are extra request-body fields sent with every model of this provider (e.g. OpenRouter routing).
 	Options json.RawMessage `json:"options,omitempty"`
+	// VerifyModels checks every model name against the provider's GET /v1/models list at startup.
+	VerifyModels bool `json:"verify_models,omitempty"`
 }
 
 // Model is one catalogue entry. ID is what the dashboard sends and sees; Model is the provider's own name, never exposed.
