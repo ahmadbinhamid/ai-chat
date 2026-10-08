@@ -28,7 +28,7 @@ func (g *modelRecordingGenerator) Generate(_ context.Context, tc ai.ThemeContext
 
 func committedCatalogue(t *testing.T) *aicatalog.Catalog {
 	t.Helper()
-	data, err := os.ReadFile("../../../config/ai-models.json")
+	data, err := os.ReadFile("../../../config/ai-models.deepseek.json")
 	if err != nil {
 		t.Fatal(err)
 	}

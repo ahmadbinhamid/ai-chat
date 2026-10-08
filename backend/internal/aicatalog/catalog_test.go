@@ -14,10 +14,10 @@ func envWith(vars map[string]string) func(string) (string, bool) {
 
 var withKey = envWith(map[string]string{"AI_API_KEY": "k"})
 
-// validCatalogue returns the committed catalogue as a map, so each case can break exactly one thing.
+// validCatalogue returns the DeepSeek rollback catalogue as a map, so each case can break exactly one thing.
 func validCatalogue(t *testing.T) map[string]any {
 	t.Helper()
-	data, err := os.ReadFile("../../config/ai-models.json")
+	data, err := os.ReadFile("../../config/ai-models.deepseek.json")
 	if err != nil {
 		t.Fatalf("read committed catalogue: %v", err)
 	}
@@ -203,5 +203,29 @@ func TestPublic_HidesProviderDetails(t *testing.T) {
 		if strings.Contains(string(raw), secret) {
 			t.Errorf("GET /models must not expose %q: %s", secret, raw)
 		}
+	}
+}
+
+// The active catalogue is OpenRouter, keyed by AI_API_KEY like the DeepSeek one, with the same model ids.
+func TestParse_OpenRouterCatalogue(t *testing.T) {
+	data, err := os.ReadFile("../../config/ai-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data, withKey)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	p, ok := c.Provider("openrouter")
+	if !ok || p.APIKeyEnv != "AI_API_KEY" || p.BaseURL != "https://openrouter.ai/api" {
+		t.Fatalf("want the openrouter provider on AI_API_KEY, got %+v", c.Providers)
+	}
+	for _, id := range []string{"deepseek-pro", "deepseek-flash", "deepseek-flash-vision"} {
+		if m, ok := c.Model(id); !ok || m.Provider != "openrouter" {
+			t.Errorf("model %q should be served by openrouter, got %+v", id, m)
+		}
+	}
+	if _, err := Parse(data, envWith(map[string]string{"OPENROUTER_API_KEY": "k"})); err == nil {
+		t.Error("want an error when AI_API_KEY is unset")
 	}
 }

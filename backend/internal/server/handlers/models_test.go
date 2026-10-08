@@ -18,7 +18,7 @@ import (
 
 func catalogueService(t *testing.T) *themebuild.Service {
 	t.Helper()
-	data, err := os.ReadFile("../../../config/ai-models.json")
+	data, err := os.ReadFile("../../../config/ai-models.deepseek.json")
 	if err != nil {
 		t.Fatal(err)
 	}
