@@ -74,8 +74,11 @@ func TestGenerate_SendsTheModelsProviderOptions(t *testing.T) {
 	// Pro gets an option of its own on top of the provider's; Flash has only the provider's.
 	g, bodies, _ := openRouterGenerator(t, func(raw map[string]any) {
 		for _, m := range raw["models"].([]any) {
-			if m.(map[string]any)["id"] == "deepseek-pro" {
+			switch m.(map[string]any)["id"] {
+			case "deepseek-pro":
 				m.(map[string]any)["options"] = map[string]any{"provider": map[string]any{"sort": "latency"}}
+			case "deepseek-flash":
+				delete(m.(map[string]any), "options")
 			}
 		}
 	})

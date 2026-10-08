@@ -106,12 +106,15 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 	if p, _ := c.Provider("openrouter"); p.SessionHeader == "" {
 		t.Error("want a session header so each chat stays on one host")
 	}
-	// "only" restricts to hosts that cached well and serve full-precision builds; unlike "order" it keeps stickiness.
-	wantOnly := map[string]int{"deepseek-pro": 2, "deepseek-flash": 2, "deepseek-flash-vision": 1}
+	// The DeepSeek models rank hosts by throughput; Grok and Kimi keep OpenRouter's default ranking.
 	for _, m := range c.Models {
 		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
-		if only, _ := p["only"].([]any); len(only) != wantOnly[m.ID] {
-			t.Errorf("model %q: want %d allowed hosts, got %v", m.ID, wantOnly[m.ID], p["only"])
+		wantSort := map[bool]any{true: "throughput", false: nil}[strings.HasPrefix(m.ID, "deepseek-")]
+		if p["sort"] != wantSort {
+			t.Errorf("model %q: want sort %v, got %v", m.ID, wantSort, p["sort"])
+		}
+		if _, restricted := p["only"]; restricted {
+			t.Errorf("model %q: want no host list, got %v", m.ID, p["only"])
 		}
 		ignore, _ := p["ignore"].([]any)
 		if _, ordered := p["order"]; ordered || p["allow_fallbacks"] != true || p["data_collection"] != "allow" || len(ignore) == 0 {
