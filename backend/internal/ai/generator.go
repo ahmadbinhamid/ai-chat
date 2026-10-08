@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -232,17 +234,28 @@ func (g *Generator) SupportsVision() bool {
 // Catalog is the model catalogue this Generator serves.
 func (g *Generator) Catalog() *aicatalog.Catalog { return g.catalog }
 
-// model resolves a choice to its catalogue entry and its provider's client.
-func (g *Generator) model(ch aicatalog.Choice) (aicatalog.Model, anthropic.Client, error) {
+// model resolves a choice to its catalogue entry, its provider's client and the catalogue's extra request fields.
+func (g *Generator) model(ch aicatalog.Choice) (aicatalog.Model, anthropic.Client, []option.RequestOption, error) {
 	m, ok := g.catalog.Model(ch.ModelID)
 	if !ok {
-		return aicatalog.Model{}, anthropic.Client{}, fmt.Errorf("model %q is not in the catalogue", ch.ModelID)
+		return aicatalog.Model{}, anthropic.Client{}, nil, fmt.Errorf("model %q is not in the catalogue", ch.ModelID)
 	}
 	client, ok := g.clients[m.Provider]
 	if !ok {
-		return aicatalog.Model{}, anthropic.Client{}, fmt.Errorf("no client for provider %q", m.Provider)
+		return aicatalog.Model{}, anthropic.Client{}, nil, fmt.Errorf("no client for provider %q", m.Provider)
 	}
-	return m, client, nil
+	return m, client, requestFieldOptions(g.catalog.RequestFields(m.ID)), nil
+}
+
+// requestFieldOptions sets each catalogue option as a top-level body field; sorted so requests are byte-identical,
+// which provider-side prompt caching depends on.
+func requestFieldOptions(fields map[string]any) []option.RequestOption {
+	keys := slices.Sorted(maps.Keys(fields))
+	opts := make([]option.RequestOption, 0, len(keys))
+	for _, k := range keys {
+		opts = append(opts, option.WithJSONSet(k, fields[k]))
+	}
+	return opts
 }
 
 // NewFake builds a Generator that never calls Claude; used to test plumbing without spending tokens.
@@ -631,7 +644,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		messages = freshMessages(history, prompt, images)
 	}
 
-	entry, client, err := g.model(choice)
+	entry, client, reqOpts, err := g.model(choice)
 	if err != nil {
 		return nil, err
 	}
@@ -718,7 +731,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		attemptsUsed := 0
 		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
 			attemptsUsed = attempt
-			stream := client.Messages.NewStreaming(ctx, params)
+			stream := client.Messages.NewStreaming(ctx, params, reqOpts...)
 			message = anthropic.Message{}
 			streamErr := consumeStream(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout)
 			// Close immediately (timeouts may abandon mid-read).
@@ -1075,7 +1088,7 @@ func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error)
 		"what was built or changed, and any decisions made. Do not include a preamble or restate this instruction.\n\n" +
 		"<conversation>\n" + transcript.String() + "</conversation>"
 
-	entry, client, err := g.model(g.catalog.Summary())
+	entry, client, reqOpts, err := g.model(g.catalog.Summary())
 	if err != nil {
 		return "", err
 	}
@@ -1086,7 +1099,7 @@ func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error)
 		// Explicit: DeepSeek thinks by default, which would eat the 1024-token budget.
 		Thinking: anthropic.ThinkingConfigParamUnion{OfDisabled: &anthropic.ThinkingConfigDisabledParam{}},
 	}
-	message, err := client.Messages.New(ctx, params)
+	message, err := client.Messages.New(ctx, params, reqOpts...)
 	if err != nil {
 		return "", fmt.Errorf("summarize turns: %w", err)
 	}

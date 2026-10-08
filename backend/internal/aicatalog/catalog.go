@@ -21,7 +21,7 @@ var validEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 type Provider struct {
 	BaseURL   string `json:"base_url"`
 	APIKeyEnv string `json:"api_key_env"`
-	// Options is reserved for provider-specific settings (e.g. OpenRouter routing); passed through untouched.
+	// Options are extra request-body fields sent with every model of this provider (e.g. OpenRouter routing).
 	Options json.RawMessage `json:"options,omitempty"`
 }
 
@@ -37,7 +37,7 @@ type Model struct {
 	DefaultEffort string   `json:"default_effort"`
 	// Selectable defaults to true; internal-only models (vision, a separate summary model) set it false.
 	Selectable *bool `json:"selectable,omitempty"`
-	// Options is reserved for provider-specific per-model settings; passed through untouched.
+	// Options are extra request-body fields for this model, deep-merged over its provider's.
 	Options json.RawMessage `json:"options,omitempty"`
 }
 
@@ -65,7 +65,8 @@ type Catalog struct {
 	VisionModel  string              `json:"vision_model,omitempty"`
 	SummaryModel string              `json:"summary_model"`
 
-	byID map[string]Model
+	byID   map[string]Model
+	fields map[string]map[string]any
 }
 
 // Choice is a resolved pick: a concrete catalogue model id (never AutoID) and an effort it allows ("" when it has none).
@@ -175,7 +176,7 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 	if _, ok := c.byID[c.SummaryModel]; !ok {
 		return fmt.Errorf("summary_model %q is not in the model list", c.SummaryModel)
 	}
-	return nil
+	return c.buildRequestFields()
 }
 
 func validateModel(m Model, providers map[string]Provider) error {
