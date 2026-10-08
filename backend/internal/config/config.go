@@ -102,7 +102,7 @@ func Load() Config {
 		AuthNegativeCacheTTL: time.Duration(getenvInt("AUTH_NEGATIVE_CACHE_TTL_SECONDS", 10)) * time.Second,
 		FlowposHTTPTimeout:   time.Duration(getenvInt("FLOWPOS_HTTP_TIMEOUT_MS", 2000)) * time.Millisecond,
 
-		Effort:      getenv("AI_EFFORT", "xhigh"),
+		Effort:      getenv("AI_EFFORT", "low"),
 		MaxTokens:   int64(getenvInt("AI_MAX_TOKENS", 64000)),
 		FakeAIMode:  getenvBool("AI_CHAT_FAKE_MODE", false),
 		FakeAIDelay: time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
@@ -114,7 +114,7 @@ func Load() Config {
 		FirstTokenTimeoutPages: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_PAGES_SECONDS", 150)) * time.Second,
 
 		APIKey:       os.Getenv("AI_API_KEY"),
-		Model:        getenv("AI_MODEL", "deepseek-v4-pro"),
+		Model:        getenv("AI_MODEL", "deepseek-v4-flash"),
 		VisionModel:  getenv("AI_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
 		BaseURL:      getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
 		ModelsConfig: os.Getenv("AI_MODELS_CONFIG"),

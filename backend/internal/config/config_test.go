@@ -14,8 +14,8 @@ func TestLoad_DeepSeekFields(t *testing.T) {
 		if cfg.APIKey != "sk-test" {
 			t.Errorf("APIKey = %q, want %q", cfg.APIKey, "sk-test")
 		}
-		if cfg.Model != "deepseek-v4-pro" {
-			t.Errorf("Model = %q, want default %q", cfg.Model, "deepseek-v4-pro")
+		if cfg.Model != "deepseek-v4-flash" {
+			t.Errorf("Model = %q, want default %q", cfg.Model, "deepseek-v4-flash")
 		}
 		if cfg.BaseURL != "https://api.deepseek.com/anthropic" {
 			t.Errorf("BaseURL = %q, want default %q", cfg.BaseURL, "https://api.deepseek.com/anthropic")
@@ -57,8 +57,8 @@ func TestLoad_EffortAndMaxTokens(t *testing.T) {
 		t.Setenv("AI_MAX_TOKENS", "")
 
 		cfg := Load()
-		if cfg.Effort != "xhigh" {
-			t.Errorf("Effort = %q, want default %q", cfg.Effort, "xhigh")
+		if cfg.Effort != "low" {
+			t.Errorf("Effort = %q, want default %q", cfg.Effort, "low")
 		}
 		if cfg.MaxTokens != 64000 {
 			t.Errorf("MaxTokens = %d, want default %d", cfg.MaxTokens, 64000)
