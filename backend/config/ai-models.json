@@ -6,6 +6,7 @@
       "models_url": "https://openrouter.ai/api/v1/models",
       "session_header": "x-session-id",
       "tool_choice": "any",
+      "idle_after": "content",
       "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare"], "data_collection": "allow" } }
     }
   },

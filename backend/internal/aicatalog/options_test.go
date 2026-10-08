@@ -197,3 +197,31 @@ func TestOpenRouterCatalogue_DeepSeekIgnoresWafer(t *testing.T) {
 		}
 	}
 }
+
+// OpenRouter sends message_start before the host has read the prompt, so its idle rule waits for real output; the
+// DeepSeek rollback keeps the default, so direct DeepSeek behaves as before.
+func TestCatalogues_IdleAfter(t *testing.T) {
+	for file, want := range map[string]string{"../../config/ai-models.json": IdleAfterContent, "../../config/ai-models.deepseek.json": ""} {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := Parse(data, withKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, p := range c.Providers {
+			if p.IdleAfter != want {
+				t.Errorf("%s provider %q: idle_after = %q, want %q", file, name, p.IdleAfter, want)
+			}
+		}
+	}
+	data, _ := json.Marshal(map[string]any{
+		"providers":     map[string]any{"p": map[string]any{"base_url": "https://x", "api_key_env": "AI_API_KEY", "idle_after": "never"}},
+		"models":        []any{map[string]any{"id": "m", "label": "M", "provider": "p", "model": "x/m"}},
+		"default_model": "m", "summary_model": "m",
+	})
+	if _, err := Parse(data, withKey); err == nil || !strings.Contains(err.Error(), "idle_after must be") {
+		t.Errorf("want an unknown idle_after rejected, got %v", err)
+	}
+}

@@ -403,3 +403,77 @@ func TestGenerator_FirstTokenTimeoutFor_DefaultsWhenZero(t *testing.T) {
 		t.Errorf("idle: got %v, want default %v", got, defaultStreamIdleTimeout)
 	}
 }
+
+// messageStartOnly is the event a router can send before its upstream host has read the prompt.
+func messageStartOnly() string {
+	var b strings.Builder
+	sseEvent(&b, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
+			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
+		},
+	})
+	return b.String()
+}
+
+// With idleAfterContent, silence between message_start and the first real output is prefill, not a stall, so only the
+// first-token budget applies to it; once output flows the idle rule applies as usual.
+func TestConsumeStreamDeltas_IdleAfterContent(t *testing.T) {
+	full := toolUseSSEResponse("msg_1", "toolu_1", "propose_changes", emptyAnswer("Done."), 10, 5)
+	start := messageStartOnly()
+	tests := []struct {
+		name    string
+		serve   func(w http.ResponseWriter, r *http.Request)
+		wantErr error
+	}{
+		{
+			name: "prefill silence after message_start is waited for",
+			serve: func(w http.ResponseWriter, r *http.Request) {
+				flush(w, start)
+				select {
+				case <-time.After(200 * time.Millisecond):
+				case <-r.Context().Done():
+					return
+				}
+				flush(w, strings.TrimPrefix(full, start))
+			},
+		},
+		{
+			name: "message_start then nothing fails on the first-token budget",
+			serve: func(w http.ResponseWriter, r *http.Request) {
+				flush(w, start)
+				<-r.Context().Done()
+			},
+			wantErr: errStreamFirstToken,
+		},
+		{
+			name: "silence after real output is still a stall",
+			serve: func(w http.ResponseWriter, r *http.Request) {
+				var b strings.Builder
+				sseEvent(&b, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+				sseEvent(&b, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "Working"}})
+				flush(w, start+b.String())
+				<-r.Context().Done()
+			},
+			wantErr: errStreamIdle,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				tt.serve(w, r)
+			}))
+			defer ts.Close()
+			stream := newStreamingTestStream(ts)
+			var message anthropic.Message
+			err := consumeStreamDeltas(context.Background(), stream, &message, 50*time.Millisecond, 400*time.Millisecond, true, nil)
+			_ = stream.Close()
+			if !errors.Is(err, tt.wantErr) && (tt.wantErr != nil || err != nil) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}

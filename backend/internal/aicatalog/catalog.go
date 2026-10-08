@@ -13,6 +13,14 @@ import (
 // AutoID is the reserved choice that routes each turn to the design or fix model.
 const AutoID = "auto"
 
+// validIdleAfter are a provider's allowed idle_after values; "" means "event".
+var validIdleAfter = []string{"", IdleAfterEvent, IdleAfterContent}
+
+const (
+	IdleAfterEvent   = "event"
+	IdleAfterContent = "content"
+)
+
 // validToolChoices are a provider's allowed tool_choice values; "" means "any".
 var validToolChoices = []string{"", ToolChoiceAny, ToolChoiceAuto}
 
@@ -34,6 +42,10 @@ type Provider struct {
 	// ToolChoice is what normal tool-loop rounds require: "any" (the default) or "auto". "auto" lets a router use hosts
 	// that don't honour a required tool call; the loop already copes with a text reply. Forced rounds always name one tool.
 	ToolChoice string `json:"tool_choice,omitempty"`
+	// IdleAfter is when the stream idle timeout starts: "event" (the default, the first stream event) or "content" (the
+	// first text, reasoning or tool output). A router that sends message_start before its host has read the prompt
+	// needs "content", or the prefill silence after it is mistaken for a stall.
+	IdleAfter string `json:"idle_after,omitempty"`
 	// SessionHeader, when set, is the request header the generator puts each chat's ID in, so the provider can keep a
 	// chat's calls on one host (e.g. OpenRouter's sticky routing, which keeps that host's prompt cache warm).
 	SessionHeader string `json:"session_header,omitempty"`
@@ -149,6 +161,9 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 		}
 		if key, ok := lookupEnv(p.APIKeyEnv); !ok || key == "" {
 			return fmt.Errorf("provider %q: environment variable %s is not set", name, p.APIKeyEnv)
+		}
+		if !slices.Contains(validIdleAfter, p.IdleAfter) {
+			return fmt.Errorf("provider %q: idle_after must be \"event\" or \"content\", got %q", name, p.IdleAfter)
 		}
 		if !slices.Contains(validToolChoices, p.ToolChoice) {
 			return fmt.Errorf("provider %q: tool_choice must be \"any\" or \"auto\", got %q", name, p.ToolChoice)

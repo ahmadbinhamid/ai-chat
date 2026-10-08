@@ -259,6 +259,12 @@ func (g *Generator) normalToolChoice(m aicatalog.Model) anthropic.ToolChoiceUnio
 	return anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
 }
 
+// idleAfterContent reports whether the model's provider starts the idle rule at the first real output, not the first event.
+func (g *Generator) idleAfterContent(m aicatalog.Model) bool {
+	p, _ := g.catalog.Provider(m.Provider)
+	return p.IdleAfter == aicatalog.IdleAfterContent
+}
+
 // sessionOptions sends the turn's session ID in the header the model's provider names, if it names one.
 func (g *Generator) sessionOptions(m aicatalog.Model, sessionID string) []option.RequestOption {
 	p, _ := g.catalog.Provider(m.Provider)
@@ -559,7 +565,7 @@ func consumeStream(
 	message *anthropic.Message,
 	idleTimeout, firstTokenTimeout time.Duration,
 ) error {
-	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, nil)
+	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, false, nil)
 }
 
 // consumeStreamDeltas is consumeStream that also hands each message_delta to onDelta: the accumulated message keeps
@@ -569,10 +575,14 @@ func consumeStreamDeltas(
 	stream *ssestream.Stream[anthropic.MessageStreamEventUnion],
 	message *anthropic.Message,
 	idleTimeout, firstTokenTimeout time.Duration,
+	// idleAfterContent waits for real output, not just an event, before the idle rule applies: a router can send
+	// message_start before its upstream host has read the prompt, so the prefill silence that follows isn't a stall.
+	idleAfterContent bool,
 	onDelta func(anthropic.MessageDeltaEvent),
 ) error {
 	sawProgress := false
 	sawEvent := false
+	waitingForFirstToken := func() bool { return !sawEvent || (idleAfterContent && !sawProgress) }
 
 	// Before the first event only the first-token budget applies: during upstream queue/prefill a router sends only SSE
 	// comments, which the SDK drops, so they never reset this timer. The per-event Reset below restores idleTimeout.
@@ -604,8 +614,8 @@ func consumeStreamDeltas(
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-idleTimer.C:
-			// Before any event both timers can fire together; that's the first-token budget running out, not a stall.
-			if !sawEvent {
+			// Before the first token both timers can fire together; that's the first-token budget running out, not a stall.
+			if waitingForFirstToken() {
 				return errStreamFirstToken
 			}
 			return errStreamIdle
@@ -640,7 +650,11 @@ func consumeStreamDeltas(
 				default:
 				}
 			}
-			idleTimer.Reset(idleTimeout)
+			if waitingForFirstToken() {
+				idleTimer.Reset(max(idleTimeout, firstTokenTimeout))
+			} else {
+				idleTimer.Reset(idleTimeout)
+			}
 			go readNext()
 		}
 	}
@@ -740,6 +754,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	// Counts consecutive rounds with no tool call that text recovery also couldn't rescue; any real call resets it.
 	consecutiveTextOnly := 0
 	normalToolChoice := g.normalToolChoice(entry)
+	idleAfterContent := g.idleAfterContent(entry)
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
 		iterationsUsed = iteration + 1
 		toolChoice := normalToolChoice
@@ -789,7 +804,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			stream := client.Messages.NewStreaming(ctx, params, reqOpts...)
 			message = anthropic.Message{}
 			callCost, callCostReported := 0.0, false
-			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, func(d anthropic.MessageDeltaEvent) {
+			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, idleAfterContent, func(d anthropic.MessageDeltaEvent) {
 				callCost, callCostReported = deltaCost(d)
 			})
 			// Close immediately (timeouts may abandon mid-read).
