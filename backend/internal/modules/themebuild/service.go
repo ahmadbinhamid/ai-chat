@@ -1086,6 +1086,63 @@ func (s *Service) FetchPreviewProducts(ctx context.Context, storeAuth themefs.Re
 	return fetcher.FetchProducts(ctx, storeAuth, limit)
 }
 
+// *themefs.Store-only capability; the storefront catalogue isn't theme files.
+type catalogFetcher interface {
+	FetchProductsPage(ctx context.Context, auth themefs.RequestAuth, q themefs.ProductsQuery) (themefs.ProductsPage, error)
+	FetchCategories(ctx context.Context, auth themefs.RequestAuth, limit int) ([]themefs.Category, error)
+}
+
+func (s *Service) catalog() (catalogFetcher, error) {
+	fetcher, ok := s.store.(catalogFetcher)
+	if !ok {
+		return nil, fmt.Errorf("theme store does not support catalogue fetch")
+	}
+	return fetcher, nil
+}
+
+// FetchPreviewProductsPage fetches one filtered page of real products for a preview of a listing or category page.
+func (s *Service) FetchPreviewProductsPage(ctx context.Context, storeAuth themefs.RequestAuth, q themefs.ProductsQuery) (themefs.ProductsPage, error) {
+	fetcher, err := s.catalog()
+	if err != nil {
+		return themefs.ProductsPage{}, err
+	}
+	return fetcher.FetchProductsPage(ctx, storeAuth, q)
+}
+
+func (s *Service) FetchPreviewCategories(ctx context.Context, storeAuth themefs.RequestAuth, limit int) ([]themefs.Category, error) {
+	fetcher, err := s.catalog()
+	if err != nil {
+		return nil, err
+	}
+	return fetcher.FetchCategories(ctx, storeAuth, limit)
+}
+
+// FetchPreviewPriceRange derives the catalogue's price bounds from the cheapest and dearest product, as the tenant API has
+// no aggregate endpoint. An empty catalogue is an error so the caller keeps its fallback range.
+func (s *Service) FetchPreviewPriceRange(ctx context.Context, storeAuth themefs.RequestAuth) (minPrice, maxPrice float64, err error) {
+	fetcher, err := s.catalog()
+	if err != nil {
+		return 0, 0, err
+	}
+	var cheapest, dearest themefs.ProductsPage
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() (err error) {
+		cheapest, err = fetcher.FetchProductsPage(gctx, storeAuth, themefs.ProductsQuery{Limit: 1, SortBy: "price-asc"})
+		return err
+	})
+	g.Go(func() (err error) {
+		dearest, err = fetcher.FetchProductsPage(gctx, storeAuth, themefs.ProductsQuery{Limit: 1, SortBy: "price-desc"})
+		return err
+	})
+	if err := g.Wait(); err != nil {
+		return 0, 0, err
+	}
+	if len(cheapest.Items) == 0 || len(dearest.Items) == 0 {
+		return 0, 0, fmt.Errorf("catalogue has no products")
+	}
+	return cheapest.Items[0].Price, dearest.Items[0].Price, nil
+}
+
 // *themefs.Store-only capability; a product's detail and its add-on groups aren't theme files.
 type productDetailFetcher interface {
 	FetchProductDetail(ctx context.Context, auth themefs.RequestAuth, slug string) (themefs.ProductDetail, error)
