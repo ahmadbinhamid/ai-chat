@@ -14,9 +14,8 @@ import (
 	"ai-chat/internal/aicatalog"
 )
 
-// With the OpenRouter catalogue's "tool_choice": "auto", normal rounds don't require a tool call, so OpenRouter can use
-// hosts that don't honour one; forced rounds still name propose_changes with thinking off, since auto alone left Flash
-// and Kimi searching on 2 of 3 forced calls.
+// A provider set to "tool_choice": "auto" requires no tool call on normal rounds; forced rounds still name
+// propose_changes with thinking off, since auto alone left Flash and Kimi searching on 2 of 3 forced calls.
 func TestGenerate_AutoToolChoiceOnNormalRoundsOnly(t *testing.T) {
 	type request struct {
 		Thinking   struct{ Type string } `json:"thinking"`
@@ -53,6 +52,7 @@ func TestGenerate_AutoToolChoiceOnNormalRoundsOnly(t *testing.T) {
 	var raw map[string]any
 	_ = json.Unmarshal(data, &raw)
 	raw["providers"].(map[string]any)["openrouter"].(map[string]any)["base_url"] = ts.URL
+	raw["providers"].(map[string]any)["openrouter"].(map[string]any)["tool_choice"] = "auto"
 	data, _ = json.Marshal(raw)
 	lookup := func(string) (string, bool) { return "k", true }
 	cat, err := aicatalog.Parse(data, lookup)

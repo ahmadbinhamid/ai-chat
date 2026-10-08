@@ -5,7 +5,7 @@
       "api_key_env": "AI_API_KEY",
       "models_url": "https://openrouter.ai/api/v1/models",
       "session_header": "x-session-id",
-      "tool_choice": "auto",
+      "tool_choice": "any",
       "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare"], "data_collection": "allow" } }
     }
   },
