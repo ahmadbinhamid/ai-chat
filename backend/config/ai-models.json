@@ -6,6 +6,7 @@
       "models_url": "https://openrouter.ai/api/v1/models",
       "session_header": "x-session-id",
       "tool_choice": "auto",
+      "force_instruction": "messages",
       "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare"], "data_collection": "allow" } }
     }
   },
@@ -31,6 +32,17 @@
       "thinking": true,
       "efforts": ["low"],
       "default_effort": "low"
+    },
+    {
+      "id": "deepseek-flash-design",
+      "label": "DeepSeek Flash (design)",
+      "provider": "openrouter",
+      "model": "deepseek/deepseek-v4-flash",
+      "options": { "provider": { "only": ["wafer", "deepinfra"] } },
+      "images": false,
+      "thinking": false,
+      "disable_thinking": true,
+      "selectable": false
     },
     {
       "id": "grok",
@@ -65,7 +77,7 @@
   ],
   "auto": {
     "label": "Auto",
-    "design_model": "deepseek-flash", "design_effort": "low",
+    "design_model": "deepseek-flash-design", "design_effort": "",
     "fix_model": "deepseek-pro", "fix_effort": "low"
   },
   "default_model": "auto",

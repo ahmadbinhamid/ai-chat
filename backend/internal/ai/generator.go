@@ -259,6 +259,26 @@ func (g *Generator) normalToolChoice(m aicatalog.Model) anthropic.ToolChoiceUnio
 	return anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
 }
 
+// forceInstructionInMessages reports whether the model's provider wants the forcing instruction at the end of the
+// messages rather than the system prompt, which keeps the system prompt identical so its cached prefix still matches.
+func (g *Generator) forceInstructionInMessages(m aicatalog.Model) bool {
+	p, _ := g.catalog.Provider(m.Provider)
+	return p.ForceInstruction == aicatalog.ForceInstructionMessages
+}
+
+// withTrailingText appends text to a copy of the conversation's last user message (after any tool results, which
+// must come first), never modifying messages itself, so the next round starts from the unforced conversation.
+func withTrailingText(messages []anthropic.MessageParam, text string) []anthropic.MessageParam {
+	out := append([]anthropic.MessageParam(nil), messages...)
+	if n := len(out); n > 0 && out[n-1].Role == anthropic.MessageParamRoleUser {
+		last := out[n-1]
+		last.Content = append(append([]anthropic.ContentBlockParamUnion(nil), last.Content...), anthropic.NewTextBlock(text))
+		out[n-1] = last
+		return out
+	}
+	return append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(text)))
+}
+
 // sessionOptions sends the turn's session ID in the header the model's provider names, if it names one.
 func (g *Generator) sessionOptions(m aicatalog.Model, sessionID string) []option.RequestOption {
 	p, _ := g.catalog.Provider(m.Provider)
@@ -732,6 +752,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	// Counts consecutive rounds with no tool call that text recovery also couldn't rescue; any real call resets it.
 	consecutiveTextOnly := 0
 	normalToolChoice := g.normalToolChoice(entry)
+	forceInMessages := g.forceInstructionInMessages(entry)
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
 		iterationsUsed = iteration + 1
 		toolChoice := normalToolChoice
@@ -755,13 +776,20 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			ToolChoice: toolChoice,
 		}
 		if forcingPropose {
-			params.System = append(append([]anthropic.TextBlockParam{}, system...), anthropic.TextBlockParam{
-				Text: forceProposeInstruction,
-			})
+			if forceInMessages {
+				params.Messages = withTrailingText(messages, forceProposeInstruction)
+			} else {
+				params.System = append(append([]anthropic.TextBlockParam{}, system...), anthropic.TextBlockParam{
+					Text: forceProposeInstruction,
+				})
+			}
 		}
-		// A model without thinking gets neither parameter.
+		// A model without thinking gets neither parameter, unless it thinks by default and must be told not to.
 		switch {
 		case !entry.Thinking:
+			if entry.DisableThinking {
+				params.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &anthropic.ThinkingConfigDisabledParam{}}
+			}
 		case forcingPropose:
 			// DeepSeek rejects a named tool_choice while thinking ("Thinking mode does not support this tool_choice"),
 			// and thinks by default, so the forced call must disable it explicitly.
