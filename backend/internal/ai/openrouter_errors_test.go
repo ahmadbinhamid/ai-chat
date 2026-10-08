@@ -122,6 +122,11 @@ func TestOpenRouterErrors(t *testing.T) {
 			message: "the AI service is temporarily unavailable", alert: "doesn't know a catalogue model",
 		},
 		{
+			name: "model gated by an account setting", status: http.StatusForbidden,
+			body:    `{"type":"error","error":{"type":"permission_error","message":"This model requires you to complete the following before use: 18+ age confirmation. Confirm at https://openrouter.ai/settings/preferences."}}`,
+			message: "the AI service is temporarily unavailable", alert: "isn't allowed to use this model",
+		},
+		{
 			name: "no host can serve it", status: http.StatusNotFound,
 			body:    `{"type":"error","error":{"type":"not_found_error","message":"No endpoints found for deepseek/deepseek-v4-pro. Every candidate endpoint was removed during routing"}}`,
 			message: "the AI service is temporarily unavailable", alert: "no host",

@@ -67,6 +67,7 @@ const (
 	providerErrUpstream
 	providerErrUnknownModel
 	providerErrNoHost
+	providerErrNoAccess
 )
 
 // classifyProviderError recognises OpenRouter's failures, whether returned as the HTTP status or as a mid-stream
@@ -86,6 +87,9 @@ func classifyProviderError(err error) providerErrorKind {
 		return providerErrUnknownModel
 	case apiErr.StatusCode == http.StatusNotFound && strings.Contains(lower, "no endpoints found"):
 		return providerErrNoHost
+	// e.g. a model gated behind an account setting (OpenRouter's 18+ confirmation).
+	case apiErr.StatusCode == http.StatusForbidden || apiErr.Type() == shared.ErrorTypePermissionError:
+		return providerErrNoAccess
 	case apiErr.StatusCode == http.StatusTooManyRequests || apiErr.Type() == shared.ErrorTypeRateLimitError:
 		return providerErrRateLimited
 	case apiErr.StatusCode == http.StatusBadGateway || apiErr.StatusCode == http.StatusServiceUnavailable ||
@@ -117,13 +121,16 @@ func alertProviderError(err error, model string) {
 	case providerErrNoHost:
 		slog.Error("ai: provider has no host that can serve this model's requests — check its routing options",
 			"model", model, "error", err)
+	case providerErrNoAccess:
+		slog.Error("ai: provider account isn't allowed to use this model — check the provider's account settings",
+			"model", model, "error", err)
 	}
 }
 
 // categorizeError maps err to a short, actionable, provider-neutral reason. A typed
 func categorizeError(err error) string {
 	switch classifyProviderError(err) {
-	case providerErrOutOfCredits, providerErrUnknownModel, providerErrNoHost:
+	case providerErrOutOfCredits, providerErrUnknownModel, providerErrNoHost, providerErrNoAccess:
 		return serviceUnavailableMessage
 	case providerErrRateLimited:
 		return "too many requests right now — please try again shortly"
