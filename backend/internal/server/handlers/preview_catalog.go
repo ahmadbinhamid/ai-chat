@@ -18,6 +18,10 @@ import (
 // filterCategoryLimit matches DataService::categoryOptions' default limit on the live storefront.
 const filterCategoryLimit = 50
 
+// previewProductsPerPage is the preview's listing page size. Live's DataService::PER_PAGE (and §7) is 15, so preview
+// pages hold different products from live's from page 2 on.
+const previewProductsPerPage = 12
+
 var errCategoryNotFound = errors.New("category not found")
 
 // buildPageContext is buildPreviewContext for one storefront URL: the page's real catalogue data filtered as the live
@@ -25,7 +29,7 @@ var errCategoryNotFound = errors.New("category not found")
 func buildPageContext(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, fetchTimeout time.Duration, page storefrontquery.Request) map[string]any {
 	fixture := themefs.FixtureContext()
 	overlayStoreAndMenu(ctx, builder, storeAuth, fixture)
-	fixture["filters"] = page.Filters.Echo(themefs.StorefrontPerPage)
+	fixture["filters"] = page.Filters.Echo(previewProductsPerPage)
 
 	var (
 		wg              sync.WaitGroup
@@ -72,7 +76,7 @@ func buildPageContext(ctx context.Context, builder *themebuild.Service, storeAut
 	} else {
 		run("preview.products", func() {
 			q := themefs.ProductsQuery{
-				Limit: themefs.StorefrontPerPage, Page: page.Filters.Page, Search: page.Filters.Search,
+				Limit: previewProductsPerPage, Page: page.Filters.Page, Search: page.Filters.Search,
 				SortBy: page.Filters.SortBy(), MinPrice: page.Filters.MinPrice, MaxPrice: page.Filters.MaxPrice,
 			}
 			if page.Filters.Category != "" {
@@ -132,7 +136,7 @@ func buildPageContext(ctx context.Context, builder *themebuild.Service, storeAut
 // fixture, where live would 404; as a listing filter it is a real, empty result, as on live.
 func applyListing(fixture map[string]any, page storefrontquery.Request, listing themefs.ProductsPage, err error, category *themefs.Category) {
 	if errors.Is(err, errCategoryNotFound) && page.Kind == storefrontquery.PageListing {
-		fixture["products"] = map[string]any{"items": []any{}, "pagination": previewPagination(themefs.ProductsPage{CurrentPage: page.Filters.Page})}
+		fixture["products"] = map[string]any{"items": []any{}, "pagination": previewPagination(themefs.ProductsPage{CurrentPage: page.Filters.Page}, previewProductsPerPage)}
 		logSource("products", nil, "count", 0, "reason", "unknown category filter")
 		return
 	}
@@ -144,7 +148,7 @@ func applyListing(fixture map[string]any, page storefrontquery.Request, listing 
 	if err != nil {
 		return
 	}
-	fixture["products"] = map[string]any{"items": previewProductItems(listing.Items), "pagination": previewPagination(listing)}
+	fixture["products"] = map[string]any{"items": previewProductItems(listing.Items), "pagination": previewPagination(listing, previewProductsPerPage)}
 	if page.Kind == storefrontquery.PageCategory && category != nil {
 		fixture["category"] = previewCategory(*category)
 	}
@@ -199,11 +203,11 @@ func previewCategoryList(categories []themefs.Category) map[string]any {
 	lastPage := max(1, (len(categories)+themefs.StorefrontPerPage-1)/themefs.StorefrontPerPage)
 	return map[string]any{"items": items, "pagination": previewPagination(themefs.ProductsPage{
 		CurrentPage: 1, LastPage: lastPage, Total: len(categories),
-	})}
+	}, themefs.StorefrontPerPage)}
 }
 
 // previewPagination mirrors DataService::mapPagination.
-func previewPagination(p themefs.ProductsPage) map[string]any {
+func previewPagination(p themefs.ProductsPage, perPage int) map[string]any {
 	current := max(1, p.CurrentPage)
 	last := max(1, p.LastPage)
 	hasNext := current < last
@@ -215,7 +219,7 @@ func previewPagination(p themefs.ProductsPage) map[string]any {
 		prev = current - 1
 	}
 	return map[string]any{
-		"page": current, "last_page": last, "total": p.Total, "per_page": themefs.StorefrontPerPage,
+		"page": current, "last_page": last, "total": p.Total, "per_page": perPage,
 		"has_next": hasNext, "has_prev": current > 1, "next_page": next, "prev_page": prev,
 	}
 }

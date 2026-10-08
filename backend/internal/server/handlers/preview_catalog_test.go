@@ -66,7 +66,7 @@ func (f *catalogFlowpos) serve(t *testing.T) *httptest.Server {
 				return
 			}
 			write(w, map[string]any{"data": map[string]any{"products": map[string]any{
-				"current_page": 2, "last_page": 3, "per_page": 15, "total": 32, "data": products,
+				"current_page": 2, "last_page": 3, "per_page": 12, "total": 32, "data": products,
 			}}})
 		case "/products/blue-mug":
 			_, _ = w.Write([]byte(`{"data":{"product":{"id":77,"slug":"blue-mug","name":"Blue Mug","price":9}}}`))
@@ -162,8 +162,8 @@ func TestPreviewContext_CategoryFilter(t *testing.T) {
 	got := getPreviewContext(t, ts.URL, "path=/products&category=shoes")
 
 	q := fake.lastListing(t)
-	if q.Get("categories") != "9" || q.Get("limit") != "15" || q.Get("sort_by") != "name-asc" {
-		t.Errorf("want /products filtered to category id 9, 15 per page, sorted by name; got %v", q)
+	if q.Get("categories") != "9" || q.Get("limit") != "12" || q.Get("page") != "1" || q.Get("sort_by") != "name-asc" {
+		t.Errorf("want /products filtered to category id 9, page 1 of 12, sorted by name; got %v", q)
 	}
 	if asMap(got["filters"])["category"] != "shoes" {
 		t.Errorf("want filters.category echoed, got %v", got["filters"])
@@ -205,10 +205,11 @@ func TestPreviewContext_CategoryPage(t *testing.T) {
 	}
 	pagination := asMap(asMap(got["products"])["pagination"])
 	if pagination["page"] != 2.0 || pagination["last_page"] != 3.0 || pagination["total"] != 32.0 ||
-		pagination["next_page"] != 3.0 || pagination["prev_page"] != 1.0 || pagination["has_next"] != true {
+		pagination["next_page"] != 3.0 || pagination["prev_page"] != 1.0 || pagination["has_next"] != true ||
+		pagination["per_page"] != 12.0 {
 		t.Errorf("want the real pagination, got %v", pagination)
 	}
-	if f := asMap(got["filters"]); f["category"] != "shoes" || f["sort"] != "price_desc" {
+	if f := asMap(got["filters"]); f["category"] != "shoes" || f["sort"] != "price_desc" || f["per_page"] != 12.0 {
 		t.Errorf("want the category and sort echoed, got %v", f)
 	}
 }
@@ -231,7 +232,7 @@ func TestPreviewContext_InvalidFiltersAreIgnored(t *testing.T) {
 			got := getPreviewContext(t, ts.URL, "path=/products&"+query)
 
 			q := fake.lastListing(t)
-			if q.Get("sort_by") != "name-asc" || q.Has("min_price") || q.Has("max_price") || q.Has("page") {
+			if q.Get("sort_by") != "name-asc" || q.Has("min_price") || q.Has("max_price") || q.Get("page") != "1" {
 				t.Errorf("want the invalid value dropped from the /products call, got %v", q)
 			}
 			f := asMap(got["filters"])

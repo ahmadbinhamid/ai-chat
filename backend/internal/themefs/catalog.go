@@ -24,9 +24,7 @@ func (s *Store) FetchProductsPage(ctx context.Context, auth RequestAuth, q Produ
 	query.Set("limit", strconv.Itoa(q.Limit))
 	query.Set("is_published_online", "1")
 	query.Set("is_active", "1")
-	if q.Page > 1 {
-		query.Set("page", strconv.Itoa(q.Page))
-	}
+	query.Set("page", strconv.Itoa(max(1, q.Page)))
 	if q.Search != "" {
 		// The tenant API matches name only; live's DataService also matches description and SKU. Widening is a
 		// flowpos-backend change and needs nothing here.
