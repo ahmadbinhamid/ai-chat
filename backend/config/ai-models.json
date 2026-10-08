@@ -15,7 +15,7 @@
       "options": { "provider": { "order": ["azure", "parasail"], "allow_fallbacks": true } },
       "images": false,
       "thinking": true,
-      "efforts": ["low", "medium", "high"],
+      "efforts": ["low"],
       "default_effort": "low"
     },
     {
@@ -26,7 +26,7 @@
       "options": { "provider": { "order": ["wafer", "deepinfra"], "allow_fallbacks": true } },
       "images": false,
       "thinking": true,
-      "efforts": ["low", "medium", "high"],
+      "efforts": ["low"],
       "default_effort": "low"
     },
     {

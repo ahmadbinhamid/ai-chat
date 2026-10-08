@@ -110,3 +110,21 @@ func TestOpenRouterCatalogue_RoutesEachModel(t *testing.T) {
 		}
 	}
 }
+
+// Measured through OpenRouter: every model thinks, only vision sees images, and no effort setting changes how much
+// they think, so each offers just one.
+func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
+	data, err := os.ReadFile("../../config/ai-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data, withKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range c.Models {
+		if !m.Thinking || m.Images != (m.ID == c.VisionModel) || len(m.Efforts) != 1 || m.DefaultEffort != "low" {
+			t.Errorf("model %q: thinking=%v images=%v efforts=%v default=%q", m.ID, m.Thinking, m.Images, m.Efforts, m.DefaultEffort)
+		}
+	}
+}
