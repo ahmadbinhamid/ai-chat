@@ -43,7 +43,7 @@ func retryOnDeadlock(ctx context.Context, fn func() error) error {
 // Shared column list for all Scan calls; prevents drift between queries.
 const generationColumns = `
 	id, chat_id, tenant_id, status, error, attempts,
-	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, resume_count, awaiting_resume_since,
+	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off, resume_count, awaiting_resume_since,
 	queued_at, started_at, finished_at
 `
 
@@ -104,9 +104,9 @@ func (r *Repository) enqueueGenerationOnce(ctx context.Context, g Generation) (p
 	effort := sql.NullString{String: g.Effort, Valid: g.Effort != ""}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO generations
-			(id, chat_id, tenant_id, status, attempts, prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, queued_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, referenceURL, g.UserMessageID, g.ThemeSlug, g.Mode, modelID, effort, enqueuedAt, enqueuedAt, enqueuedAt)
+			(id, chat_id, tenant_id, status, attempts, prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off, queued_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, referenceURL, g.UserMessageID, g.ThemeSlug, g.Mode, modelID, effort, g.ThinkingOff, enqueuedAt, enqueuedAt, enqueuedAt)
 	if err != nil {
 		return 0, err
 	}

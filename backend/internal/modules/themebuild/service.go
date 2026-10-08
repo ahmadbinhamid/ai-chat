@@ -283,6 +283,8 @@ type GenerateInput struct {
 	Effort  string
 	// model is the resolved choice: set by Generate at enqueue, rebuilt from the generation row on dequeue.
 	model aicatalog.Choice
+	// thinkingOff: Auto's design route switched thinking off for this turn; stored with the generation like model.
+	thinkingOff bool
 	// Set by doGenerate; nil in tests that call generation helpers directly, which then place no images.
 	imageCatalog *imageCatalog
 	// Earlier pending turns' files, set by doGenerate; nil skips the draft-reversion check in checkAndRepair.
@@ -367,7 +369,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if err != nil {
 		return GenerateOutcome{}, err
 	}
-	if in.model, err = s.resolveModel(ctx, in, c, selection, len(previewErrorsJSON) > 0); err != nil {
+	if in.model, in.thinkingOff, err = s.resolveModel(ctx, in, c, selection, len(previewErrorsJSON) > 0); err != nil {
 		return GenerateOutcome{}, err
 	}
 
@@ -389,6 +391,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		Mode:          in.Mode,
 		ModelID:       in.model.ModelID,
 		Effort:        in.model.Effort,
+		ThinkingOff:   in.thinkingOff,
 	})
 	if err != nil {
 		if errors.Is(err, ErrQueueFull) {
@@ -484,6 +487,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		Mode:          g.Mode,
 		UserMessageID: g.UserMessageID,
 		model:         aicatalog.Choice{ModelID: g.ModelID, Effort: g.Effort},
+		thinkingOff:   g.ThinkingOff,
 		// Held by a restart, either queued or cut off mid-run and re-queued by the drain.
 		resumedAfterUpdate: g.AwaitingResumeSince != nil || g.ResumeCount > 0,
 	}
@@ -881,6 +885,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 		tc.GenerationMode = in.Mode
 		tc.Model = in.model
+		tc.ThinkingOff = in.thinkingOff
 		tc.SessionID = c.ID
 		tc.DraftPaths = make([]string, 0, len(draft))
 		for path, content := range draft {

@@ -66,6 +66,12 @@ func (c *Catalog) Resolve(s Selection, fixTurn bool) Choice {
 	return Choice{ModelID: id, Effort: effort}
 }
 
+// DesignThinkingOff reports whether this turn is Auto's design route with thinking switched off (auto.design_thinking
+// false). Kept beside Choice rather than in it, since a merchant's explicit pick never turns thinking off.
+func (c *Catalog) DesignThinkingOff(s Selection, fixTurn bool) bool {
+	return s.ModelID == AutoID && !fixTurn && c.Auto != nil && c.Auto.DesignThinking != nil && !*c.Auto.DesignThinking
+}
+
 // Default is the choice for a turn with nothing stored (a row queued before choices existed, or a test).
 func (c *Catalog) Default() Choice {
 	return c.Resolve(Selection{ModelID: c.DefaultModel, Effort: c.byID[c.DefaultModel].DefaultEffort}, false)

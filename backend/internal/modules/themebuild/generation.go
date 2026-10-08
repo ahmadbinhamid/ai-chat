@@ -32,6 +32,8 @@ type Generation struct {
 	// merchant's choice. Empty on rows queued before the catalogue existed, which then use its default.
 	ModelID string
 	Effort  string
+	// ThinkingOff: Auto's design route disabled thinking for this turn.
+	ThinkingOff bool
 	// ResumeCount: times a shutdown drain re-queued this generation; it is re-queued at most once.
 	ResumeCount int
 	// AwaitingResumeSince: set when a restart left this queued without its sender's token; it runs when they return.
@@ -62,7 +64,7 @@ func scanGeneration(s rowScanner) (Generation, error) {
 	var queuedAt, startedAt, finishedAt, awaitingSince sql.NullTime
 
 	err := s.Scan(&g.ID, &g.ChatID, &g.TenantID, &g.Status, &errMsg, &g.Attempts,
-		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &g.ResumeCount, &awaitingSince, &queuedAt, &startedAt, &finishedAt)
+		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &g.ThinkingOff, &g.ResumeCount, &awaitingSince, &queuedAt, &startedAt, &finishedAt)
 	if err != nil {
 		return Generation{}, err
 	}

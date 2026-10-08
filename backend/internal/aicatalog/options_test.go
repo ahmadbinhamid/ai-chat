@@ -225,3 +225,48 @@ func TestCatalogues_IdleAfter(t *testing.T) {
 		t.Errorf("want an unknown idle_after rejected, got %v", err)
 	}
 }
+
+// Thinking is off only on Auto's design route (Flash): a fix turn, or a model the merchant picked, keeps it on.
+func TestOpenRouterCatalogue_DesignThinkingOff(t *testing.T) {
+	data, err := os.ReadFile("../../config/ai-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data, withKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		sel     Selection
+		fixTurn bool
+		want    bool
+	}{
+		{"auto design turn", Selection{ModelID: AutoID}, false, true},
+		{"auto fix turn", Selection{ModelID: AutoID}, true, false},
+		{"flash picked by the merchant", Selection{ModelID: "deepseek-flash", Effort: "low"}, false, false},
+		{"kimi picked by the merchant", Selection{ModelID: "kimi", Effort: "low"}, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := c.DesignThinkingOff(tt.sel, tt.fixTurn); got != tt.want {
+				t.Errorf("DesignThinkingOff = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	if design := c.Resolve(Selection{ModelID: AutoID}, false); design.ModelID != "deepseek-flash" {
+		t.Errorf("auto design model = %q, want deepseek-flash", design.ModelID)
+	}
+}
+
+func TestParse_DesignThinkingNeedsAThinkingModel(t *testing.T) {
+	data, _ := json.Marshal(map[string]any{
+		"providers":     map[string]any{"p": map[string]any{"base_url": "https://x", "api_key_env": "AI_API_KEY"}},
+		"models":        []any{map[string]any{"id": "m", "label": "M", "provider": "p", "model": "x/m"}},
+		"auto":          map[string]any{"label": "Auto", "design_model": "m", "fix_model": "m", "design_thinking": false},
+		"default_model": "auto", "summary_model": "m",
+	})
+	if _, err := Parse(data, withKey); err == nil || !strings.Contains(err.Error(), "design_thinking false needs") {
+		t.Errorf("want design_thinking false rejected on a model without thinking, got %v", err)
+	}
+}

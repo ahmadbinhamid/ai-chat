@@ -66,7 +66,7 @@
   ],
   "auto": {
     "label": "Auto",
-    "design_model": "deepseek-flash", "design_effort": "low",
+    "design_model": "deepseek-flash", "design_effort": "low", "design_thinking": false,
     "fix_model": "deepseek-pro", "fix_effort": "low"
   },
   "default_model": "auto",

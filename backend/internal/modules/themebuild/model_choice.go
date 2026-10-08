@@ -41,20 +41,23 @@ func (s *Service) selectModel(in GenerateInput) (aicatalog.Selection, error) {
 	return sel, nil
 }
 
-// resolveModel picks this turn's concrete model; auto needs the chat's earlier prompts to spot a fix follow-up.
-func (s *Service) resolveModel(ctx context.Context, in GenerateInput, c chat.Chat, sel aicatalog.Selection, hasPreviewErrors bool) (aicatalog.Choice, error) {
+// resolveModel picks this turn's concrete model, and whether thinking is off for it; auto needs the chat's earlier
+// prompts to spot a fix follow-up.
+func (s *Service) resolveModel(ctx context.Context, in GenerateInput, c chat.Chat, sel aicatalog.Selection, hasPreviewErrors bool) (aicatalog.Choice, bool, error) {
 	if s.models == nil {
-		return aicatalog.Choice{}, nil
+		return aicatalog.Choice{}, false, nil
 	}
 	if sel.ModelID != aicatalog.AutoID {
-		return s.models.Resolve(sel, false), nil
+		return s.models.Resolve(sel, false), false, nil
 	}
 	prior, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
-		return aicatalog.Choice{}, fmt.Errorf("load chat history for model routing: %w", err)
+		return aicatalog.Choice{}, false, fmt.Errorf("load chat history for model routing: %w", err)
 	}
 	fixTurn := previewerrors.IsFixTurn(in.Prompt, earlierUserPrompts(prior, ""), hasPreviewErrors)
 	choice := s.models.Resolve(sel, fixTurn)
-	slog.Info("ai: auto routed turn", "chat_id", c.ID, "fix_turn", fixTurn, "model_id", choice.ModelID, "effort", choice.Effort)
-	return choice, nil
+	thinkingOff := s.models.DesignThinkingOff(sel, fixTurn)
+	slog.Info("ai: auto routed turn", "chat_id", c.ID, "fix_turn", fixTurn, "model_id", choice.ModelID, "effort", choice.Effort,
+		"thinking_off", thinkingOff)
+	return choice, thinkingOff, nil
 }

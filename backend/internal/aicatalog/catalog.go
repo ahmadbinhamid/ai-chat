@@ -82,6 +82,9 @@ type Auto struct {
 	DesignEffort string `json:"design_effort"`
 	FixModel     string `json:"fix_model"`
 	FixEffort    string `json:"fix_effort"`
+	// DesignThinking false switches thinking off on the design route (unset keeps the model's own setting): a design
+	// change rarely needs long reasoning, and on a slow host that reasoning is most of the turn. Fix turns keep it.
+	DesignThinking *bool `json:"design_thinking,omitempty"`
 }
 
 // Catalog is a validated catalogue; build it with Parse or FromEnv, never by hand.
@@ -196,6 +199,9 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 		}
 		if err := c.validateAutoTarget("fix", c.Auto.FixModel, c.Auto.FixEffort); err != nil {
 			return err
+		}
+		if c.Auto.DesignThinking != nil && !*c.Auto.DesignThinking && !c.byID[c.Auto.DesignModel].Thinking {
+			return fmt.Errorf("auto design_thinking false needs a design_model with \"thinking\": true")
 		}
 	}
 	if c.VisionModel != "" {

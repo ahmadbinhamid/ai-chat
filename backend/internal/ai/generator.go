@@ -116,6 +116,8 @@ type ThemeContext struct {
 	StagedImagePaths map[string]bool
 	// Continue resumes a prior call's conversation (history and images are then ignored); nil = fresh call.
 	Continue *Conversation
+	// ThinkingOff disables thinking for this turn (Auto's design route); forced rounds already send it disabled.
+	ThinkingOff bool
 	// SessionID groups a chat's calls so a provider with a session header keeps them on one host (and its cache).
 	SessionID string
 }
@@ -725,7 +727,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}
 	reqOpts = append(reqOpts, g.sessionOptions(entry, tc.SessionID)...)
 	slog.Info("ai: turn model", "model_id", choice.ModelID, "model", entry.Model, "effort", choice.Effort,
-		"thinking", entry.Thinking, "resumed", tc.Continue != nil)
+		"thinking", entry.Thinking && !tc.ThinkingOff, "resumed", tc.Continue != nil)
 
 	tools := toolsForMode(tc.GenerationMode)
 	// Clamp first-token timeout to ctx deadline (slow iterations tighten budget naturally).
@@ -796,7 +798,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		// A model without thinking gets neither parameter.
 		switch {
 		case !entry.Thinking:
-		case forcingPropose:
+		case forcingPropose, tc.ThinkingOff:
 			// DeepSeek rejects a named tool_choice while thinking ("Thinking mode does not support this tool_choice"),
 			// and thinks by default, so the forced call must disable it explicitly.
 			params.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &anthropic.ThinkingConfigDisabledParam{}}
