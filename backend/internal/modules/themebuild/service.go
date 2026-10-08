@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/aicatalog"
 	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/pageintent"
 	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/safego"
 	"ai-chat/internal/themecheck"
@@ -116,6 +118,8 @@ type Service struct {
 	repo  *Repository
 	chats *chat.Service
 	gen   generator
+	// nil in struct-literal tests, which then skip model selection and run on the generator's default.
+	models *aicatalog.Catalog
 	// nil in struct-literal tests; Generate treats as no reference link.
 	links linkFetcher
 	// nil in same tests; fetchReferenceURL falls back to uncached call.
@@ -131,6 +135,10 @@ type Service struct {
 	historySummaryLocks         *stripedMutex
 	// Zero (struct-literal tests) means imageplacement.DefaultMaxBytes; see placedImageLimit.
 	placedImageMaxBytes int
+	// Running generation loops, for Drain on shutdown; the zero value is ready to use.
+	runs runTracker
+	// True while a restart left generations waiting for their senders; gates the per-request ResumeForUser check.
+	resumePending atomic.Bool
 }
 
 // SetPlacedImageMaxBytes sets the largest attached image a turn may place; match it to FlowPOS's PHP upload limit.
@@ -207,6 +215,14 @@ func (p *pendingTokens) take(generationID string) (string, bool) {
 	return token, ok
 }
 
+// peek reports whether a token is held for the generation, without taking it.
+func (p *pendingTokens) peek(generationID string) (string, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	token, ok := p.tokens[generationID]
+	return token, ok
+}
+
 // Drops token without returning; used when queued generation is cancelled before running.
 func (p *pendingTokens) discard(generationID string) {
 	p.mu.Lock()
@@ -215,6 +231,9 @@ func (p *pendingTokens) discard(generationID string) {
 }
 
 var ErrVisionNotConfigured = errors.New("image attachments aren't enabled on this deployment")
+
+// ErrInvalidModelChoice wraps an aicatalog selection error: an unknown model or an effort it doesn't offer.
+var ErrInvalidModelChoice = errors.New("invalid model choice")
 var ErrTooManyImages = errors.New("too many images attached")
 var ErrImageTooLarge = errors.New("an attached image is too large")
 var ErrHTMLAttachmentTooLarge = errors.New("attached HTML file is too large")
@@ -259,8 +278,19 @@ type GenerateInput struct {
 	Mode string
 	// Browser errors captured from the preview; this turn only, never carried forward (they're stale once a fix is attempted).
 	PreviewErrors []previewerrors.Entry
+	// ModelID/Effort are the merchant's requested choice; empty uses the catalogue's default_model and its effort.
+	ModelID string
+	Effort  string
+	// model is the resolved choice: set by Generate at enqueue, rebuilt from the generation row on dequeue.
+	model aicatalog.Choice
 	// Set by doGenerate; nil in tests that call generation helpers directly, which then place no images.
 	imageCatalog *imageCatalog
+	// Earlier pending turns' files, set by doGenerate; nil skips the draft-reversion check in checkAndRepair.
+	draft map[string]string
+	// Earlier user messages, newest first, set by doGenerate so a bare "still not working" keeps its request's notes.
+	earlierPrompts []string
+	// resumedAfterUpdate: a restart held this turn until its sender came back; the reply says so.
+	resumedAfterUpdate bool
 }
 
 // Synchronous result of accepting prompt; AssistantMessage/Files always nil.
@@ -288,6 +318,10 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	// Reject before persisting (fails cheaper than dequeued).
 	if len(in.Images) > 0 && !s.gen.SupportsVision() {
 		return GenerateOutcome{}, ErrVisionNotConfigured
+	}
+	selection, err := s.selectModel(in)
+	if err != nil {
+		return GenerateOutcome{}, err
 	}
 	// DecodedLen is cheap arithmetic; HTTP handler already validated base64.
 	for i, img := range in.Images {
@@ -333,6 +367,9 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if err != nil {
 		return GenerateOutcome{}, err
 	}
+	if in.model, err = s.resolveModel(ctx, in, c, selection, len(previewErrorsJSON) > 0); err != nil {
+		return GenerateOutcome{}, err
+	}
 
 	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt, in.Images, in.HTMLAttachmentFilename, in.HTMLAttachmentContent, previewErrorsJSON)
 	if err != nil {
@@ -350,6 +387,8 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		UserMessageID: &userMsg.ID,
 		ThemeSlug:     in.ThemeSlug,
 		Mode:          in.Mode,
+		ModelID:       in.model.ModelID,
+		Effort:        in.model.Effort,
 	})
 	if err != nil {
 		if errors.Is(err, ErrQueueFull) {
@@ -362,14 +401,10 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	// never becomes a column on the row EnqueueGeneration just inserted.
 	s.tokens.store(genID, in.Token)
 
-	next, err := s.repo.DequeueNext(ctx, c.ID)
+	// Not started while draining: it stays queued for the next process.
+	_, err = s.startChatQueue(ctx, c)
 	switch {
 	case err == nil:
-		// Detached from request lifecycle, but bounded: each iteration gets its own generateTimeout.
-		go func() {
-			defer safego.Recover("themebuild.runGeneration")
-			s.runGeneration(context.WithoutCancel(ctx), c, next)
-		}()
 	case errors.Is(err, ErrGenerationInProgress):
 		// Already running; its drain loop will dequeue this row when it finishes.
 		emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
@@ -386,8 +421,14 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 // Drains chatID's queue one-at-a-time starting with g; continues on failure (visible chat message).
 func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) {
 	for {
-		s.runOneQueuedGeneration(ctx, c, g)
+		if !s.runOneQueuedGeneration(ctx, c, g) {
+			return
+		}
 
+		// Shutting down: the rest of this chat's queue stays queued for the next process.
+		if s.runs.isDraining() {
+			return
+		}
 		next, err := s.repo.DequeueNext(ctx, c.ID)
 		if errors.Is(err, ErrNotFound) {
 			return // queue drained
@@ -402,24 +443,37 @@ func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) 
 	}
 }
 
-// Runs one already-dequeued (status=running) generation to completion and records outcome.
-func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Generation) {
+// Runs one already-dequeued (status=running) generation to completion and records outcome. false stops the drain
+// loop: the generation went back to the queue to wait for its sender, who restarts the loop on return.
+func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Generation) bool {
+	token, ok := s.tokens.take(g.ID)
+	if !ok && waitingForSender(g) {
+		slog.Info("generation is waiting for its sender after a restart; returning it to the queue", "chat_id", c.ID, "generation_id", g.ID)
+		s.releaseToQueue(ctx, c, g)
+		return false
+	}
+
 	emitter := newEventEmitter(ctx, s.repo, s.bus, g.ID, c.ID)
 	emitter.emit(ctx, EventTypeDequeued, struct{}{})
 
-	token, ok := s.tokens.take(g.ID)
 	if !ok {
 		// Pod restart (between enqueue and dequeue) or reaper-restarted queue has no token.
 		// Expected condition (Warn not Error) but should be visible to catch spurious reaping.
-		slog.Warn("generation has no bearer token available; failing with session-expired", "chat_id", c.ID, "generation_id", g.ID)
-		s.recordGenerationFailure(ctx, c, g.ID, errSessionExpired)
+		failErr := errSessionExpired
+		if g.AwaitingResumeSince != nil {
+			failErr = errResumeExpired
+		}
+		slog.Warn("generation has no bearer token available; failing it", "chat_id", c.ID, "generation_id", g.ID, "error", failErr)
+		s.recordGenerationFailure(ctx, c, g.ID, failErr)
 		endCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := s.repo.EndGeneration(endCtx, c.ID, errSessionExpired); err != nil {
+		if err := s.repo.EndGeneration(endCtx, c.ID, failErr); err != nil {
 			slog.Error("failed to record generation end", "chat_id", c.ID, "error", err)
 		}
-		return
+		return true
 	}
+	s.runs.track(g.ID, c)
+	defer s.runs.untrack(g.ID)
 
 	in := GenerateInput{
 		TenantID:      g.TenantID,
@@ -429,6 +483,9 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		ReferenceURL:  g.ReferenceURL,
 		Mode:          g.Mode,
 		UserMessageID: g.UserMessageID,
+		model:         aicatalog.Choice{ModelID: g.ModelID, Effort: g.Effort},
+		// Held by a restart, either queued or cut off mid-run and re-queued by the drain.
+		resumedAfterUpdate: g.AwaitingResumeSince != nil || g.ResumeCount > 0,
 	}
 
 	// Fresh timeout per iteration, not shared across queue (prevents starvation).
@@ -490,10 +547,15 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	// Heartbeat ticker: keeps slow-but-healthy generations from being reaped mid-flight (second layer after emitLive).
 	heartbeatTicker := time.NewTicker(heartbeatTickerInterval())
 	defer heartbeatTicker.Stop()
+	heartbeatStop, heartbeatDone := make(chan struct{}), make(chan struct{})
 	go func() {
+		defer close(heartbeatDone)
+		defer safego.Recover("themebuild.heartbeatLoop")
 		for {
 			select {
 			case <-workCtx.Done():
+				return
+			case <-heartbeatStop:
 				return
 			case <-heartbeatTicker.C:
 				// Per-tick recovery: one bad tick shouldn't end heartbeats for rest of generation.
@@ -516,6 +578,9 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	}()
 
 	err := s.doGenerate(workCtx, in, c, g.ID, &cancelledByUser)
+	// Waited for, not just signalled: a tick already writing could otherwise land after the end is recorded.
+	close(heartbeatStop)
+	<-heartbeatDone
 
 	// Fresh context: workCtx may be expired (timeout or userCancel).
 	endCtx, endCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -525,6 +590,10 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		slog.Info("generation ended", "chat_id", c.ID, "generation_id", g.ID,
 			"cancelled_by_user", cancelledByUser.Load(), "error", err.Error())
 	}
+	// Its row was finished, reaped or re-queued by someone else; EndGeneration selects by chat, so it must not run.
+	if errors.Is(err, ErrGenerationNotRunning) {
+		return true
+	}
 	// err != nil required: flag can flip true after doGenerate committed success.
 	if err != nil && cancelledByUser.Load() {
 		if endErr := s.repo.EndGenerationCancelled(endCtx, c.ID); endErr != nil {
@@ -533,6 +602,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	} else if endErr := s.repo.EndGeneration(endCtx, c.ID, err); endErr != nil {
 		slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
 	}
+	return true
 }
 
 // Queued generation failure when no bearer token available (see pendingTokens).
@@ -625,6 +695,12 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			return
 		}
 
+		// Cancelled, reaped or re-queued before it committed: there is no failure to report, and the row is not ours.
+		if errors.Is(retErr, ErrGenerationNotRunning) {
+			slog.Info("generation stopped running before its turn committed; discarding it", "chat_id", c.ID, "generation_id", genID)
+			return
+		}
+
 		if retErr != nil {
 			// Log raw error (never surfaced to merchant; contains provider name/URL).
 			slog.Error("generation failed", "chat_id", c.ID, "tenant_id", in.TenantID, "error", retErr)
@@ -634,7 +710,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				message = errSessionExpired.Error()
 			}
 			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
-			if _, err := s.chats.RecordAssistantMessage(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable); err != nil {
+			if _, err := s.chats.RecordAssistantMessageFromModel(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable, in.model.ModelID, in.model.Effort); err != nil {
 				slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
 			}
 		} else {
@@ -651,6 +727,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		return fmt.Errorf("load draft overlay: %w", err)
 	}
 	store := themefs.NewCachingStore(themefs.NewOverlayStore(s.store, draft))
+	in.draft = draft
 
 	priorMessages, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
@@ -706,6 +783,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	if in.UserMessageID != nil {
 		currentMessageID = *in.UserMessageID
 	}
+	in.earlierPrompts = earlierUserPrompts(priorMessages, currentMessageID)
 	in.imageCatalog = newImageCatalog(priorMessages, currentMessageID, draft, func(ctx context.Context, id string) ([]byte, error) {
 		a, err := s.chats.GetChatImageAttachment(ctx, c.ID, id)
 		return a.Content, err
@@ -802,6 +880,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			return fmt.Errorf("load theme context: %w", err)
 		}
 		tc.GenerationMode = in.Mode
+		tc.Model = in.model
 		tc.DraftPaths = make([]string, 0, len(draft))
 		for path, content := range draft {
 			tc.DraftPaths = append(tc.DraftPaths, path)
@@ -857,8 +936,14 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
+	// checkAndRepair blocks any other reversion, so only an asked-for undo or redesign reaches here; both get a note.
 	if !deterministic && proposalHasChanges(result) {
-		warnings = append(warnings, s.draftReversionWarnings(ctx, storeAuth, c.ID, draft, result)...)
+		switch {
+		case pageintent.DetectUndo(in.Prompt):
+			warnings = append(warnings, s.draftReversionWarnings(ctx, storeAuth, c.ID, draft, result)...)
+		case pageintent.DetectReplace(in.Prompt):
+			warnings = append(warnings, s.draftReplacementNotes(ctx, storeAuth, c.ID, draft, result)...)
+		}
 	}
 
 	// Final gate: never silently delete/unregister protected pages (blog, home).
@@ -889,7 +974,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		emitter.emit(ctx, EventTypeStaged, map[string]any{"paths": plan.paths()})
 
 		// Draft/apply split: nothing reaches FlowPOS here (only staged, not committed).
-		staged = planToStaged(dropUnchangedFiles(plan))
+		plan = dropUnchangedFiles(plan)
+		if !pageintent.DetectFormatting(in.Prompt) {
+			plan = dropWhitespaceOnlyFiles(plan)
+		}
+		staged = planToStaged(plan)
 		// Backstop against fake success: a proposal that changes nothing must never read as "Fixed".
 		if len(staged) == 0 {
 			slog.Warn("proposal changed nothing after staging; reporting no change", "chat_id", c.ID, "proposed_files", len(result.Files))
@@ -910,21 +999,44 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		summary = "Done."
 	}
 	summary = appendWarningsNote(summary, warnings)
+	if in.resumedAfterUpdate {
+		summary += "\n\n" + resumedAfterUpdateNote
+	}
 	summary = protectedPagesNote(summary, blockedPages)
 
 	// Detached commitCtx: cancel can only stop BEFORE this point, never mid-commit.
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer commitCancel()
 
-	assistantMsg, err := s.chats.RecordAssistantMessage(commitCtx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus)
+	return s.commitTurn(commitCtx, c, genID, summary, result, applyStatus, staged)
+}
+
+// commitTurn saves a finished turn in one transaction: the reply and chat usage (chat module), the draft files and
+// the generation's success (this module). A crash can't leave a reply without its draft, or a staged turn whose
+// generation the reaper later fails; and a generation that stopped running first commits nothing.
+func (s *Service) commitTurn(ctx context.Context, c chat.Chat, genID, summary string, result *ai.Result, applyStatus chat.ApplyStatus, staged []writtenFile) error {
+	tx, err := s.repo.BeginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin turn commit: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	msg, err := s.chats.RecordAssistantMessageInTx(ctx, tx, c, summary, chat.MessageStatusCompleted,
+		result.InputTokens, result.OutputTokens, applyStatus, result.ModelID, result.Effort)
 	if err != nil {
 		return fmt.Errorf("record assistant message: %w", err)
 	}
-
-	if _, err := s.persistFileRecords(commitCtx, c, assistantMsg.ID, staged); err != nil {
-		return fmt.Errorf("persist generated-file audit rows: %w", err)
+	for _, f := range fileRecords(c, msg.ID, staged) {
+		if err := s.repo.CreateFileTx(ctx, tx, f); err != nil {
+			return fmt.Errorf("persist generated-file audit rows: %w", err)
+		}
 	}
-
+	if err := s.repo.FinishGenerationTx(ctx, tx, genID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit turn: %w", err)
+	}
 	return nil
 }
 
@@ -972,6 +1084,63 @@ func (s *Service) FetchPreviewProducts(ctx context.Context, storeAuth themefs.Re
 		return themefs.ProductsPage{}, fmt.Errorf("theme store does not support products fetch")
 	}
 	return fetcher.FetchProducts(ctx, storeAuth, limit)
+}
+
+// *themefs.Store-only capability; the storefront catalogue isn't theme files.
+type catalogFetcher interface {
+	FetchProductsPage(ctx context.Context, auth themefs.RequestAuth, q themefs.ProductsQuery) (themefs.ProductsPage, error)
+	FetchCategories(ctx context.Context, auth themefs.RequestAuth, limit int) ([]themefs.Category, error)
+}
+
+func (s *Service) catalog() (catalogFetcher, error) {
+	fetcher, ok := s.store.(catalogFetcher)
+	if !ok {
+		return nil, fmt.Errorf("theme store does not support catalogue fetch")
+	}
+	return fetcher, nil
+}
+
+// FetchPreviewProductsPage fetches one filtered page of real products for a preview of a listing or category page.
+func (s *Service) FetchPreviewProductsPage(ctx context.Context, storeAuth themefs.RequestAuth, q themefs.ProductsQuery) (themefs.ProductsPage, error) {
+	fetcher, err := s.catalog()
+	if err != nil {
+		return themefs.ProductsPage{}, err
+	}
+	return fetcher.FetchProductsPage(ctx, storeAuth, q)
+}
+
+func (s *Service) FetchPreviewCategories(ctx context.Context, storeAuth themefs.RequestAuth, limit int) ([]themefs.Category, error) {
+	fetcher, err := s.catalog()
+	if err != nil {
+		return nil, err
+	}
+	return fetcher.FetchCategories(ctx, storeAuth, limit)
+}
+
+// FetchPreviewPriceRange derives the catalogue's price bounds from the cheapest and dearest product, as the tenant API has
+// no aggregate endpoint. An empty catalogue is an error so the caller keeps its fallback range.
+func (s *Service) FetchPreviewPriceRange(ctx context.Context, storeAuth themefs.RequestAuth) (minPrice, maxPrice float64, err error) {
+	fetcher, err := s.catalog()
+	if err != nil {
+		return 0, 0, err
+	}
+	var cheapest, dearest themefs.ProductsPage
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() (err error) {
+		cheapest, err = fetcher.FetchProductsPage(gctx, storeAuth, themefs.ProductsQuery{Limit: 1, SortBy: "price-asc"})
+		return err
+	})
+	g.Go(func() (err error) {
+		dearest, err = fetcher.FetchProductsPage(gctx, storeAuth, themefs.ProductsQuery{Limit: 1, SortBy: "price-desc"})
+		return err
+	})
+	if err := g.Wait(); err != nil {
+		return 0, 0, err
+	}
+	if len(cheapest.Items) == 0 || len(dearest.Items) == 0 {
+		return 0, 0, fmt.Errorf("catalogue has no products")
+	}
+	return cheapest.Items[0].Price, dearest.Items[0].Price, nil
 }
 
 // *themefs.Store-only capability; a product's detail and its add-on groups aren't theme files.
@@ -1114,25 +1283,24 @@ func (s *Service) buildThemeContext(ctx context.Context, store themefs.ThemeStor
 	}, nil
 }
 
+// earlierUserPrompts returns the user messages before the current one, newest first, capped at maxEarlierPrompts.
+func earlierUserPrompts(messages []chat.Message, currentID string) []string {
+	var out []string
+	for i := len(messages) - 1; i >= 0 && len(out) < maxEarlierPrompts; i-- {
+		if m := messages[i]; m.Role == chat.RoleUser && m.ID != currentID {
+			out = append(out, m.Content)
+		}
+	}
+	return out
+}
+
+// maxEarlierPrompts covers previewerrors.FeatureNotes' lookback; older messages never change a turn's notes.
+const maxEarlierPrompts = 3
+
 // draftReversionWarnings flags proposed updates that drop much of earlier unsaved work. Warning only, never a rejection;
 // reads the saved theme from s.store (not the overlay), and a failed read skips that file rather than guessing.
 func (s *Service) draftReversionWarnings(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) []themecheck.Finding {
-	saved := make(map[string]string)
-	for _, f := range result.Files {
-		if f.Action != "update" {
-			continue
-		}
-		if _, inDraft := draft[f.Path]; !inDraft {
-			continue
-		}
-		content, err := s.store.ReadFile(ctx, storeAuth, f.Path)
-		if err != nil {
-			slog.Info("draft reversion check skipped: saved file unreadable", "chat_id", chatID, "path", f.Path, "error", err)
-			continue
-		}
-		saved[f.Path] = content
-	}
-
+	saved := s.savedDraftUpdates(ctx, storeAuth, chatID, draft, result)
 	var findings []themecheck.Finding
 	for _, r := range themecheck.DetectDraftReversions(toProposal(result), saved, draft) {
 		slog.Warn("proposal may undo earlier unsaved changes", "chat_id", chatID, "path", r.Path,
@@ -1140,6 +1308,59 @@ func (s *Service) draftReversionWarnings(ctx context.Context, storeAuth themefs.
 		findings = append(findings, r.Finding())
 	}
 	return findings
+}
+
+// draftReplacementNotes tells the merchant which earlier unsaved work a redesign replaced.
+func (s *Service) draftReplacementNotes(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) []themecheck.Finding {
+	saved := s.savedDraftUpdates(ctx, storeAuth, chatID, draft, result)
+	var notes []themecheck.Finding
+	for _, r := range themecheck.DetectDraftReversions(toProposal(result), saved, draft) {
+		slog.Info("redesign replaced earlier unsaved changes", "chat_id", chatID, "path", r.Path,
+			"dropped_lines", r.Dropped, "earlier_added_lines", r.Added)
+		notes = append(notes, r.ReplacedFinding())
+	}
+	return notes
+}
+
+// draftReversionBlocking returns blocking findings for proposed updates that drop much of earlier unsaved work, so the
+// repair round restores it; same saved-theme reads and fail-open skips as draftReversionWarnings.
+func (s *Service) draftReversionBlocking(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) []themecheck.Finding {
+	saved := s.savedDraftUpdates(ctx, storeAuth, chatID, draft, result)
+	if len(saved) == 0 {
+		return nil
+	}
+	findings := themecheck.DraftReversionFindings(toProposal(result), saved, draft)
+	for _, f := range findings {
+		slog.Warn("proposal undoes earlier unsaved changes; sending it to repair", "chat_id", chatID, "path", f.Path)
+	}
+	return findings
+}
+
+// savedDraftUpdates reads, in parallel, the saved (not overlay) version of each proposed update to a draft file.
+// A failed read skips that file rather than guessing, so the reversion checks never fail a generation.
+func (s *Service) savedDraftUpdates(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) map[string]string {
+	saved := make(map[string]string)
+	var mu sync.Mutex
+	var g errgroup.Group
+	g.SetLimit(loadThemeFilesConcurrency)
+	for _, f := range result.Files {
+		if _, inDraft := draft[f.Path]; f.Action != "update" || !inDraft {
+			continue
+		}
+		g.Go(func() error {
+			content, err := s.store.ReadFile(ctx, storeAuth, f.Path)
+			if err != nil {
+				slog.Info("draft reversion check skipped: saved file unreadable", "chat_id", chatID, "path", f.Path, "error", err)
+				return nil
+			}
+			mu.Lock()
+			saved[f.Path] = content
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait() // every goroutine returns nil
+	return saved
 }
 
 // Fetches invariant snapshot part: file-path listing + content for files themecheck reads.
@@ -1262,8 +1483,8 @@ func isUnauthorizedErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "status 401:")
 }
 
-// Writes audit row for each staged file; done after assistant message (FK constraint).
-func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID string, written []writtenFile) ([]GeneratedFile, error) {
+// fileRecords builds the chat_generated_files rows for a turn's written files.
+func fileRecords(c chat.Chat, messageID string, written []writtenFile) []GeneratedFile {
 	files := make([]GeneratedFile, 0, len(written))
 	now := time.Now().UTC()
 	for _, w := range written {
@@ -1285,12 +1506,9 @@ func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		}
-		if err := s.repo.CreateFile(ctx, f); err != nil {
-			return nil, err
-		}
 		files = append(files, f)
 	}
-	return files, nil
+	return files
 }
 
 // Fetches render-relevant theme files (liquid + optional css/js + pages.json); concurrent reads capped at 8.

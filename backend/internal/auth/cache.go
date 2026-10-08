@@ -51,6 +51,7 @@ func NewMemoryCache() *MemoryCache {
 }
 
 func (c *MemoryCache) sweepLoop() {
+	defer safego.Recover("auth.MemoryCache.sweepLoop")
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {

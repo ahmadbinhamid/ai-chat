@@ -1,0 +1,46 @@
+{
+  "providers": {
+    "deepseek": { "base_url": "https://api.deepseek.com/anthropic", "api_key_env": "AI_API_KEY" }
+  },
+  "models": [
+    {
+      "id": "deepseek-pro",
+      "label": "DeepSeek Pro",
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "images": false,
+      "thinking": true,
+      "efforts": ["low", "medium", "high"],
+      "default_effort": "low"
+    },
+    {
+      "id": "deepseek-flash",
+      "label": "DeepSeek Flash",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "images": false,
+      "thinking": true,
+      "efforts": ["low", "medium", "high"],
+      "default_effort": "low"
+    },
+    {
+      "id": "deepseek-flash-vision",
+      "label": "DeepSeek Flash Vision",
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash-vision-exp",
+      "images": true,
+      "thinking": true,
+      "efforts": ["low"],
+      "default_effort": "low",
+      "selectable": false
+    }
+  ],
+  "auto": {
+    "label": "Auto",
+    "design_model": "deepseek-flash", "design_effort": "low",
+    "fix_model": "deepseek-pro", "fix_effort": "low"
+  },
+  "default_model": "auto",
+  "vision_model": "deepseek-flash-vision",
+  "summary_model": "deepseek-flash"
+}

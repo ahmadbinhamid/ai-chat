@@ -16,6 +16,7 @@ import (
 	"ai-chat/internal/httpresponse"
 	"ai-chat/internal/liquidrender"
 	"ai-chat/internal/modules/themebuild"
+	"ai-chat/internal/storefrontquery"
 	"ai-chat/internal/themefs"
 
 	"github.com/gin-gonic/gin"
@@ -28,13 +29,7 @@ const defaultProductsFetchTimeout = 2 * time.Second
 // buildPreviewContext overlays real store name/menu/products on the fixture; category/basket/custom...
 func buildPreviewContext(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, productsFetchTimeout time.Duration) map[string]any {
 	fixture := themefs.FixtureContext()
-
-	if settings, err := builder.FetchStoreSettings(ctx, storeAuth); err == nil && settings.Name != "" {
-		fixture["store"] = map[string]any{"name": settings.Name}
-	}
-	if menu, err := builder.FetchThemeMenu(ctx, storeAuth); err == nil {
-		fixture["menu"] = menu
-	}
+	overlayStoreAndMenu(ctx, builder, storeAuth, fixture)
 
 	fetchCtx, cancel := context.WithTimeout(ctx, productsFetchTimeout)
 	defer cancel()
@@ -62,6 +57,15 @@ func buildPreviewContext(ctx context.Context, builder *themebuild.Service, store
 	slog.Info("preview: product detail source", "source", "real", "slug", detail.Slug)
 
 	return fixture
+}
+
+func overlayStoreAndMenu(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, fixture map[string]any) {
+	if settings, err := builder.FetchStoreSettings(ctx, storeAuth); err == nil && settings.Name != "" {
+		fixture["store"] = map[string]any{"name": settings.Name}
+	}
+	if menu, err := builder.FetchThemeMenu(ctx, storeAuth); err == nil {
+		fixture["menu"] = menu
+	}
 }
 
 // previewProductLimit is how many real products the preview's grids show; the fallback fixture keeps its own smaller list.
@@ -445,7 +449,13 @@ func (h *PreviewHandler) Preview(c *gin.Context) {
 }
 
 // Context handles GET /api/v1/preview/context — returns themefs.FixtureContext() as JSON so the frontend fetches the one source of truth instead of hand-copying a driftable second copy.
+// With a path or listing filters (storefrontquery's params), it returns that page's real catalogue data instead.
 func (h *PreviewHandler) Context(c *gin.Context) {
 	storeAuth := themefs.RequestAuth{Token: auth.Token(c), TenantID: auth.TenantID(c)}
-	httpresponse.OK(c, buildPreviewContext(c.Request.Context(), h.builder, storeAuth, h.productsFetchTimeout))
+	page := storefrontquery.Parse(c.Request.URL.Query())
+	if !page.HasParams {
+		httpresponse.OK(c, buildPreviewContext(c.Request.Context(), h.builder, storeAuth, h.productsFetchTimeout))
+		return
+	}
+	httpresponse.OK(c, buildPageContext(c.Request.Context(), h.builder, storeAuth, h.productsFetchTimeout, page))
 }

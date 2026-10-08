@@ -40,6 +40,10 @@ type sendMessageRequest struct {
 	// Browser errors captured from the preview (max=20 is previewerrors.MaxEntries; gin needs a literal).
 	// Binding rejects an unknown type; previewerrors.Sanitize does the rest, since the frontend isn't a trust boundary.
 	PreviewErrors []previewError `json:"preview_errors" binding:"omitempty,max=20,dive"`
+	// Model is a catalogue id (or "auto"); Effort one that model offers. Both optional — the service rejects
+	// anything not in the catalogue, so a raw provider model name can never get through.
+	Model  string `json:"model" binding:"omitempty,max=64"`
+	Effort string `json:"effort" binding:"omitempty,max=16"`
 }
 
 type previewError struct {
@@ -135,6 +139,8 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		HTMLAttachmentFilename: htmlFilename,
 		HTMLAttachmentContent:  htmlContent,
 		PreviewErrors:          previewErrors,
+		ModelID:                in.Model,
+		Effort:                 in.Effort,
 	})
 	if err != nil {
 		respondErr(c, err)

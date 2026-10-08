@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
 
+	"ai-chat/internal/aicatalog"
 	"ai-chat/internal/themefs"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -74,7 +76,10 @@ type Result struct {
 	OutputTokens   int64                 `json:"-"`
 	// ExplorationToolCalls: distinguishes hallucinated empty from explored-and-empty via isUnexploredEmptyProposal.
 	ExplorationToolCalls int `json:"-"`
-	conversation         *Conversation
+	// ModelID/Effort: the catalogue model that produced this result, after any switch to the vision model.
+	ModelID      string `json:"-"`
+	Effort       string `json:"-"`
+	conversation *Conversation
 }
 
 // Conversation returns this result's resumable conversation, or nil (fake mode, or not produced by Generate).
@@ -101,6 +106,7 @@ type ThemeContext struct {
 	FileTree       []themefs.FileTreeEntry // supplied up front to avoid initial list_theme_files cost
 	Manifest       *themefs.Manifest       // component param signatures; nil if unavailable
 	GenerationMode string                  // restricts what this turn may touch; empty = GenerationModeEdit
+	Model          aicatalog.Choice        // this turn's model and effort; zero = the catalogue default
 	DraftPaths     []string                // files with unsaved changes from earlier turns; paths only, contents come via read_theme_file
 	// StagedImagePaths are DraftPaths that are placed images: not in the live theme until the merchant applies.
 	StagedImagePaths map[string]bool
@@ -110,10 +116,9 @@ type ThemeContext struct {
 
 // Generator calls Claude to produce theme file changes.
 type Generator struct {
-	client         anthropic.Client
-	model          anthropic.Model
-	effort         anthropic.OutputConfigEffort
-	visionModel    anthropic.Model // separate model for image calls; text-only turns use model for proven quality
+	catalog *aicatalog.Catalog
+	// One client per catalogue provider, built at startup and shared by every call to that provider.
+	clients        map[string]anthropic.Client
 	fake           bool
 	fakeDelay      time.Duration
 	maxTokens      int64          // Claude call's max_tokens; see AI_MAX_TOKENS env var
@@ -187,43 +192,67 @@ func clampToContextDeadline(ctx context.Context, d time.Duration) time.Duration 
 
 // New constructs the client. apiKey empty is a startup error.
 // DeepSeek's Anthropic-compat endpoint: tool_choice forcing NOT reliably honored; see zero-tool-calls handling in Generate.
-func New(apiKey, baseURL, model, effort, visionModel string, maxTokens int64, streamTimeouts StreamTimeouts) (*Generator, error) {
-	if apiKey == "" {
-		return nil, fmt.Errorf("API key is not set")
+func New(catalog *aicatalog.Catalog, lookupEnv func(string) (string, bool), maxTokens int64, streamTimeouts StreamTimeouts) (*Generator, error) {
+	if catalog == nil {
+		return nil, fmt.Errorf("model catalogue is not set")
 	}
 	if maxTokens <= 0 {
 		maxTokens = defaultMaxTokens
 	}
-	opts := []option.RequestOption{option.WithAPIKey(apiKey)}
-	if baseURL != "" {
-		opts = append(opts, option.WithBaseURL(baseURL))
+	clients := make(map[string]anthropic.Client, len(catalog.Providers))
+	for name, p := range catalog.Providers {
+		key, ok := lookupEnv(p.APIKeyEnv)
+		if !ok || key == "" {
+			return nil, fmt.Errorf("provider %q: %s is not set", name, p.APIKeyEnv)
+		}
+		opts := []option.RequestOption{option.WithAPIKey(key)}
+		if p.BaseURL != "" {
+			opts = append(opts, option.WithBaseURL(p.BaseURL))
+		}
+		clients[name] = anthropic.NewClient(opts...)
 	}
+	def := catalog.Default()
 	slog.Info("ai: generator configured",
-		"model", model,
-		"effort", effort,
-		"max_tokens", maxTokens,
-		"base_url_set", baseURL != "",
-		"adaptive_thinking_supported", adaptiveThinkingSupported,
-		"vision_model", visionModel)
-	return &Generator{
-		client:         anthropic.NewClient(opts...),
-		model:          model,
-		effort:         anthropic.OutputConfigEffort(effort),
-		streamTimeouts: streamTimeouts,
-		maxTokens:      maxTokens,
-		visionModel:    visionModel,
-	}, nil
+		"default_model", catalog.DefaultModel,
+		"default_turn_model", def.ModelID,
+		"default_effort", def.Effort,
+		"models", len(catalog.Models),
+		"providers", len(clients),
+		"vision_model", catalog.VisionModel,
+		"summary_model", catalog.SummaryModel,
+		"max_tokens", maxTokens)
+	return &Generator{catalog: catalog, clients: clients, streamTimeouts: streamTimeouts, maxTokens: maxTokens}, nil
 }
 
-// SupportsVision reports whether this Generator was configured with a
-// vision-capable model — Generate rejects an Image when this is false
+// SupportsVision reports whether the catalogue has a model that can see images; Generate rejects an Image otherwise.
 func (g *Generator) SupportsVision() bool {
-	return g.visionModel != ""
+	return g.catalog.SupportsImages()
+}
+
+// Catalog is the model catalogue this Generator serves.
+func (g *Generator) Catalog() *aicatalog.Catalog { return g.catalog }
+
+// model resolves a choice to its catalogue entry and its provider's client.
+func (g *Generator) model(ch aicatalog.Choice) (aicatalog.Model, anthropic.Client, error) {
+	m, ok := g.catalog.Model(ch.ModelID)
+	if !ok {
+		return aicatalog.Model{}, anthropic.Client{}, fmt.Errorf("model %q is not in the catalogue", ch.ModelID)
+	}
+	client, ok := g.clients[m.Provider]
+	if !ok {
+		return aicatalog.Model{}, anthropic.Client{}, fmt.Errorf("no client for provider %q", m.Provider)
+	}
+	return m, client, nil
 }
 
 // NewFake builds a Generator that never calls Claude; used to test plumbing without spending tokens.
 func NewFake(fakeDelay time.Duration) *Generator {
-	return &Generator{fake: true, fakeDelay: fakeDelay}
+	// Placeholder catalogue: fake mode never calls a provider, and without a vision model images stay rejected as before.
+	cat, err := aicatalog.FromEnv("fake-mode", "", "fake-model", string(anthropic.OutputConfigEffortLow), "")
+	if err != nil {
+		panic(err)
+	}
+	return &Generator{fake: true, fakeDelay: fakeDelay, catalog: cat}
 }
 
 // fakeGenerate: NewFake implementation. No changes proposed to avoid corrupting real themes.
@@ -240,7 +269,18 @@ func (g *Generator) fakeGenerate(ctx context.Context, prompt string) (*Result, e
 
 // newTestGenerator builds a test Generator against a caller-supplied base URL.
 func newTestGenerator(client anthropic.Client) *Generator {
-	return &Generator{client: client, model: "test-model", effort: anthropic.OutputConfigEffortMedium, maxTokens: defaultMaxTokens}
+	g := &Generator{clients: map[string]anthropic.Client{"default": client}, maxTokens: defaultMaxTokens}
+	g.setTestVisionModel("")
+	return g
+}
+
+// setTestVisionModel rebuilds a test Generator's one-model catalogue with visionModel for image turns.
+func (g *Generator) setTestVisionModel(visionModel string) {
+	cat, err := aicatalog.FromEnv("test-key", "", "test-model", string(anthropic.OutputConfigEffortMedium), visionModel)
+	if err != nil {
+		panic(err)
+	}
+	g.catalog = cat
 }
 
 // resultSchema is propose_changes' input_schema; additionalProperties: false matches API requirements.
@@ -365,14 +405,35 @@ var resultSchema = map[string]any{
 	},
 }
 
-// adaptiveThinkingSupported gates thinking: {type: "adaptive"} and output_config.effort.
-const adaptiveThinkingSupported = true
-
 // maxToolIterations bounds the read/explore loop; real page-creation prompts use full budget gathering context.
 const maxToolIterations = 28
 
-// forceProposeWithinLastN: distance from ceiling where model is forced to commit to a proposal.
-const forceProposeWithinLastN = 3
+// forceProposeAfterRounds: real redesigns propose within 2-8 rounds, so 12 leaves room; a turn past it is searching
+// for a cause it hasn't found, and later rounds of that only get slower (30-45s each seen on DeepSeek).
+const forceProposeAfterRounds = 12
+
+// forceProposeAfter caps search time on one turn: a merchant waiting longer than this for "I couldn't find it" is worse
+// off than getting the question sooner, whatever the round count.
+const forceProposeAfter = 3 * time.Minute
+
+// forceProposeWithinLastN: how many rounds below maxToolIterations are forced when the time limit doesn't fire first.
+const forceProposeWithinLastN = maxToolIterations - forceProposeAfterRounds
+
+// forceProposeCauseRule: a forced round once resubmitted a file with only its line endings changed and called it the fix.
+const forceProposeCauseRule = "Only propose a change you can tie to a specific cause you found in the code. If you " +
+	"can't name the cause, change nothing: set `needs_clarification: true` and ask the merchant one specific question."
+
+// forceProposeInstruction: a forced turn that found nothing must ask, never claim a fix it didn't make.
+const forceProposeInstruction = "Stop searching and call propose_changes now. " + forceProposeCauseRule + " " +
+	"If you did find the cause, include the change. Never say something was fixed when no file changed, and never " +
+	"resubmit a file with only whitespace or line-ending changes as a fix. Only include a file in `files` if you " +
+	"actually read/verified its current content (for an update) or have real, complete content ready (for a create) " +
+	"— never invent a placeholder path or partial content to fill the array."
+
+// shouldForcePropose reports whether this round must propose: past forceProposeAfterRounds or forceProposeAfter.
+func shouldForcePropose(iteration int, elapsed time.Duration) bool {
+	return iteration >= forceProposeAfterRounds || elapsed >= forceProposeAfter
+}
 
 // thrashOutputTokenThreshold: flags iterations with high output but exploration-only, no propose_changes (diagnostic only).
 const thrashOutputTokenThreshold = 5000
@@ -406,6 +467,9 @@ const streamAccumulateRetryDelay = 5 * time.Second
 func isRetryableAccumulateErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "accumulate stream")
 }
+
+// errStreamReaderPanicked: not retryable — a stream that panicked once is not trusted to read again.
+var errStreamReaderPanicked = errors.New("provider stream reader panicked")
 
 // errStreamIdle and errStreamFirstToken: consumeStream timeout classes, both retried like truncated chunks.
 var (
@@ -464,9 +528,21 @@ func consumeStream(
 	defer firstTokenTimer.Stop()
 
 	// Run stream.Next() in goroutine; select on: read completion, ctx deadline, idle/first-token timers.
-	type nextResult struct{ ok bool }
+	type nextResult struct {
+		ok  bool
+		err error
+	}
 	nextCh := make(chan nextResult, 1)
-	readNext := func() { nextCh <- nextResult{ok: stream.Next()} }
+	readNext := func() {
+		// A panic here would crash the server; recovered, it must still reach the select below or the call hangs.
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("recovered panic reading the provider stream", "panic", r, "stack", string(debug.Stack()))
+				nextCh <- nextResult{err: fmt.Errorf("%w: %v", errStreamReaderPanicked, r)}
+			}
+		}()
+		nextCh <- nextResult{ok: stream.Next()}
+	}
 	go readNext()
 
 	for {
@@ -481,6 +557,9 @@ func consumeStream(
 			}
 			// Stale fire (Stop() returned false, timer not drained); sawProgress true = no-op.
 		case r := <-nextCh:
+			if r.err != nil {
+				return r.err
+			}
 			if !r.ok {
 				return nil
 			}
@@ -527,10 +606,17 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	if len(images) > 0 && !g.SupportsVision() {
 		return nil, fmt.Errorf("image attached but no vision model is configured")
 	}
-	// Use vision model only when images attached; text-only turns use proven text model.
-	callModel := g.model
+	choice := tc.Model
+	if choice.ModelID == "" {
+		choice = g.catalog.Default()
+	}
 	if len(images) > 0 {
-		callModel = g.visionModel
+		visionChoice, switched, _ := g.catalog.ForImages(choice)
+		if switched {
+			slog.Info("ai: chosen model can't see images; the vision model handles this turn",
+				"chosen_model", choice.ModelID, "vision_model", visionChoice.ModelID, "effort", visionChoice.Effort)
+		}
+		choice = visionChoice
 	}
 	// editFailureCounts: path tracking for materializeEdits fallback (full content vs retry forever).
 	editFailureCounts := make(map[string]int)
@@ -539,11 +625,18 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	var messages []anthropic.MessageParam
 	if tc.Continue != nil {
 		// Images already sit in the resumed history's first prompt; re-attaching would duplicate them.
-		callModel = tc.Continue.model
+		choice = tc.Continue.choice
 		messages = tc.Continue.resumeMessages(prompt)
 	} else {
 		messages = freshMessages(history, prompt, images)
 	}
+
+	entry, client, err := g.model(choice)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("ai: turn model", "model_id", choice.ModelID, "model", entry.Model, "effort", choice.Effort,
+		"thinking", entry.Thinking, "resumed", tc.Continue != nil)
 
 	tools := toolsForMode(tc.GenerationMode)
 	// Clamp first-token timeout to ctx deadline (slow iterations tighten budget naturally).
@@ -582,15 +675,19 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
 		iterationsUsed = iteration + 1
 		toolChoice := anthropic.ToolChoiceUnionParam{OfAny: &anthropic.ToolChoiceAnyParam{}}
-		forcingPropose := iteration >= maxToolIterations-forceProposeWithinLastN
+		forcingPropose := shouldForcePropose(iteration, time.Since(generateStart))
+		// The request always lists every tool, keeping the prompt cache intact; a forced round instead refuses any call
+		// but propose_changes, since DeepSeek ignores a named tool_choice and keeps searching.
+		allowedTools := tools
 		if forcingPropose {
-			// Near ceiling: force propose_changes to commit from gathered context, not run out of budget reading.
 			toolChoice = anthropic.ToolChoiceParamOfTool(toolNameProposeChanges)
-			slog.Info("ai: forcing propose_changes near tool-loop budget ceiling",
-				"iteration", iteration, "max_tool_iterations", maxToolIterations)
+			allowedTools = []anthropic.ToolUnionParam{proposeChangesTool()}
+			slog.Info("ai: forcing propose_changes",
+				"iteration", iteration, "max_tool_iterations", maxToolIterations,
+				"elapsed_ms", time.Since(generateStart).Milliseconds())
 		}
 		params := anthropic.MessageNewParams{
-			Model:      callModel,
+			Model:      entry.Model,
 			MaxTokens:  g.maxTokens,
 			System:     system,
 			Messages:   messages,
@@ -598,25 +695,22 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			ToolChoice: toolChoice,
 		}
 		if forcingPropose {
-			// Nudge: don't invent placeholder paths; use needs_clarification + empty files if not ready.
 			params.System = append(append([]anthropic.TextBlockParam{}, system...), anthropic.TextBlockParam{
-				Text: "You are at the tool-loop budget ceiling and must call propose_changes now. " +
-					"Only include a file in `files` if you actually read/verified its current content " +
-					"(for an update) or have real, complete content ready (for a create) — never invent " +
-					"a placeholder path or partial content to fill the array. If you do not yet have a " +
-					"complete, verified proposal, call propose_changes with needs_clarification: true, " +
-					"files: [], and a summary explaining that the request needs to be split into a " +
-					"smaller step or retried, instead of guessing.",
+				Text: forceProposeInstruction,
 			})
 		}
+		// A model without thinking gets neither parameter.
 		switch {
+		case !entry.Thinking:
 		case forcingPropose:
 			// DeepSeek rejects a named tool_choice while thinking ("Thinking mode does not support this tool_choice"),
 			// and thinks by default, so the forced call must disable it explicitly.
 			params.Thinking = anthropic.ThinkingConfigParamUnion{OfDisabled: &anthropic.ThinkingConfigDisabledParam{}}
-		case adaptiveThinkingSupported:
+		default:
 			params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{}}
-			params.OutputConfig = anthropic.OutputConfigParam{Effort: g.effort}
+			if choice.Effort != "" {
+				params.OutputConfig = anthropic.OutputConfigParam{Effort: anthropic.OutputConfigEffort(choice.Effort)}
+			}
 		}
 		var message anthropic.Message
 		// Track attempts separately to distinguish retried streams from slow inference.
@@ -624,7 +718,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		attemptsUsed := 0
 		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
 			attemptsUsed = attempt
-			stream := g.client.Messages.NewStreaming(ctx, params)
+			stream := client.Messages.NewStreaming(ctx, params)
 			message = anthropic.Message{}
 			streamErr := consumeStream(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout)
 			// Close immediately (timeouts may abandon mid-read).
@@ -761,9 +855,10 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				result.InputTokens = totalInputTokens
 				result.OutputTokens = totalOutputTokens
 				result.ExplorationToolCalls = explorationToolCalls
+				result.ModelID, result.Effort = choice.ModelID, choice.Effort
 				// A recovered call has no tool_use ID to pair a resumed tool_result with, so repair uses the flat-recap fallback.
 				if !recovered {
-					result.conversation = newConversation(messages, message, proposeID, callModel)
+					result.conversation = newConversation(messages, message, proposeID, choice)
 				}
 				return &result, nil
 			}
@@ -807,6 +902,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, materializeFailureMsg, true))
 				continue
 			}
+			// Enforced here, not by the request: DeepSeek calls tools a round doesn't allow (seen on forced rounds).
+			if !toolOffered(allowedTools, tu.Name) {
+				slog.Warn("ai: model called a tool this round doesn't allow; not running it", "iteration", iteration, "tool", tu.Name)
+				resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, toolUnavailableMessage(tu.Name, allowedTools), true))
+				continue
+			}
 			if tu.Name == toolNameReadThemeFile {
 				registerReadPaths(tu.Input, knownPaths) // Track read requests for warnReadBeforeWriteViolations.
 			}
@@ -833,7 +934,38 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		messages = append(messages, anthropic.NewUserMessage(resultBlocks...))
 	}
 
-	return nil, fmt.Errorf("model did not call propose_changes within %d tool-loop iterations", maxToolIterations)
+	// Every round from forceProposeAfterRounds on was forced, so the model had its chance; the merchant gets a fixed
+	// question instead of an error, and never the model's own text, which could claim a fix that wasn't made.
+	slog.Warn("ai: no proposal after forced rounds; ending the turn with a clarifying question", "iterations", maxToolIterations)
+	return &Result{
+		Summary:              ExhaustedSearchReply,
+		NeedsClarification:   true,
+		InputTokens:          totalInputTokens,
+		OutputTokens:         totalOutputTokens,
+		ExplorationToolCalls: explorationToolCalls,
+		ModelID:              choice.ModelID,
+		Effort:               choice.Effort,
+	}, nil
+}
+
+// toolOffered reports whether name is one of the tools this round allows.
+func toolOffered(tools []anthropic.ToolUnionParam, name string) bool {
+	for _, t := range tools {
+		if t.OfTool != nil && t.OfTool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func toolUnavailableMessage(name string, tools []anthropic.ToolUnionParam) string {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if t.OfTool != nil {
+			names = append(names, t.OfTool.Name)
+		}
+	}
+	return fmt.Sprintf("%s isn't allowed in this round, so it wasn't run. Allowed now: %s.", name, strings.Join(names, ", "))
 }
 
 // toolResultBlock prefixes failures with "ERROR:" and keeps is_error: DeepSeek ignores is_error, so the flag alone is invisible.
@@ -943,14 +1075,18 @@ func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error)
 		"what was built or changed, and any decisions made. Do not include a preamble or restate this instruction.\n\n" +
 		"<conversation>\n" + transcript.String() + "</conversation>"
 
+	entry, client, err := g.model(g.catalog.Summary())
+	if err != nil {
+		return "", err
+	}
 	params := anthropic.MessageNewParams{
-		Model:     g.model,
+		Model:     entry.Model,
 		MaxTokens: summarizeMaxTokens,
 		Messages:  []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(instruction))},
 		// Explicit: DeepSeek thinks by default, which would eat the 1024-token budget.
 		Thinking: anthropic.ThinkingConfigParamUnion{OfDisabled: &anthropic.ThinkingConfigDisabledParam{}},
 	}
-	message, err := g.client.Messages.New(ctx, params)
+	message, err := client.Messages.New(ctx, params)
 	if err != nil {
 		return "", fmt.Errorf("summarize turns: %w", err)
 	}
@@ -1051,6 +1187,9 @@ func dynamicSystemPrompt(tc ThemeContext) string {
 		formatDraftPaths(tc.DraftPaths, tc.StagedImagePaths))
 }
 
+const draftUndoRule = "Never undo earlier changes by rewriting a file — you can't see the originals. " +
+	"If earlier changes should go, tell the merchant to use Undo on that turn."
+
 // formatDraftPaths lists unsaved-draft paths, sorted so identical drafts give identical prompts; "" when there are none.
 func formatDraftPaths(paths []string, stagedImages map[string]bool) string {
 	if len(paths) == 0 {
@@ -1060,6 +1199,8 @@ func formatDraftPaths(paths []string, stagedImages map[string]bool) string {
 	sort.Strings(sorted)
 	var b strings.Builder
 	b.WriteString("- Files with unsaved changes from earlier turns (the merchant hasn't applied them yet — keep that work; change only what this request needs):\n")
+	// At the decision point because the spec's version of this rule didn't hold against repeated failed fixes.
+	b.WriteString("  " + draftUndoRule + "\n")
 	for _, p := range sorted {
 		if stagedImages[p] {
 			fmt.Fprintf(&b, "  - %s (staged image — goes live when the merchant applies)\n", p)

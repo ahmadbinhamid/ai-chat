@@ -3,8 +3,10 @@ package themebuild
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
 
 	"golang.org/x/sync/errgroup"
@@ -249,6 +251,21 @@ func dropUnchangedFiles(plan writePlan) writePlan {
 	kept := plan.files[:0:0]
 	for _, f := range plan.files {
 		if f.pageMeta == nil && f.previous != nil && *f.previous == f.content {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	plan.files = kept
+	return plan
+}
+
+// dropWhitespaceOnlyFiles drops updates that only change whitespace, which a forced round once passed off as a fix.
+// Callers skip it when the merchant asked for formatting.
+func dropWhitespaceOnlyFiles(plan writePlan) writePlan {
+	kept := plan.files[:0:0]
+	for _, f := range plan.files {
+		if f.pageMeta == nil && f.previous != nil && themecheck.WhitespaceOnlyChange(*f.previous, f.content) {
+			slog.Info("dropping a whitespace-only change from the proposal", "path", f.path)
 			continue
 		}
 		kept = append(kept, f)

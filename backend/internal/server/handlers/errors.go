@@ -33,6 +33,8 @@ func respondErr(c *gin.Context, err error) {
 		httpresponse.Error(c, http.StatusConflict, err.Error(), "NO_PENDING_CHANGES")
 	case errors.Is(err, themebuild.ErrManualEditFileNotFound):
 		httpresponse.Error(c, http.StatusNotFound, err.Error(), "FILE_NOT_FOUND")
+	case errors.Is(err, themebuild.ErrInvalidModelChoice):
+		httpresponse.Error(c, http.StatusBadRequest, err.Error(), "INVALID_MODEL_CHOICE")
 	case errors.Is(err, themebuild.ErrVisionNotConfigured):
 		httpresponse.Error(c, http.StatusUnprocessableEntity, err.Error(), "VISION_NOT_CONFIGURED")
 	case errors.Is(err, themebuild.ErrTooManyImages):

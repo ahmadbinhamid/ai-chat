@@ -1,6 +1,10 @@
 package ai
 
-import "github.com/anthropics/anthropic-sdk-go"
+import (
+	"github.com/anthropics/anthropic-sdk-go"
+
+	"ai-chat/internal/aicatalog"
+)
 
 // Conversation is an opaque snapshot of a Generate call's messages, ending on the assistant turn whose
 // propose_changes was accepted; set ThemeContext.Continue to resume it instead of rebuilding from []Turn.
@@ -10,7 +14,7 @@ type Conversation struct {
 	finalToolUses []finalToolUse
 	acceptedID    string
 	// The resume must use the model that produced the history (a vision history can't go to a text-only model).
-	model         anthropic.Model
+	choice        aicatalog.Choice
 	proposalRecap string
 }
 
@@ -24,7 +28,7 @@ const (
 )
 
 // newConversation snapshots messages plus final, the turn holding the accepted propose_changes (acceptedID).
-func newConversation(messages []anthropic.MessageParam, final anthropic.Message, acceptedID string, model anthropic.Model) *Conversation {
+func newConversation(messages []anthropic.MessageParam, final anthropic.Message, acceptedID string, choice aicatalog.Choice) *Conversation {
 	snapshot := make([]anthropic.MessageParam, 0, len(messages)+1)
 	snapshot = append(snapshot, messages...)
 	snapshot = append(snapshot, final.ToParam())
@@ -34,7 +38,7 @@ func newConversation(messages []anthropic.MessageParam, final anthropic.Message,
 			uses = append(uses, finalToolUse{id: block.ID, name: block.Name})
 		}
 	}
-	return &Conversation{messages: snapshot, finalToolUses: uses, acceptedID: acceptedID, model: model}
+	return &Conversation{messages: snapshot, finalToolUses: uses, acceptedID: acceptedID, choice: choice}
 }
 
 // WithProposalRecap returns a copy whose accepted propose_changes tool_result carries recap: the proposal's

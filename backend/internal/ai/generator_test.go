@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"ai-chat/internal/aicatalog"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -215,7 +216,11 @@ func TestNew_BaseURLReachesFakeServer(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	g, err := New("test-key", ts.URL, "test-model", "", "", 0, StreamTimeouts{})
+	cat, err := aicatalog.FromEnv("test-key", ts.URL, "test-model", "low", "")
+	if err != nil {
+		t.Fatalf("FromEnv: %v", err)
+	}
+	g, err := New(cat, func(string) (string, bool) { return "test-key", true }, 0, StreamTimeouts{})
 	if err != nil {
 		t.Fatalf("New returned an error: %v", err)
 	}
@@ -250,9 +255,12 @@ func TestGenerate_GivesUpAfterMaxIterations(t *testing.T) {
 		return "[]", nil
 	}
 
-	_, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, nil, toolExec, nil)
-	if err == nil {
-		t.Fatal("expected an error once the iteration cap is hit")
+	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "do something", nil, nil, toolExec, nil)
+	if err != nil {
+		t.Fatalf("expected the iteration cap to end with a clarifying question, got error %v", err)
+	}
+	if !result.NeedsClarification || len(result.Files) != 0 || result.Summary != ExhaustedSearchReply {
+		t.Errorf("expected the fixed needs_clarification reply with no files, got %+v", result)
 	}
 	if calls != maxToolIterations {
 		t.Errorf("expected exactly %d calls (the iteration cap), got %d", maxToolIterations, calls)

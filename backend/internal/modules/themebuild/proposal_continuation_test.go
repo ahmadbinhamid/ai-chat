@@ -95,10 +95,7 @@ func emptyProposal() map[string]any {
 
 func realGenerator(t *testing.T, url string) *ai.Generator {
 	t.Helper()
-	gen, err := ai.New("k", url, "test-model", "medium", "", 0, ai.StreamTimeouts{})
-	if err != nil {
-		t.Fatalf("ai.New: %v", err)
-	}
+	gen := newSingleModelGenerator(t, url, "test-model", "medium", "")
 	return gen
 }
 

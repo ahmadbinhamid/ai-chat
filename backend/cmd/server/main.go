@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -57,6 +58,13 @@ func main() {
 	}
 
 	go func() {
+		// Not swallowed like other goroutines' panics: a server that silently stopped listening is worse than a restart.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("http listener panicked", "panic", r, "stack", string(debug.Stack()))
+				os.Exit(1)
+			}
+		}()
 		logger.Info("listening", "addr", httpServer.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "error", err)
@@ -68,6 +76,16 @@ func main() {
 	defer stop()
 	<-ctx.Done()
 	stop()
+
+	// Generations run detached from any request, so httpServer.Shutdown never waits for them. Drain them first, with
+	// HTTP still serving (new prompts just queue), so a deploy doesn't take the dashboard down for the drain.
+	logger.Info("draining running generations", "limit", cfg.ShutdownDrain)
+	finished, stillRunning := srv.DrainGenerations(context.Background())
+	logger.Info("generation drain done", "finished", finished, "still_running", stillRunning)
+	if stillRunning > 0 {
+		requeued, failed := srv.RequeueUnfinished(context.Background())
+		logger.Info("cut-off generations re-queued to resume after restart", "requeued", requeued, "failed", failed)
+	}
 
 	logger.Info("shutting down, draining in-flight requests")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

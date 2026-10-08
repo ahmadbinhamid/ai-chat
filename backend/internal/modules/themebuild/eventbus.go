@@ -91,6 +91,7 @@ func (b *redisEventBus) Subscribe(ctx context.Context, chatID string) (<-chan Ge
 
 	go func() {
 		defer close(ch)
+		defer safego.Recover("themebuild.eventBusSubscribeLoop")
 		for msg := range sub.Channel() {
 			// Per-message recovery: one bad message doesn't kill delivery.
 			func() {

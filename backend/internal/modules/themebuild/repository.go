@@ -44,11 +44,29 @@ func decodePageMeta(raw sql.NullString) (*themefs.PageMeta, error) {
 }
 
 func (r *Repository) CreateFile(ctx context.Context, f GeneratedFile) error {
+	return createFile(ctx, r.db, f)
+}
+
+// CreateFileTx is CreateFile inside the caller's transaction.
+func (r *Repository) CreateFileTx(ctx context.Context, tx *sql.Tx, f GeneratedFile) error {
+	return createFile(ctx, tx, f)
+}
+
+// BeginTx opens a transaction the service can share with other modules' repositories.
+func (r *Repository) BeginTx(ctx context.Context) (*sql.Tx, error) {
+	return r.db.BeginTx(ctx, nil)
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func createFile(ctx context.Context, e execer, f GeneratedFile) error {
 	pageMeta, err := encodePageMeta(f.PageMeta)
 	if err != nil {
 		return err
 	}
-	_, err = r.db.ExecContext(ctx, `
+	_, err = e.ExecContext(ctx, `
 		INSERT INTO chat_generated_files
 			(id, message_id, chat_id, file_path, action, kind, language, content, previous_content, page_meta, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

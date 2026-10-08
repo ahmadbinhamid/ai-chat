@@ -26,6 +26,8 @@ func NewChatHandler(chats *chat.Service, builder *themebuild.Service) *ChatHandl
 type messageWithFiles struct {
 	chat.Message
 	GeneratedFiles []themebuild.GeneratedFile `json:"generated_files"`
+	// ModelLabel names the model that answered; set for internal-only models too, which GET /models never lists.
+	ModelLabel string `json:"model_label,omitempty"`
 }
 
 // chatDetail is the chat plus its full message log. Chat is a pointer so a tenant with no chat yet gets the same response shape.
@@ -87,6 +89,9 @@ func (h *ChatHandler) Get(c *gin.Context) {
 	withFiles := make([]messageWithFiles, len(messages))
 	for i, m := range messages {
 		withFiles[i] = messageWithFiles{Message: m, GeneratedFiles: filesByMessage[m.ID]}
+		if m.ModelID != nil {
+			withFiles[i].ModelLabel = h.builder.ModelLabel(*m.ModelID)
+		}
 	}
 
 	generating, genErr := h.builder.GenerationStatus(c.Request.Context(), ch.ID)

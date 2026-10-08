@@ -142,7 +142,7 @@ func TestGenerate_FreshCallMessagesUnchanged(t *testing.T) {
 	srv, ts := newScriptedServer(t, modelTurnSSE("msg_1", []map[string]any{proposeTurn("toolu_1")}))
 	defer ts.Close()
 	g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
-	g.visionModel = "vision-model"
+	g.setTestVisionModel("vision-model")
 	hist := []Turn{{Role: "user", Content: "make it blue"}, {Role: "assistant", Content: "Made it blue."}, {Role: "user", Content: "  "}}
 	imgs := []Image{{Base64: "aGk=", MediaType: "image/png"}}
 
@@ -178,7 +178,7 @@ func TestGenerate_ContinuationCarriesToolLoop(t *testing.T) {
 	)
 	defer ts.Close()
 	g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
-	g.visionModel = "vision-model"
+	g.setTestVisionModel("vision-model")
 	imgs := []Image{{Base64: "aGk=", MediaType: "image/png"}}
 	tc := ThemeContext{ThemeSlug: "shop"}
 

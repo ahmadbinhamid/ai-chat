@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -292,6 +293,29 @@ func (s *Service) RecordManualEditMessage(ctx context.Context, c Chat, filePath 
 // RecordAssistantMessage appends the model's reply, rolling token usage into the chat's
 // running totals. Also called for a failed generation (status MessageStatusFailed).
 func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus) (Message, error) {
+	return s.RecordAssistantMessageFromModel(ctx, c, content, status, inputTokens, outputTokens, applyStatus, "", "")
+}
+
+// RecordAssistantMessageFromModel is RecordAssistantMessage plus the catalogue model and effort that answered; empty
+// values store NULL.
+func (s *Service) RecordAssistantMessageFromModel(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) (Message, error) {
+	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort)
+	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, nil, inputTokens, outputTokens, m.CreatedAt); err != nil {
+		return Message{}, err
+	}
+	return m, nil
+}
+
+// RecordAssistantMessageInTx records the reply inside the caller's transaction; nothing is written until it commits.
+func (s *Service) RecordAssistantMessageInTx(ctx context.Context, tx *sql.Tx, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) (Message, error) {
+	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort)
+	if err := s.repo.CreateMessageAndTouchUsageTx(ctx, tx, m, inputTokens, outputTokens, m.CreatedAt); err != nil {
+		return Message{}, err
+	}
+	return m, nil
+}
+
+func assistantMessage(c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) Message {
 	now := time.Now().UTC()
 	m := Message{
 		ID:           uuid.NewString(),
@@ -304,12 +328,18 @@ func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content st
 		OutputTokens: outputTokens,
 		ApplyStatus:  applyStatus,
 		CreatedAt:    now,
+		ModelID:      nonEmpty(modelID),
+		Effort:       nonEmpty(effort),
 	}
 	if applyStatus == ApplyStatusApplied {
 		m.AppliedAt = &now
 	}
-	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, nil, inputTokens, outputTokens, now); err != nil {
-		return Message{}, err
+	return m
+}
+
+func nonEmpty(s string) *string {
+	if s == "" {
+		return nil
 	}
-	return m, nil
+	return &s
 }

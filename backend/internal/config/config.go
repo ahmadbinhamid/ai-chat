@@ -3,11 +3,14 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"ai-chat/internal/aicatalog"
 )
 
 type Config struct {
@@ -48,6 +51,11 @@ type Config struct {
 	BaseURL string
 	// VisionModel replaces Model for any turn with an image attached; empty rejects images outright.
 	VisionModel string
+	// ShutdownDrain bounds how long shutdown waits for running generations; keep it inside the process manager's
+	// stop timeout, or the manager kills the process mid-drain.
+	ShutdownDrain time.Duration
+	// ModelsConfig is the model catalogue file (AI_MODELS_CONFIG); empty builds a one-model catalogue from the AI_* vars.
+	ModelsConfig string
 	// HistorySummarizationEnabled gates collapsed-history-turn summarization; the cached
 	// summary also matters for DeepSeek's prefix-match request caching.
 	HistorySummarizationEnabled bool
@@ -97,7 +105,7 @@ func Load() Config {
 		AuthNegativeCacheTTL: time.Duration(getenvInt("AUTH_NEGATIVE_CACHE_TTL_SECONDS", 10)) * time.Second,
 		FlowposHTTPTimeout:   time.Duration(getenvInt("FLOWPOS_HTTP_TIMEOUT_MS", 2000)) * time.Millisecond,
 
-		Effort:      getenv("AI_EFFORT", "xhigh"),
+		Effort:      getenv("AI_EFFORT", "low"),
 		MaxTokens:   int64(getenvInt("AI_MAX_TOKENS", 64000)),
 		FakeAIMode:  getenvBool("AI_CHAT_FAKE_MODE", false),
 		FakeAIDelay: time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
@@ -108,10 +116,12 @@ func Load() Config {
 		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
 		FirstTokenTimeoutPages: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_PAGES_SECONDS", 150)) * time.Second,
 
-		APIKey:      os.Getenv("AI_API_KEY"),
-		Model:       getenv("AI_MODEL", "deepseek-v4-pro"),
-		VisionModel: getenv("AI_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
-		BaseURL:     getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
+		APIKey:        os.Getenv("AI_API_KEY"),
+		Model:         getenv("AI_MODEL", "deepseek-v4-flash"),
+		VisionModel:   getenv("AI_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
+		BaseURL:       getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
+		ModelsConfig:  os.Getenv("AI_MODELS_CONFIG"),
+		ShutdownDrain: time.Duration(getenvInt("SHUTDOWN_DRAIN_SECONDS", 120)) * time.Second,
 
 		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
 
@@ -141,6 +151,19 @@ func getenvList(key string) []string {
 		}
 	}
 	return out
+}
+
+// ModelCatalog loads AI_MODELS_CONFIG, or without it the one-model catalogue from AI_API_KEY/AI_BASE_URL/AI_MODEL/
+// AI_EFFORT/AI_VISION_MODEL. Callers refuse to start on an error rather than fail on a merchant's request.
+func (c Config) ModelCatalog() (*aicatalog.Catalog, error) {
+	if c.ModelsConfig == "" {
+		return aicatalog.FromEnv(c.APIKey, c.BaseURL, c.Model, c.Effort, c.VisionModel)
+	}
+	data, err := os.ReadFile(c.ModelsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("read AI_MODELS_CONFIG: %w", err)
+	}
+	return aicatalog.Parse(data, os.LookupEnv)
 }
 
 func getenv(key, fallback string) string {

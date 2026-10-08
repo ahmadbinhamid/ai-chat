@@ -2,6 +2,7 @@ package ai
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,11 +73,6 @@ func TestSanitizeError(t *testing.T) {
 			wantContain: "timed out",
 		},
 		{
-			name:        "tool-loop iterations exhausted",
-			err:         errors.New("model did not call propose_changes within 28 tool-loop iterations"),
-			wantContain: "too complex",
-		},
-		{
 			name:        "themecheck validation exhausted after repairs",
 			err:         errors.New("the generated changes didn't pass validation after 3 attempts: some_rule (2 files)"),
 			wantContain: "couldn't be validated",
@@ -131,5 +127,25 @@ func TestSanitizeError(t *testing.T) {
 func TestSanitizeError_Nil(t *testing.T) {
 	if got := SanitizeError(nil); got != "" {
 		t.Errorf("SanitizeError(nil) = %q, want empty string", got)
+	}
+}
+
+// Honest answers are shown to the merchant as replies, so they carry no "Error from AI agent:" prefix.
+func TestSanitizeError_HonestMessagesHaveNoPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"tool-loop iterations exhausted", errors.New("model did not call propose_changes within 28 tool-loop iterations"), ExhaustedSearchReply},
+		{"stuck in text", fmt.Errorf("retry generation: %w", errStuckInTextReplies), stuckInTextMessage},
+		{"unrepaired draft reversion", fmt.Errorf("%w after 3 attempts", ErrDraftReversionUnrepaired), draftReversionUnrepairedMessage},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SanitizeError(tt.err); got != tt.want {
+				t.Errorf("SanitizeError() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
