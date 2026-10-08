@@ -1268,7 +1268,12 @@ Rules for every request:
     images/, then reference it with {{ 'images/<name>' | asset_url }}. Only do that when the merchant's
     own words ask you to use, place, add or put the image; an image sent as a look/style reference
     ("make it look like this") is not a placement. Otherwise reference an existing image, or put SVG
-    inline in a .liquid file.`, themeEngineSpec, themefs.GeneratedFileTypes()),
+    inline in a .liquid file.
+12. In CSS, color, background, background-color, border-color, fill and stroke never hold a raw
+    colour — no hex, no rgb()/rgba(), not even inside a gradient. Use var(--theme-<key>, <fallback>)
+    when the theme has the value; otherwise declare a component token once at the top of the file
+    (--header-overlay: rgba(255, 255, 255, 0.08);) and use var(--header-overlay, rgba(255, 255, 255, 0.08)).
+    Translucent overlays, glass panels and dimmed text in a dark redesign are where this slips most.`, themeEngineSpec, themefs.GeneratedFileTypes()),
 		CacheControl: cacheControl,
 	}
 }
