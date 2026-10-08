@@ -249,6 +249,30 @@ func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr er
 	return err
 }
 
+// ErrGenerationNotRunning: the generation stopped being this process's to finish (cancelled, reaped or re-queued by
+// a drain) before its turn committed, so the turn must be discarded.
+var ErrGenerationNotRunning = errors.New("generation is no longer running")
+
+// FinishGenerationTx marks a still-running generation succeeded inside the caller's transaction.
+func (r *Repository) FinishGenerationTx(ctx context.Context, tx *sql.Tx, generationID string) error {
+	now := time.Now().UTC()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE generations SET status = ?, error = NULL, finished_at = ?, updated_at = ?
+		WHERE id = ? AND status = ?
+	`, GenerationStatusSucceeded, now, now, generationID, GenerationStatusRunning)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrGenerationNotRunning
+	}
+	return nil
+}
+
 // Records themecheck retry attempts; called from checkAndRepair.
 func (r *Repository) SetGenerationAttempts(ctx context.Context, chatID string, attempts int) error {
 	_, err := r.db.ExecContext(ctx, `

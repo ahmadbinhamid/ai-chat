@@ -124,6 +124,15 @@ func (r *Repository) CreateMessageAndTouchUsage(ctx context.Context, m Message, 
 	return tx.Commit()
 }
 
+// CreateMessageAndTouchUsageTx is CreateMessageAndTouchUsage inside the caller's transaction, for a turn whose
+// reply must commit together with other modules' writes.
+func (r *Repository) CreateMessageAndTouchUsageTx(ctx context.Context, tx *sql.Tx, m Message, inputTokens, outputTokens int64, at time.Time) error {
+	if err := createMessage(ctx, tx, m); err != nil {
+		return err
+	}
+	return touchChatUsage(ctx, tx, m.ChatID, inputTokens, outputTokens, at)
+}
+
 // ListMessagesByChat returns full turn history with attachment METADATA only — this backs
 func (r *Repository) ListMessagesByChat(ctx context.Context, chatID string) ([]Message, error) {
 	rows, err := r.db.QueryContext(ctx, `

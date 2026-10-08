@@ -116,11 +116,11 @@ func Load() Config {
 		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
 		FirstTokenTimeoutPages: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_PAGES_SECONDS", 150)) * time.Second,
 
-		APIKey:       os.Getenv("AI_API_KEY"),
-		Model:        getenv("AI_MODEL", "deepseek-v4-flash"),
-		VisionModel:  getenv("AI_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
-		BaseURL:      getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
-		ModelsConfig: os.Getenv("AI_MODELS_CONFIG"),
+		APIKey:        os.Getenv("AI_API_KEY"),
+		Model:         getenv("AI_MODEL", "deepseek-v4-flash"),
+		VisionModel:   getenv("AI_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
+		BaseURL:       getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
+		ModelsConfig:  os.Getenv("AI_MODELS_CONFIG"),
 		ShutdownDrain: time.Duration(getenvInt("SHUTDOWN_DRAIN_SECONDS", 120)) * time.Second,
 
 		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),

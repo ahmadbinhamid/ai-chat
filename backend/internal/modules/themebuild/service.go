@@ -573,6 +573,10 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		slog.Info("generation ended", "chat_id", c.ID, "generation_id", g.ID,
 			"cancelled_by_user", cancelledByUser.Load(), "error", err.Error())
 	}
+	// Its row was finished, reaped or re-queued by someone else; EndGeneration selects by chat, so it must not run.
+	if errors.Is(err, ErrGenerationNotRunning) {
+		return
+	}
 	// err != nil required: flag can flip true after doGenerate committed success.
 	if err != nil && cancelledByUser.Load() {
 		if endErr := s.repo.EndGenerationCancelled(endCtx, c.ID); endErr != nil {
@@ -670,6 +674,12 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				slog.Error("generation failed (raced a concurrent cancel request)", "chat_id", c.ID, "tenant_id", in.TenantID, "error", retErr)
 			}
 			emitter.emit(emitCtx, EventTypeCancelled, map[string]string{"generation_id": genID})
+			return
+		}
+
+		// Cancelled, reaped or re-queued before it committed: there is no failure to report, and the row is not ours.
+		if errors.Is(retErr, ErrGenerationNotRunning) {
+			slog.Info("generation stopped running before its turn committed; discarding it", "chat_id", c.ID, "generation_id", genID)
 			return
 		}
 
@@ -977,15 +987,35 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer commitCancel()
 
-	assistantMsg, err := s.chats.RecordAssistantMessageFromModel(commitCtx, c, summary, chat.MessageStatusCompleted, result.InputTokens, result.OutputTokens, applyStatus, result.ModelID, result.Effort)
+	return s.commitTurn(commitCtx, c, genID, summary, result, applyStatus, staged)
+}
+
+// commitTurn saves a finished turn in one transaction: the reply and chat usage (chat module), the draft files and
+// the generation's success (this module). A crash can't leave a reply without its draft, or a staged turn whose
+// generation the reaper later fails; and a generation that stopped running first commits nothing.
+func (s *Service) commitTurn(ctx context.Context, c chat.Chat, genID, summary string, result *ai.Result, applyStatus chat.ApplyStatus, staged []writtenFile) error {
+	tx, err := s.repo.BeginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin turn commit: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	msg, err := s.chats.RecordAssistantMessageInTx(ctx, tx, c, summary, chat.MessageStatusCompleted,
+		result.InputTokens, result.OutputTokens, applyStatus, result.ModelID, result.Effort)
 	if err != nil {
 		return fmt.Errorf("record assistant message: %w", err)
 	}
-
-	if _, err := s.persistFileRecords(commitCtx, c, assistantMsg.ID, staged); err != nil {
-		return fmt.Errorf("persist generated-file audit rows: %w", err)
+	for _, f := range fileRecords(c, msg.ID, staged) {
+		if err := s.repo.CreateFileTx(ctx, tx, f); err != nil {
+			return fmt.Errorf("persist generated-file audit rows: %w", err)
+		}
 	}
-
+	if err := s.repo.FinishGenerationTx(ctx, tx, genID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit turn: %w", err)
+	}
 	return nil
 }
 
@@ -1375,8 +1405,8 @@ func isUnauthorizedErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "status 401:")
 }
 
-// Writes audit row for each staged file; done after assistant message (FK constraint).
-func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID string, written []writtenFile) ([]GeneratedFile, error) {
+// fileRecords builds the chat_generated_files rows for a turn's written files.
+func fileRecords(c chat.Chat, messageID string, written []writtenFile) []GeneratedFile {
 	files := make([]GeneratedFile, 0, len(written))
 	now := time.Now().UTC()
 	for _, w := range written {
@@ -1398,12 +1428,9 @@ func (s *Service) persistFileRecords(ctx context.Context, c chat.Chat, messageID
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		}
-		if err := s.repo.CreateFile(ctx, f); err != nil {
-			return nil, err
-		}
 		files = append(files, f)
 	}
-	return files, nil
+	return files
 }
 
 // Fetches render-relevant theme files (liquid + optional css/js + pages.json); concurrent reads capped at 8.

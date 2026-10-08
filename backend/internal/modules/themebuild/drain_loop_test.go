@@ -154,8 +154,8 @@ func TestRunGeneration_DrainsWholeQueueInOrder(t *testing.T) {
 	}
 
 	waitForCalls(t, gen, 3, 10*time.Second)
-	// Generator called 3 times doesn't guarantee third call's EndGeneration landed; give it time.
-	time.Sleep(200 * time.Millisecond)
+	// A third generator call doesn't mean the third turn has committed; wait for its reply rather than a fixed sleep.
+	waitForAssistantReplies(t, chatSvc, tenantID, chatID, 3)
 
 	messages, err := chatSvc.ListMessagesForVerifiedChat(ctx, chatID)
 	if err != nil {
@@ -200,7 +200,8 @@ func TestRunGeneration_FailureDoesNotStopLaterQueuedPrompts(t *testing.T) {
 	}
 
 	waitForCalls(t, gen, 3, 10*time.Second)
-	time.Sleep(200 * time.Millisecond)
+	// A third generator call doesn't mean the third turn has committed; wait for its reply rather than a fixed sleep.
+	waitForAssistantReplies(t, chatSvc, tenantID, chatID, 3)
 
 	messages, err := chatSvc.ListMessagesForVerifiedChat(ctx, chatID)
 	if err != nil {
@@ -252,7 +253,8 @@ func TestRunGeneration_EachIterationGetsFreshTimeout(t *testing.T) {
 	}
 
 	waitForCalls(t, gen, 3, 10*time.Second)
-	time.Sleep(200 * time.Millisecond)
+	// A third generator call doesn't mean the third turn has committed; wait for its reply rather than a fixed sleep.
+	waitForAssistantReplies(t, chatSvc, tenantID, chatID, 3)
 
 	messages, err := chatSvc.ListMessagesForVerifiedChat(ctx, chatID)
 	if err != nil {
