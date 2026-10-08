@@ -111,8 +111,8 @@ func TestOpenRouterCatalogue_RoutesEachModel(t *testing.T) {
 	}
 }
 
-// Measured through OpenRouter: every model thinks, only vision sees images, and no effort setting changes how much
-// they think, so each offers just one.
+// Measured through OpenRouter for each model: whether it takes thinking settings, sees images, and whether effort changes
+// how much it thinks (DeepSeek: no, so one effort; Kimi: yes). Grok reasons on its own and rejects thinking: disabled.
 func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 	data, err := os.ReadFile("../../config/ai-models.json")
 	if err != nil {
@@ -122,9 +122,26 @@ func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	want := map[string]struct {
+		thinking, images bool
+		efforts          int
+	}{
+		"deepseek-pro":          {thinking: true, images: false, efforts: 1},
+		"deepseek-flash":        {thinking: true, images: false, efforts: 1},
+		"deepseek-flash-vision": {thinking: true, images: true, efforts: 1},
+		"grok":                  {thinking: false, images: true, efforts: 0},
+		"kimi":                  {thinking: true, images: true, efforts: 3},
+	}
+	if len(c.Models) != len(want) {
+		t.Fatalf("want %d models, got %d", len(want), len(c.Models))
+	}
 	for _, m := range c.Models {
-		if !m.Thinking || m.Images != (m.ID == c.VisionModel) || len(m.Efforts) != 1 || m.DefaultEffort != "low" {
-			t.Errorf("model %q: thinking=%v images=%v efforts=%v default=%q", m.ID, m.Thinking, m.Images, m.Efforts, m.DefaultEffort)
+		w, ok := want[m.ID]
+		if !ok || m.Thinking != w.thinking || m.Images != w.images || len(m.Efforts) != w.efforts {
+			t.Errorf("model %q: thinking=%v images=%v efforts=%v", m.ID, m.Thinking, m.Images, m.Efforts)
+		}
+		if m.Thinking && m.DefaultEffort != "low" {
+			t.Errorf("model %q: default effort %q, want low", m.ID, m.DefaultEffort)
 		}
 	}
 }

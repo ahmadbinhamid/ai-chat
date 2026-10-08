@@ -31,6 +31,26 @@
       "default_effort": "low"
     },
     {
+      "id": "grok",
+      "label": "Grok",
+      "provider": "openrouter",
+      "model": "x-ai/grok-4.7",
+      "options": { "provider": { "order": ["xai"], "allow_fallbacks": true } },
+      "images": true,
+      "thinking": false
+    },
+    {
+      "id": "kimi",
+      "label": "Kimi",
+      "provider": "openrouter",
+      "model": "moonshotai/kimi-k3",
+      "options": { "provider": { "order": ["moonshotai", "fireworks"], "allow_fallbacks": true } },
+      "images": true,
+      "thinking": true,
+      "efforts": ["low", "medium", "high"],
+      "default_effort": "low"
+    },
+    {
       "id": "deepseek-flash-vision",
       "label": "DeepSeek Flash Vision",
       "provider": "openrouter",
