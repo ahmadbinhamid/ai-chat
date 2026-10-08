@@ -21,14 +21,6 @@ const (
 	ToolChoiceAuto = "auto"
 )
 
-// validForceInstructions are a provider's allowed force_instruction values; "" means "system".
-var validForceInstructions = []string{"", ForceInstructionSystem, ForceInstructionMessages}
-
-const (
-	ForceInstructionSystem   = "system"
-	ForceInstructionMessages = "messages"
-)
-
 // validEfforts are the output_config.effort values the provider API accepts.
 var validEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 
@@ -42,9 +34,6 @@ type Provider struct {
 	// ToolChoice is what normal tool-loop rounds require: "any" (the default) or "auto". "auto" lets a router use hosts
 	// that don't honour a required tool call; the loop already copes with a text reply. Forced rounds always name one tool.
 	ToolChoice string `json:"tool_choice,omitempty"`
-	// ForceInstruction is where a forced round's instruction goes: "system" (the default, appended to the system
-	// prompt) or "messages" (appended to the last user message, so the system prompt's cached prefix still matches).
-	ForceInstruction string `json:"force_instruction,omitempty"`
 	// SessionHeader, when set, is the request header the generator puts each chat's ID in, so the provider can keep a
 	// chat's calls on one host (e.g. OpenRouter's sticky routing, which keeps that host's prompt cache warm).
 	SessionHeader string `json:"session_header,omitempty"`
@@ -64,9 +53,6 @@ type Model struct {
 	DefaultEffort string   `json:"default_effort"`
 	// Selectable defaults to true; internal-only models (vision, a separate summary model) set it false.
 	Selectable *bool `json:"selectable,omitempty"`
-	// DisableThinking, on a model with "thinking": false, sends thinking disabled for a model that would otherwise
-	// reason by default (DeepSeek), e.g. a design-turn variant that trades reasoning for speed.
-	DisableThinking bool `json:"disable_thinking,omitempty"`
 	// Options are extra request-body fields for this model, deep-merged over its provider's.
 	Options json.RawMessage `json:"options,omitempty"`
 }
@@ -164,9 +150,6 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 		if key, ok := lookupEnv(p.APIKeyEnv); !ok || key == "" {
 			return fmt.Errorf("provider %q: environment variable %s is not set", name, p.APIKeyEnv)
 		}
-		if !slices.Contains(validForceInstructions, p.ForceInstruction) {
-			return fmt.Errorf("provider %q: force_instruction must be \"system\" or \"messages\", got %q", name, p.ForceInstruction)
-		}
 		if !slices.Contains(validToolChoices, p.ToolChoice) {
 			return fmt.Errorf("provider %q: tool_choice must be \"any\" or \"auto\", got %q", name, p.ToolChoice)
 		}
@@ -228,9 +211,6 @@ func validateModel(m Model, providers map[string]Provider) error {
 	}
 	if _, ok := providers[m.Provider]; !ok {
 		return fmt.Errorf("model %q: unknown provider %q", m.ID, m.Provider)
-	}
-	if m.DisableThinking && m.Thinking {
-		return fmt.Errorf("model %q: disable_thinking needs \"thinking\": false", m.ID)
 	}
 	// Effort is a thinking control, so a model without thinking gets neither parameter.
 	if !m.Thinking {

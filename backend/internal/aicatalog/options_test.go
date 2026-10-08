@@ -107,7 +107,7 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 		t.Error("want a session header so each chat stays on one host")
 	}
 	// "only" restricts to hosts that cached well and serve full-precision builds; unlike "order" it keeps stickiness.
-	wantOnly := map[string]int{"deepseek-pro": 2, "deepseek-flash": 2, "deepseek-flash-design": 2, "deepseek-flash-vision": 1}
+	wantOnly := map[string]int{"deepseek-pro": 2, "deepseek-flash": 2, "deepseek-flash-vision": 1}
 	for _, m := range c.Models {
 		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
 		if only, _ := p["only"].([]any); len(only) != wantOnly[m.ID] {
@@ -138,8 +138,6 @@ func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 		"deepseek-pro":          {thinking: true, images: false, efforts: 1},
 		"deepseek-flash":        {thinking: true, images: false, efforts: 1},
 		"deepseek-flash-vision": {thinking: true, images: true, efforts: 1},
-		// Auto's design route: DeepSeek reasons by default, so it is told not to.
-		"deepseek-flash-design": {thinking: false, images: false, efforts: 0},
 		"grok":                  {thinking: false, images: true, efforts: 0},
 		"kimi":                  {thinking: true, images: true, efforts: 3},
 	}
@@ -150,9 +148,6 @@ func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 		w, ok := want[m.ID]
 		if !ok || m.Thinking != w.thinking || m.Images != w.images || len(m.Efforts) != w.efforts {
 			t.Errorf("model %q: thinking=%v images=%v efforts=%v", m.ID, m.Thinking, m.Images, m.Efforts)
-		}
-		if m.DisableThinking != (m.ID == "deepseek-flash-design") {
-			t.Errorf("model %q: disable_thinking=%v", m.ID, m.DisableThinking)
 		}
 		if m.Thinking && m.DefaultEffort != "low" {
 			t.Errorf("model %q: default effort %q, want low", m.ID, m.DefaultEffort)
@@ -174,59 +169,6 @@ func TestParse_ToolChoice(t *testing.T) {
 			data, _ := json.Marshal(raw)
 			if _, err := Parse(data, withKey); (err != nil) != tt.wantErr {
 				t.Errorf("tool_choice %q: err = %v, wantErr %v", tt.value, err, tt.wantErr)
-			}
-		})
-	}
-}
-
-// Auto sends design turns to the no-thinking Flash variant and keeps fix turns on Pro with thinking.
-func TestOpenRouterCatalogue_AutoDesignTurnsSkipThinking(t *testing.T) {
-	data, err := os.ReadFile("../../config/ai-models.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	c, err := Parse(data, withKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	design := c.Resolve(Selection{ModelID: AutoID}, false)
-	if m, _ := c.Model(design.ModelID); m.Thinking || !m.DisableThinking || m.IsSelectable() {
-		t.Errorf("design route: want a hidden model with thinking disabled, got %+v", m)
-	}
-	fix := c.Resolve(Selection{ModelID: AutoID}, true)
-	if m, _ := c.Model(fix.ModelID); !m.Thinking || fix.ModelID != "deepseek-pro" {
-		t.Errorf("fix route: want Pro with thinking, got %q %+v", fix.ModelID, m)
-	}
-}
-
-func TestParse_DisableThinkingAndForceInstruction(t *testing.T) {
-	tests := []struct {
-		name     string
-		provider map[string]any
-		model    map[string]any
-		wantErr  string
-	}{
-		{name: "disable_thinking without thinking", model: map[string]any{"disable_thinking": true}},
-		{name: "disable_thinking with thinking", model: map[string]any{"disable_thinking": true, "thinking": true, "efforts": []any{"low"}, "default_effort": "low"},
-			wantErr: "disable_thinking needs"},
-		{name: "force_instruction messages", provider: map[string]any{"force_instruction": "messages"}},
-		{name: "force_instruction system", provider: map[string]any{"force_instruction": "system"}},
-		{name: "force_instruction unknown", provider: map[string]any{"force_instruction": "tools"}, wantErr: "force_instruction must be"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := map[string]any{"base_url": "https://x", "api_key_env": "AI_API_KEY"}
-			for k, v := range tt.provider {
-				p[k] = v
-			}
-			m := map[string]any{"id": "m", "label": "M", "provider": "p", "model": "x/m"}
-			for k, v := range tt.model {
-				m[k] = v
-			}
-			data, _ := json.Marshal(map[string]any{"providers": map[string]any{"p": p}, "models": []any{m}, "default_model": "m", "summary_model": "m"})
-			_, err := Parse(data, withKey)
-			if (tt.wantErr == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tt.wantErr)) {
-				t.Errorf("err = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}
