@@ -116,6 +116,8 @@ type ThemeContext struct {
 	StagedImagePaths map[string]bool
 	// Continue resumes a prior call's conversation (history and images are then ignored); nil = fresh call.
 	Continue *Conversation
+	// SessionID groups a chat's calls so a provider with a session header keeps them on one host (and its cache).
+	SessionID string
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -247,6 +249,15 @@ func (g *Generator) model(ch aicatalog.Choice) (aicatalog.Model, anthropic.Clien
 		return aicatalog.Model{}, anthropic.Client{}, nil, fmt.Errorf("no client for provider %q", m.Provider)
 	}
 	return m, client, requestFieldOptions(g.catalog.RequestFields(m.ID)), nil
+}
+
+// sessionOptions sends the turn's session ID in the header the model's provider names, if it names one.
+func (g *Generator) sessionOptions(m aicatalog.Model, sessionID string) []option.RequestOption {
+	p, _ := g.catalog.Provider(m.Provider)
+	if p.SessionHeader == "" || sessionID == "" {
+		return nil
+	}
+	return []option.RequestOption{option.WithHeader(p.SessionHeader, sessionID)}
 }
 
 // requestFieldOptions sets each catalogue option as a top-level body field; sorted so requests are byte-identical,
@@ -671,6 +682,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	if err != nil {
 		return nil, err
 	}
+	reqOpts = append(reqOpts, g.sessionOptions(entry, tc.SessionID)...)
 	slog.Info("ai: turn model", "model_id", choice.ModelID, "model", entry.Model, "effort", choice.Effort,
 		"thinking", entry.Thinking, "resumed", tc.Continue != nil)
 

@@ -23,6 +23,9 @@ type Provider struct {
 	APIKeyEnv string `json:"api_key_env"`
 	// Options are extra request-body fields sent with every model of this provider (e.g. OpenRouter routing).
 	Options json.RawMessage `json:"options,omitempty"`
+	// SessionHeader, when set, is the request header the generator puts each chat's ID in, so the provider can keep a
+	// chat's calls on one host (e.g. OpenRouter's sticky routing, which keeps that host's prompt cache warm).
+	SessionHeader string `json:"session_header,omitempty"`
 	// ModelsURL, when set, is a model list ({"data":[{"id":...}]}) every model name is checked against at startup.
 	ModelsURL string `json:"models_url,omitempty"`
 }

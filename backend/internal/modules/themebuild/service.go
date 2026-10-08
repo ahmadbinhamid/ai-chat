@@ -881,6 +881,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 		tc.GenerationMode = in.Mode
 		tc.Model = in.model
+		tc.SessionID = c.ID
 		tc.DraftPaths = make([]string, 0, len(draft))
 		for path, content := range draft {
 			tc.DraftPaths = append(tc.DraftPaths, path)

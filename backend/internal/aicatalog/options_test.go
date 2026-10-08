@@ -92,8 +92,9 @@ func TestParse_Options(t *testing.T) {
 	}
 }
 
-// Every OpenRouter model prefers a host but may fall back, and data collection stays at OpenRouter's default.
-func TestOpenRouterCatalogue_RoutesEachModel(t *testing.T) {
+// No model sets a host order, which would switch off OpenRouter's sticky routing; every model may fall back, skips
+// the host that never cached, keeps OpenRouter's default data collection, and the provider sends a session header.
+func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 	data, err := os.ReadFile("../../config/ai-models.json")
 	if err != nil {
 		t.Fatal(err)
@@ -102,11 +103,14 @@ func TestOpenRouterCatalogue_RoutesEachModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if p, _ := c.Provider("openrouter"); p.SessionHeader == "" {
+		t.Error("want a session header so each chat stays on one host")
+	}
 	for _, m := range c.Models {
 		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
-		order, _ := p["order"].([]any)
-		if len(order) == 0 || p["allow_fallbacks"] != true || p["data_collection"] != "allow" {
-			t.Errorf("model %q: want a preferred host, fallbacks allowed and data_collection allow; got %v", m.ID, p)
+		ignore, _ := p["ignore"].([]any)
+		if _, ordered := p["order"]; ordered || p["allow_fallbacks"] != true || p["data_collection"] != "allow" || len(ignore) == 0 {
+			t.Errorf("model %q: want no order, fallbacks, ignored hosts and data_collection allow; got %v", m.ID, p)
 		}
 	}
 }
