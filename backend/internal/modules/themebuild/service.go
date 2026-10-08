@@ -886,9 +886,14 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		}
 	}
 
-	// Without an undo request checkAndRepair already blocked any reversion, so only an asked-for undo can reach here.
-	if !deterministic && proposalHasChanges(result) && pageintent.DetectUndo(in.Prompt) {
-		warnings = append(warnings, s.draftReversionWarnings(ctx, storeAuth, c.ID, draft, result)...)
+	// checkAndRepair blocks any other reversion, so only an asked-for undo or redesign reaches here; both get a note.
+	if !deterministic && proposalHasChanges(result) {
+		switch {
+		case pageintent.DetectUndo(in.Prompt):
+			warnings = append(warnings, s.draftReversionWarnings(ctx, storeAuth, c.ID, draft, result)...)
+		case pageintent.DetectReplace(in.Prompt):
+			warnings = append(warnings, s.draftReplacementNotes(ctx, storeAuth, c.ID, draft, result)...)
+		}
 	}
 
 	// Final gate: never silently delete/unregister protected pages (blog, home).
@@ -1173,6 +1178,18 @@ func (s *Service) draftReversionWarnings(ctx context.Context, storeAuth themefs.
 		findings = append(findings, r.Finding())
 	}
 	return findings
+}
+
+// draftReplacementNotes tells the merchant which earlier unsaved work a redesign replaced.
+func (s *Service) draftReplacementNotes(ctx context.Context, storeAuth themefs.RequestAuth, chatID string, draft map[string]string, result *ai.Result) []themecheck.Finding {
+	saved := s.savedDraftUpdates(ctx, storeAuth, chatID, draft, result)
+	var notes []themecheck.Finding
+	for _, r := range themecheck.DetectDraftReversions(toProposal(result), saved, draft) {
+		slog.Info("redesign replaced earlier unsaved changes", "chat_id", chatID, "path", r.Path,
+			"dropped_lines", r.Dropped, "earlier_added_lines", r.Added)
+		notes = append(notes, r.ReplacedFinding())
+	}
+	return notes
 }
 
 // draftReversionBlocking returns blocking findings for proposed updates that drop much of earlier unsaved work, so the

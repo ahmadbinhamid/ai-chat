@@ -113,6 +113,14 @@ func (r DraftReversion) Finding() Finding {
 	}
 }
 
+// ReplacedFinding renders r for a redesign that was allowed to replace earlier unsaved work: never silently.
+func (r DraftReversion) ReplacedFinding() Finding {
+	return Finding{
+		Path: r.Path, Rule: ruleIDDraftReversion, Severity: SeverityWarning,
+		Message: "Your earlier unsaved changes to this file were replaced by this redesign. Use Undo on this message to get them back.",
+	}
+}
+
 // normalizedLineSet collapses whitespace so re-indented or moved lines still match, and skips lines with no letter or digit
 // (a lone "}" or "</div>") since they can't tell one change from another.
 func normalizedLineSet(content string) map[string]bool {

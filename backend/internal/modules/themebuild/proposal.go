@@ -304,8 +304,8 @@ func (s *Service) checkAndRepair(
 		// Downgrade pre-existing findings (after auto-fixers, to preserve raw error count for free fixes).
 		findings = themecheck.DowngradePreExistingFindings(findings, toProposal(result), snap.Files)
 		errorFindings, warningFindings := splitFindings(findings)
-		// Rewriting a draft file from memory drops the merchant's unsaved work; only their own undo request may do that.
-		if len(in.draft) > 0 && !pageintent.DetectUndo(in.Prompt) {
+		// Rewriting a draft file from memory drops the merchant's unsaved work; only an undo or a redesign request may.
+		if len(in.draft) > 0 && !pageintent.DetectUndo(in.Prompt) && !pageintent.DetectReplace(in.Prompt) {
 			storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
 			errorFindings = append(errorFindings, s.draftReversionBlocking(ctx, storeAuth, chatID, in.draft, result)...)
 		}

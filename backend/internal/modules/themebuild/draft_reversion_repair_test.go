@@ -54,6 +54,7 @@ func TestCheckAndRepair_DraftReversion(t *testing.T) {
 		{name: "functionality fix that drops the earlier turn goes to repair", prompt: "the add to cart button does nothing, fix it",
 			proposed: reverted, wantRepair: true},
 		{name: "undo request passes without repair", prompt: "undo the header change", proposed: reverted},
+		{name: "redesign request passes without repair", prompt: "redesign the header completely", proposed: reverted},
 		{name: "one-line edit never trips the check", prompt: "make the header padding 20px", proposed: oneLineEdit},
 	}
 	for _, tt := range tests {
