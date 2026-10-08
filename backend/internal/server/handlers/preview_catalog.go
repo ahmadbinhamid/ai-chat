@@ -105,7 +105,7 @@ func buildPageContext(ctx context.Context, builder *themebuild.Service, storeAut
 	}
 	wg.Wait()
 
-	if categoriesErr == nil && len(categories) > 0 {
+	if categoriesErr == nil {
 		fixture["categories"] = previewCategoryList(categories)
 		options := make([]any, len(categories))
 		for i, c := range categories {

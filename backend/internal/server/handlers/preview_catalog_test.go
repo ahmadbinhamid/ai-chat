@@ -23,6 +23,8 @@ type catalogFlowpos struct {
 	listings []url.Values
 	paths    []string
 	fail     map[string]bool
+	// noCategories serves an empty category list, like a store that has published none.
+	noCategories bool
 }
 
 func (f *catalogFlowpos) serve(t *testing.T) *httptest.Server {
@@ -49,6 +51,10 @@ func (f *catalogFlowpos) serve(t *testing.T) *httptest.Server {
 		case "/store":
 			write(w, map[string]any{"data": map[string]any{"store": map[string]any{"name": "Fleure"}}})
 		case "/categories":
+			if f.noCategories {
+				write(w, map[string]any{"data": map[string]any{"categories": map[string]any{"data": []any{}}}})
+				return
+			}
 			write(w, map[string]any{"data": map[string]any{"categories": map[string]any{"data": []map[string]any{
 				{"id": 9, "name": "Shoes", "slug": "shoes", "description": "All the shoes", "thumbnail": map[string]any{"url": "https://cdn.example.com/shoes.jpg"}},
 				{"id": 4, "name": "Hats", "slug": "hats"},
@@ -174,6 +180,19 @@ func TestPreviewContext_CategoryFilter(t *testing.T) {
 	}
 	if r := asMap(got["filter_price_range"]); r["min"] != 3.0 || r["max"] != 80.0 {
 		t.Errorf("want real price bounds 3..80, got %v", r)
+	}
+}
+
+func TestPreviewContext_StoreWithNoCategoriesShowsNone(t *testing.T) {
+	fake := &catalogFlowpos{noCategories: true}
+	ts := fake.serve(t)
+	got := getPreviewContext(t, ts.URL, "path=/products")
+
+	if options, ok := got["filter_categories"].([]any); !ok || len(options) != 0 {
+		t.Errorf("want no filter categories, not the samples, got %v", got["filter_categories"])
+	}
+	if items, ok := asMap(got["categories"])["items"].([]any); !ok || len(items) != 0 {
+		t.Errorf("want no categories, not the samples, got %v", got["categories"])
 	}
 }
 
