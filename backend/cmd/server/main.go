@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -57,6 +58,13 @@ func main() {
 	}
 
 	go func() {
+		// Not swallowed like other goroutines' panics: a server that silently stopped listening is worse than a restart.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("http listener panicked", "panic", r, "stack", string(debug.Stack()))
+				os.Exit(1)
+			}
+		}()
 		logger.Info("listening", "addr", httpServer.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "error", err)

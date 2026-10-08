@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -467,6 +468,9 @@ func isRetryableAccumulateErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "accumulate stream")
 }
 
+// errStreamReaderPanicked: not retryable — a stream that panicked once is not trusted to read again.
+var errStreamReaderPanicked = errors.New("provider stream reader panicked")
+
 // errStreamIdle and errStreamFirstToken: consumeStream timeout classes, both retried like truncated chunks.
 var (
 	errStreamIdle       = errors.New("provider stream idle timeout")
@@ -524,9 +528,21 @@ func consumeStream(
 	defer firstTokenTimer.Stop()
 
 	// Run stream.Next() in goroutine; select on: read completion, ctx deadline, idle/first-token timers.
-	type nextResult struct{ ok bool }
+	type nextResult struct {
+		ok  bool
+		err error
+	}
 	nextCh := make(chan nextResult, 1)
-	readNext := func() { nextCh <- nextResult{ok: stream.Next()} }
+	readNext := func() {
+		// A panic here would crash the server; recovered, it must still reach the select below or the call hangs.
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("recovered panic reading the provider stream", "panic", r, "stack", string(debug.Stack()))
+				nextCh <- nextResult{err: fmt.Errorf("%w: %v", errStreamReaderPanicked, r)}
+			}
+		}()
+		nextCh <- nextResult{ok: stream.Next()}
+	}
 	go readNext()
 
 	for {
@@ -541,6 +557,9 @@ func consumeStream(
 			}
 			// Stale fire (Stop() returned false, timer not drained); sawProgress true = no-op.
 		case r := <-nextCh:
+			if r.err != nil {
+				return r.err
+			}
 			if !r.ok {
 				return nil
 			}

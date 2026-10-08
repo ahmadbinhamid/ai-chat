@@ -517,6 +517,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 	heartbeatTicker := time.NewTicker(heartbeatTickerInterval())
 	defer heartbeatTicker.Stop()
 	go func() {
+		defer safego.Recover("themebuild.heartbeatLoop")
 		for {
 			select {
 			case <-workCtx.Done():

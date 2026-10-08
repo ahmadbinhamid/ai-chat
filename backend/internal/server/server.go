@@ -19,6 +19,7 @@ import (
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/modules/themebuild"
 	"ai-chat/internal/ratelimit"
+	"ai-chat/internal/safego"
 	"ai-chat/internal/server/handlers"
 	"ai-chat/internal/themefs"
 
@@ -160,7 +161,10 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	// Runs immediately and then every minute until Close cancels it — independent of any
 	// single request's lifecycle, so it needs its own long-lived context.
 	reaperCtx, reaperCancel := context.WithCancel(context.Background())
-	go buildSvc.RunReaper(reaperCtx)
+	go func() {
+		defer safego.Recover("themebuild.RunReaper")
+		buildSvc.RunReaper(reaperCtx)
+	}()
 
 	return &Server{cfg: cfg, engine: r, authCache: authCache, reaperCancel: reaperCancel}, nil
 }
