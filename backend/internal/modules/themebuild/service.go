@@ -135,6 +135,8 @@ type Service struct {
 	historySummaryLocks         *stripedMutex
 	// Zero (struct-literal tests) means imageplacement.DefaultMaxBytes; see placedImageLimit.
 	placedImageMaxBytes int
+	// Running generation loops, for Drain on shutdown; the zero value is ready to use.
+	runs runTracker
 }
 
 // SetPlacedImageMaxBytes sets the largest attached image a turn may place; match it to FlowPOS's PHP upload limit.
@@ -387,11 +389,19 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	// never becomes a column on the row EnqueueGeneration just inserted.
 	s.tokens.store(genID, in.Token)
 
+	// Shutting down: leave it queued rather than start work the process is about to stop waiting for.
+	if !s.runs.start() {
+		return GenerateOutcome{Chat: c, UserMessage: userMsg, QueuePosition: position, GenerationID: genID}, nil
+	}
 	next, err := s.repo.DequeueNext(ctx, c.ID)
+	if err != nil {
+		s.runs.done()
+	}
 	switch {
 	case err == nil:
 		// Detached from request lifecycle, but bounded: each iteration gets its own generateTimeout.
 		go func() {
+			defer s.runs.done()
 			defer safego.Recover("themebuild.runGeneration")
 			s.runGeneration(context.WithoutCancel(ctx), c, next)
 		}()
@@ -413,6 +423,10 @@ func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) 
 	for {
 		s.runOneQueuedGeneration(ctx, c, g)
 
+		// Shutting down: the rest of this chat's queue stays queued for the next process.
+		if s.runs.isDraining() {
+			return
+		}
 		next, err := s.repo.DequeueNext(ctx, c.ID)
 		if errors.Is(err, ErrNotFound) {
 			return // queue drained

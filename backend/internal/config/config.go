@@ -51,6 +51,9 @@ type Config struct {
 	BaseURL string
 	// VisionModel replaces Model for any turn with an image attached; empty rejects images outright.
 	VisionModel string
+	// ShutdownDrain bounds how long shutdown waits for running generations; keep it inside the process manager's
+	// stop timeout, or the manager kills the process mid-drain.
+	ShutdownDrain time.Duration
 	// ModelsConfig is the model catalogue file (AI_MODELS_CONFIG); empty builds a one-model catalogue from the AI_* vars.
 	ModelsConfig string
 	// HistorySummarizationEnabled gates collapsed-history-turn summarization; the cached
@@ -118,6 +121,7 @@ func Load() Config {
 		VisionModel:  getenv("AI_VISION_MODEL", "deepseek-v4-flash-vision-exp"),
 		BaseURL:      getenv("AI_BASE_URL", "https://api.deepseek.com/anthropic"),
 		ModelsConfig: os.Getenv("AI_MODELS_CONFIG"),
+		ShutdownDrain: time.Duration(getenvInt("SHUTDOWN_DRAIN_SECONDS", 120)) * time.Second,
 
 		HistorySummarizationEnabled: getenvBool("HISTORY_SUMMARIZATION_ENABLED", true),
 

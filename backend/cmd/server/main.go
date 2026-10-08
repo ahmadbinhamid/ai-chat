@@ -85,5 +85,10 @@ func main() {
 		logger.Error("graceful shutdown failed", "error", err)
 		os.Exit(1)
 	}
+
+	// Generations run detached from any request, so Shutdown above never waited for them.
+	logger.Info("draining running generations", "limit", cfg.ShutdownDrain)
+	finished, stillRunning := srv.DrainGenerations(context.Background())
+	logger.Info("generation drain done", "finished", finished, "still_running", stillRunning)
 	logger.Info("shutdown complete")
 }

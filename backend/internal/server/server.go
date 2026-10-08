@@ -34,6 +34,12 @@ type Server struct {
 	engine       *gin.Engine
 	authCache    *auth.MemoryCache
 	reaperCancel context.CancelFunc
+	builder      *themebuild.Service
+}
+
+// DrainGenerations waits for running generations, up to SHUTDOWN_DRAIN_SECONDS; call after the HTTP server stops.
+func (s *Server) DrainGenerations(ctx context.Context) (finished, stillRunning int) {
+	return s.builder.Drain(ctx, s.cfg.ShutdownDrain)
 }
 
 // New builds the router and mounts every route. AI generation being unavailable is a
@@ -166,7 +172,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 		buildSvc.RunReaper(reaperCtx)
 	}()
 
-	return &Server{cfg: cfg, engine: r, authCache: authCache, reaperCancel: reaperCancel}, nil
+	return &Server{cfg: cfg, engine: r, authCache: authCache, reaperCancel: reaperCancel, builder: buildSvc}, nil
 }
 
 // Close releases resources the server started that outlive a single request — the auth
