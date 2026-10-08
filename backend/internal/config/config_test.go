@@ -23,11 +23,11 @@ func TestLoad_DeepSeekFields(t *testing.T) {
 	})
 
 	t.Run("env vars override defaults", func(t *testing.T) {
-		t.Setenv("AI_MODEL", "deepseek-v4-flash")
+		t.Setenv("AI_MODEL", "deepseek-v4-pro")
 		t.Setenv("AI_BASE_URL", "https://mock.test/anthropic")
 		cfg := Load()
-		if cfg.Model != "deepseek-v4-flash" {
-			t.Errorf("Model = %q, want %q", cfg.Model, "deepseek-v4-flash")
+		if cfg.Model != "deepseek-v4-pro" {
+			t.Errorf("Model = %q, want %q", cfg.Model, "deepseek-v4-pro")
 		}
 		if cfg.BaseURL != "https://mock.test/anthropic" {
 			t.Errorf("BaseURL = %q, want %q", cfg.BaseURL, "https://mock.test/anthropic")
