@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -80,5 +81,54 @@ func TestEditFailure_KeepsTheErrorText(t *testing.T) {
 	_, _, _, err := applyEdits("one\n", []Edit{{OldString: "one", NewString: "1"}, {OldString: "two", NewString: "2"}})
 	if err == nil || err.Error() != "edit 2: old_string not found (0 matches)" {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// The two failures that aren't about matching text also log which file and which error, with messages unchanged.
+func TestMaterializeEdits_LogsDuplicatePathsAndEmptyEdits(t *testing.T) {
+	tests := []struct {
+		name       string
+		files      []GeneratedFile
+		wantReason string
+		wantPath   string
+		wantMsg    string
+	}{
+		{
+			name: "same file listed twice",
+			files: []GeneratedFile{
+				{Path: "components/css/footer.css", Action: "edit", Edits: []Edit{{OldString: "a", NewString: "b"}}},
+				{Path: "components/css/footer.css", Action: "edit", Edits: []Edit{{OldString: "c", NewString: "d"}}},
+			},
+			wantReason: "duplicate_paths", wantPath: "components/css/footer.css",
+			wantMsg: "files[] proposes the same path more than once",
+		},
+		{
+			name:       "edit with no change pairs",
+			files:      []GeneratedFile{{Path: "components/css/footer.css", Action: "edit"}},
+			wantReason: "no_edits", wantPath: "components/css/footer.css",
+			wantMsg: `components/css/footer.css: action "edit" requires at least one edits[] pair`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureWarnings(t)
+			read := func(context.Context, string) (string, error) { return "a\nc\n", nil }
+			ok, msg := materializeEdits(context.Background(), &Result{Files: tt.files}, read, map[string]int{})
+			if ok || !strings.Contains(msg, tt.wantMsg) {
+				t.Fatalf("want the unchanged failure message %q, got ok=%v %q", tt.wantMsg, ok, msg)
+			}
+			var rec map[string]any
+			for _, r := range logs() {
+				if r["msg"] == "ai: edit materialization failed" {
+					rec = r
+				}
+			}
+			if rec == nil || rec["reason"] != tt.wantReason {
+				t.Fatalf("want a %q failure logged, got %v", tt.wantReason, rec)
+			}
+			if !strings.Contains(fmt.Sprint(rec["path"], rec["paths"]), tt.wantPath) {
+				t.Errorf("want the path logged, got %v", rec)
+			}
+		})
 	}
 }

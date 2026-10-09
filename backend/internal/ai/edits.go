@@ -27,6 +27,8 @@ const duplicatePathsFailureKey = "<duplicate-paths>"
 func materializeEdits(ctx context.Context, result *Result, readFile FileReader, failureCounts map[string]int) (ok bool, retryMessage string) {
 	if dupes := duplicateFilePaths(result.Files); len(dupes) > 0 {
 		failureCounts[duplicatePathsFailureKey]++
+		slog.Warn("ai: edit materialization failed", "paths", dupes, "reason", "duplicate_paths",
+			"failure_count", failureCounts[duplicatePathsFailureKey])
 		msg := fmt.Sprintf(
 			"files[] proposes the same path more than once, which is ambiguous: %s. Each path must appear at most "+
 				"once — combine every change to one file into a single files[] entry (multiple edits[] pairs on one "+
@@ -45,6 +47,7 @@ func materializeEdits(ctx context.Context, result *Result, readFile FileReader, 
 		}
 
 		if len(f.Edits) == 0 {
+			slog.Warn("ai: edit materialization failed", "path", f.Path, "reason", "no_edits")
 			problems = append(problems, fmt.Sprintf(`%s: action "edit" requires at least one edits[] pair`, f.Path))
 			continue
 		}
