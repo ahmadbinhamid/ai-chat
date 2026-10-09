@@ -42,6 +42,10 @@ func promptWithAttachments(prompt string, in GenerateInput) string {
 	if block := in.imageCatalog.promptBlock(); block != "" {
 		text += "\n\n" + block
 	}
+	// With the attachments: a resumed conversation keeps its first turn, and a flat fallback rebuilds it from here.
+	if block := preloadBlock(in.preload); block != "" {
+		text += "\n\n" + block
+	}
 	return text
 }
 
@@ -171,7 +175,9 @@ func (s *Service) generateValidProposal(
 			// The correction is the resumed turn's prompt; the attachment is already in the conversation.
 			genTC.Continue, genPrompt = conversation, continuePrompt
 		}
+		in.metrics.contextBuilt()
 		result, genErr := s.gen.Generate(ctx, genTC, turns, genPrompt, imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, readFile)
+		in.metrics.addGenerate(result)
 		if genErr != nil {
 			// Hard API/transport error; handled by caller/reaper, not retried here.
 			return nil, turns, genErr
@@ -243,7 +249,7 @@ func (s *Service) generateValidProposal(
 func (s *Service) checkAndRepair(
 	ctx context.Context,
 	in GenerateInput,
-	chatID string,
+	chatID, genID string,
 	tc ai.ThemeContext,
 	history []ai.Turn,
 	result *ai.Result,
@@ -260,12 +266,13 @@ func (s *Service) checkAndRepair(
 	for attempt := 1; ; attempt++ {
 		// Best-effort: recorded for measurable retry frequency (never fails generation). s.repo is nil in tests.
 		if s.repo != nil {
-			if err := s.repo.SetGenerationAttempts(ctx, chatID, attempt); err != nil {
-				slog.Warn("failed to record generation attempt count", "chat_id", chatID, "error", err)
+			if err := s.repo.SetGenerationAttempts(ctx, chatID, genID, attempt); err != nil {
+				slog.Warn("failed to record generation attempt count", "chat_id", chatID, "generation_id", genID, "error", err)
 			}
 		}
 
 		emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": attempt})
+		validationStart := time.Now()
 		findings := s.checkProposal(ctx, in, result, snap)
 		// Only raw error COUNT needed to gate auto-fixer; real findings computed after filtering below.
 		rawErrorFindings, _ := splitFindings(findings)
@@ -309,6 +316,7 @@ func (s *Service) checkAndRepair(
 			storeAuth := themefs.RequestAuth{Token: in.Token, TenantID: in.TenantID}
 			errorFindings = append(errorFindings, s.draftReversionBlocking(ctx, storeAuth, chatID, in.draft, result)...)
 		}
+		in.metrics.addValidation(time.Since(validationStart))
 
 		if len(errorFindings) == 0 {
 			if attempt > 1 {
@@ -352,6 +360,8 @@ func (s *Service) checkAndRepair(
 		repairStart := time.Now()
 		retried, genErr := s.gen.Generate(ctx, repairTC, turns, repairText, imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, repairFileReader(readFile, result))
 		repairElapsed := time.Since(repairStart)
+		in.metrics.addRepair(repairElapsed)
+		in.metrics.addGenerate(retried)
 		if genErr != nil {
 			// Distinct log for repair timeout (ctx canceled mid-call).
 			slog.Error("repair generation failed", "tenant_id", in.TenantID, "theme_slug", in.ThemeSlug,

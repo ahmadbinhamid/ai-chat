@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"ai-chat/internal/aicatalog"
 	"ai-chat/internal/config"
 
 	"github.com/gin-gonic/gin"
@@ -163,21 +165,112 @@ func TestMaxBodySize_AllowsBodyUnderLimit(t *testing.T) {
 	}
 }
 
-// TestHealth_ReportsBuild confirms /health exposes the build identity so a deploy can be verified with one request.
-func TestHealth_ReportsBuild(t *testing.T) {
+type fakePinger struct{ err error }
+
+func (f fakePinger) Ping() error { return f.err }
+
+func TestHealth(t *testing.T) {
+	const secret = "dial tcp 10.0.0.5:3306: connect: connection refused (user ai_chat)"
+	tests := []struct {
+		name      string
+		pingErr   error
+		wantCode  int
+		wantBuild bool
+	}{
+		{"database reachable reports ok with build", nil, http.StatusOK, true},
+		{"database unreachable reports only unhealthy", errors.New(secret), http.StatusServiceUnavailable, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			r := gin.New()
+			r.GET("/health", healthHandler(fakePinger{tt.pingErr}, slog.New(slog.NewTextHandler(&logs, nil))))
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tt.wantCode, rec.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode /health: %v (%s)", err, rec.Body.String())
+			}
+			if _, hasBuild := body["build"]; hasBuild != tt.wantBuild {
+				t.Errorf("build present = %v, want %v (%s)", hasBuild, tt.wantBuild, rec.Body.String())
+			}
+			if tt.pingErr == nil {
+				return
+			}
+			if rec.Body.String() != `{"status":"unhealthy"}` {
+				t.Errorf("failure body = %s, want only {\"status\":\"unhealthy\"}", rec.Body.String())
+			}
+			if !strings.Contains(logs.String(), secret) {
+				t.Errorf("expected the real ping error to be logged, got %q", logs.String())
+			}
+		})
+	}
+}
+
+// The real route must not leak the driver's dial error either.
+func TestHealth_RouteHidesDatabaseError(t *testing.T) {
 	srv := newTestServer(t, testConfig())
 	rec := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusServiceUnavailable || rec.Body.String() != `{"status":"unhealthy"}` {
+		t.Fatalf("got %d %s, want 503 {\"status\":\"unhealthy\"}", rec.Code, rec.Body.String())
+	}
+}
 
-	var body struct {
-		Build struct {
-			Commit string `json:"commit"`
-		} `json:"build"`
+func TestLogCatalog_NeverLogsKeys(t *testing.T) {
+	const keyEnv, key = "SECRET_PROVIDER_KEY_ENV", "sk-super-secret-value"
+	catalog := &aicatalog.Catalog{
+		Providers:    map[string]aicatalog.Provider{"openrouter": {BaseURL: "https://openrouter.ai/api", APIKeyEnv: keyEnv}},
+		Models:       []aicatalog.Model{{ID: "flash"}, {ID: "vision"}},
+		DefaultModel: "flash",
+		VisionModel:  "vision",
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode /health: %v (%s)", err, rec.Body.String())
+	t.Setenv(keyEnv, key)
+	var logs bytes.Buffer
+	logCatalog(slog.New(slog.NewTextHandler(&logs, nil)), "config/ai-models.json", catalog)
+
+	out := logs.String()
+	for _, want := range []string{"config/ai-models.json", "openrouter=https://openrouter.ai/api", "default_model=flash", "vision_model=vision", "model_count=2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("catalogue log missing %q: %s", want, out)
+		}
 	}
-	if body.Build.Commit == "" {
-		t.Errorf("expected /health to report a build commit, got %s", rec.Body.String())
+	for _, leak := range []string{key, keyEnv} {
+		if strings.Contains(out, leak) {
+			t.Errorf("catalogue log leaked %q: %s", leak, out)
+		}
+	}
+}
+
+func TestNew_ProductionModelCatalogue(t *testing.T) {
+	tests := []struct {
+		name    string
+		fake    bool
+		wantErr bool
+	}{
+		{"production without AI_MODELS_CONFIG refuses to start", false, true},
+		{"fake mode is exempt", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.AppEnv = config.AppEnvProduction
+			cfg.FakeAIMode = tt.fake
+			cfg.APIKey = "sk-test"
+			srv, err := New(cfg, lazyDB(t), slog.New(slog.DiscardHandler))
+			if srv != nil {
+				t.Cleanup(srv.Close)
+			}
+			if gotErr := err != nil; gotErr != tt.wantErr {
+				t.Fatalf("New error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), "AI_MODELS_CONFIG is required") {
+				t.Errorf("error should name AI_MODELS_CONFIG, got %v", err)
+			}
+		})
 	}
 }

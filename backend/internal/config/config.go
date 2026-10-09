@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,9 @@ import (
 )
 
 type Config struct {
+	// AppEnv is APP_ENV, lower-cased; "production" requires AI_MODELS_CONFIG.
+	AppEnv string
+
 	// HTTP
 	Port string
 
@@ -70,6 +74,12 @@ type Config struct {
 
 	// GenerationRateLimitPerMinute caps /messages calls per tenant per minute.
 	GenerationRateLimitPerMinute int
+	// MaxConcurrentGenerations / MaxConcurrentGenerationsPerTenant cap generations running at once; 0 is unlimited.
+	MaxConcurrentGenerations          int
+	MaxConcurrentGenerationsPerTenant int
+	// LargeThemePages / LargeThemeFiles: above either, the prompt summarises the theme instead of listing it whole.
+	LargeThemePages int
+	LargeThemeFiles int
 
 	// CORSAllowedOrigins is the browser origins allowed to call this API. Empty blocks all
 	// cross-origin requests (fails closed).
@@ -92,6 +102,8 @@ func Load() Config {
 	}
 
 	return Config{
+		AppEnv: strings.ToLower(strings.TrimSpace(getenv("APP_ENV", "development"))),
+
 		Port: getenv("PORT", "8080"),
 
 		DBHost:     os.Getenv("DB_HOST"),
@@ -129,6 +141,12 @@ func Load() Config {
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 
+		MaxConcurrentGenerations:          getenvNonNegativeInt("AI_MAX_CONCURRENT_GENERATIONS", 8),
+		MaxConcurrentGenerationsPerTenant: getenvNonNegativeInt("AI_MAX_CONCURRENT_GENERATIONS_PER_TENANT", 2),
+
+		LargeThemePages: getenvInt("AI_LARGE_THEME_PAGES", 40),
+		LargeThemeFiles: getenvInt("AI_LARGE_THEME_FILES", 250),
+
 		CORSAllowedOrigins: getenvList("CORS_ALLOWED_ORIGINS"),
 
 		RedisURL: os.Getenv("REDIS_URL"),
@@ -153,10 +171,17 @@ func getenvList(key string) []string {
 	return out
 }
 
+const AppEnvProduction = "production"
+
 // ModelCatalog loads AI_MODELS_CONFIG, or without it the one-model catalogue from AI_API_KEY/AI_BASE_URL/AI_MODEL/
 // AI_EFFORT/AI_VISION_MODEL. Callers refuse to start on an error rather than fail on a merchant's request.
 func (c Config) ModelCatalog() (*aicatalog.Catalog, error) {
 	if c.ModelsConfig == "" {
+		// The env catalogue silently defaults to api.deepseek.com, so production must name its catalogue explicitly.
+		if c.AppEnv == AppEnvProduction {
+			return nil, errors.New("AI_MODELS_CONFIG is required when APP_ENV=production; refusing to fall back to " +
+				"the one-model AI_* env catalogue (set AI_MODELS_CONFIG, e.g. config/ai-models.json)")
+		}
 		return aicatalog.FromEnv(c.APIKey, c.BaseURL, c.Model, c.Effort, c.VisionModel)
 	}
 	data, err := os.ReadFile(c.ModelsConfig)
@@ -193,6 +218,20 @@ func getenvInt(key string, fallback int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
+		log.Printf("WARNING: invalid %s=%q, using default %d", key, v, fallback)
+		return fallback
+	}
+	return n
+}
+
+// getenvNonNegativeInt is getenvInt for settings where 0 is meaningful (unlimited).
+func getenvNonNegativeInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
 		log.Printf("WARNING: invalid %s=%q, using default %d", key, v, fallback)
 		return fallback
 	}

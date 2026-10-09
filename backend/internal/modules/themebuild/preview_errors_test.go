@@ -70,7 +70,7 @@ func TestCheckAndRepair_ResumeDoesNotRepeatPreviewErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Generate: %v", err)
 	}
-	if _, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", tc, nil, first, testSnapshot(), readOutputExec, nil, nil); err != nil {
+	if _, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", tc, nil, first, testSnapshot(), readOutputExec, nil, nil); err != nil {
 		t.Fatalf("checkAndRepair: %v", err)
 	}
 	if len(*bodies) != 3 {

@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/aicatalog"
 	"ai-chat/internal/auth"
 	"ai-chat/internal/buildinfo"
 	"ai-chat/internal/config"
@@ -73,6 +75,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 		if err != nil {
 			return nil, err
 		}
+		logCatalog(logger, cfg.ModelsConfig, catalog)
 		generator, err = ai.New(catalog, os.LookupEnv, cfg.MaxTokens, streamTimeouts)
 		if err != nil {
 			return nil, err
@@ -103,6 +106,11 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	buildSvc.SetHistorySummarizationEnabled(cfg.HistorySummarizationEnabled)
 	buildSvc.SetPlacedImageMaxBytes(cfg.PlacedImageMaxBytes)
 	buildSvc.SetModelCatalog(generator.Catalog())
+	buildSvc.SetGenerationLimits(cfg.MaxConcurrentGenerations, cfg.MaxConcurrentGenerationsPerTenant)
+	buildSvc.SetLargeThemeLimits(ai.LargeThemeLimits{Pages: cfg.LargeThemePages, Files: cfg.LargeThemeFiles})
+	// Limits are per replica: N replicas allow N times as many concurrent generations.
+	logger.Info("generation concurrency limits (0 = unlimited)",
+		"max_concurrent", cfg.MaxConcurrentGenerations, "max_concurrent_per_tenant", cfg.MaxConcurrentGenerationsPerTenant)
 
 	limiter := ratelimit.NewPerTenantLimiter(cfg.GenerationRateLimitPerMinute)
 
@@ -142,14 +150,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 		logger.Warn("CORS_ALLOWED_ORIGINS is empty — no browser origin will be able to call this API cross-origin")
 	}
 
-	r.GET("/health", func(c *gin.Context) {
-		build := buildinfo.Get()
-		if err := conn.Ping(); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "db": err.Error(), "build": build})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "build": build})
-	})
+	r.GET("/health", healthHandler(conn, logger))
 
 	api := r.Group("/api/v1")
 
@@ -190,6 +191,45 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	}()
 
 	return &Server{cfg: cfg, engine: r, authCache: authCache, reaperCancel: reaperCancel, builder: buildSvc}, nil
+}
+
+type pinger interface {
+	Ping() error
+}
+
+// healthHandler is public and unauthenticated, so a failure response carries no error text or build identity.
+func healthHandler(db pinger, logger *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if err := db.Ping(); err != nil {
+			logger.Error("health check: database ping failed", "error", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "unhealthy"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "build": buildinfo.Get()})
+	}
+}
+
+// logCatalog records which catalogue is live; it must never log api keys or the api_key_env variable names.
+func logCatalog(logger *slog.Logger, modelsConfig string, catalog *aicatalog.Catalog) {
+	source := modelsConfig
+	if source == "" {
+		source = "env"
+	}
+	names := make([]string, 0, len(catalog.Providers))
+	for name := range catalog.Providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	providers := make([]string, 0, len(names))
+	for _, name := range names {
+		providers = append(providers, name+"="+catalog.Providers[name].BaseURL)
+	}
+	logger.Info("ai model catalogue loaded",
+		"source", source,
+		"providers", providers,
+		"default_model", catalog.DefaultModel,
+		"vision_model", catalog.VisionModel,
+		"model_count", len(catalog.Models))
 }
 
 // Close releases resources the server started that outlive a single request — the auth

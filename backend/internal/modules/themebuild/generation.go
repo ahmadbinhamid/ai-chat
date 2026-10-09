@@ -34,6 +34,10 @@ type Generation struct {
 	Effort  string
 	// ThinkingOff: Auto's design route disabled thinking for this turn.
 	ThinkingOff bool
+	// PreviewRoute is the route shown in the merchant's preview at send time; nil when unknown, "" for home.
+	PreviewRoute *string
+	// FocusFile is the source file of the element the merchant last selected there; "" when none.
+	FocusFile string
 	// ResumeCount: times a shutdown drain re-queued this generation; it is re-queued at most once.
 	ResumeCount int
 	// AwaitingResumeSince: set when a restart left this queued without its sender's token; it runs when they return.
@@ -60,11 +64,11 @@ type rowScanner interface {
 // Reads from *sql.Row or *sql.Rows; centralizes nullable-column handling.
 func scanGeneration(s rowScanner) (Generation, error) {
 	var g Generation
-	var errMsg, userMessageID, referenceURL, modelID, effort sql.NullString
+	var errMsg, userMessageID, referenceURL, modelID, effort, previewRoute, focusFile sql.NullString
 	var queuedAt, startedAt, finishedAt, awaitingSince sql.NullTime
 
 	err := s.Scan(&g.ID, &g.ChatID, &g.TenantID, &g.Status, &errMsg, &g.Attempts,
-		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &g.ThinkingOff, &g.ResumeCount, &awaitingSince, &queuedAt, &startedAt, &finishedAt)
+		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &g.ThinkingOff, &previewRoute, &focusFile, &g.ResumeCount, &awaitingSince, &queuedAt, &startedAt, &finishedAt)
 	if err != nil {
 		return Generation{}, err
 	}
@@ -78,6 +82,10 @@ func scanGeneration(s rowScanner) (Generation, error) {
 		g.UserMessageID = &userMessageID.String
 	}
 	g.ModelID, g.Effort = modelID.String, effort.String
+	if previewRoute.Valid {
+		g.PreviewRoute = &previewRoute.String
+	}
+	g.FocusFile = focusFile.String
 	if queuedAt.Valid {
 		g.QueuedAt = &queuedAt.Time
 	}
@@ -134,7 +142,7 @@ func (s *Service) reapOnce(ctx context.Context) {
 
 // Fails chats with queues stranded by dead pod (no drain loop or bearer token).
 func (s *Service) reapOrphanedQueues(ctx context.Context) {
-	chatIDs, err := s.repo.ChatsWithOrphanedQueues(ctx)
+	chatIDs, err := s.repo.ChatsWithOrphanedQueues(ctx, time.Now().UTC().Add(-generationHeartbeatTimeout))
 	if err != nil {
 		slog.Error("failed to list chats with orphaned queues", "error", err)
 		return
@@ -174,8 +182,6 @@ func (s *Service) failOrphanedQueue(ctx context.Context, chatID string) {
 		// Warn: expected, but spike could indicate false staleness detection.
 		slog.Warn("failing an orphaned queued generation", "chat_id", chatID, "generation_id", g.ID, "error", failErr)
 		s.recordGenerationFailure(ctx, c, g.ID, failErr)
-		if endErr := s.repo.EndGeneration(ctx, chatID, failErr); endErr != nil {
-			slog.Error("failed to record generation end for an orphaned queue", "chat_id", chatID, "error", endErr)
-		}
+		s.logGenerationEnd(chatID, g.ID, s.repo.EndGeneration(ctx, chatID, g.ID, failErr))
 	}
 }

@@ -16,6 +16,17 @@ type runTracker struct {
 	running  int
 	// The generation each loop is running now, for re-queuing at the drain limit; bounded by concurrent loops.
 	generations map[string]chat.Chat
+	// Closed when draining begins, so loops waiting for capacity stop instead of holding up Drain.
+	drained chan struct{}
+}
+
+func (t *runTracker) drainedCh() <-chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.drained == nil {
+		t.drained = make(chan struct{})
+	}
+	return t.drained
 }
 
 func (t *runTracker) track(genID string, c chat.Chat) {
@@ -80,6 +91,12 @@ const drainPollInterval = 100 * time.Millisecond
 // the process exit will cut off.
 func (s *Service) Drain(ctx context.Context, limit time.Duration) (finished, stillRunning int) {
 	s.runs.mu.Lock()
+	if !s.runs.draining {
+		if s.runs.drained == nil {
+			s.runs.drained = make(chan struct{})
+		}
+		close(s.runs.drained)
+	}
 	s.runs.draining = true
 	started := s.runs.running
 	s.runs.mu.Unlock()

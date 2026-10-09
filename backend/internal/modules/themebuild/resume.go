@@ -58,9 +58,7 @@ func (s *Service) RequeueUnfinished(ctx context.Context) (requeued, failed int) 
 			continue // finished in the meantime
 		}
 		s.recordGenerationFailure(ctx, c, genID, errInterruptedTwice)
-		if err := s.repo.EndGeneration(ctx, c.ID, errInterruptedTwice); err != nil {
-			slog.Error("failed to record generation end", "chat_id", c.ID, "error", err)
-		}
+		s.logGenerationEnd(c.ID, genID, s.repo.EndGeneration(ctx, c.ID, genID, errInterruptedTwice))
 		failed++
 	}
 	return requeued, failed
@@ -84,7 +82,7 @@ func (s *Service) ResumeForUser(ctx context.Context, tenantID uint64, userID *ui
 	}
 	for chatID := range chats {
 		started, err := s.startChatQueue(ctx, chat.Chat{ID: chatID, TenantID: tenantID})
-		if err != nil && !errors.Is(err, ErrGenerationInProgress) && !errors.Is(err, ErrNotFound) {
+		if err != nil && !errors.Is(err, ErrGenerationInProgress) && !errors.Is(err, ErrNotFound) && !errors.Is(err, errAwaitingCapacity) {
 			slog.Error("failed to resume a chat's queue", "chat_id", chatID, "error", err)
 		}
 		if started {
@@ -104,23 +102,44 @@ func (s *Service) refreshResumePending(ctx context.Context) {
 	}
 }
 
-// startChatQueue starts a drain loop on the chat's oldest queued generation. started is false while draining.
+// startChatQueue starts a drain loop on the chat's oldest queued generation. started is false while draining. At
+// capacity it returns started with errAwaitingCapacity: the loop waits in the background, rows still queued.
 func (s *Service) startChatQueue(ctx context.Context, c chat.Chat) (started bool, err error) {
 	if !s.runs.start() {
 		return false, nil
 	}
-	next, err := s.repo.DequeueNext(ctx, c.ID)
-	if err != nil {
-		s.runs.done()
-		return false, err
-	}
 	// Detached from request lifecycle, but bounded: each iteration gets its own generateTimeout.
+	loopCtx := context.WithoutCancel(ctx)
+	release, ok := s.limiter.TryAcquire(c.TenantID)
+	if ok {
+		next, err := s.repo.DequeueNext(ctx, c.ID)
+		if err != nil {
+			release()
+			s.runs.done()
+			return false, err
+		}
+		go func() {
+			defer s.runs.done()
+			defer safego.Recover("themebuild.runGeneration")
+			s.runGeneration(loopCtx, c, next, release)
+		}()
+		return true, nil
+	}
+	if !s.waiters.add(c.ID) {
+		s.runs.done()
+		return false, ErrGenerationInProgress
+	}
 	go func() {
 		defer s.runs.done()
 		defer safego.Recover("themebuild.runGeneration")
-		s.runGeneration(context.WithoutCancel(ctx), c, next)
+		next, release, err := s.claimAfterWait(loopCtx, c, false)
+		if err != nil {
+			s.logClaimEnd(c, err)
+			return
+		}
+		s.runGeneration(loopCtx, c, next, release)
 	}()
-	return true, nil
+	return true, errAwaitingCapacity
 }
 
 // releaseToQueue hands a dequeued generation back, keeping its place, for its sender's return to pick up.

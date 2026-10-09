@@ -73,7 +73,7 @@ func TestCheckAndRepair_ResumesToolLoopConversation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Generate: %v", err)
 	}
-	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", tc, nil, first, testSnapshot(), toolExec, nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", tc, nil, first, testSnapshot(), toolExec, nil, nil)
 	if err != nil {
 		t.Fatalf("checkAndRepair: %v", err)
 	}

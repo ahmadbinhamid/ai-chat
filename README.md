@@ -35,7 +35,15 @@ cp backend/.env.example backend/.env
 Fill in `backend/.env`. The only values that are actually required to start
 the server are `FLOWPOS_API_BASE` (auth is fully delegated to FlowPOS — every
 request forwards its bearer token there, there is no local auth system) and
-`AI_API_KEY`. Everything else in `.env.example` has a working default.
+`AI_API_KEY`. Everything else in `.env.example` has a working default for
+local development.
+
+In production, set `APP_ENV=production` and `AI_MODELS_CONFIG` (e.g.
+`config/ai-models.json`): with `APP_ENV=production` the server refuses to
+start without a catalogue file instead of falling back to the one-model `AI_*`
+setup, whose base URL defaults to `api.deepseek.com`. `AI_CHAT_FAKE_MODE` is
+exempt. On startup the server logs the catalogue it loaded (source, providers
+and base URLs, default and vision model, model count; never keys).
 Leave `REDIS_URL` empty unless
 you're actually running Redis locally — it only backs cross-replica event
 delivery and isn't needed for a single instance.
@@ -54,7 +62,9 @@ make migrate
 make run
 ```
 
-Check it's up: `curl localhost:8080/health`
+Check it's up: `curl localhost:8080/health`. It returns `200` with the build
+info, or `503 {"status":"unhealthy"}` when the database is unreachable (the
+real error goes to the server log only).
 
 ## Commands
 

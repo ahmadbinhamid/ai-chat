@@ -221,7 +221,7 @@ func TestStreamHandler_ReplaysThenDeliversLiveThenStaysOpenPastDone(t *testing.T
 	readEvent(t, wsConn, themebuild.EventTypeRepairing, 3)
 
 	// A "done" event must NOT close the connection — the chat can still receive another prompt without a reconnect.
-	if err := buildRepo.EndGeneration(ctx, ch.ID, nil); err != nil {
+	if err := buildRepo.EndGeneration(ctx, ch.ID, genID, nil); err != nil {
 		t.Fatalf("EndGeneration failed: %v", err)
 	}
 	mustAppendEvent(t, ctx, buildRepo, genID, ch.ID, 4, themebuild.EventTypeDone, map[string]string{"summary": "ok"})

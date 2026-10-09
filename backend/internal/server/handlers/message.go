@@ -44,6 +44,9 @@ type sendMessageRequest struct {
 	// anything not in the catalogue, so a raw provider model name can never get through.
 	Model  string `json:"model" binding:"omitempty,max=64"`
 	Effort string `json:"effort" binding:"omitempty,max=16"`
+	// Where the merchant was looking; unvalidated here because a bad value must be dropped, never fail the send.
+	PreviewRoute *string `json:"preview_route"`
+	FocusFile    string  `json:"focus_file"`
 }
 
 type previewError struct {
@@ -141,6 +144,8 @@ func (h *MessageHandler) Send(c *gin.Context) {
 		PreviewErrors:          previewErrors,
 		ModelID:                in.Model,
 		Effort:                 in.Effort,
+		PreviewRoute:           in.PreviewRoute,
+		FocusFile:              in.FocusFile,
 	})
 	if err != nil {
 		respondErr(c, err)

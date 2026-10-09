@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -400,3 +401,70 @@ func (alwaysErrorCache) Set(context.Context, string, CacheEntry, time.Duration) 
 }
 
 var errCacheUnavailable = errors.New("cache unavailable")
+
+// A tenant the user doesn't belong to is refused on both auth entry points, and the request never reaches the handler.
+func TestAuth_UnownedTenantRejectedBeforeHandler(t *testing.T) {
+	tests := []struct {
+		name       string
+		tenant     string
+		wantStatus int
+		wantReach  bool
+	}{
+		{"owned tenant reaches the handler", "501", http.StatusOK, true},
+		{"unowned tenant is rejected", "99999", http.StatusForbidden, false},
+		{"adjacent tenant id is rejected", "385", http.StatusForbidden, false},
+	}
+	entryPoints := []struct {
+		name  string
+		build func(client *Client, reached *atomic.Bool) *gin.Engine
+		req   func(tenant string) *http.Request
+	}{
+		{"X-Tenant-Id header", func(client *Client, reached *atomic.Bool) *gin.Engine {
+			r := gin.New()
+			r.Use(Middleware(client, NewMemoryCache(), time.Minute, 10*time.Second))
+			r.GET("/ping", func(c *gin.Context) { reached.Store(true); c.Status(http.StatusOK) })
+			return r
+		}, func(tenant string) *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "/ping", nil)
+			req.Header.Set("Authorization", "Bearer "+testToken)
+			req.Header.Set(hdrTenantID, tenant)
+			return req
+		}},
+		{"WebSocket tenant subprotocol", func(client *Client, reached *atomic.Bool) *gin.Engine {
+			r := gin.New()
+			r.GET("/ping", func(c *gin.Context) {
+				if _, _, ok := WebSocketAuth(c, client, NewMemoryCache(), time.Minute, 10*time.Second); !ok {
+					return
+				}
+				reached.Store(true)
+				c.Status(http.StatusOK)
+			})
+			return r
+		}, func(tenant string) *http.Request {
+			req := httptest.NewRequest(http.MethodGet, "/ping", nil)
+			req.Header.Set("Sec-WebSocket-Protocol",
+				"bearer."+base64.RawURLEncoding.EncodeToString([]byte(testToken))+", tenant."+tenant)
+			return req
+		}},
+	}
+	for _, ep := range entryPoints {
+		for _, tt := range tests {
+			t.Run(ep.name+"/"+tt.name, func(t *testing.T) {
+				var calls int32
+				srv := httptest.NewServer(introspectHandler(&calls, activeUser(testTenants), tenantPtr(384)))
+				defer srv.Close()
+
+				var reached atomic.Bool
+				w := httptest.NewRecorder()
+				ep.build(NewClient(srv.URL, time.Second), &reached).ServeHTTP(w, ep.req(tt.tenant))
+
+				if w.Code != tt.wantStatus {
+					t.Fatalf("status = %d, want %d: %s", w.Code, tt.wantStatus, w.Body.String())
+				}
+				if reached.Load() != tt.wantReach {
+					t.Fatalf("handler reached = %v, want %v", reached.Load(), tt.wantReach)
+				}
+			})
+		}
+	}
+}

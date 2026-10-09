@@ -63,7 +63,7 @@ func TestCheckAndRepair_DraftReversion(t *testing.T) {
 			svc := &Service{gen: gen, store: mapThemeStore{files: map[string]string{reversionPath: reversionSaved}}}
 			in := GenerateInput{TenantID: 1, ThemeSlug: "demo", Prompt: tt.prompt, draft: map[string]string{reversionPath: reversionDraft}}
 
-			got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, reversionResult(tt.proposed), testSnapshot(), nil, nil, nil)
+			got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, reversionResult(tt.proposed), testSnapshot(), nil, nil, nil)
 			if err != nil {
 				t.Fatalf("checkAndRepair: %v", err)
 			}
@@ -135,7 +135,7 @@ func TestCheckAndRepair_UnrepairedReversionIsExplained(t *testing.T) {
 	svc := &Service{gen: gen, store: mapThemeStore{files: map[string]string{reversionPath: reversionSaved}}}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo", Prompt: "still not working", draft: map[string]string{reversionPath: reversionDraft}}
 
-	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, reversionResult(reverted), testSnapshot(), nil, nil, nil)
+	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, reversionResult(reverted), testSnapshot(), nil, nil, nil)
 	if !errors.Is(err, ai.ErrDraftReversionUnrepaired) {
 		t.Fatalf("expected ErrDraftReversionUnrepaired once repairs ran out, got %v", err)
 	}

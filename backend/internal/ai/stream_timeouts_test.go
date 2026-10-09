@@ -469,7 +469,7 @@ func TestConsumeStreamDeltas_IdleAfterContent(t *testing.T) {
 			defer ts.Close()
 			stream := newStreamingTestStream(ts)
 			var message anthropic.Message
-			err := consumeStreamDeltas(context.Background(), stream, &message, 50*time.Millisecond, 400*time.Millisecond, true, nil, nil)
+			err := consumeStreamDeltas(context.Background(), stream, &message, 50*time.Millisecond, 400*time.Millisecond, true, nil, nil, nil)
 			_ = stream.Close()
 			if !errors.Is(err, tt.wantErr) && (tt.wantErr != nil || err != nil) {
 				t.Fatalf("err = %v, want %v", err, tt.wantErr)

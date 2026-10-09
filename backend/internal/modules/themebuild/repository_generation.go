@@ -43,7 +43,8 @@ func retryOnDeadlock(ctx context.Context, fn func() error) error {
 // Shared column list for all Scan calls; prevents drift between queries.
 const generationColumns = `
 	id, chat_id, tenant_id, status, error, attempts,
-	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off, resume_count, awaiting_resume_since,
+	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off, preview_route, focus_file,
+	resume_count, awaiting_resume_since,
 	queued_at, started_at, finished_at
 `
 
@@ -102,11 +103,14 @@ func (r *Repository) enqueueGenerationOnce(ctx context.Context, g Generation) (p
 	referenceURL := sql.NullString{String: g.ReferenceURL, Valid: g.ReferenceURL != ""}
 	modelID := sql.NullString{String: g.ModelID, Valid: g.ModelID != ""}
 	effort := sql.NullString{String: g.Effort, Valid: g.Effort != ""}
+	focusFile := sql.NullString{String: g.FocusFile, Valid: g.FocusFile != ""}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO generations
-			(id, chat_id, tenant_id, status, attempts, prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off, queued_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, referenceURL, g.UserMessageID, g.ThemeSlug, g.Mode, modelID, effort, g.ThinkingOff, enqueuedAt, enqueuedAt, enqueuedAt)
+			(id, chat_id, tenant_id, status, attempts, prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off,
+			 preview_route, focus_file, queued_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, referenceURL, g.UserMessageID, g.ThemeSlug, g.Mode, modelID, effort, g.ThinkingOff,
+		g.PreviewRoute, focusFile, enqueuedAt, enqueuedAt, enqueuedAt)
 	if err != nil {
 		return 0, err
 	}
@@ -203,8 +207,9 @@ func (r *Repository) ListPending(ctx context.Context, chatID string) ([]Generati
 	return gens, rows.Err()
 }
 
-// Returns chats with queued rows but no running row; used by reaper for dead-pod recovery.
-func (r *Repository) ChatsWithOrphanedQueues(ctx context.Context) ([]string, error) {
+// Returns chats with queued rows but no running row; used by reaper for dead-pod recovery. A chat whose queued rows
+// were heartbeated since waitingSince has a live process waiting for capacity, so it is not orphaned.
+func (r *Repository) ChatsWithOrphanedQueues(ctx context.Context, waitingSince time.Time) ([]string, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT DISTINCT q.chat_id
 		FROM generations q
@@ -212,7 +217,10 @@ func (r *Repository) ChatsWithOrphanedQueues(ctx context.Context) ([]string, err
 		AND NOT EXISTS (
 			SELECT 1 FROM generations r WHERE r.chat_id = q.chat_id AND r.status = ?
 		)
-	`, GenerationStatusQueued, GenerationStatusRunning)
+		AND NOT EXISTS (
+			SELECT 1 FROM generations w WHERE w.chat_id = q.chat_id AND w.status = ? AND w.last_heartbeat_at >= ?
+		)
+	`, GenerationStatusQueued, GenerationStatusRunning, GenerationStatusQueued, waitingSince)
 	if err != nil {
 		return nil, err
 	}
@@ -229,8 +237,8 @@ func (r *Repository) ChatsWithOrphanedQueues(ctx context.Context) ([]string, err
 	return chatIDs, rows.Err()
 }
 
-// Marks running generation finished/failed; no-op if already reaped.
-func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr error) error {
+// Marks running generation finished/failed; ErrGenerationNotRunning if it was already reaped, cancelled or finished.
+func (r *Repository) EndGeneration(ctx context.Context, chatID, generationID string, genErr error) error {
 	status := GenerationStatusSucceeded
 	var errMsg *string
 	if genErr != nil {
@@ -244,11 +252,26 @@ func (r *Repository) EndGeneration(ctx context.Context, chatID string, genErr er
 		errMsg = &msg
 	}
 	now := time.Now().UTC()
-	_, err := r.db.ExecContext(ctx, `
+	// Fenced by id: a reaped worker's late end must never land on the chat's next running generation.
+	res, err := r.db.ExecContext(ctx, `
 		UPDATE generations SET status = ?, error = ?, finished_at = ?, updated_at = ?
-		WHERE chat_id = ? AND status = ?
-	`, status, errMsg, now, now, chatID, GenerationStatusRunning)
-	return err
+		WHERE id = ? AND chat_id = ? AND status = ?
+	`, status, errMsg, now, now, generationID, chatID, GenerationStatusRunning)
+	return requireRunningRowAffected(res, err)
+}
+
+func requireRunningRowAffected(res sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrGenerationNotRunning
+	}
+	return nil
 }
 
 // RequeueInterrupted puts a generation cut off by a shutdown drain back in the queue, once: false when it was already
@@ -342,25 +365,28 @@ func (r *Repository) FinishGenerationTx(ctx context.Context, tx *sql.Tx, generat
 		UPDATE generations SET status = ?, error = NULL, finished_at = ?, updated_at = ?
 		WHERE id = ? AND status = ?
 	`, GenerationStatusSucceeded, now, now, generationID, GenerationStatusRunning)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
+	return requireRunningRowAffected(res, err)
+}
+
+// LockRunningGenerationTx row-locks a still-running generation so the caller's writes commit only while it is ours;
+// a concurrent reap waits for the commit.
+func (r *Repository) LockRunningGenerationTx(ctx context.Context, tx *sql.Tx, generationID string) error {
+	var id string
+	err := tx.QueryRowContext(ctx, `
+		SELECT id FROM generations WHERE id = ? AND status = ? FOR UPDATE
+	`, generationID, GenerationStatusRunning).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrGenerationNotRunning
 	}
-	return nil
+	return err
 }
 
 // Records themecheck retry attempts; called from checkAndRepair.
-func (r *Repository) SetGenerationAttempts(ctx context.Context, chatID string, attempts int) error {
-	_, err := r.db.ExecContext(ctx, `
-		UPDATE generations SET attempts = ?, updated_at = ? WHERE chat_id = ? AND status = ?
-	`, attempts, time.Now().UTC(), chatID, GenerationStatusRunning)
-	return err
+func (r *Repository) SetGenerationAttempts(ctx context.Context, chatID, generationID string, attempts int) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE generations SET attempts = ?, updated_at = ? WHERE id = ? AND chat_id = ? AND status = ?
+	`, attempts, time.Now().UTC(), generationID, chatID, GenerationStatusRunning)
+	return requireRunningRowAffected(res, err)
 }
 
 // Returns most recently started generation; NULL sorts smallest (queued last).
@@ -390,13 +416,13 @@ func (r *Repository) GetGenerationByID(ctx context.Context, chatID, generationID
 }
 
 // Marks running generation cancelled; counterpart to CancelQueued.
-func (r *Repository) EndGenerationCancelled(ctx context.Context, chatID string) error {
+func (r *Repository) EndGenerationCancelled(ctx context.Context, chatID, generationID string) error {
 	now := time.Now().UTC()
-	_, err := r.db.ExecContext(ctx, `
+	res, err := r.db.ExecContext(ctx, `
 		UPDATE generations SET status = ?, finished_at = ?, updated_at = ?
-		WHERE chat_id = ? AND status = ?
-	`, GenerationStatusCancelled, now, now, chatID, GenerationStatusRunning)
-	return err
+		WHERE id = ? AND chat_id = ? AND status = ?
+	`, GenerationStatusCancelled, now, now, generationID, chatID, GenerationStatusRunning)
+	return requireRunningRowAffected(res, err)
 }
 
 // Durable counterpart to live EventTypeCancelRequested; re-stamps for idempotent retries.
@@ -434,12 +460,25 @@ func (r *Repository) IsCancellationRequested(ctx context.Context, chatID, genera
 	return requested.Valid, nil
 }
 
+// TouchQueuedHeartbeat stamps every queued row of chatID while a process waits for capacity to run them; 0 means
+// nothing is left queued.
+func (r *Repository) TouchQueuedHeartbeat(ctx context.Context, chatID string) (int64, error) {
+	now := time.Now().UTC()
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE generations SET last_heartbeat_at = ?, updated_at = ? WHERE chat_id = ? AND status = ?
+	`, now, now, chatID, GenerationStatusQueued)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // Best-effort; failure must never fail the generation itself (caller logs only).
 func (r *Repository) UpdateGenerationHeartbeat(ctx context.Context, id string) error {
 	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx, `
-		UPDATE generations SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?
-	`, now, now, id)
+		UPDATE generations SET last_heartbeat_at = ?, updated_at = ? WHERE id = ? AND status = ?
+	`, now, now, id, GenerationStatusRunning)
 	return err
 }
 
