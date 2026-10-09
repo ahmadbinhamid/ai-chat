@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // FileReader reads one theme file's current raw content by path, for materializing a
@@ -73,7 +74,8 @@ func materializeEdits(ctx context.Context, result *Result, readFile FileReader, 
 		if applyErr != nil {
 			failureCounts[f.Path]++
 			slog.Warn("ai: edit materialization failed", "path", f.Path, "reason", "no_match", "tier", tier.String(),
-				"match_count", matchCount, "failure_count", failureCounts[f.Path])
+				"match_count", matchCount, "failure_count", failureCounts[f.Path], "old_string", failedOldString(applyErr, f.Edits),
+				"edit_count", len(f.Edits), "old_bytes", editBytes(f.Edits, true), "new_bytes", editBytes(f.Edits, false))
 			if failureCounts[f.Path] >= maxEditMaterializationFailures {
 				problems = append(problems, fmt.Sprintf(
 					`%s: edits failed to apply %d times — resubmit this file with action "update" and its complete `+
@@ -167,7 +169,7 @@ func nearMissWindow(content string, edits []Edit, windowBytes int) (window strin
 }
 
 // matchTier identifies which matching strategy resolved an edit, increasing tolerance order.
-// Logged (never old_string or file content) so a failure says which tier the file needed.
+// Logged so a failure says which tier the file needed; the failing old_string is logged too, truncated (see editFailure).
 type matchTier int
 
 const (
@@ -196,7 +198,7 @@ func applyEdits(content string, edits []Edit) (result string, worstTier matchTie
 	for i, e := range edits {
 		start, end, tier, count, matchErr := findMatch(content, e.OldString)
 		if matchErr != nil {
-			return "", tierNone, count, fmt.Errorf("edit %d: %w", i+1, matchErr)
+			return "", tierNone, count, &editFailure{index: i, err: matchErr}
 		}
 		if tier > worstTier {
 			worstTier = tier
@@ -452,4 +454,47 @@ func exactMatchStarts(content, sub string) []int {
 		starts = append(starts, from+i)
 		from += i + len(sub)
 	}
+}
+
+// loggedOldStringCap bounds the failing old_string in the log: enough to see what the model tried to match.
+const loggedOldStringCap = 300
+
+// editFailure is applyEdits' error for one edit; the message is unchanged ("edit N: ..."), the index says which.
+type editFailure struct {
+	index int
+	err   error
+}
+
+func (e *editFailure) Error() string { return fmt.Sprintf("edit %d: %v", e.index+1, e.err) }
+func (e *editFailure) Unwrap() error { return e.err }
+
+// failedOldString is the old_string of the edit applyErr names, truncated for the log; "" if it names none.
+func failedOldString(applyErr error, edits []Edit) string {
+	var failure *editFailure
+	if !errors.As(applyErr, &failure) || failure.index >= len(edits) {
+		return ""
+	}
+	s := edits[failure.index].OldString
+	if len(s) <= loggedOldStringCap {
+		return s
+	}
+	// Cut on a rune boundary so the log line stays valid UTF-8.
+	cut := loggedOldStringCap
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+// editBytes totals the old or new strings across a file's edits: a proposal far larger than its file shows up here.
+func editBytes(edits []Edit, old bool) int {
+	n := 0
+	for _, e := range edits {
+		if old {
+			n += len(e.OldString)
+		} else {
+			n += len(e.NewString)
+		}
+	}
+	return n
 }
