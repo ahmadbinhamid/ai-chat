@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/auth"
 	"ai-chat/internal/config"
 	"ai-chat/internal/db"
 	"ai-chat/internal/evals"
@@ -56,6 +57,18 @@ func main() {
 			"(the AI theme builder never creates one itself), then set this to its slug")
 	}
 
+	// User prompts must carry a user_id (chk_chat_messages_user_role), so the eval runs as the token's own user.
+	introspectCtx, cancelIntrospect := context.WithTimeout(context.Background(), 10*time.Second)
+	user, err := auth.NewClient(cfg.FlowposAPIBase, 10*time.Second).Introspect(introspectCtx, token)
+	cancelIntrospect()
+	if err != nil {
+		log.Fatalf("EVAL_BEARER_TOKEN could not be verified against FLOWPOS_API_BASE: %v", err)
+	}
+	if err := checkEvalUser(user, tenantID); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("running as user %d in tenant %d", user.UserID, tenantID)
+
 	conn, err := db.Connect(cfg)
 	if err != nil {
 		log.Fatalf("database connection failed: %v", err)
@@ -96,7 +109,7 @@ func main() {
 
 	results := make([]taskResult, 0, len(evals.Tasks))
 	for _, task := range evals.Tasks {
-		res := runTask(ctx, buildSvc, chatSvc, tenantID, token, themeSlug, task)
+		res := runTask(ctx, buildSvc, chatSvc, user, tenantID, token, themeSlug, task)
 		results = append(results, res)
 
 		status := "FAIL"
@@ -121,12 +134,30 @@ func main() {
 	}
 }
 
+// checkEvalUser fails fast on a token that every task would otherwise fail on, one generation at a time.
+func checkEvalUser(user *auth.IntrospectResult, tenantID uint64) error {
+	if user.UserID == 0 {
+		return fmt.Errorf("EVAL_BEARER_TOKEN resolved to no user id")
+	}
+	if !user.IsActive {
+		return fmt.Errorf("EVAL_BEARER_TOKEN belongs to inactive user %d", user.UserID)
+	}
+	for _, t := range user.Tenants {
+		if t.ID == tenantID {
+			return nil
+		}
+	}
+	return fmt.Errorf("EVAL_BEARER_TOKEN's user %d is not a member of EVAL_TENANT_ID %d", user.UserID, tenantID)
+}
+
 // runTask sends the task's prompt, waits for generation to finish, and checks
 // whether files were written this turn against task.ExpectedOK.
-func runTask(ctx context.Context, buildSvc *themebuild.Service, chatSvc *chat.Service, tenantID uint64, token, themeSlug string, task evals.Task) taskResult {
+func runTask(ctx context.Context, buildSvc *themebuild.Service, chatSvc *chat.Service, user *auth.IntrospectResult, tenantID uint64, token, themeSlug string, task evals.Task) taskResult {
 	outcome, err := buildSvc.Generate(ctx, themebuild.GenerateInput{
 		TenantID:  tenantID,
-		UserName:  "eval",
+		UserID:    &user.UserID,
+		UserName:  user.Name,
+		UserEmail: user.Email,
 		Token:     token,
 		ThemeSlug: themeSlug,
 		Prompt:    task.Prompt,
