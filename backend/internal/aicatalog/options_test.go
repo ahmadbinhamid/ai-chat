@@ -270,3 +270,45 @@ func TestParse_DesignThinkingNeedsAThinkingModel(t *testing.T) {
 		t.Errorf("want design_thinking false rejected on a model without thinking, got %v", err)
 	}
 }
+
+// The DeepSeek models allow every quantization except 4-bit builds (whose runs looped and missed their caches), keep
+// "unknown" so Azure stays available, and ignore Reka (cost) and Mancer (no prompt caching). Grok and Kimi are unchanged.
+func TestOpenRouterCatalogue_DeepSeekFullPrecisionHosts(t *testing.T) {
+	data, err := os.ReadFile("../../config/ai-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data, withKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range c.Models {
+		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
+		quants := fmt.Sprint(p["quantizations"])
+		ignore := fmt.Sprint(p["ignore"])
+		if !strings.HasPrefix(m.ID, "deepseek-") {
+			if p["quantizations"] != nil {
+				t.Errorf("model %q: want no quantization filter, got %v", m.ID, p["quantizations"])
+			}
+			continue
+		}
+		for _, banned := range []string{"fp4", "int4"} {
+			if strings.Contains(" "+strings.Trim(quants, "[]")+" ", " "+banned+" ") {
+				t.Errorf("model %q allows %s: %v", m.ID, banned, quants)
+			}
+		}
+		for _, want := range []string{"fp8", "unknown"} {
+			if !strings.Contains(quants, want) {
+				t.Errorf("model %q: want %s allowed, got %v", m.ID, want, quants)
+			}
+		}
+		for _, host := range []string{"cloudflare", "wafer", "reka", "mancer"} {
+			if !strings.Contains(ignore, host) {
+				t.Errorf("model %q: want %s ignored, got %v", m.ID, host, ignore)
+			}
+		}
+		if p["sort"] != "throughput" || p["allow_fallbacks"] != true {
+			t.Errorf("model %q: want sort throughput with fallbacks, got %v", m.ID, p)
+		}
+	}
+}
