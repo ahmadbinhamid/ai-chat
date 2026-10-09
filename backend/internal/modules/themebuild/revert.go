@@ -29,23 +29,33 @@ func (s *Service) RevertToMessage(ctx context.Context, tenantID uint64, token, c
 	if _, err := s.chats.GetChat(ctx, tenantID, chatID); err != nil {
 		return RevertResult{}, err
 	}
-	target, err := s.chats.GetMessage(ctx, chatID, messageID)
-	if err != nil {
+	gen, err := s.repo.GetGeneration(ctx, chatID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
 		return RevertResult{}, err
 	}
-
-	if gen, err := s.repo.GetGeneration(ctx, chatID); err == nil && gen.Status == GenerationStatusRunning {
+	if err == nil && gen.Status == GenerationStatusRunning {
 		return RevertResult{}, ErrRevertBlockedByRunningGeneration
 	}
 
-	if target.ApplyStatus == chat.ApplyStatusPending {
-		return s.revertWithinDraft(ctx, chatID, target)
+	// Apply's key: a revert racing an apply could leave live content that the rows call discarded, or mix both writes.
+	lockCtx, unlock, err := s.themeLocks.Lock(ctx, themeLockKey(tenantID, gen.ThemeSlug))
+	if err != nil {
+		return RevertResult{}, fmt.Errorf("revert: %w", err)
 	}
-	return s.revertAppliedHistory(ctx, tenantID, token, chatID, target)
+	defer unlock()
+
+	// Read under the lock: an apply that just finished has moved the target from pending to applied.
+	target, err := s.chats.GetMessage(lockCtx, chatID, messageID)
+	if err != nil {
+		return RevertResult{}, err
+	}
+	if target.ApplyStatus == chat.ApplyStatusPending {
+		return s.revertWithinDraft(lockCtx, chatID, target)
+	}
+	return s.revertAppliedHistory(lockCtx, tenantID, token, chatID, target)
 }
 
-// revertWithinDraft discards every still-pending message after target. No themeLocks here:
-// only a chat_messages UPDATE, which needs no more coordination than the DB already gives it.
+// revertWithinDraft discards every still-pending message after target; the caller holds the theme lock.
 func (s *Service) revertWithinDraft(ctx context.Context, chatID string, target chat.Message) (RevertResult, error) {
 	discardedPaths, err := s.repo.DiscardMessagesAfter(ctx, chatID, target.CreatedAt)
 	if err != nil {
@@ -58,7 +68,7 @@ func (s *Service) revertWithinDraft(ctx context.Context, chatID string, target c
 }
 
 // revertAppliedHistory restores every path applied after target to its last-applied-at-or-before
-// state, or deletes it if not yet applied then. Scoped to 'applied' rows only.
+// state, or deletes it if not yet applied then. Scoped to 'applied' rows only; the caller holds the theme lock.
 func (s *Service) revertAppliedHistory(ctx context.Context, tenantID uint64, token, chatID string, target chat.Message) (RevertResult, error) {
 	files, err := s.repo.ListAppliedFilesByChat(ctx, chatID)
 	if err != nil {
@@ -76,14 +86,6 @@ func (s *Service) revertAppliedHistory(ctx context.Context, tenantID uint64, tok
 			touchedAfter[f.FilePath] = true
 		}
 	}
-
-	// Keyed by chatID, not themeSlug (a chat has no slug of its own), but still prevents two
-	// reverts of the same chat from racing.
-	unlock, err := s.themeLocks.Lock(ctx, chatID)
-	if err != nil {
-		return RevertResult{}, fmt.Errorf("revert applied history: %w", err)
-	}
-	defer unlock()
 
 	storeAuth := themefs.RequestAuth{Token: token, TenantID: tenantID}
 	var result RevertResult

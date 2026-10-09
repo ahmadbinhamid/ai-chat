@@ -1023,20 +1023,23 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	hasChanges = proposalHasChanges(result)
 
 	var staged []writtenFile
+	lockCtx := ctx
 	if hasChanges {
 		// Lock for buildWritePlan (reads layout files); concurrent generations could race.
-		unlock, err := s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
+		var unlock func()
+		var err error
+		lockCtx, unlock, err = s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
 		defer unlock()
 
 		// Computed entirely in memory; failure leaves draft untouched (not half-staged).
-		plan, err := s.buildWritePlan(ctx, store, storeAuth, result)
+		plan, err := s.buildWritePlan(lockCtx, store, storeAuth, result)
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
-		placed, err := in.imageCatalog.planFiles(ctx, store, storeAuth, result.UseAttachments)
+		placed, err := in.imageCatalog.planFiles(lockCtx, store, storeAuth, result.UseAttachments)
 		if err != nil {
 			return fmt.Errorf("stage attached images: %w", err)
 		}
@@ -1073,6 +1076,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		summary += "\n\n" + resumedAfterUpdateNote
 	}
 	summary = protectedPagesNote(summary, blockedPages)
+
+	// A lost lock means another holder may be staging this theme; committing now could interleave with it.
+	if errors.Is(context.Cause(lockCtx), errThemeLockLost) {
+		return fmt.Errorf("stage theme changes: %w", errThemeLockLost)
+	}
 
 	// Detached commitCtx: cancel can only stop BEFORE this point, never mid-commit.
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)

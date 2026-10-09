@@ -88,6 +88,8 @@ type Config struct {
 	// RedisURL backs cross-replica generation-event pub/sub. Optional: empty means no
 	// cross-replica live delivery, not a startup failure.
 	RedisURL string
+	// SingleReplica (AI_CHAT_SINGLE_REPLICA) is the explicit opt-in to run production without Redis.
+	SingleReplica bool
 
 	// MaxRequestBodyBytes caps request bodies; sized for POST /chats/messages' worst case
 	// (base64 images + an HTML attachment).
@@ -149,7 +151,8 @@ func Load() Config {
 
 		CORSAllowedOrigins: getenvList("CORS_ALLOWED_ORIGINS"),
 
-		RedisURL: os.Getenv("REDIS_URL"),
+		RedisURL:      os.Getenv("REDIS_URL"),
+		SingleReplica: getenvBool("AI_CHAT_SINGLE_REPLICA", false),
 
 		MaxRequestBodyBytes: int64(getenvInt("MAX_REQUEST_BODY_BYTES", 45*1024*1024)),
 	}
@@ -172,6 +175,16 @@ func getenvList(key string) []string {
 }
 
 const AppEnvProduction = "production"
+
+// ValidateLockBackend refuses production without Redis unless single-replica is declared: the in-process theme lock
+// can't stop two replicas writing the same theme at once.
+func (c Config) ValidateLockBackend() error {
+	if c.AppEnv == AppEnvProduction && c.RedisURL == "" && !c.SingleReplica {
+		return errors.New("REDIS_URL is required when APP_ENV=production: without it theme writes are only locked " +
+			"within one process. Set REDIS_URL, or AI_CHAT_SINGLE_REPLICA=true if exactly one replica will ever run")
+	}
+	return nil
+}
 
 // ModelCatalog loads AI_MODELS_CONFIG, or without it the one-model catalogue from AI_API_KEY/AI_BASE_URL/AI_MODEL/
 // AI_EFFORT/AI_VISION_MODEL. Callers refuse to start on an error rather than fail on a merchant's request.

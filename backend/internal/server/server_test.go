@@ -259,6 +259,7 @@ func TestNew_ProductionModelCatalogue(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := testConfig()
 			cfg.AppEnv = config.AppEnvProduction
+			cfg.SingleReplica = true
 			cfg.FakeAIMode = tt.fake
 			cfg.APIKey = "sk-test"
 			srv, err := New(cfg, lazyDB(t), slog.New(slog.DiscardHandler))
@@ -273,4 +274,23 @@ func TestNew_ProductionModelCatalogue(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNew_ProductionRefusesInProcessLockWithoutOptIn(t *testing.T) {
+	cfg := testConfig()
+	cfg.AppEnv = config.AppEnvProduction
+	srv, err := New(cfg, lazyDB(t), slog.New(slog.DiscardHandler))
+	if srv != nil {
+		t.Cleanup(srv.Close)
+	}
+	if err == nil || !strings.Contains(err.Error(), "REDIS_URL is required") {
+		t.Fatalf("New in production without Redis = %v, want a refusal naming REDIS_URL", err)
+	}
+
+	cfg.SingleReplica = true
+	srv, err = New(cfg, lazyDB(t), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("New with AI_CHAT_SINGLE_REPLICA=true failed: %v", err)
+	}
+	srv.Close()
 }

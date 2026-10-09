@@ -1035,19 +1035,21 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			// Never turn the text into an answer: that would need answered_question: true, which bypasses the
 			// fake-success guard, so a plain-text "Done!" would reach the merchant with nothing changed.
 			consecutiveTextOnly++
+			// Debug only, for diagnosing text-only rounds locally; the server logger runs at Info, so this never ships.
+			slog.Debug("ai: text-only round",
+				"iteration", iteration,
+				"block_types", contentBlockTypes(message),
+				"text_head", headRunes(blockText(message, false), 300),
+				"thinking_head", headRunes(blockText(message, true), 300))
 			if consecutiveTextOnly >= maxConsecutiveTextOnlyRounds {
 				slog.Warn("ai: model stuck replying in text, stopping", "iteration", iteration, "consecutive_text_rounds", consecutiveTextOnly)
 				return nil, errStuckInTextReplies
 			}
-			slog.Warn("ai: tool-loop nudge fired (no tool call this round)", "iteration", iteration)
+			nudge := textOnlyNudge(blockText(message, false))
+			slog.Warn("ai: tool-loop nudge fired (no tool call this round)", "iteration", iteration, "wrote_edit_as_text", nudge == textEditNudge)
 			// DeepSeek does NOT honor ToolChoice: OfAny (Anthropic does). Nudge instead of failing.
 			messages = append(messages, message.ToParam())
-			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(
-				"You must call one of the available tools on every turn — propose_changes if you already have enough "+
-					"to finish (even for a simple greeting or question, propose_changes with no file changes, "+
-					"answered_question: true, and the reply in `summary` is correct), or a read/explore tool otherwise. "+
-					"A plain text reply with no tool call is not valid here.",
-			)))
+			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(nudge)))
 			continue
 		}
 

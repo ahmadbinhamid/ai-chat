@@ -69,7 +69,7 @@ func TestCheckAndRepair_ResumesToolLoopConversation(t *testing.T) {
 	tc := ai.ThemeContext{ThemeSlug: "demo"}
 	toolExec := func(context.Context, string, json.RawMessage) (string, error) { return "READ-OUTPUT", nil }
 
-	first, err := gen.Generate(context.Background(), tc, nil, promptWithHTMLAttachment("build offers", in), nil, nil, toolExec, nil)
+	first, err := gen.Generate(context.Background(), tc, nil, promptWithAttachments("build offers", in), nil, nil, toolExec, nil)
 	if err != nil {
 		t.Fatalf("first Generate: %v", err)
 	}

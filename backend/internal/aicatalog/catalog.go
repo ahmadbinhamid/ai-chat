@@ -67,7 +67,12 @@ type Model struct {
 	Selectable *bool `json:"selectable,omitempty"`
 	// Options are extra request-body fields for this model, deep-merged over its provider's.
 	Options json.RawMessage `json:"options,omitempty"`
+	// Preload defaults to true; false sends this model no preloaded theme files with its first prompt.
+	Preload *bool `json:"preload,omitempty"`
 }
+
+// PreloadEnabled reports whether turns on this model get likely-needed files with their first prompt.
+func (m Model) PreloadEnabled() bool { return m.Preload == nil || *m.Preload }
 
 // IsSelectable reports whether the model appears in the merchant's picker.
 func (m Model) IsSelectable() bool { return m.Selectable == nil || *m.Selectable }

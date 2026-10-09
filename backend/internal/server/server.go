@@ -57,6 +57,10 @@ func (s *Server) RequeueUnfinished(ctx context.Context) (requeued, failed int) {
 func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) {
 	useJSONFieldNames()
 
+	if err := cfg.ValidateLockBackend(); err != nil {
+		return nil, err
+	}
+
 	streamTimeouts := ai.StreamTimeouts{
 		Idle:            cfg.StreamIdleTimeout,
 		FirstTokenEdit:  cfg.FirstTokenTimeoutEdit,
@@ -93,7 +97,10 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	if err != nil {
 		return nil, err
 	}
-	if rdb == nil {
+	if rdb != nil {
+		logger.Info("theme lock backend", "backend", "redis")
+	} else {
+		logger.Info("theme lock backend", "backend", "in-process", "single_replica", cfg.SingleReplica)
 		logger.Warn("REDIS_URL is not set — generation events still persist to generation_events, " +
 			"but won't publish live to a WebSocket connected to a different replica than the one running the generation")
 	}
@@ -129,6 +136,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	assetHandler := handlers.NewAssetHandler(buildSvc)
 	attachmentHandler := handlers.NewAttachmentHandler(buildSvc)
 	modelsHandler := handlers.NewModelsHandler(buildSvc)
+	clientTimingHandler := handlers.NewClientTimingHandler(buildSvc)
 
 	r := gin.New()
 	r.Use(gin.Recovery(), logging.Middleware(logger), maxBodySize(cfg.MaxRequestBodyBytes))
@@ -171,6 +179,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	identified.POST("/chats/:chatId/discard", applyHandler.Discard)
 	identified.GET("/chats/:chatId/draft", draftHandler.Files)
 	identified.POST("/chats/:chatId/draft/edit", draftHandler.SaveManualEdit)
+	identified.POST("/chats/:chatId/generations/:generationId/client-timing", clientTimingHandler.Record)
 	identified.GET("/preview/context", previewHandler.Context)
 	identified.GET("/models", modelsHandler.List)
 	identified.GET("/theme-assets/*path", assetHandler.Get)

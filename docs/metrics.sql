@@ -70,3 +70,24 @@ FROM ranked r
 LEFT JOIN unreported u ON u.model_id <=> r.model_id
 GROUP BY r.model_id
 ORDER BY total_cost_usd DESC;
+
+-- 4. p50/p95 preview_visible_ms per model: send pressed -> preview showing the result, measured by the browser.
+-- Joined to generation_metrics for the model; only succeeded generations whose browser reported the moment.
+WITH ranked AS (
+  SELECT m.model_id,
+         t.preview_visible_ms,
+         ROW_NUMBER() OVER (PARTITION BY m.model_id ORDER BY t.preview_visible_ms) AS rn,
+         COUNT(*)     OVER (PARTITION BY m.model_id)                               AS n
+  FROM generation_client_timing t
+  JOIN generation_metrics m ON m.generation_id = t.generation_id
+  WHERE t.created_at >= UTC_TIMESTAMP() - INTERVAL 7 DAY
+    AND m.outcome = 'succeeded'
+    AND t.preview_visible_ms IS NOT NULL
+)
+SELECT model_id,
+       MAX(n)                                                        AS generations,
+       MIN(CASE WHEN rn >= CEIL(0.50 * n) THEN preview_visible_ms END) AS p50_preview_visible_ms,
+       MIN(CASE WHEN rn >= CEIL(0.95 * n) THEN preview_visible_ms END) AS p95_preview_visible_ms
+FROM ranked
+GROUP BY model_id
+ORDER BY generations DESC;

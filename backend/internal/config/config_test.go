@@ -138,3 +138,39 @@ func TestLoad_ConcurrencyLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateLockBackend(t *testing.T) {
+	tests := []struct {
+		name          string
+		appEnv        string
+		redisURL      string
+		singleReplica bool
+		wantErr       bool
+	}{
+		{"production without Redis refuses", AppEnvProduction, "", false, true},
+		{"production without Redis, single replica declared", AppEnvProduction, "", true, false},
+		{"production with Redis", AppEnvProduction, "redis://127.0.0.1:6379", false, false},
+		{"development without Redis", "development", "", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := Config{AppEnv: tt.appEnv, RedisURL: tt.redisURL, SingleReplica: tt.singleReplica}.ValidateLockBackend()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateLockBackend = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), "AI_CHAT_SINGLE_REPLICA") {
+				t.Errorf("error should name the opt-out, got %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_SingleReplica(t *testing.T) {
+	t.Setenv("FLOWPOS_API_BASE", "http://flowpos.test")
+	for env, want := range map[string]bool{"": false, "false": false, "true": true} {
+		t.Setenv("AI_CHAT_SINGLE_REPLICA", env)
+		if got := Load().SingleReplica; got != want {
+			t.Errorf("AI_CHAT_SINGLE_REPLICA=%q → %v, want %v", env, got, want)
+		}
+	}
+}

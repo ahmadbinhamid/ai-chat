@@ -35,7 +35,7 @@ func sanitizePreviewContext(route *string, focusFile string) (*string, string) {
 // preloadFiles picks and reads, through the turn's draft overlay, the files this turn will almost certainly read.
 func (s *Service) preloadFiles(ctx context.Context, in GenerateInput, tc ai.ThemeContext, store themefs.ThemeStore, storeAuth themefs.RequestAuth) prefetch.Result {
 	// Brand turns only edit defaults.json, which is already in context.
-	if in.Mode == ai.GenerationModeBrand {
+	if in.Mode == ai.GenerationModeBrand || !s.preloadEnabledFor(in.model.ModelID) {
 		return prefetch.Result{}
 	}
 	pin := prefetch.Input{
@@ -52,6 +52,15 @@ func (s *Service) preloadFiles(ctx context.Context, in GenerateInput, tc ai.Them
 	})
 }
 
+// preloadEnabledFor reads the catalogue's per-model switch; with no catalogue (tests) or an unknown id, preload stays on.
+func (s *Service) preloadEnabledFor(modelID string) bool {
+	if s.models == nil {
+		return true
+	}
+	m, ok := s.models.Model(modelID)
+	return !ok || m.PreloadEnabled()
+}
+
 func logPreload(chatID string, r prefetch.Result) {
 	paths := make([]string, 0, len(r.Files))
 	for _, f := range r.Files {
@@ -61,7 +70,7 @@ func logPreload(chatID string, r prefetch.Result) {
 		"preloaded_files", len(r.Files), "preloaded_bytes", r.Bytes, "paths", paths)
 }
 
-const preloadHeading = "Files already loaded for you — do not read_theme_file these again unless they changed:"
+const preloadHeading = "Current contents of files you'll likely need (you can edit these via propose_changes without reading them first):"
 
 // preloadBlock goes in the user turn, not the cached system block: it changes with every page the merchant views.
 func preloadBlock(r prefetch.Result) string {
@@ -90,7 +99,7 @@ func preloadedContents(r prefetch.Result) map[string]string {
 }
 
 func alreadyProvidedNote(path string) string {
-	return fmt.Sprintf("### %s\n(already provided above in \"Files already loaded for you\" and unchanged since — use that copy)\n\n", path)
+	return fmt.Sprintf("### %s\n(already provided above in \"Current contents of files you'll likely need\" and unchanged since — use that copy)\n\n", path)
 }
 
 // SetLargeThemeLimits sets when the prompt summarises a theme instead of listing it whole. Call once before serving.

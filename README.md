@@ -42,7 +42,11 @@ In production, set `APP_ENV=production` and `AI_MODELS_CONFIG` (e.g.
 `config/ai-models.json`): with `APP_ENV=production` the server refuses to
 start without a catalogue file instead of falling back to the one-model `AI_*`
 setup, whose base URL defaults to `api.deepseek.com`. `AI_CHAT_FAKE_MODE` is
-exempt. On startup the server logs the catalogue it loaded (source, providers
+exempt. Production also needs `REDIS_URL`: theme writes are locked through
+Redis so replicas can't write the same theme at once. Without it the server
+refuses to start unless you set `AI_CHAT_SINGLE_REPLICA=true` to declare that
+exactly one replica will ever run. On startup the server logs which theme lock
+backend is active, and the catalogue it loaded (source, providers
 and base URLs, default and vision model, model count; never keys).
 Leave `REDIS_URL` empty unless
 you're actually running Redis locally — it only backs cross-replica event

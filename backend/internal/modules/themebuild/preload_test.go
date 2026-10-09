@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/aicatalog"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/prefetch"
 	"ai-chat/internal/themefs"
@@ -67,8 +68,8 @@ func TestPreloadBlock(t *testing.T) {
 func TestPromptWithAttachments_CarriesPreload(t *testing.T) {
 	in := GenerateInput{Prompt: "make it darker", preload: prefetch.Result{Files: []prefetch.File{{Path: "pages/home.liquid", Content: "<h1>Hi</h1>"}}}}
 	got := promptWithAttachments("make it darker", in)
-	if !strings.HasPrefix(got, "make it darker") || !strings.Contains(got, preloadHeading) || !strings.Contains(got, "### pages/home.liquid") {
-		t.Fatalf("prompt does not carry the preload block:\n%s", got)
+	if !strings.HasPrefix(got, preloadHeading) || !strings.Contains(got, "### pages/home.liquid") || !strings.HasSuffix(got, "make it darker\n\n"+proposeInstruction) {
+		t.Fatalf("prompt should open with the preload block and end with the request:\n%s", got)
 	}
 	if strings.Contains(promptWithAttachments("make it darker", GenerateInput{}), preloadHeading) {
 		t.Fatal("prompt without a preload must not mention one")
@@ -270,5 +271,43 @@ func TestGenerate_PreloadsTheViewedPageIntoTheFirstPrompt(t *testing.T) {
 	})
 	if m.PreloadedFiles != 3 || m.PreloadedBytes == 0 {
 		t.Errorf("metrics preloaded = %d files / %d bytes, want 3 files and some bytes", m.PreloadedFiles, m.PreloadedBytes)
+	}
+}
+
+func TestPreloadFiles_ModelSwitch(t *testing.T) {
+	pages := `[{"title":"Shop","slug":"shop","path":"/pages","page":"products"}]`
+	ts := newFakeThemeServer(t, map[string]string{"pages/products.liquid": "<h1>Shop</h1>"})
+	defer ts.Close()
+	catalog, err := aicatalog.Parse([]byte(`{
+		"providers": {"p": {"base_url": "https://p.test", "api_key_env": "K"}},
+		"models": [
+			{"id": "on", "label": "On", "provider": "p", "model": "m-on", "thinking": true, "efforts": ["low"], "default_effort": "low"},
+			{"id": "off", "label": "Off", "provider": "p", "model": "m-off", "thinking": true, "efforts": ["low"], "default_effort": "low", "preload": false}
+		],
+		"default_model": "on", "summary_model": "on"
+	}`), func(string) (string, bool) { return "k", true })
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+	tests := []struct {
+		name    string
+		models  *aicatalog.Catalog
+		modelID string
+		want    int
+	}{
+		{"model with preload on", catalog, "on", 1},
+		{"model with preload off", catalog, "off", 0},
+		{"unknown model keeps preload on", catalog, "gone", 1},
+		{"no catalogue keeps preload on", nil, "off", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := &Service{store: themefs.NewStore(ts.URL), models: tt.models}
+			in := GenerateInput{PreviewRoute: strPtr("shop"), model: aicatalog.Choice{ModelID: tt.modelID}}
+			got := svc.preloadFiles(context.Background(), in, ai.ThemeContext{PagesJSON: pages}, svc.store, testStoreAuth())
+			if len(got.Files) != tt.want {
+				t.Fatalf("preloaded %d files, want %d", len(got.Files), tt.want)
+			}
+		})
 	}
 }

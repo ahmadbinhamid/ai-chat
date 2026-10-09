@@ -21,14 +21,14 @@ var samplePreviewErrors = []previewerrors.Entry{
 
 func TestPromptWithAttachments(t *testing.T) {
 	plain := GenerateInput{}
-	if got := promptWithAttachments("fix the cart", plain); got != "fix the cart" {
-		t.Errorf("expected a message without preview errors to pass through unchanged, got %q", got)
+	if got, want := promptWithAttachments("fix the cart", plain), "fix the cart\n\n"+proposeInstruction; got != want {
+		t.Errorf("a message with nothing attached should be the request plus the tool instruction, got %q", got)
 	}
 
 	withErrors := GenerateInput{PreviewErrors: samplePreviewErrors}
 	got := promptWithAttachments("fix the cart", withErrors)
-	if !strings.HasPrefix(got, "fix the cart\n\n--- Browser errors captured from the preview") {
-		t.Errorf("expected the block appended after the prompt, got %q", got)
+	if !strings.HasPrefix(got, "--- Browser errors captured from the preview") || !strings.HasSuffix(got, "fix the cart\n\n"+proposeInstruction) {
+		t.Errorf("expected the errors block first and the request last, got %q", got)
 	}
 	if !strings.Contains(got, "Uncaught error — js/minicart.js line 42 (×1): "+previewErrorMarker) {
 		t.Errorf("expected the formatted error line, got %q", got)
@@ -195,8 +195,8 @@ func TestDoGenerate_PreviewErrorsThisTurnOnly(t *testing.T) {
 
 func TestPromptWithAttachments_SandboxErrorNote(t *testing.T) {
 	turn2 := promptWithAttachments("Invalid base URL", GenerateInput{Prompt: "Invalid base URL"})
-	if !strings.HasPrefix(turn2, "Invalid base URL\n\n") || !strings.Contains(turn2, previewerrors.SandboxErrorNote) {
-		t.Errorf("expected the sandbox note after the exact turn-2 message, got %q", turn2)
+	if !strings.HasSuffix(turn2, "Invalid base URL\n\n"+proposeInstruction) || !strings.Contains(turn2, previewerrors.SandboxErrorNote) {
+		t.Errorf("expected the sandbox note before the exact turn-2 message, got %q", turn2)
 	}
 	plain := promptWithAttachments("add to cart does nothing", GenerateInput{Prompt: "add to cart does nothing"})
 	if strings.Contains(plain, previewerrors.SandboxErrorNote) {

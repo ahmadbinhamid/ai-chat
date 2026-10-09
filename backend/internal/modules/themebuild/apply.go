@@ -68,7 +68,14 @@ func (s *Service) ApplyDraft(ctx context.Context, tenantID uint64, token, chatID
 		return ApplyResult{}, err
 	}
 
-	pending, err := s.repo.ListPending(ctx, chatID)
+	// Pending state is read under the lock: read before it, a revert could discard turns this apply then writes live.
+	lockCtx, unlock, err := s.themeLocks.Lock(ctx, themeLockKey(tenantID, themeSlug))
+	if err != nil {
+		return ApplyResult{}, fmt.Errorf("apply draft: %w", err)
+	}
+	defer unlock()
+
+	pending, err := s.repo.ListPending(lockCtx, chatID)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -76,19 +83,13 @@ func (s *Service) ApplyDraft(ctx context.Context, tenantID uint64, token, chatID
 		return ApplyResult{}, ErrApplyBlockedByRunningGeneration
 	}
 
-	files, err := s.repo.PendingFiles(ctx, chatID)
+	files, err := s.repo.PendingFiles(lockCtx, chatID)
 	if err != nil {
 		return ApplyResult{}, err
 	}
 	if len(files) == 0 {
 		return ApplyResult{}, ErrNoPendingChanges
 	}
-
-	unlock, err := s.themeLocks.Lock(ctx, themeLockKey(tenantID, themeSlug))
-	if err != nil {
-		return ApplyResult{}, fmt.Errorf("apply draft: %w", err)
-	}
-	defer unlock()
 
 	plan, droppedPaths := dropUnreferencedImages(pendingFilesToPlan(files))
 	var droppedIDs []string
@@ -103,12 +104,12 @@ func (s *Service) ApplyDraft(ctx context.Context, tenantID uint64, token, chatID
 	}
 
 	storeAuth := themefs.RequestAuth{Token: token, TenantID: tenantID}
-	written, err := s.commitWritePlan(ctx, storeAuth, chatID, plan)
+	written, err := s.commitWritePlan(lockCtx, storeAuth, chatID, plan)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("apply draft: %w", err)
 	}
 
-	if err := s.repo.MarkMessagesAppliedDroppingFiles(ctx, chatID, time.Now().UTC(), droppedIDs); err != nil {
+	if err := s.repo.MarkMessagesAppliedDroppingFiles(lockCtx, chatID, time.Now().UTC(), droppedIDs); err != nil {
 		return ApplyResult{}, fmt.Errorf("mark draft applied: %w", err)
 	}
 
