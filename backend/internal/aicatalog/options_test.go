@@ -107,12 +107,11 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 	if p, _ := c.Provider("openrouter"); p.SessionHeader == "" {
 		t.Error("want a session header so each chat stays on one host")
 	}
-	// The DeepSeek models rank hosts by throughput; Grok and Kimi keep OpenRouter's default ranking.
+	// No model sets sort: like order, it ranks hosts afresh (on a rolling 5-minute window) and moved a chat mid-turn.
 	for _, m := range c.Models {
 		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
-		wantSort := map[bool]any{true: "throughput", false: nil}[strings.HasPrefix(m.ID, "deepseek-")]
-		if p["sort"] != wantSort {
-			t.Errorf("model %q: want sort %v, got %v", m.ID, wantSort, p["sort"])
+		if _, sorted := p["sort"]; sorted {
+			t.Errorf("model %q: want no sort, got %v", m.ID, p["sort"])
 		}
 		if _, restricted := p["only"]; restricted {
 			t.Errorf("model %q: want no host list, got %v", m.ID, p["only"])
@@ -307,8 +306,8 @@ func TestOpenRouterCatalogue_DeepSeekFullPrecisionHosts(t *testing.T) {
 				t.Errorf("model %q: want %s ignored, got %v", m.ID, host, ignore)
 			}
 		}
-		if p["sort"] != "throughput" || p["allow_fallbacks"] != true {
-			t.Errorf("model %q: want sort throughput with fallbacks, got %v", m.ID, p)
+		if p["allow_fallbacks"] != true {
+			t.Errorf("model %q: want fallbacks allowed, got %v", m.ID, p)
 		}
 	}
 }
