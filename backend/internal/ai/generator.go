@@ -472,6 +472,15 @@ const forceProposeInstruction = "Stop searching and call propose_changes now. " 
 	"actually read/verified its current content (for an update) or have real, complete content ready (for a create) " +
 	"— never invent a placeholder path or partial content to fill the array."
 
+// designNudgeAfterRounds: with thinking off, Flash reads one file a round and kept exploring all 12 rounds until forced,
+// and the forced round (thinking disabled, a named tool) is where it ran away; a one-time nudge after this many
+// exploration-only rounds lets it propose on a normal round instead.
+const designNudgeAfterRounds = 6
+
+// designNudge is appended once to the tool results of a thinking-off turn's designNudgeAfterRounds-th exploration round.
+const designNudge = "You have explored for several rounds. Unless a file you must change is still unread, call " +
+	"propose_changes now, using edits for the specific lines that change."
+
 // shouldForcePropose reports whether this round must propose: past forceProposeAfterRounds or forceProposeAfter.
 func shouldForcePropose(iteration int, elapsed time.Duration) bool {
 	return iteration >= forceProposeAfterRounds || elapsed >= forceProposeAfter
@@ -766,6 +775,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}()
 	// Counts consecutive rounds with no tool call that text recovery also couldn't rescue; any real call resets it.
 	consecutiveTextOnly := 0
+	explorationRounds := 0
 	normalToolChoice := g.normalToolChoice(entry)
 	idleAfterContent := g.idleAfterContent(entry)
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
@@ -1042,6 +1052,13 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				output = err.Error()
 			}
 			resultBlocks = append(resultBlocks, toolResultBlock(tu.ID, output, isError))
+		}
+		if allExplorationTools(toolNames) {
+			explorationRounds++
+			if tc.ThinkingOff && explorationRounds == designNudgeAfterRounds && !forcingPropose {
+				slog.Info("ai: nudging a thinking-off turn to propose", "iteration", iteration, "exploration_rounds", explorationRounds)
+				resultBlocks = append(resultBlocks, anthropic.NewTextBlock(designNudge))
+			}
 		}
 		messages = append(messages, anthropic.NewUserMessage(resultBlocks...))
 	}
