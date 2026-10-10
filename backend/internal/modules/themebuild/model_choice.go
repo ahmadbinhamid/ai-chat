@@ -42,15 +42,19 @@ func (s *Service) selectModel(in GenerateInput) (aicatalog.Selection, error) {
 	return sel, nil
 }
 
-// classifyTurn reports whether a turn is a fix (spotted with the chat's earlier prompts, for a bare follow-up) and
-// whether it is a redesign; a fix is never a redesign, so a bug fix never gets the redesign brief.
+// classifyTurn reports whether a turn is a fix (spotted with the chat's earlier prompts, for a bare follow-up) or a
+// redesign, never both. A merchant's words reporting a bug make it a fix; captured preview errors alone don't override
+// words asking for a redesign, since the dashboard attaches them to nearly every message.
 func (s *Service) classifyTurn(ctx context.Context, in GenerateInput, c chat.Chat, hasPreviewErrors, hasReference bool) (fixTurn, redesign bool, err error) {
 	prior, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
 		return false, false, fmt.Errorf("load chat history for turn routing: %w", err)
 	}
-	fixTurn = previewerrors.IsFixTurn(in.Prompt, earlierUserPrompts(prior, ""), hasPreviewErrors)
-	return fixTurn, !fixTurn && pageintent.DetectRedesign(in.Prompt, hasReference), nil
+	earlier := earlierUserPrompts(prior, "")
+	if pageintent.DetectRedesign(in.Prompt, hasReference) && !previewerrors.IsFixTurn(in.Prompt, earlier, false) {
+		return false, true, nil
+	}
+	return previewerrors.IsFixTurn(in.Prompt, earlier, hasPreviewErrors), false, nil
 }
 
 // resolveModel picks this turn's concrete model, and whether thinking is off for it.

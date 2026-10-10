@@ -132,7 +132,7 @@ func Load() Config {
 		FakeAIDelay: time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
 		StreamIdleTimeout:      time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_SECONDS", 60)) * time.Second,
-		StreamStallTimeout:     time.Duration(getenvInt("AI_STREAM_STALL_TIMEOUT_SECONDS", 120)) * time.Second,
+		StreamStallTimeout:     time.Duration(getenvInt("AI_STREAM_STALL_TIMEOUT_SECONDS", 300)) * time.Second,
 		FirstTokenTimeoutEdit:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_SECONDS", 120)) * time.Second,
 		FirstTokenTimeoutBrand: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
 		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,

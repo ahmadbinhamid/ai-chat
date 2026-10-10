@@ -98,7 +98,7 @@
     "label": "Auto",
     "design_model": "deepseek-flash", "design_effort": "low", "design_thinking": true,
     "fix_model": "deepseek-pro", "fix_effort": "low",
-    "redesign_model": "kimi", "redesign_effort": "medium", "redesign_thinking": true
+    "redesign_model": "kimi", "redesign_effort": "low", "redesign_thinking": true
   },
   "default_model": "auto",
   "vision_model": "deepseek-flash-vision",

@@ -178,8 +178,9 @@ type StreamTimeouts struct {
 const (
 	// Google AI Studio pauses over 12s mid tool call without pinging; real hangs are still caught by the stall timeout.
 	defaultStreamIdleTimeout = 60 * time.Second
-	// Generous: some hosts compose a whole tool call before sending it, pinging meanwhile, so a big proposal is quiet.
-	defaultStreamStallTimeout      = 120 * time.Second
+	// Generous: some hosts compose a whole tool call before sending it, pinging meanwhile, so a big proposal is quiet;
+	// Kimi on Morph wrote a full-page redesign proposal for over 3 minutes without content, and 120s cut it off.
+	defaultStreamStallTimeout      = 300 * time.Second
 	defaultFirstTokenTimeoutEdit   = 120 * time.Second
 	defaultFirstTokenTimeoutNarrow = 45 * time.Second
 	defaultFirstTokenTimeoutPages  = 150 * time.Second

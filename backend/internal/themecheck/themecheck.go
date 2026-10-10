@@ -71,6 +71,8 @@ type Proposal struct {
 	PageRegistryEntry  *themefs.PageEntry
 	LayoutLinksToAdd   []string
 	LayoutScriptsToAdd []string
+	// PlacedImages are the images/ paths this proposal saves through use_attachments; they exist once it's staged.
+	PlacedImages []string
 }
 
 // fileByPath returns the proposal's file at path, if any — used by rules checking whether a dependency is part of this same proposal.
@@ -102,5 +104,6 @@ func Check(proposal Proposal, snap Snapshot) []Finding {
 	findings = append(findings, checkJSSyntax(proposal, snap)...)
 	findings = append(findings, checkKnownFields(proposal, snap)...)
 	findings = append(findings, checkImageHost(proposal, snap)...)
+	findings = append(findings, checkImageExists(proposal, snap)...)
 	return findings
 }

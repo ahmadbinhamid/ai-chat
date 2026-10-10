@@ -128,7 +128,8 @@ func waitForAssistantReplies(t *testing.T, chatSvc *chat.Service, tenantID uint6
 }
 
 // Auto sends a redesign turn to redesign_model with the brief; a model the merchant picked keeps running but still
-// gets the brief; an ordinary turn, and a fix that also asks for a redesign, get neither. The flag is stored on the generation the queued turn runs from.
+// gets the brief; an ordinary turn, and a turn whose words report a bug, get neither, but captured preview errors alone
+// don't cancel a redesign. The flag is stored on the generation the queued turn runs from.
 func TestGenerate_RoutesRedesignTurns(t *testing.T) {
 	conn := openTestDB(t)
 	chatSvc := chat.NewService(chat.NewRepository(conn))
@@ -167,8 +168,12 @@ func TestGenerate_RoutesRedesignTurns(t *testing.T) {
 		{prompt: "redesign the homepage", want: aicatalog.Choice{ModelID: "deepseek-pro", Effort: "medium"}, redesign: true},
 		{prompt: "make the header dark", want: aicatalog.Choice{ModelID: "deepseek-flash", Effort: "low"}},
 		{prompt: "give the store a makeover", model: "deepseek-flash", effort: "high", want: aicatalog.Choice{ModelID: "deepseek-flash", Effort: "high"}, redesign: true},
-		// A fix wins over a redesign: no brief, and Auto takes the fix route.
-		{prompt: "redesign the homepage", previewErrors: true, want: aicatalog.Choice{ModelID: "deepseek-pro", Effort: "low"}},
+		// Captured preview errors alone don't cancel a redesign the merchant asked for.
+		{prompt: "redesign the homepage", previewErrors: true, want: aicatalog.Choice{ModelID: "deepseek-pro", Effort: "medium"}, redesign: true},
+		// Preview errors don't turn a design request into a fix; a vague message carrying them still is one.
+		{prompt: "make the header dark", previewErrors: true, want: aicatalog.Choice{ModelID: "deepseek-flash", Effort: "low"}},
+		{prompt: "can you look at this", previewErrors: true, want: aicatalog.Choice{ModelID: "deepseek-pro", Effort: "low"}},
+		// Words reporting a bug win over a redesign: no brief, and Auto takes the fix route.
 		{prompt: "revamp the cart page, checkout is broken and doesn't work", model: "deepseek-flash", effort: "low", want: aicatalog.Choice{ModelID: "deepseek-flash", Effort: "low"}},
 	}
 	for i, turn := range turns {

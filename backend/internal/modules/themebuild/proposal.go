@@ -122,7 +122,16 @@ func toProposal(r *ai.Result) themecheck.Proposal {
 		PageRegistryEntry:  r.PageRegistryEntry,
 		LayoutLinksToAdd:   r.LayoutLinksToAdd,
 		LayoutScriptsToAdd: r.LayoutScriptsToAdd,
+		PlacedImages:       placedImagePaths(r.UseAttachments),
 	}
+}
+
+func placedImagePaths(placements []ai.AttachmentPlacement) []string {
+	paths := make([]string, 0, len(placements))
+	for _, p := range placements {
+		paths = append(paths, p.Path)
+	}
+	return paths
 }
 
 func proposalHasChanges(result *ai.Result) bool {
