@@ -104,11 +104,11 @@ func readGenerationMetrics(t *testing.T, conn *sql.DB, generationID string) (Gen
 		queueWait, contextBuild, firstToken, model, tool, validation, repair, total int64
 	)
 	err := conn.QueryRowContext(context.Background(), `
-		SELECT generation_id, chat_id, tenant_id, model_id, effort, outcome,
+		SELECT generation_id, chat_id, tenant_id, model_id, effort, redesign, outcome,
 		       queue_wait_ms, context_build_ms, first_token_ms, model_ms, tool_ms, tool_calls, preloaded_files, preloaded_bytes, iterations,
 		       validation_ms, repair_attempts, repair_ms, input_tokens, output_tokens, cache_read_tokens, cost_usd, total_ms
 		FROM generation_metrics WHERE generation_id = ?
-	`, generationID).Scan(&m.GenerationID, &m.ChatID, &m.TenantID, &modelID, &effort, &m.Outcome,
+	`, generationID).Scan(&m.GenerationID, &m.ChatID, &m.TenantID, &modelID, &effort, &m.Redesign, &m.Outcome,
 		&queueWait, &contextBuild, &firstToken, &model, &tool, &m.ToolCalls, &m.PreloadedFiles, &m.PreloadedBytes, &m.Iterations,
 		&validation, &m.RepairAttempts, &repair, &m.InputTokens, &m.OutputTokens, &m.CacheReadTokens, &cost, &total)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -135,7 +135,7 @@ func TestRepository_InsertGenerationMetrics(t *testing.T) {
 		row  GenerationMetrics
 	}{
 		{"every field set", GenerationMetrics{
-			ModelID: "flash", Effort: "low", Outcome: GenerationStatusSucceeded,
+			ModelID: "flash", Effort: "low", Outcome: GenerationStatusSucceeded, Redesign: true,
 			QueueWait: 1200 * time.Millisecond, ContextBuild: 300 * time.Millisecond, FirstToken: 900 * time.Millisecond,
 			Model: 8 * time.Second, Tool: 2 * time.Second, ToolCalls: 7, PreloadedFiles: 3, PreloadedBytes: 9100, Iterations: 5,
 			Validation: 40 * time.Millisecond, RepairAttempts: 1, Repair: 3 * time.Second,
@@ -215,5 +215,15 @@ func TestRunGeneration_RecordsMetricsPerOutcome(t *testing.T) {
 			}
 			waitFor(t, "the loop to finish", func() bool { return svc.runs.count() == 0 })
 		})
+	}
+}
+
+// A redesign generation's metrics row says so, even when the turn never reached the model.
+func TestMetricsRow_CarriesRedesign(t *testing.T) {
+	g := Generation{ID: "gen", TenantID: 1, Redesign: true}
+	for _, m := range []*turnMetrics{nil, {}} {
+		if got := metricsRow(m, chat.Chat{ID: "chat"}, g, GenerationStatusSucceeded, 0); !got.Redesign {
+			t.Errorf("metricsRow(%v) dropped redesign", m)
+		}
 	}
 }

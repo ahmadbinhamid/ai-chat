@@ -63,8 +63,10 @@ type answeringGenerator struct{}
 func (answeringGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, string, []ai.Image, ai.ToolProgress, ai.ToolExecutor, ai.FileReader) (*ai.Result, error) {
 	return &ai.Result{Summary: "An answer.", AnsweredQuestion: true}, nil
 }
-func (answeringGenerator) SupportsVision() bool                                 { return false }
-func (answeringGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) { return "", nil }
+func (answeringGenerator) SupportsVision() bool { return false }
+func (answeringGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) {
+	return "", nil
+}
 
 // newCountingStoreService is newQueueTestService with a FlowPOS fake that counts every request.
 func newCountingStoreService(t *testing.T) (*Service, *chat.Service, *atomic.Int64) {

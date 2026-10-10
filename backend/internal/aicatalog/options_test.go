@@ -387,3 +387,74 @@ func TestOpenRouterCatalogue_DeepSeekExcludesAzure(t *testing.T) {
 		t.Fatal("no DeepSeek models in the catalogue; this guard checked nothing")
 	}
 }
+
+func TestParse_RedesignThinkingNeedsAThinkingModel(t *testing.T) {
+	data, _ := json.Marshal(map[string]any{
+		"providers": map[string]any{"p": map[string]any{"base_url": "https://x", "api_key_env": "AI_API_KEY"}},
+		"models":    []any{map[string]any{"id": "m", "label": "M", "provider": "p", "model": "x/m"}},
+		"auto": map[string]any{"label": "Auto", "design_model": "m", "fix_model": "m",
+			"redesign_model": "m", "redesign_thinking": true},
+		"default_model": "auto", "summary_model": "m",
+	})
+	if _, err := Parse(data, withKey); err == nil || !strings.Contains(err.Error(), "redesign_thinking needs") {
+		t.Errorf("want redesign_thinking rejected on a model without thinking, got %v", err)
+	}
+}
+
+// Auto sends a redesign turn to redesign_model (a fix still outranks it), falls back to the design route without one, and
+// never swaps a model the merchant picked.
+func TestResolveTurn(t *testing.T) {
+	load := func(t *testing.T, auto map[string]any) *Catalog {
+		t.Helper()
+		data, err := os.ReadFile("../../config/ai-models.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range auto {
+			raw["auto"].(map[string]any)[k] = v
+		}
+		for _, k := range []string{"redesign_model", "redesign_effort", "redesign_thinking"} {
+			if auto[k] == nil {
+				delete(raw["auto"].(map[string]any), k)
+			}
+		}
+		data, _ = json.Marshal(raw)
+		c, err := Parse(data, withKey)
+		if err != nil {
+			t.Fatalf("Parse: %v", err)
+		}
+		return c
+	}
+	withKimi := map[string]any{"redesign_model": "kimi", "redesign_effort": "medium", "redesign_thinking": true}
+	tests := []struct {
+		name            string
+		auto            map[string]any
+		sel             Selection
+		fixTurn         bool
+		redesign        bool
+		want            Choice
+		wantThinkingOff bool
+	}{
+		{"auto redesign", withKimi, Selection{ModelID: AutoID}, false, true, Choice{ModelID: "kimi", Effort: "medium"}, false},
+		{"auto fix outranks redesign", withKimi, Selection{ModelID: AutoID}, true, true, Choice{ModelID: "deepseek-pro", Effort: "low"}, false},
+		{"auto redesign, effort from the model", map[string]any{"redesign_model": "kimi"}, Selection{ModelID: AutoID}, false, true, Choice{ModelID: "kimi", Effort: "low"}, false},
+		{"auto redesign, thinking off", map[string]any{"redesign_model": "kimi", "redesign_thinking": false}, Selection{ModelID: AutoID}, false, true, Choice{ModelID: "kimi", Effort: "low"}, true},
+		{"auto redesign without redesign_model", nil, Selection{ModelID: AutoID}, false, true, Choice{ModelID: "deepseek-flash", Effort: "low"}, false},
+		{"auto design turn", withKimi, Selection{ModelID: AutoID}, false, false, Choice{ModelID: "deepseek-flash", Effort: "low"}, false},
+		{"auto fix turn", withKimi, Selection{ModelID: AutoID}, true, false, Choice{ModelID: "deepseek-pro", Effort: "low"}, false},
+		{"explicit pick on a redesign", withKimi, Selection{ModelID: "grok"}, false, true, Choice{ModelID: "grok"}, false},
+		{"explicit pick with effort", withKimi, Selection{ModelID: "deepseek-pro", Effort: "low"}, true, true, Choice{ModelID: "deepseek-pro", Effort: "low"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, off := load(t, tt.auto).ResolveTurn(tt.sel, tt.fixTurn, tt.redesign)
+			if got != tt.want || off != tt.wantThinkingOff {
+				t.Errorf("ResolveTurn = %+v thinkingOff=%v, want %+v thinkingOff=%v", got, off, tt.want, tt.wantThinkingOff)
+			}
+		})
+	}
+}

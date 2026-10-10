@@ -29,6 +29,11 @@ import (
 //go:embed prompts/theme_engine_spec.md
 var themeEngineSpec string
 
+// redesignBrief rides in a redesign turn's user message, never the system prompt, so ordinary turns keep their cache.
+//
+//go:embed prompts/redesign_brief.md
+var redesignBrief string
+
 // Turn is one prior conversation turn, replayed as grounding.
 type Turn struct {
 	Role    string // "user" or "assistant"
@@ -131,6 +136,10 @@ type ThemeContext struct {
 	Continue *Conversation
 	// ThinkingOff disables thinking for this turn (Auto's design route); forced rounds already send it disabled.
 	ThinkingOff bool
+	// Redesign adds the redesign brief to a fresh call's prompt and allows a redesign's longer search time.
+	Redesign bool
+	// StockImages offers search_stock_images (redesign and create turns, with a provider configured).
+	StockImages bool
 	// SessionID groups a chat's calls so a provider with a session header keeps them on one host (and its cache).
 	SessionID string
 	// Compact summarises pages.json, the file tree and the manifest for a large theme (see IsLargeTheme).
@@ -500,6 +509,10 @@ const forceProposeAfterRounds = 12
 // off than getting the question sooner, whatever the round count.
 const forceProposeAfter = 3 * time.Minute
 
+// redesignForceProposeAfter: a redesign reads more files before its one large proposal; at 30-45s a round on a slow
+// host, 3 minutes forced it before it proposed, and a forced round runs without thinking.
+const redesignForceProposeAfter = 6 * time.Minute
+
 // forceProposeWithinLastN: how many rounds below maxToolIterations are forced when the time limit doesn't fire first.
 const forceProposeWithinLastN = maxToolIterations - forceProposeAfterRounds
 
@@ -523,9 +536,9 @@ const designNudgeAfterRounds = 6
 const designNudge = "You have explored for several rounds. Unless a file you must change is still unread, call " +
 	"propose_changes now, using edits for the specific lines that change."
 
-// shouldForcePropose reports whether this round must propose: past forceProposeAfterRounds or forceProposeAfter.
-func shouldForcePropose(iteration int, elapsed time.Duration) bool {
-	return iteration >= forceProposeAfterRounds || elapsed >= forceProposeAfter
+// shouldForcePropose reports whether this round must propose: past forceProposeAfterRounds or the turn's time limit.
+func shouldForcePropose(iteration int, elapsed, limit time.Duration) bool {
+	return iteration >= forceProposeAfterRounds || elapsed >= limit
 }
 
 // thrashOutputTokenThreshold: flags iterations with high output but exploration-only, no propose_changes (diagnostic only).
@@ -537,6 +550,8 @@ var explorationToolNames = map[string]bool{
 	toolNameListThemeFiles: true,
 	toolNameReadThemeFile:  true,
 	toolNameGrepTheme:      true,
+	// Read-only like the theme tools, so a stock search counts as exploration for forcing and nudges.
+	ToolNameSearchStockImages: true,
 }
 
 // allExplorationTools reports whether all names are read-only exploration tools (never propose_changes).
@@ -828,6 +843,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		messages = tc.Continue.resumeMessages(prompt)
 	} else {
 		messages = freshMessages(history, prompt, images)
+		if tc.Redesign {
+			messages = withTrailingText(messages, redesignBrief)
+		}
 	}
 
 	entry, client, reqOpts, err := g.model(choice)
@@ -838,7 +856,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	slog.Info("ai: turn model", "model_id", choice.ModelID, "model", entry.Model, "effort", choice.Effort,
 		"thinking", entry.Thinking && !tc.ThinkingOff, "resumed", tc.Continue != nil)
 
-	tools := toolsForMode(tc.GenerationMode)
+	tools := toolsForMode(tc.GenerationMode, tc.StockImages)
 	// Clamp first-token timeout to ctx deadline (slow iterations tighten budget naturally).
 	firstTokenTimeout := clampToContextDeadline(ctx, g.firstTokenTimeoutFor(tc.GenerationMode))
 	// Dynamic block (pages.json, defaults.json, file tree, manifest): byte-identical across iterations/retries.
@@ -885,10 +903,14 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	explorationRounds := 0
 	normalToolChoice := g.normalToolChoice(entry)
 	idleAfterContent := g.idleAfterContent(entry)
+	forceAfter := forceProposeAfter
+	if tc.Redesign {
+		forceAfter = redesignForceProposeAfter
+	}
 	for iteration := 0; iteration < maxToolIterations; iteration++ {
 		iterationsUsed = iteration + 1
 		toolChoice := normalToolChoice
-		forcingPropose := shouldForcePropose(iteration, time.Since(generateStart))
+		forcingPropose := shouldForcePropose(iteration, time.Since(generateStart), forceAfter)
 		// The request always lists every tool, keeping the prompt cache intact; a forced round instead refuses any call
 		// but propose_changes, since DeepSeek ignores a named tool_choice and keeps searching.
 		allowedTools := tools
@@ -1400,8 +1422,9 @@ Rules for every request:
 5. Every new page needs a pages.json entry (return it in page_registry_entry); every new CSS/JS
    file needs its <link>/<script> tag registered (return those paths in layout_links_to_add /
    layout_scripts_to_add).
-6. Keep changes scoped to the request — don't refactor components you weren't asked to touch,
-   don't add sections the merchant didn't ask for, don't add narrating code comments.
+6. Keep changes scoped to the request unless this turn is a redesign — don't refactor components
+   you weren't asked to touch, don't add sections the merchant didn't ask for. Never add narrating
+   code comments.
 7. summary is shown directly to the merchant in a chat UI: 1-3 plain-language sentences, no code,
    no file paths, describing what you built. If you set needs_clarification, summary is your
    question to the merchant instead. If you set answered_question, summary is your direct answer
@@ -1410,10 +1433,10 @@ Rules for every request:
 8. Before you modify any existing file, read it with read_theme_file — never write a file you
    have not read, and never guess at its current content. Emit only files whose content actually
    changes as a result of this request.
-9. Once you've read an existing file, action: "edit" is the default way to change it —
-   old_string/new_string pairs materialize into the same complete corrected file, just cheaper to
-   express. Use action: "update" only for a specific reason: the change is broad enough that a
-   full rewrite is genuinely smaller than expressing it as edits.
+9. Once you've read an existing file, action: "edit" is the default way to change it, unless this
+   turn is a redesign — old_string/new_string pairs materialize into the same complete corrected
+   file, just cheaper to express. Use action: "update" only for a specific reason: the change is
+   broad enough that a full rewrite is genuinely smaller than expressing it as edits.
 10. Use list_theme_files/read_theme_file/grep_theme as needed to explore the theme before you
     finalize anything. Call propose_changes exactly once, when you're done, with the complete,
     final set of changes for this request — not a partial draft.

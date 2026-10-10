@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"path"
 	"regexp"
 	"sort"
 	"strings"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/stockimages"
 	"ai-chat/internal/themefs"
 )
 
@@ -34,6 +36,9 @@ type toolOptions struct {
 	preloaded map[string]string
 	// pagesJSONReadable: the prompt carried only a summary of pages.json, so reading it in full isn't a wasted trip.
 	pagesJSONReadable bool
+	tenantID          uint64
+	// stockImages: search_stock_images was offered this turn; a call to it on any other turn is refused.
+	stockImages bool
 }
 
 func (s *Service) buildToolExecutorWithPreload(store themefs.ThemeStore, storeAuth themefs.RequestAuth, opts toolOptions) ai.ToolExecutor {
@@ -45,6 +50,11 @@ func (s *Service) buildToolExecutorWithPreload(store themefs.ThemeStore, storeAu
 			return s.execReadThemeFile(ctx, store, storeAuth, input, opts)
 		case "grep_theme":
 			return s.execGrepTheme(ctx, store, storeAuth, input)
+		case ai.ToolNameSearchStockImages:
+			if !opts.stockImages || s.stock == nil {
+				return "", fmt.Errorf("unknown tool %q", name)
+			}
+			return s.execSearchStockImages(ctx, opts.tenantID, input)
 		default:
 			return "", fmt.Errorf("unknown tool %q", name)
 		}
@@ -223,4 +233,25 @@ func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, s
 		return "(no matches)", nil
 	}
 	return b.String(), nil
+}
+
+// execSearchStockImages runs one stock search; a failed search tells the model to carry on with theme images.
+func (s *Service) execSearchStockImages(ctx context.Context, tenantID uint64, input json.RawMessage) (string, error) {
+	in, err := stockimages.ParseInput(input)
+	if err != nil {
+		return "", err
+	}
+	imgs, err := s.stock.Search(ctx, tenantID, in)
+	if err != nil {
+		slog.Warn("stock image search failed", "tenant_id", tenantID, "error", err)
+		return "", fmt.Errorf("%w — continue with the theme's own images", err)
+	}
+	if len(imgs) == 0 {
+		return `{"images":[],"note":"No photos matched; try a broader query or use the theme's own images."}`, nil
+	}
+	out, err := json.Marshal(map[string]any{"images": imgs})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }

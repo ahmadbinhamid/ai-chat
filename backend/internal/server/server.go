@@ -23,7 +23,9 @@ import (
 	"ai-chat/internal/ratelimit"
 	"ai-chat/internal/safego"
 	"ai-chat/internal/server/handlers"
+	"ai-chat/internal/stockimages"
 	"ai-chat/internal/themefs"
+	"ai-chat/internal/urlfetch"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -116,6 +118,10 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	buildSvc.SetModelCatalog(generator.Catalog())
 	buildSvc.SetGenerationLimits(cfg.MaxConcurrentGenerations, cfg.MaxConcurrentGenerationsPerTenant)
 	buildSvc.SetLargeThemeLimits(ai.LargeThemeLimits{Pages: cfg.LargeThemePages, Files: cfg.LargeThemeFiles})
+	buildSvc.SetImageHosts(cfg.ImageHosts())
+	if cfg.StockImagesAPIKey != "" {
+		buildSvc.SetStockImages(stockimages.New(cfg.StockImagesAPIKey, urlfetch.NewGuardedClient(10*time.Second)), stockimages.Host)
+	}
 	// Limits are per replica: N replicas allow N times as many concurrent generations.
 	logger.Info("generation concurrency limits (0 = unlimited)",
 		"max_concurrent", cfg.MaxConcurrentGenerations, "max_concurrent_per_tenant", cfg.MaxConcurrentGenerationsPerTenant)

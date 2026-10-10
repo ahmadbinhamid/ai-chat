@@ -72,6 +72,26 @@ func (c *Catalog) DesignThinkingOff(s Selection, fixTurn bool) bool {
 	return s.ModelID == AutoID && !fixTurn && c.Auto != nil && c.Auto.DesignThinking != nil && !*c.Auto.DesignThinking
 }
 
+// ResolveTurn is Resolve plus Auto's redesign route, and whether thinking is off for the result. A fix outranks a
+// redesign, so a bug fix always runs on the fix route.
+func (c *Catalog) ResolveTurn(s Selection, fixTurn, redesign bool) (Choice, bool) {
+	if s.ModelID != AutoID {
+		return Choice(s), false
+	}
+	if fixTurn || !redesign {
+		return c.Resolve(s, fixTurn), c.DesignThinkingOff(s, fixTurn)
+	}
+	if c.Auto.RedesignModel == "" {
+		return c.Resolve(s, false), c.DesignThinkingOff(s, false)
+	}
+	effort := c.Auto.RedesignEffort
+	if effort == "" {
+		effort = c.byID[c.Auto.RedesignModel].DefaultEffort
+	}
+	thinkingOff := c.Auto.RedesignThinking != nil && !*c.Auto.RedesignThinking
+	return Choice{ModelID: c.Auto.RedesignModel, Effort: effort}, thinkingOff
+}
+
 // Default is the choice for a turn with nothing stored (a row queued before choices existed, or a test).
 func (c *Catalog) Default() Choice {
 	return c.Resolve(Selection{ModelID: c.DefaultModel, Effort: c.byID[c.DefaultModel].DefaultEffort}, false)

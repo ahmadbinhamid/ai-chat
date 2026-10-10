@@ -21,6 +21,8 @@ type GenerationMetrics struct {
 	Outcome      string
 	// Escalated: Auto retried the turn on its fix model; ModelID is then the fix model.
 	Escalated bool
+	// Redesign: the turn was detected as a redesign, so it ran with the redesign brief (and route, under Auto).
+	Redesign bool
 
 	QueueWait    time.Duration
 	ContextBuild time.Duration
@@ -144,7 +146,7 @@ func (m *turnMetrics) addRepair(d time.Duration) {
 func metricsRow(m *turnMetrics, c chat.Chat, g Generation, outcome string, total time.Duration) GenerationMetrics {
 	row := GenerationMetrics{
 		GenerationID: g.ID, ChatID: c.ID, TenantID: g.TenantID, ModelID: g.ModelID, Effort: g.Effort,
-		Outcome: outcome, Total: total,
+		Outcome: outcome, Total: total, Redesign: g.Redesign,
 	}
 	if g.QueuedAt != nil && g.StartedAt != nil && g.StartedAt.After(*g.QueuedAt) {
 		row.QueueWait = g.StartedAt.Sub(*g.QueuedAt)

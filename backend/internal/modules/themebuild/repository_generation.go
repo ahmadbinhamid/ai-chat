@@ -43,7 +43,7 @@ func retryOnDeadlock(ctx context.Context, fn func() error) error {
 // Shared column list for all Scan calls; prevents drift between queries.
 const generationColumns = `
 	id, chat_id, tenant_id, status, error, attempts,
-	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off, auto_selected, preview_route, focus_file,
+	prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off, auto_selected, redesign, preview_route, focus_file,
 	resume_count, awaiting_resume_since,
 	queued_at, started_at, finished_at
 `
@@ -107,10 +107,10 @@ func (r *Repository) enqueueGenerationOnce(ctx context.Context, g Generation) (p
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO generations
 			(id, chat_id, tenant_id, status, attempts, prompt, reference_url, user_message_id, theme_slug, mode, model_id, effort, thinking_off,
-			 auto_selected, preview_route, focus_file, queued_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 auto_selected, redesign, preview_route, focus_file, queued_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, g.ID, g.ChatID, g.TenantID, GenerationStatusQueued, g.Prompt, referenceURL, g.UserMessageID, g.ThemeSlug, g.Mode, modelID, effort, g.ThinkingOff,
-		g.AutoSelected, g.PreviewRoute, focusFile, enqueuedAt, enqueuedAt, enqueuedAt)
+		g.AutoSelected, g.Redesign, g.PreviewRoute, focusFile, enqueuedAt, enqueuedAt, enqueuedAt)
 	if err != nil {
 		return 0, err
 	}

@@ -274,3 +274,18 @@ func sniffsAsHTML(body []byte) bool {
 	}
 	return len(s) >= 2 && s[0] == '<' && s[1] >= 'a' && s[1] <= 'z'
 }
+
+// NewGuardedClient is a plain HTTP client behind the same dial-time SSRF guard as Fetcher, for fixed API endpoints.
+func NewGuardedClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext:           guardedDialer().DialContext,
+			TLSHandshakeTimeout:   4 * time.Second,
+			ResponseHeaderTimeout: 6 * time.Second,
+		},
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}

@@ -92,6 +92,10 @@ type Auto struct {
 	// DesignThinking false switches thinking off on the design route (unset keeps the model's own setting): a design
 	// change rarely needs long reasoning, and on a slow host that reasoning is most of the turn. Fix turns keep it.
 	DesignThinking *bool `json:"design_thinking,omitempty"`
+	// Redesign* route redesign turns; an empty RedesignModel sends them down the design route instead.
+	RedesignModel    string `json:"redesign_model,omitempty"`
+	RedesignEffort   string `json:"redesign_effort,omitempty"`
+	RedesignThinking *bool  `json:"redesign_thinking,omitempty"`
 }
 
 // Catalog is a validated catalogue; build it with Parse or FromEnv, never by hand.
@@ -209,6 +213,18 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 		}
 		if c.Auto.DesignThinking != nil && !*c.Auto.DesignThinking && !c.byID[c.Auto.DesignModel].Thinking {
 			return fmt.Errorf("auto design_thinking false needs a design_model with \"thinking\": true")
+		}
+		if c.Auto.RedesignModel == "" {
+			if c.Auto.RedesignEffort != "" || c.Auto.RedesignThinking != nil {
+				return errors.New("auto redesign_effort and redesign_thinking need a redesign_model")
+			}
+		} else {
+			if err := c.validateAutoTarget("redesign", c.Auto.RedesignModel, c.Auto.RedesignEffort); err != nil {
+				return err
+			}
+			if c.Auto.RedesignThinking != nil && !c.byID[c.Auto.RedesignModel].Thinking {
+				return fmt.Errorf("auto redesign_thinking needs a redesign_model with \"thinking\": true")
+			}
 		}
 	}
 	if c.VisionModel != "" {

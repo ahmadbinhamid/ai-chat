@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -83,6 +84,10 @@ type Config struct {
 	LargeThemePages int
 	LargeThemeFiles int
 
+	// StockImagesAPIKey (Pexels) enables search_stock_images on redesign and create turns; empty leaves it off.
+	StockImagesAPIKey string
+	// PlatformImageHosts are extra hosts a proposed <img> may load from, beside FLOWPOS_API_BASE's and the stock host.
+	PlatformImageHosts []string
 	// CORSAllowedOrigins is the browser origins allowed to call this API. Empty blocks all
 	// cross-origin requests (fails closed).
 	CORSAllowedOrigins []string
@@ -153,6 +158,8 @@ func Load() Config {
 		LargeThemeFiles: getenvInt("AI_LARGE_THEME_FILES", 250),
 
 		CORSAllowedOrigins: getenvList("CORS_ALLOWED_ORIGINS"),
+		StockImagesAPIKey:  os.Getenv("STOCK_IMAGES_API_KEY"),
+		PlatformImageHosts: getenvList("PLATFORM_IMAGE_HOSTS"),
 
 		RedisURL:      os.Getenv("REDIS_URL"),
 		SingleReplica: getenvBool("AI_CHAT_SINGLE_REPLICA", false),
@@ -259,4 +266,14 @@ func getenvNonNegativeInt(key string, fallback int) int {
 func (c Config) DSN() string {
 	return c.DBUsername + ":" + c.DBPassword + "@tcp(" + c.DBHost + ":" + c.DBPort + ")/" + c.DBDatabase +
 		"?parseTime=true&charset=utf8mb4&loc=UTC&clientFoundRows=true"
+}
+
+// ImageHosts is every external host a proposed <img> may load from on the platform's side: FLOWPOS_API_BASE's host
+// plus PLATFORM_IMAGE_HOSTS. The stock provider's host is added only when stock images are enabled.
+func (c Config) ImageHosts() []string {
+	hosts := append([]string(nil), c.PlatformImageHosts...)
+	if u, err := url.Parse(c.FlowposAPIBase); err == nil && u.Hostname() != "" {
+		hosts = append(hosts, u.Hostname())
+	}
+	return hosts
 }

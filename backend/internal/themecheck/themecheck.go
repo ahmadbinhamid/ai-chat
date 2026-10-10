@@ -30,6 +30,8 @@ type Finding struct {
 type Snapshot struct {
 	Files map[string]string // theme-relative path -> content, for the handful of files this package reads
 	Paths map[string]bool   // every theme-relative file path that exists, content or not — for existence checks only (rule 4)
+	// ImageHosts are the external hosts an <img> may load from (platform and stock provider); theme assets are relative.
+	ImageHosts map[string]bool
 }
 
 // HasPath reports whether relPath exists anywhere in the theme.
@@ -99,5 +101,6 @@ func Check(proposal Proposal, snap Snapshot) []Finding {
 	findings = append(findings, checkJSShape(proposal, snap)...)
 	findings = append(findings, checkJSSyntax(proposal, snap)...)
 	findings = append(findings, checkKnownFields(proposal, snap)...)
+	findings = append(findings, checkImageHost(proposal, snap)...)
 	return findings
 }

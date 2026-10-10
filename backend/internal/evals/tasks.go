@@ -2,6 +2,8 @@
 // theme-builder pipeline to catch regressions before they reach merchants.
 package evals
 
+import "strings"
+
 // Task is one scripted prompt sent to a fresh, base-themed test theme.
 type Task struct {
 	ID          string
@@ -194,9 +196,33 @@ var Tasks = []Task{
 		ExpectedOK:  true,
 	},
 	{
+		ID:          "homepage_redesign",
+		Description: "Redesign turn: rebuild the homepage as a complete brand page",
+		Prompt:      "Redesign the homepage so it looks like a real premium brand",
+		ExpectedOK:  true,
+	},
+	{
 		ID:          "small_copy_tweak",
 		Description: "Small wording tweak to footer and hero together",
 		Prompt:      "Change the hero paragraph to mention free shipping and update the footer year to 2026",
 		ExpectedOK:  true,
 	},
+}
+
+// Select returns the tasks whose IDs are listed in ids (comma-separated), in list order; "" selects every task.
+func Select(ids string) []Task {
+	if strings.TrimSpace(ids) == "" {
+		return Tasks
+	}
+	want := map[string]bool{}
+	for _, id := range strings.Split(ids, ",") {
+		want[strings.TrimSpace(id)] = true
+	}
+	var out []Task
+	for _, t := range Tasks {
+		if want[t.ID] {
+			out = append(out, t)
+		}
+	}
+	return out
 }

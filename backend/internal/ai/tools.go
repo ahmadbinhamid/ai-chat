@@ -24,6 +24,8 @@ const (
 	toolNameReadThemeFile  = "read_theme_file"
 	toolNameGrepTheme      = "grep_theme"
 	toolNameProposeChanges = "propose_changes"
+	// ToolNameSearchStockImages is offered only on redesign and create turns, when a stock provider is configured.
+	ToolNameSearchStockImages = "search_stock_images"
 )
 
 func listThemeFilesTool() anthropic.ToolUnionParam {
@@ -106,9 +108,40 @@ func proposeChangesTool() anthropic.ToolUnionParam {
 
 // toolsForMode returns the tool set for a GenerationMode. Brand mode offers only
 // propose_changes, so the model can't wander off editing files beyond defaults.json.
-func toolsForMode(mode string) []anthropic.ToolUnionParam {
+func toolsForMode(mode string, stockImages bool) []anthropic.ToolUnionParam {
 	if mode == GenerationModeBrand {
 		return []anthropic.ToolUnionParam{proposeChangesTool()}
 	}
+	if stockImages && mode != GenerationModeCopy {
+		return []anthropic.ToolUnionParam{listThemeFilesTool(), readThemeFileTool(), grepThemeTool(), searchStockImagesTool(), proposeChangesTool()}
+	}
 	return []anthropic.ToolUnionParam{listThemeFilesTool(), readThemeFileTool(), grepThemeTool(), proposeChangesTool()}
+}
+
+func searchStockImagesTool() anthropic.ToolUnionParam {
+	return anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
+		Name: ToolNameSearchStockImages,
+		Description: param.NewOpt(
+			"Searches licensed stock photos (Pexels) for hero and section imagery. Returns up to 6 images, each with " +
+				"url and url_small (hotlink exactly as returned), alt, width, height and the photographer. Use only " +
+				"URLs this tool returned — never invent or alter an image URL. Pick images that match the brand. On every " +
+				"<img>: alt text describing the image in context, width and height, srcset with url_small and url plus " +
+				"sizes, and loading=\"lazy\" except the hero. Credit each photo you use with a small visible line near it " +
+				"or in a credits line: Photo by <a href=\"photographer_url\">photographer</a> on " +
+				"<a href=\"https://www.pexels.com\">Pexels</a>.",
+		),
+		InputSchema: anthropic.ToolInputSchemaParam{
+			Properties: map[string]any{
+				"query": map[string]any{
+					"type":        "string",
+					"description": "A short search phrase, e.g. 'espresso being poured' or 'cozy cafe interior'.",
+				},
+				"count": map[string]any{
+					"type":        "integer",
+					"description": "How many images to return, 1-6 (default 4).",
+				},
+			},
+			Required: []string{"query"},
+		},
+	}}
 }

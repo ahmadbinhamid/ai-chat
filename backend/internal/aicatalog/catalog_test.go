@@ -66,6 +66,13 @@ func TestParse_RefusesInvalidCatalogues(t *testing.T) {
 		{name: "summary model not in list", mutate: func(m map[string]any) { m["summary_model"] = "nope" }, wantErr: `summary_model "nope" is not in the model list`},
 		{name: "auto fix model not in list", mutate: func(m map[string]any) { m["auto"].(map[string]any)["fix_model"] = "nope" }, wantErr: `auto fix_model "nope"`},
 		{name: "auto effort not offered", mutate: func(m map[string]any) { m["auto"].(map[string]any)["design_effort"] = "max" }, wantErr: `auto design_effort "max"`},
+		{name: "auto redesign model not in list", mutate: func(m map[string]any) { m["auto"].(map[string]any)["redesign_model"] = "nope" }, wantErr: `auto redesign_model "nope"`},
+		{name: "auto redesign effort not offered", mutate: func(m map[string]any) {
+			m["auto"].(map[string]any)["redesign_model"] = "deepseek-flash-vision"
+			m["auto"].(map[string]any)["redesign_effort"] = "high"
+		}, wantErr: `auto redesign_effort "high"`},
+		{name: "auto redesign effort without a model", mutate: func(m map[string]any) { m["auto"].(map[string]any)["redesign_effort"] = "low" }, wantErr: "need a redesign_model"},
+		{name: "auto redesign thinking without a model", mutate: func(m map[string]any) { m["auto"].(map[string]any)["redesign_thinking"] = true }, wantErr: "need a redesign_model"},
 		{name: "default model not selectable", mutate: func(m map[string]any) { m["default_model"] = "deepseek-flash-vision" }, wantErr: "is not a selectable model"},
 		{name: "reserved id", mutate: func(m map[string]any) { model(m, 0)["id"] = "auto" }, wantErr: "is reserved"},
 		{name: "efforts without thinking", mutate: func(m map[string]any) { model(m, 0)["thinking"] = false }, wantErr: `efforts need "thinking": true`},

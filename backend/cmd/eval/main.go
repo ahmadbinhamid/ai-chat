@@ -17,6 +17,8 @@ import (
 	"ai-chat/internal/evals"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/modules/themebuild"
+	"ai-chat/internal/stockimages"
+	"ai-chat/internal/urlfetch"
 
 	"ai-chat/internal/themefs"
 
@@ -26,7 +28,8 @@ import (
 // pollInterval/pollTimeout bound how long eval waits for one async Generate call to finish.
 const (
 	pollInterval = 2 * time.Second
-	pollTimeout  = 5 * time.Minute
+	// A redesign may explore for up to 6 minutes before its proposal (redesignForceProposeAfter).
+	pollTimeout = 10 * time.Minute
 )
 
 type taskResult struct {
@@ -52,7 +55,8 @@ func main() {
 	}
 	// The AI builder never creates a theme, only edits an already-installed one, so
 	// a human must install/activate a real theme for EVAL_TENANT_ID first.
-	// Optional: EVAL_MODEL picks a catalogue model (empty uses the default); EVAL_DEBUG=1 shows Debug logs.
+	// Optional: EVAL_MODEL picks a catalogue model (empty uses the default); EVAL_DEBUG=1 shows Debug logs;
+	// EVAL_TASKS (comma-separated task IDs) runs only those tasks.
 	modelID := os.Getenv("EVAL_MODEL")
 	if os.Getenv("EVAL_DEBUG") == "1" {
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -116,12 +120,20 @@ func main() {
 	buildSvc.SetHistorySummarizationEnabled(cfg.HistorySummarizationEnabled)
 	buildSvc.SetPlacedImageMaxBytes(cfg.PlacedImageMaxBytes)
 	buildSvc.SetLargeThemeLimits(ai.LargeThemeLimits{Pages: cfg.LargeThemePages, Files: cfg.LargeThemeFiles})
+	buildSvc.SetImageHosts(cfg.ImageHosts())
+	if cfg.StockImagesAPIKey != "" {
+		buildSvc.SetStockImages(stockimages.New(cfg.StockImagesAPIKey, urlfetch.NewGuardedClient(10*time.Second)), stockimages.Host)
+	}
 	discardLeftoverDraft(context.Background(), buildSvc, chatSvc, tenantID)
 
 	ctx := context.Background()
 
-	results := make([]taskResult, 0, len(evals.Tasks))
-	for _, task := range evals.Tasks {
+	tasks := evals.Select(os.Getenv("EVAL_TASKS"))
+	if len(tasks) == 0 {
+		log.Fatalf("EVAL_TASKS %q matches no task", os.Getenv("EVAL_TASKS"))
+	}
+	results := make([]taskResult, 0, len(tasks))
+	for _, task := range tasks {
 		res := runTask(ctx, buildSvc, chatSvc, user, tenantID, token, themeSlug, modelID, task)
 		results = append(results, res)
 

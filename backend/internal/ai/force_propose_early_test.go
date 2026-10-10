@@ -21,6 +21,7 @@ func TestShouldForcePropose(t *testing.T) {
 		name      string
 		iteration int
 		elapsed   time.Duration
+		limit     time.Duration
 		want      bool
 	}{
 		{name: "first round", iteration: 0, elapsed: 0, want: false},
@@ -29,10 +30,17 @@ func TestShouldForcePropose(t *testing.T) {
 		{name: "3 minutes in, early round", iteration: 4, elapsed: forceProposeAfter, want: true},
 		{name: "just under 3 minutes", iteration: 4, elapsed: forceProposeAfter - time.Second, want: false},
 		{name: "ceiling", iteration: maxToolIterations - 1, elapsed: 0, want: true},
+		{name: "redesign, 3 minutes in", iteration: 4, elapsed: forceProposeAfter, limit: redesignForceProposeAfter, want: false},
+		{name: "redesign, 6 minutes in", iteration: 4, elapsed: redesignForceProposeAfter, limit: redesignForceProposeAfter, want: true},
+		{name: "redesign, 12 rounds", iteration: forceProposeAfterRounds, elapsed: time.Minute, limit: redesignForceProposeAfter, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldForcePropose(tt.iteration, tt.elapsed); got != tt.want {
+			limit := tt.limit
+			if limit == 0 {
+				limit = forceProposeAfter
+			}
+			if got := shouldForcePropose(tt.iteration, tt.elapsed, limit); got != tt.want {
 				t.Errorf("shouldForcePropose(%d, %s) = %v, want %v", tt.iteration, tt.elapsed, got, tt.want)
 			}
 		})

@@ -23,6 +23,7 @@ import (
 	"ai-chat/internal/prefetch"
 	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/safego"
+	"ai-chat/internal/stockimages"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
 	"ai-chat/internal/urlfetch"
@@ -147,6 +148,43 @@ type Service struct {
 	largeTheme ai.LargeThemeLimits
 	// True while a restart left generations waiting for their senders; gates the per-request ResumeForUser check.
 	resumePending atomic.Bool
+	// nil (no STOCK_IMAGES_API_KEY, or tests) never offers search_stock_images.
+	stock stockSearcher
+	// imageHosts are the external hosts a proposed <img> may load from; see SetImageHosts and SetStockImages.
+	imageHosts map[string]bool
+}
+
+// stockSearcher is stockimages.Client's search, behind an interface so tests never call the provider.
+type stockSearcher interface {
+	Search(ctx context.Context, tenantID uint64, in stockimages.Input) ([]stockimages.Image, error)
+}
+
+// SetStockImages offers search_stock_images on redesign and create turns and lets proposals hotlink host.
+// Call once before serving, after SetImageHosts.
+func (s *Service) SetStockImages(searcher stockSearcher, host string) {
+	s.stock = searcher
+	if s.imageHosts == nil {
+		s.imageHosts = map[string]bool{}
+	}
+	s.imageHosts[strings.ToLower(host)] = true
+}
+
+// stockImagesFor reports whether in's turn is offered search_stock_images: only a redesign or a new page needs photos.
+func (s *Service) stockImagesFor(in GenerateInput) bool {
+	if s.stock == nil || in.Mode == ai.GenerationModeBrand || in.Mode == ai.GenerationModeCopy {
+		return false
+	}
+	return in.redesign || in.Mode == ai.GenerationModePages || pageintent.DetectCreatePage(in.Prompt)
+}
+
+// SetImageHosts sets the platform hosts a proposed <img> may load from. Call once before serving.
+func (s *Service) SetImageHosts(hosts []string) {
+	s.imageHosts = make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			s.imageHosts[h] = true
+		}
+	}
 }
 
 // SetPlacedImageMaxBytes sets the largest attached image a turn may place; match it to FlowPOS's PHP upload limit.
@@ -301,6 +339,8 @@ type GenerateInput struct {
 	thinkingOff bool
 	// autoSelected: the merchant chose Auto, the only case where a stuck turn may move to another model.
 	autoSelected bool
+	// redesign: decided once at enqueue and stored, so the brief and the route a queued turn runs with always agree.
+	redesign bool
 	// Set by doGenerate; nil in tests that call generation helpers directly, which then place no images.
 	imageCatalog *imageCatalog
 	// Earlier pending turns' files, set by doGenerate; nil skips the draft-reversion check in checkAndRepair.
@@ -389,9 +429,13 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if err != nil {
 		return GenerateOutcome{}, err
 	}
-	if in.model, in.thinkingOff, err = s.resolveModel(ctx, in, c, selection, len(previewErrorsJSON) > 0); err != nil {
+	hasReference := in.HTMLAttachmentContent != nil || referenceURL != "" || len(in.Images) > 0
+	fixTurn, redesign, err := s.classifyTurn(ctx, in, c, len(previewErrorsJSON) > 0, hasReference)
+	if err != nil {
 		return GenerateOutcome{}, err
 	}
+	in.redesign = redesign
+	in.model, in.thinkingOff = s.resolveModel(c, selection, fixTurn, redesign)
 	in.autoSelected = selection.ModelID == aicatalog.AutoID
 
 	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt, in.Images, in.HTMLAttachmentFilename, in.HTMLAttachmentContent, previewErrorsJSON)
@@ -414,6 +458,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		Effort:        in.model.Effort,
 		ThinkingOff:   in.thinkingOff,
 		AutoSelected:  in.autoSelected,
+		Redesign:      in.redesign,
 		PreviewRoute:  in.PreviewRoute,
 		FocusFile:     in.FocusFile,
 	})
@@ -528,6 +573,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		model:         aicatalog.Choice{ModelID: g.ModelID, Effort: g.Effort},
 		thinkingOff:   g.ThinkingOff,
 		autoSelected:  g.AutoSelected,
+		redesign:      g.Redesign,
 		PreviewRoute:  g.PreviewRoute,
 		FocusFile:     g.FocusFile,
 		// Held by a restart, either queued or cut off mid-run and re-queued by the drain.
@@ -949,6 +995,8 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		tc.GenerationMode = in.Mode
 		tc.Model = in.model
 		tc.ThinkingOff = in.thinkingOff
+		tc.Redesign = in.redesign
+		tc.StockImages = s.stockImagesFor(in)
 		tc.SessionID = c.ID
 		tc.DraftPaths = make([]string, 0, len(draft))
 		for path, content := range draft {
@@ -972,6 +1020,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		s.summariseLargeTheme(&tc, in.preload, draft)
 		toolExec = s.buildToolExecutorWithPreload(store, storeAuth, toolOptions{
 			preloaded: preloadedContents(in.preload), pagesJSONReadable: tc.Compact,
+			tenantID: in.TenantID, stockImages: tc.StockImages,
 		})
 		readFile = s.buildFileReader(store, storeAuth)
 
@@ -1483,7 +1532,7 @@ func (s *Service) buildSnapshotBase(ctx context.Context, store themefs.ThemeStor
 		}
 		files[path] = content
 	}
-	return themecheck.Snapshot{Files: files, Paths: paths}, nil
+	return themecheck.Snapshot{Files: files, Paths: paths, ImageHosts: s.imageHosts}, nil
 }
 
 // Layers real content of proposed-update files on top of base (for placeholder/pre-existing checks).
@@ -1510,7 +1559,7 @@ func (s *Service) buildSnapshot(ctx context.Context, store themefs.ThemeStore, s
 		files[f.Path] = content
 	}
 
-	return themecheck.Snapshot{Files: files, Paths: base.Paths}
+	return themecheck.Snapshot{Files: files, Paths: base.Paths, ImageHosts: base.ImageHosts}
 }
 
 // Walks file tree, recording every FILE path (not directories).
