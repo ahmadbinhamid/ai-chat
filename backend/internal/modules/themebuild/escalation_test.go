@@ -58,7 +58,7 @@ func (g *perModelGenerator) recorded() []recordedCall {
 	return append([]recordedCall(nil), g.calls...)
 }
 
-func (*perModelGenerator) Summarize(context.Context, []ai.Turn) (string, error) { return "", nil }
+func (*perModelGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) { return "", nil }
 
 func (*perModelGenerator) SupportsVision() bool { return false }
 

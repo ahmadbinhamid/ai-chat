@@ -63,7 +63,7 @@ func (g *scriptedGenerator) callCount() int {
 	return g.calls
 }
 
-func (*scriptedGenerator) Summarize(context.Context, []ai.Turn) (string, error) { return "", nil }
+func (*scriptedGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) { return "", nil }
 
 func (*scriptedGenerator) SupportsVision() bool { return false }
 

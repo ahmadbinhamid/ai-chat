@@ -121,7 +121,7 @@ func (g *historyCapturingGenerator) Generate(_ context.Context, _ ai.ThemeContex
 
 func (g *historyCapturingGenerator) SupportsVision() bool { return false }
 
-func (g *historyCapturingGenerator) Summarize(context.Context, []ai.Turn) (string, error) {
+func (g *historyCapturingGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) {
 	return "", nil
 }
 

@@ -27,7 +27,7 @@ func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Tu
 func (f *fakeGenerator) SupportsVision() bool { return f.visionSupported }
 
 // Satisfies interface; tests never reach summarizeHistoryThreshold.
-func (f *fakeGenerator) Summarize(_ context.Context, turns []ai.Turn) (string, error) {
+func (f *fakeGenerator) Summarize(_ context.Context, _ string, turns []ai.Turn) (string, error) {
 	return "", nil
 }
 

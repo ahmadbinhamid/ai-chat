@@ -38,7 +38,7 @@ func (g *capturingGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []
 
 func (g *capturingGenerator) SupportsVision() bool { return g.visionSupported }
 
-func (g *capturingGenerator) Summarize(_ context.Context, _ []ai.Turn) (string, error) {
+func (g *capturingGenerator) Summarize(_ context.Context, _ string, _ []ai.Turn) (string, error) {
 	return "", nil
 }
 
@@ -64,7 +64,7 @@ func (g *allCallsCapturingGenerator) Generate(_ context.Context, _ ai.ThemeConte
 
 func (g *allCallsCapturingGenerator) SupportsVision() bool { return false }
 
-func (g *allCallsCapturingGenerator) Summarize(_ context.Context, _ []ai.Turn) (string, error) {
+func (g *allCallsCapturingGenerator) Summarize(_ context.Context, _ string, _ []ai.Turn) (string, error) {
 	return "", nil
 }
 

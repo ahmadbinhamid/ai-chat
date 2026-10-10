@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -41,8 +42,9 @@ func TestShouldForcePropose(t *testing.T) {
 	}
 }
 
-// A model that only ever searches: the first forced round is round 12, still lists every tool (so the prompt cache holds)
-// but names propose_changes, and the turn ends there with an honest question and no files.
+// A model that only ever searches: the first forced round is round 12, still lists every tool and sends the same
+// system blocks (so the prompt cache holds) but names propose_changes, with the forcing instruction last in the
+// messages; the turn ends there with an honest question and no files.
 func TestGenerate_ForcedRoundKeepsEveryToolAndNamesProposeChanges(t *testing.T) {
 	type request struct {
 		Tools []struct {
@@ -51,9 +53,14 @@ func TestGenerate_ForcedRoundKeepsEveryToolAndNamesProposeChanges(t *testing.T) 
 		ToolChoice struct {
 			Type string `json:"type"`
 		} `json:"tool_choice"`
-		System []struct {
-			Text string `json:"text"`
-		} `json:"system"`
+		System   json.RawMessage `json:"system"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
 	}
 	var requests []request
 	question := "I checked the add to cart button's data-* hooks, its script registration and the basket request, " +
@@ -101,9 +108,29 @@ func TestGenerate_ForcedRoundKeepsEveryToolAndNamesProposeChanges(t *testing.T) 
 		if len(req.Tools) != len(requests[0].Tools) || req.ToolChoice.Type != "tool" {
 			t.Errorf("call %d (forced): want the same full tool list with tool_choice propose_changes, got %+v / %+v", i, req.Tools, req.ToolChoice)
 		}
-		last := req.System[len(req.System)-1].Text
-		if last != forceProposeInstruction || !strings.Contains(last, "needs_clarification: true") {
-			t.Errorf("call %d (forced): want the forcing instruction last in the system prompt, got %q", i, last)
+		if !bytes.Equal(req.System, requests[0].System) {
+			t.Errorf("call %d (forced): system blocks differ from a normal round's, which misses the cached prefix", i)
+		}
+		if strings.Contains(string(req.System), "Stop searching") {
+			t.Errorf("call %d (forced): the forcing instruction must not be in the system prompt", i)
+		}
+		lastMsg := req.Messages[len(req.Messages)-1]
+		blocks := lastMsg.Content
+		last := blocks[len(blocks)-1]
+		if lastMsg.Role != "user" || last.Type != "text" || last.Text != forceProposeInstruction {
+			t.Errorf("call %d (forced): want the forcing instruction as the last block of the last user message, got %s %+v", i, lastMsg.Role, last)
+		}
+		if len(blocks) < 2 || blocks[0].Type != "tool_result" {
+			t.Errorf("call %d (forced): want the instruction after the round's tool results, got %+v", i, blocks)
+		}
+	}
+	for i, req := range requests[:forceProposeAfterRounds] {
+		for _, m := range req.Messages {
+			for _, b := range m.Content {
+				if b.Text == forceProposeInstruction {
+					t.Errorf("call %d: the forcing instruction leaked into a normal round's history", i)
+				}
+			}
 		}
 	}
 
@@ -179,5 +206,40 @@ func TestForceProposeInstruction_RequiresANamedCause(t *testing.T) {
 		if !strings.Contains(forceProposeInstruction, want) {
 			t.Errorf("forcing instruction missing %q:\n%s", want, forceProposeInstruction)
 		}
+	}
+}
+
+func TestWithTrailingText(t *testing.T) {
+	toolResults := anthropic.NewUserMessage(anthropic.NewToolResultBlock("toolu_1", "ok", false))
+	assistant := anthropic.NewAssistantMessage(anthropic.NewTextBlock("thinking out loud"))
+	tests := []struct {
+		name       string
+		messages   []anthropic.MessageParam
+		wantLen    int
+		wantBlocks int
+	}{
+		{name: "after the last user message's tool results", messages: []anthropic.MessageParam{assistant, toolResults}, wantLen: 2, wantBlocks: 2},
+		{name: "new user message after an assistant one", messages: []anthropic.MessageParam{toolResults, assistant}, wantLen: 3, wantBlocks: 1},
+		{name: "empty conversation", messages: nil, wantLen: 1, wantBlocks: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before, _ := json.Marshal(tt.messages)
+			got := withTrailingText(tt.messages, "STOP")
+			after, _ := json.Marshal(tt.messages)
+			if !bytes.Equal(before, after) {
+				t.Errorf("input messages were modified")
+			}
+			if len(got) != tt.wantLen {
+				t.Fatalf("got %d messages, want %d", len(got), tt.wantLen)
+			}
+			last := got[len(got)-1]
+			if last.Role != anthropic.MessageParamRoleUser || len(last.Content) != tt.wantBlocks {
+				t.Fatalf("got last message %s with %d blocks, want user with %d", last.Role, len(last.Content), tt.wantBlocks)
+			}
+			if b := last.Content[len(last.Content)-1]; b.OfText == nil || b.OfText.Text != "STOP" {
+				t.Errorf("want the text as the last block, got %+v", b)
+			}
+		})
 	}
 }

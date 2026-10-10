@@ -23,7 +23,7 @@ func (g neverCalledGenerator) Generate(context.Context, ai.ThemeContext, []ai.Tu
 	return nil, nil
 }
 
-func (g neverCalledGenerator) Summarize(context.Context, []ai.Turn) (string, error) { return "", nil }
+func (g neverCalledGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) { return "", nil }
 
 func (g neverCalledGenerator) SupportsVision() bool { return false }
 

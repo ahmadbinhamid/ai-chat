@@ -64,7 +64,7 @@ func (answeringGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn, 
 	return &ai.Result{Summary: "An answer.", AnsweredQuestion: true}, nil
 }
 func (answeringGenerator) SupportsVision() bool                                 { return false }
-func (answeringGenerator) Summarize(context.Context, []ai.Turn) (string, error) { return "", nil }
+func (answeringGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) { return "", nil }
 
 // newCountingStoreService is newQueueTestService with a FlowPOS fake that counts every request.
 func newCountingStoreService(t *testing.T) (*Service, *chat.Service, *atomic.Int64) {

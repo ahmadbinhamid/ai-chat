@@ -151,7 +151,7 @@ func TestSummarize_UsesTheSummaryModel(t *testing.T) {
 	defer ts.Close()
 	g := catalogueGenerator(t, client(ts.URL), nil)
 
-	if _, err := g.Summarize(context.Background(), []Turn{{Role: "user", Content: "hi"}}); err != nil {
+	if _, err := g.Summarize(context.Background(), "", []Turn{{Role: "user", Content: "hi"}}); err != nil {
 		t.Fatalf("Summarize: %v", err)
 	}
 	if body["model"] != "deepseek-v4-flash" {

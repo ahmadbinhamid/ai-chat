@@ -297,6 +297,17 @@ func (g *Generator) idleAfterContent(m aicatalog.Model) bool {
 	return p.IdleAfter == aicatalog.IdleAfterContent
 }
 
+// withTrailingText appends text to a copy of the last user message (after its tool results, which must come first);
+// messages itself is untouched, so the next round and a resumed conversation never carry it.
+func withTrailingText(messages []anthropic.MessageParam, text string) []anthropic.MessageParam {
+	out := slices.Clone(messages)
+	if n := len(out); n > 0 && out[n-1].Role == anthropic.MessageParamRoleUser {
+		out[n-1].Content = append(slices.Clone(out[n-1].Content), anthropic.NewTextBlock(text))
+		return out
+	}
+	return append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(text)))
+}
+
 // sessionOptions sends the turn's session ID in the header the model's provider names, if it names one.
 func (g *Generator) sessionOptions(m aicatalog.Model, sessionID string) []option.RequestOption {
 	p, _ := g.catalog.Provider(m.Provider)
@@ -896,9 +907,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			ToolChoice: toolChoice,
 		}
 		if forcingPropose {
-			params.System = append(append([]anthropic.TextBlockParam{}, system...), anthropic.TextBlockParam{
-				Text: forceProposeInstruction,
-			})
+			// Last in the messages, not the system prompt: a changed system prompt misses the whole cached prefix.
+			params.Messages = withTrailingText(messages, forceProposeInstruction)
 		}
 		// A model without thinking gets neither parameter.
 		switch {
@@ -1311,7 +1321,8 @@ func warnReadBeforeWriteViolations(files []GeneratedFile, knownPaths map[string]
 const summarizeMaxTokens = 1024
 
 // Summarize: concise prose summary of turns as prior context (plain completion, no tools/thinking/system prompt).
-func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error) {
+// sessionID is the chat's ID, sent like a turn's so the summary stays on the chat's host; "" sends none.
+func (g *Generator) Summarize(ctx context.Context, sessionID string, turns []Turn) (string, error) {
 	if g.fake {
 		return fmt.Sprintf("[fake mode summary of %d turns]", len(turns)), nil
 	}
@@ -1341,6 +1352,7 @@ func (g *Generator) Summarize(ctx context.Context, turns []Turn) (string, error)
 		// Explicit: DeepSeek thinks by default, which would eat the 1024-token budget.
 		Thinking: anthropic.ThinkingConfigParamUnion{OfDisabled: &anthropic.ThinkingConfigDisabledParam{}},
 	}
+	reqOpts = append(reqOpts, g.sessionOptions(entry, sessionID)...)
 	message, err := client.Messages.New(ctx, params, reqOpts...)
 	if err != nil {
 		alertProviderError(err, entry.Model)

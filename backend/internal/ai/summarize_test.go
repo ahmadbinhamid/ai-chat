@@ -40,7 +40,7 @@ func TestSummarize_SendsThinkingDisabled(t *testing.T) {
 	defer ts.Close()
 	g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key")))
 
-	if _, err := g.Summarize(context.Background(), []Turn{{Role: "user", Content: "hi"}}); err != nil {
+	if _, err := g.Summarize(context.Background(), "", []Turn{{Role: "user", Content: "hi"}}); err != nil {
 		t.Fatalf("Summarize: %v", err)
 	}
 
@@ -65,7 +65,7 @@ func TestSummarize_ReturnsOnlyTextBlocks(t *testing.T) {
 	defer ts.Close()
 	g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("test-key")))
 
-	got, err := g.Summarize(context.Background(), []Turn{{Role: "user", Content: "hi"}})
+	got, err := g.Summarize(context.Background(), "", []Turn{{Role: "user", Content: "hi"}})
 	if err != nil {
 		t.Fatalf("Summarize: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestSummarize_ReturnsOnlyTextBlocks(t *testing.T) {
 }
 
 func TestSummarize_FakeModeUnchanged(t *testing.T) {
-	got, err := NewFake(0).Summarize(context.Background(), make([]Turn, 7))
+	got, err := NewFake(0).Summarize(context.Background(), "", make([]Turn, 7))
 	if err != nil {
 		t.Fatalf("Summarize: %v", err)
 	}

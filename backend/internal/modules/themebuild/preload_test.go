@@ -219,7 +219,7 @@ func (g *promptRecorder) first() string {
 	return g.prompts[0]
 }
 
-func (*promptRecorder) Summarize(context.Context, []ai.Turn) (string, error) { return "", nil }
+func (*promptRecorder) Summarize(context.Context, string, []ai.Turn) (string, error) { return "", nil }
 
 func (*promptRecorder) SupportsVision() bool { return false }
 

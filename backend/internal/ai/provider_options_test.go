@@ -154,3 +154,67 @@ func TestGenerate_NoSessionHeaderWithoutOne(t *testing.T) {
 		t.Errorf("want no session header for a provider without session_header, got %q", v)
 	}
 }
+
+// summarizeHeaderServer answers one non-streaming Summarize call and records its request headers.
+func summarizeHeaderServer(t *testing.T, got *http.Header) *httptest.Server {
+	t.Helper()
+	var body map[string]any
+	inner := summarizeServer(t, []map[string]any{{"type": "text", "text": "summary"}}, &body)
+	t.Cleanup(inner.Close)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*got = r.Header.Clone()
+		inner.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// A history summary goes to the chat's host too, or OpenRouter can route it anywhere.
+func TestSummarize_SendsTheSessionHeader(t *testing.T) {
+	var got http.Header
+	ts := summarizeHeaderServer(t, &got)
+	g, _, _ := openRouterGenerator(t, func(raw map[string]any) {
+		for _, p := range raw["providers"].(map[string]any) {
+			p.(map[string]any)["base_url"] = ts.URL
+		}
+	})
+	if _, err := g.Summarize(context.Background(), "chat-123", []Turn{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Get("X-Session-Id"); v != "chat-123" {
+		t.Errorf("x-session-id = %q, want the chat ID", v)
+	}
+}
+
+func TestSummarize_NoSessionHeaderWithoutOne(t *testing.T) {
+	tests := []struct {
+		name      string
+		sessionID string
+		openR     bool
+	}{
+		{name: "provider names no header", sessionID: "chat-123"},
+		{name: "no chat ID", sessionID: "", openR: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got http.Header
+			ts := summarizeHeaderServer(t, &got)
+			var g *Generator
+			if tt.openR {
+				g, _, _ = openRouterGenerator(t, func(raw map[string]any) {
+					for _, p := range raw["providers"].(map[string]any) {
+						p.(map[string]any)["base_url"] = ts.URL
+					}
+				})
+			} else {
+				g = catalogueGenerator(t, client(ts.URL), nil)
+			}
+			if _, err := g.Summarize(context.Background(), tt.sessionID, []Turn{{Role: "user", Content: "hi"}}); err != nil {
+				t.Fatal(err)
+			}
+			if v, ok := got["X-Session-Id"]; ok {
+				t.Errorf("want no session header, got %q", v)
+			}
+		})
+	}
+}

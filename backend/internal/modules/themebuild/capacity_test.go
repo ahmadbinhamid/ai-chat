@@ -48,7 +48,7 @@ func (g *gatedGenerator) counts() (inFlight, peak int) {
 	return g.inFlight, g.peak
 }
 
-func (*gatedGenerator) Summarize(context.Context, []ai.Turn) (string, error) { return "", nil }
+func (*gatedGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) { return "", nil }
 
 func (*gatedGenerator) SupportsVision() bool { return false }
 

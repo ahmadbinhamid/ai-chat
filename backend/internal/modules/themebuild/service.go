@@ -106,7 +106,7 @@ func heartbeatTickerInterval() time.Duration { return time.Duration(heartbeatTic
 type generator interface {
 	Generate(ctx context.Context, tc ai.ThemeContext, history []ai.Turn, prompt string, images []ai.Image, progress ai.ToolProgress, toolExec ai.ToolExecutor, readFile ai.FileReader) (*ai.Result, error)
 	SupportsVision() bool
-	Summarize(ctx context.Context, turns []ai.Turn) (string, error)
+	Summarize(ctx context.Context, sessionID string, turns []ai.Turn) (string, error)
 }
 
 // Private interface: lets tests substitute fake without real network calls.
