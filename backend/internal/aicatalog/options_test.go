@@ -93,9 +93,10 @@ func TestParse_Options(t *testing.T) {
 	}
 }
 
-// No model sets a host order, which would switch off OpenRouter's sticky routing; every model may fall back, skips
-// the host that never cached, keeps OpenRouter's default data collection, and the provider sends a session header.
+// No host order (it disables sticky routing), fallbacks on, Cloudflare skipped, a session header. Only Gemini Flash
+// names a host: Vertex buffers tool calls and OpenRouter aborts a host silent for ~35s; AI Studio streams.
 func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
+	pinned := map[string]string{"gemini-flash": "[google-ai-studio]"}
 	data, err := os.ReadFile("../../config/ai-models.json")
 	if err != nil {
 		t.Fatal(err)
@@ -115,8 +116,8 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 		if _, sorted := p["sort"]; sorted {
 			t.Errorf("model %q: want no sort, got %v", m.ID, p["sort"])
 		}
-		if _, restricted := p["only"]; restricted {
-			t.Errorf("model %q: want no host list, got %v", m.ID, p["only"])
+		if only, restricted := p["only"]; restricted != (pinned[m.ID] != "") || (restricted && fmt.Sprint(only) != pinned[m.ID]) {
+			t.Errorf("model %q: want host list %q, got %v", m.ID, pinned[m.ID], only)
 		}
 		ignore, _ := p["ignore"].([]any)
 		if _, ordered := p["order"]; ordered || p["allow_fallbacks"] != true || p["data_collection"] != "allow" || len(ignore) == 0 {
@@ -126,7 +127,7 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 }
 
 // Measured through OpenRouter for each model: whether it takes thinking settings, sees images, and whether effort changes
-// how much it thinks (DeepSeek: no, so one effort; Kimi: yes). Grok reasons on its own and rejects thinking: disabled.
+// how much it thinks (DeepSeek: no, so one effort; Kimi: yes). Grok and Gemini Flash reason on their own and reject thinking: disabled.
 func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 	data, err := os.ReadFile("../../config/ai-models.json")
 	if err != nil {
@@ -146,7 +147,7 @@ func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 		"grok":                  {thinking: false, images: true, efforts: 0},
 		"kimi":                  {thinking: true, images: true, efforts: 3},
 		"gemini-pro":            {thinking: true, images: true, efforts: 1},
-		"gemini-flash":          {thinking: true, images: true, efforts: 1},
+		"gemini-flash":          {thinking: false, images: true, efforts: 0},
 	}
 	if len(c.Models) != len(want) {
 		t.Fatalf("want %d models, got %d", len(want), len(c.Models))
@@ -181,9 +182,9 @@ func TestParse_ToolChoice(t *testing.T) {
 	}
 }
 
-// Wafer cut two tool-loop calls off at 8,192 tokens mid-reasoning and was the slowest host measured, so the DeepSeek
-// models ignore it as well as Cloudflare; a model's ignore list replaces the provider's, so it must repeat Cloudflare.
-func TestOpenRouterCatalogue_DeepSeekIgnoresWafer(t *testing.T) {
+// Wafer cut DeepSeek's tool-loop calls off at 8,192 tokens and Kimi's at 2,048, and was the slowest host measured, so
+// those models ignore it as well as Cloudflare; a model's ignore list replaces the provider's, so it repeats Cloudflare.
+func TestOpenRouterCatalogue_DeepSeekAndKimiIgnoreWafer(t *testing.T) {
 	data, err := os.ReadFile("../../config/ai-models.json")
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +196,8 @@ func TestOpenRouterCatalogue_DeepSeekIgnoresWafer(t *testing.T) {
 	for _, m := range c.Models {
 		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
 		ignore := fmt.Sprint(p["ignore"])
-		if strings.HasPrefix(m.ID, "deepseek-") != strings.Contains(ignore, "wafer") || !strings.Contains(ignore, "cloudflare") {
+		wantWafer := strings.HasPrefix(m.ID, "deepseek-") || m.ID == "kimi"
+		if wantWafer != strings.Contains(ignore, "wafer") || !strings.Contains(ignore, "cloudflare") {
 			t.Errorf("model %q: ignore = %v", m.ID, p["ignore"])
 		}
 	}

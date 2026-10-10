@@ -61,6 +61,7 @@
       "label": "Kimi",
       "provider": "openrouter",
       "model": "moonshotai/kimi-k3",
+      "options": { "provider": { "ignore": ["cloudflare", "wafer"] } },
       "images": true,
       "thinking": true,
       "efforts": ["low", "medium", "high"],
@@ -82,11 +83,9 @@
       "label": "Gemini Flash",
       "provider": "openrouter",
       "model": "google/gemini-3.7-flash",
-      "options": { "provider": { "require_parameters": true } },
+      "options": { "provider": { "require_parameters": true, "only": ["google-ai-studio"] } },
       "images": true,
-      "thinking": true,
-      "efforts": ["low"],
-      "default_effort": "low"
+      "thinking": false
     },
     {
       "id": "deepseek-flash-vision",

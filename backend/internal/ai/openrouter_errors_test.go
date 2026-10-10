@@ -117,6 +117,11 @@ func TestOpenRouterErrors(t *testing.T) {
 			message: "temporarily unavailable", retryable: true,
 		},
 		{
+			// Seen on Gemini Flash: OpenRouter aborted the upstream call mid-turn.
+			name: "upstream timed out mid-stream", status: http.StatusOK, body: midStreamError("timeout_error", "The operation was aborted"),
+			message: "temporarily unavailable", retryable: true,
+		},
+		{
 			name: "unknown model", status: http.StatusBadRequest,
 			body:    `{"type":"error","error":{"type":"invalid_request_error","message":"deepseek/deepseek-v9 is not a valid model ID"}}`,
 			message: "the AI service is temporarily unavailable", alert: "doesn't know a catalogue model",

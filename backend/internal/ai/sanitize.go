@@ -94,7 +94,8 @@ func classifyProviderError(err error) providerErrorKind {
 		return providerErrRateLimited
 	case apiErr.StatusCode == http.StatusBadGateway || apiErr.StatusCode == http.StatusServiceUnavailable ||
 		apiErr.StatusCode == http.StatusGatewayTimeout || (apiErr.StatusCode >= 520 && apiErr.StatusCode <= 524) ||
-		apiErr.Type() == shared.ErrorTypeOverloadedError || apiErr.Type() == shared.ErrorTypeAPIError:
+		apiErr.Type() == shared.ErrorTypeOverloadedError || apiErr.Type() == shared.ErrorTypeAPIError ||
+		apiErr.Type() == shared.ErrorTypeTimeoutError:
 		return providerErrUpstream
 	}
 	return providerErrOther
