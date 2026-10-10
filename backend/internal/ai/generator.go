@@ -940,6 +940,9 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			if streamErr == nil {
 				err := stream.Err()
 				if err == nil {
+					if !callCostReported {
+						callCost, callCostReported = pricedCost(entry, message.Usage, time.Now())
+					}
 					cost.add(callCost, callCostReported)
 					break
 				}

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -293,4 +294,31 @@ func TestNew_ProductionRefusesInProcessLockWithoutOptIn(t *testing.T) {
 		t.Fatalf("New with AI_CHAT_SINGLE_REPLICA=true failed: %v", err)
 	}
 	srv.Close()
+}
+
+func TestLogCatalog_BYOKShowsTheDirectProviderNotItsKey(t *testing.T) {
+	const deepseekKey, openrouterKey = "sk-deepseek-secret", "sk-or-secret"
+	data, err := os.ReadFile("../../config/ai-models.byok.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[string]string{"DEEPSEEK_API_KEY": deepseekKey, "AI_API_KEY": openrouterKey}
+	catalog, err := aicatalog.Parse(data, func(name string) (string, bool) { v, ok := keys[name]; return v, ok })
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var logs bytes.Buffer
+	logCatalog(slog.New(slog.NewTextHandler(&logs, nil)), "config/ai-models.byok.json", catalog)
+
+	out := logs.String()
+	for _, want := range []string{"config/ai-models.byok.json", "deepseek-direct=https://api.deepseek.com/anthropic", "openrouter=https://openrouter.ai/api"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("catalogue log missing %q: %s", want, out)
+		}
+	}
+	for _, leak := range []string{deepseekKey, openrouterKey, "DEEPSEEK_API_KEY", "AI_API_KEY"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("catalogue log leaked %q: %s", leak, out)
+		}
+	}
 }

@@ -1,0 +1,112 @@
+{
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api",
+      "api_key_env": "AI_API_KEY",
+      "models_url": "https://openrouter.ai/api/v1/models",
+      "session_header": "x-session-id",
+      "tool_choice": "any",
+      "idle_after": "content",
+      "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare"], "data_collection": "allow" } }
+    },
+    "openrouter-deepseek": {
+      "base_url": "https://openrouter.ai/api",
+      "api_key_env": "AI_API_KEY",
+      "models_url": "https://openrouter.ai/api/v1/models",
+      "session_header": "x-session-id",
+      "tool_choice": "auto",
+      "idle_after": "content",
+      "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare"], "data_collection": "allow" } }
+    },
+    "deepseek-direct": {
+      "base_url": "https://api.deepseek.com/anthropic",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "tool_choice": "auto",
+      "idle_after": "content"
+    }
+  },
+  "models": [
+        {
+      "id": "deepseek-pro",
+      "label": "DeepSeek Pro",
+      "provider": "deepseek-direct",
+      "model": "deepseek-v4-pro",
+      "pricing": { "input": 0.66, "cache_hit_input": 0.022, "output": 1.98, "peak": { "input": 1.32, "cache_hit_input": 0.044, "output": 3.96, "hours_utc": ["01:00-04:00", "06:00-10:00"], "weekdays_only": true } },
+      "images": false,
+      "thinking": true,
+      "efforts": ["low"],
+      "default_effort": "low"
+    },
+    {
+      "id": "deepseek-flash",
+      "label": "DeepSeek Flash",
+      "provider": "deepseek-direct",
+      "model": "deepseek-flash",
+      "pricing": { "input": 0.15, "cache_hit_input": 0.003, "output": 0.6, "peak": { "input": 0.3, "cache_hit_input": 0.006, "output": 1.2, "hours_utc": ["01:00-04:00", "06:00-10:00"], "weekdays_only": true } },
+      "images": false,
+      "thinking": true,
+      "efforts": ["low"],
+      "default_effort": "low"
+    },
+    {
+      "id": "grok",
+      "label": "Grok",
+      "provider": "openrouter",
+      "model": "x-ai/grok-4.7",
+      "images": true,
+      "thinking": false
+    },
+    {
+      "id": "kimi",
+      "label": "Kimi",
+      "provider": "openrouter",
+      "model": "moonshotai/kimi-k3",
+      "images": true,
+      "thinking": true,
+      "efforts": ["low", "medium", "high"],
+      "default_effort": "low"
+    },
+    {
+      "id": "gemini-pro",
+      "label": "Gemini Pro",
+      "provider": "openrouter",
+      "model": "google/gemini-3.1-pro-preview",
+      "options": { "provider": { "require_parameters": true } },
+      "images": true,
+      "thinking": true,
+      "efforts": ["low"],
+      "default_effort": "low"
+    },
+    {
+      "id": "gemini-flash",
+      "label": "Gemini Flash",
+      "provider": "openrouter",
+      "model": "google/gemini-3.7-flash",
+      "options": { "provider": { "require_parameters": true } },
+      "images": true,
+      "thinking": true,
+      "efforts": ["low"],
+      "default_effort": "low"
+    },
+    {
+      "id": "deepseek-flash-vision",
+      "label": "DeepSeek Flash Vision",
+      "provider": "openrouter-deepseek",
+      "model": "deepseek/deepseek-v4-flash-vision-exp",
+      "options": { "provider": { "ignore": ["cloudflare", "wafer", "reka", "mancer", "azure"], "quantizations": ["fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"], "require_parameters": true } },
+      "images": true,
+      "thinking": true,
+      "efforts": ["low"],
+      "default_effort": "low",
+      "selectable": false
+    }
+  ],
+  "auto": {
+    "label": "Auto",
+    "design_model": "deepseek-flash", "design_effort": "low", "design_thinking": true,
+    "fix_model": "deepseek-pro", "fix_effort": "low"
+  },
+  "default_model": "auto",
+  "vision_model": "deepseek-flash-vision",
+  "summary_model": "deepseek-flash"
+}

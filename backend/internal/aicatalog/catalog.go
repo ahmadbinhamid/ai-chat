@@ -69,6 +69,8 @@ type Model struct {
 	Options json.RawMessage `json:"options,omitempty"`
 	// Preload defaults to true; false sends this model no preloaded theme files with its first prompt.
 	Preload *bool `json:"preload,omitempty"`
+	// Pricing prices a call whose provider doesn't report its cost; nil leaves such calls' cost unknown.
+	Pricing *Pricing `json:"pricing,omitempty"`
 }
 
 // PreloadEnabled reports whether turns on this model get likely-needed files with their first prompt.
@@ -237,6 +239,11 @@ func validateModel(m Model, providers map[string]Provider) error {
 	}
 	if _, ok := providers[m.Provider]; !ok {
 		return fmt.Errorf("model %q: unknown provider %q", m.ID, m.Provider)
+	}
+	if m.Pricing != nil {
+		if err := m.Pricing.validate(); err != nil {
+			return fmt.Errorf("model %q: pricing: %w", m.ID, err)
+		}
 	}
 	// Effort is a thinking control, so a model without thinking gets neither parameter.
 	if !m.Thinking {

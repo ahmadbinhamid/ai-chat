@@ -52,6 +52,21 @@ Leave `REDIS_URL` empty unless
 you're actually running Redis locally — it only backs cross-replica event
 delivery and isn't needed for a single instance.
 
+**Using our DeepSeek key directly**
+
+DeepSeek's own servers aren't an OpenRouter host for V4, so to use our DeepSeek
+balance for DeepSeek Pro and Flash, point the catalogue at the BYOK file:
+
+```env
+DEEPSEEK_API_KEY=sk-...
+AI_MODELS_CONFIG=config/ai-models.byok.json
+```
+
+Grok, Kimi, Gemini and DeepSeek Flash Vision stay on OpenRouter (`AI_API_KEY`).
+To go back, set `AI_MODELS_CONFIG=config/ai-models.json` and restart. While on
+the direct key there is **no failover to OpenRouter**: if DeepSeek's API is
+down or the balance runs out, DeepSeek turns fail until you switch back.
+
 **4. Install dependencies and migrate**
 
 ```bash

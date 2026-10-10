@@ -3,6 +3,9 @@ package ai
 import (
 	"encoding/json"
 	"strconv"
+	"time"
+
+	"ai-chat/internal/aicatalog"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -19,6 +22,15 @@ func deltaCost(d anthropic.MessageDeltaEvent) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// pricedCost prices a call from the catalogue when its provider reported no cost; false without prices. Anthropic usage
+// counts cache reads apart from input_tokens, and a cache write is billed like a miss.
+func pricedCost(m aicatalog.Model, u anthropic.Usage, at time.Time) (float64, bool) {
+	if m.Pricing == nil {
+		return 0, false
+	}
+	return m.Pricing.Cost(u.InputTokens+u.CacheCreationInputTokens, u.CacheReadInputTokens, u.OutputTokens, at), true
 }
 
 // costTotal sums the cost of a turn's calls, remembering whether any call reported one at all.
