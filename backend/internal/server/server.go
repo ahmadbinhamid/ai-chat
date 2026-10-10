@@ -63,6 +63,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 
 	streamTimeouts := ai.StreamTimeouts{
 		Idle:            cfg.StreamIdleTimeout,
+		Stall:           cfg.StreamStallTimeout,
 		FirstTokenEdit:  cfg.FirstTokenTimeoutEdit,
 		FirstTokenBrand: cfg.FirstTokenTimeoutBrand,
 		FirstTokenCopy:  cfg.FirstTokenTimeoutCopy,

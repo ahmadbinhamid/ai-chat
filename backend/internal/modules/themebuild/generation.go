@@ -34,6 +34,8 @@ type Generation struct {
 	Effort  string
 	// ThinkingOff: Auto's design route disabled thinking for this turn.
 	ThinkingOff bool
+	// AutoSelected: the merchant chose Auto (ModelID is what it resolved to), so a stuck turn may escalate.
+	AutoSelected bool
 	// PreviewRoute is the route shown in the merchant's preview at send time; nil when unknown, "" for home.
 	PreviewRoute *string
 	// FocusFile is the source file of the element the merchant last selected there; "" when none.
@@ -68,7 +70,7 @@ func scanGeneration(s rowScanner) (Generation, error) {
 	var queuedAt, startedAt, finishedAt, awaitingSince sql.NullTime
 
 	err := s.Scan(&g.ID, &g.ChatID, &g.TenantID, &g.Status, &errMsg, &g.Attempts,
-		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &g.ThinkingOff, &previewRoute, &focusFile, &g.ResumeCount, &awaitingSince, &queuedAt, &startedAt, &finishedAt)
+		&g.Prompt, &referenceURL, &userMessageID, &g.ThemeSlug, &g.Mode, &modelID, &effort, &g.ThinkingOff, &g.AutoSelected, &previewRoute, &focusFile, &g.ResumeCount, &awaitingSince, &queuedAt, &startedAt, &finishedAt)
 	if err != nil {
 		return Generation{}, err
 	}

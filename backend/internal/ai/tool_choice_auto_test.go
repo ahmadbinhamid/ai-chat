@@ -51,8 +51,10 @@ func TestGenerate_AutoToolChoiceOnNormalRoundsOnly(t *testing.T) {
 	}
 	var raw map[string]any
 	_ = json.Unmarshal(data, &raw)
-	raw["providers"].(map[string]any)["openrouter"].(map[string]any)["base_url"] = ts.URL
-	raw["providers"].(map[string]any)["openrouter"].(map[string]any)["tool_choice"] = "auto"
+	for _, p := range raw["providers"].(map[string]any) {
+		p.(map[string]any)["base_url"] = ts.URL
+		p.(map[string]any)["tool_choice"] = "auto"
+	}
 	data, _ = json.Marshal(raw)
 	lookup := func(string) (string, bool) { return "k", true }
 	cat, err := aicatalog.Parse(data, lookup)

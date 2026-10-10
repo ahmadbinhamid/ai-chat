@@ -104,8 +104,10 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p, _ := c.Provider("openrouter"); p.SessionHeader == "" {
-		t.Error("want a session header so each chat stays on one host")
+	for name, p := range c.Providers {
+		if p.SessionHeader == "" {
+			t.Errorf("provider %q: want a session header so each chat stays on one host", name)
+		}
 	}
 	// No model sets sort: like order, it ranks hosts afresh (on a rolling 5-minute window) and moved a chat mid-turn.
 	for _, m := range c.Models {
@@ -143,6 +145,8 @@ func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 		"deepseek-flash-vision": {thinking: true, images: true, efforts: 1},
 		"grok":                  {thinking: false, images: true, efforts: 0},
 		"kimi":                  {thinking: true, images: true, efforts: 3},
+		"gemini-pro":            {thinking: true, images: true, efforts: 1},
+		"gemini-flash":          {thinking: true, images: true, efforts: 1},
 	}
 	if len(c.Models) != len(want) {
 		t.Fatalf("want %d models, got %d", len(want), len(c.Models))
@@ -225,7 +229,8 @@ func TestCatalogues_IdleAfter(t *testing.T) {
 	}
 }
 
-// Thinking is off only on Auto's design route (Flash): a fix turn, or a model the merchant picked, keeps it on.
+// The committed catalogue sets auto.design_thinking true, so no route turns thinking off; the switch itself is covered
+// by TestDesignThinkingOff_OnlyAutosDesignRoute.
 func TestOpenRouterCatalogue_DesignThinkingOff(t *testing.T) {
 	data, err := os.ReadFile("../../config/ai-models.json")
 	if err != nil {
@@ -241,7 +246,7 @@ func TestOpenRouterCatalogue_DesignThinkingOff(t *testing.T) {
 		fixTurn bool
 		want    bool
 	}{
-		{"auto design turn", Selection{ModelID: AutoID}, false, true},
+		{"auto design turn", Selection{ModelID: AutoID}, false, false},
 		{"auto fix turn", Selection{ModelID: AutoID}, true, false},
 		{"flash picked by the merchant", Selection{ModelID: "deepseek-flash", Effort: "low"}, false, false},
 		{"kimi picked by the merchant", Selection{ModelID: "kimi", Effort: "low"}, false, false},
@@ -309,5 +314,74 @@ func TestOpenRouterCatalogue_DeepSeekFullPrecisionHosts(t *testing.T) {
 		if p["allow_fallbacks"] != true {
 			t.Errorf("model %q: want fallbacks allowed, got %v", m.ID, p)
 		}
+	}
+}
+
+// With design_thinking false, only Auto's design route runs without thinking; its fix route and explicit picks keep it.
+func TestDesignThinkingOff_OnlyAutosDesignRoute(t *testing.T) {
+	data, err := os.ReadFile("../../config/ai-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["auto"].(map[string]any)["design_thinking"] = false
+	c, err := Parse(encode(t, raw), withKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	design := raw["auto"].(map[string]any)["design_model"].(string)
+	tests := []struct {
+		name    string
+		sel     Selection
+		fixTurn bool
+		want    bool
+	}{
+		{"auto design turn", Selection{ModelID: AutoID}, false, true},
+		{"auto fix turn", Selection{ModelID: AutoID}, true, false},
+		{"the design model picked by the merchant", Selection{ModelID: design, Effort: "low"}, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := c.DesignThinkingOff(tt.sel, tt.fixTurn); got != tt.want {
+				t.Errorf("DesignThinkingOff = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// OpenRouter's Azure host returns DeepSeek's native tool calls as raw text inside the reasoning, so a DeepSeek turn
+// served there never calls a tool and fails as "stuck replying in text". Every DeepSeek model must keep it excluded.
+func TestOpenRouterCatalogue_DeepSeekExcludesAzure(t *testing.T) {
+	data, err := os.ReadFile("../../config/ai-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data, withKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, m := range c.Models {
+		if !strings.HasPrefix(m.Model, "deepseek/") {
+			continue
+		}
+		checked++
+		p, _ := c.RequestFields(m.ID)["provider"].(map[string]any)
+		ignore, _ := p["ignore"].([]any)
+		found := false
+		for _, host := range ignore {
+			if host == "azure" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("model %q: provider.ignore %v must include \"azure\"", m.ID, ignore)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no DeepSeek models in the catalogue; this guard checked nothing")
 	}
 }

@@ -65,7 +65,7 @@ func modelListServer(t *testing.T, status int, ids ...string) (*httptest.Server,
 }
 
 var openRouterModels = []string{"deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-flash-vision-exp",
-	"x-ai/grok-4.7", "moonshotai/kimi-k3", "other/model"}
+	"x-ai/grok-4.7", "moonshotai/kimi-k3", "google/gemini-3.1-pro-preview", "google/gemini-3.7-flash", "other/model"}
 
 func TestVerifyModels(t *testing.T) {
 	tests := []struct {

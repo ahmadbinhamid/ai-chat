@@ -96,7 +96,7 @@ func TestGenerateValidProposal_RetryDoesNotRepeatPreviewErrors(t *testing.T) {
 	svc := &Service{gen: realGenerator(t, ts.URL)}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo", PreviewErrors: samplePreviewErrors}
 
-	if _, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{ThemeSlug: "demo"}, nil, "fix the cart", readOutputExec, nil, nil, in); err != nil {
+	if _, _, err := svc.generateValidProposal(context.Background(), &ai.ThemeContext{ThemeSlug: "demo"}, nil, "fix the cart", readOutputExec, nil, nil, in); err != nil {
 		t.Fatalf("generateValidProposal: %v", err)
 	}
 	if n := strings.Count((*bodies)[2], previewErrorMarker); n != 1 {

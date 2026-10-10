@@ -19,6 +19,8 @@ type GenerationMetrics struct {
 	ModelID      string
 	Effort       string
 	Outcome      string
+	// Escalated: Auto retried the turn on its fix model; ModelID is then the fix model.
+	Escalated bool
 
 	QueueWait    time.Duration
 	ContextBuild time.Duration
@@ -68,6 +70,7 @@ type turnMetrics struct {
 	repairAttempts          int
 	preloadedFiles          int
 	preloadedBytes          int
+	escalated               bool
 
 	inputTokens, outputTokens, cacheReadTokens int64
 	cost                                       *float64
@@ -112,6 +115,12 @@ func (m *turnMetrics) addGenerate(r *ai.Result) {
 	}
 }
 
+func (m *turnMetrics) setEscalated() {
+	if m != nil {
+		m.escalated = true
+	}
+}
+
 func (m *turnMetrics) setPreload(files, bytes int) {
 	if m != nil {
 		m.preloadedFiles, m.preloadedBytes = files, bytes
@@ -150,6 +159,7 @@ func metricsRow(m *turnMetrics, c chat.Chat, g Generation, outcome string, total
 	row.Validation, row.Repair, row.RepairAttempts = m.validation, m.repair, m.repairAttempts
 	row.ToolCalls, row.Iterations = m.toolCalls, m.iterations
 	row.PreloadedFiles, row.PreloadedBytes = m.preloadedFiles, m.preloadedBytes
+	row.Escalated = m.escalated
 	row.InputTokens, row.OutputTokens, row.CacheReadTokens, row.CostUSD = m.inputTokens, m.outputTokens, m.cacheReadTokens, m.cost
 	return row
 }

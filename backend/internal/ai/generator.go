@@ -2,6 +2,7 @@
 package ai
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -153,7 +154,9 @@ type Generator struct {
 
 // StreamTimeouts configures idle and first-token budgets for consumeStream.
 type StreamTimeouts struct {
-	Idle            time.Duration
+	Idle time.Duration
+	// Stall bounds how long a reply that has started can go without new content; keep-alive pings don't count.
+	Stall           time.Duration
 	FirstTokenEdit  time.Duration
 	FirstTokenBrand time.Duration
 	FirstTokenCopy  time.Duration
@@ -162,7 +165,9 @@ type StreamTimeouts struct {
 
 // Default stream timeouts, used when StreamTimeouts fields are zero.
 const (
-	defaultStreamIdleTimeout       = 12 * time.Second
+	defaultStreamIdleTimeout = 12 * time.Second
+	// Generous: some hosts compose a whole tool call before sending it, pinging meanwhile, so a big proposal is quiet.
+	defaultStreamStallTimeout      = 120 * time.Second
 	defaultFirstTokenTimeoutEdit   = 120 * time.Second
 	defaultFirstTokenTimeoutNarrow = 45 * time.Second
 	defaultFirstTokenTimeoutPages  = 150 * time.Second
@@ -173,6 +178,13 @@ func (g *Generator) idleTimeout() time.Duration {
 		return g.streamTimeouts.Idle
 	}
 	return defaultStreamIdleTimeout
+}
+
+func (g *Generator) stallTimeout() time.Duration {
+	if g.streamTimeouts.Stall > 0 {
+		return g.streamTimeouts.Stall
+	}
+	return defaultStreamStallTimeout
 }
 
 // firstTokenTimeoutFor picks the first-token budget for mode (ai.GenerationMode value).
@@ -544,12 +556,14 @@ var errStreamReaderPanicked = errors.New("provider stream reader panicked")
 var (
 	errStreamIdle       = errors.New("provider stream idle timeout")
 	errStreamFirstToken = errors.New("provider stream first-token timeout")
+	// errStreamStalled: output started, then no new content for the stall window while the host kept the stream open.
+	errStreamStalled = errors.New("provider stream stalled: no new output")
 )
 
 // isRetryableStreamErr reports if err is a provider hiccup (timeout or garbled), not a deadline/cancel.
 func isRetryableStreamErr(err error) bool {
 	return isRetryableAccumulateErr(err) || errors.Is(err, errStreamIdle) || errors.Is(err, errStreamFirstToken) ||
-		isRetryableProviderErr(err)
+		errors.Is(err, errStreamStalled) || isRetryableProviderErr(err)
 }
 
 // streamRetryReason labels err for retry warning log (diagnostic only).
@@ -559,6 +573,8 @@ func streamRetryReason(err error) string {
 		return "idle_timeout"
 	case errors.Is(err, errStreamFirstToken):
 		return "first_token_timeout"
+	case errors.Is(err, errStreamStalled):
+		return "stalled"
 	case isRetryableAccumulateErr(err):
 		return "truncated_stream"
 	case classifyProviderError(err) == providerErrRateLimited:
@@ -594,7 +610,7 @@ func consumeStream(
 	message *anthropic.Message,
 	idleTimeout, firstTokenTimeout time.Duration,
 ) error {
-	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, false, nil, nil, nil)
+	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, 0, false, nil, nil, nil)
 }
 
 // consumeStreamDeltas is consumeStream that also hands each message_delta to onDelta: the accumulated message keeps
@@ -604,6 +620,8 @@ func consumeStreamDeltas(
 	stream *ssestream.Stream[anthropic.MessageStreamEventUnion],
 	message *anthropic.Message,
 	idleTimeout, firstTokenTimeout time.Duration,
+	// stallTimeout, when > 0, fails a reply whose content stops growing for that long, however many pings keep arriving.
+	stallTimeout time.Duration,
 	// idleAfterContent waits for real output, not just an event, before the idle rule applies: a router can send
 	// message_start before its upstream host has read the prompt, so the prefill silence that follows isn't a stall.
 	idleAfterContent bool,
@@ -624,6 +642,16 @@ func consumeStreamDeltas(
 	defer idleTimer.Stop()
 	firstTokenTimer := time.NewTimer(firstTokenTimeout)
 	defer firstTokenTimer.Stop()
+
+	// Armed by the first real output and pushed back only by more of it; nil channel until then never fires.
+	var stallTimer *time.Timer
+	var stallC <-chan time.Time
+	progressBytes := 0
+	defer func() {
+		if stallTimer != nil {
+			stallTimer.Stop()
+		}
+	}()
 
 	// Run stream.Next() in goroutine; select on: read completion, ctx deadline, idle/first-token timers.
 	type nextResult struct {
@@ -672,6 +700,8 @@ func consumeStreamDeltas(
 				return errStreamFirstToken
 			}
 			return errStreamIdle
+		case <-stallC:
+			return errStreamStalled
 		case <-firstTokenTimer.C:
 			if !sawProgress {
 				return errStreamFirstToken
@@ -691,6 +721,21 @@ func consumeStreamDeltas(
 			}
 			if onDelta != nil && event.Type == "message_delta" {
 				onDelta(event.AsMessageDelta())
+			}
+			if p := streamProgressBytes(*message); p > progressBytes && stallTimeout > 0 {
+				progressBytes = p
+				if stallTimer == nil {
+					stallTimer = time.NewTimer(stallTimeout)
+					stallC = stallTimer.C
+				} else {
+					if !stallTimer.Stop() {
+						select {
+						case <-stallTimer.C:
+						default:
+						}
+					}
+					stallTimer.Reset(stallTimeout)
+				}
 			}
 			if !sawProgress && streamProgressBytes(*message) > 0 {
 				sawProgress = true
@@ -712,8 +757,28 @@ const defaultMaxTokens = 64000
 // and nudging on to maxToolIterations only burns minutes before failing anyway.
 const maxConsecutiveTextOnlyRounds = 3
 
-// errStuckInTextReplies is deliberately not a "too complex" failure: it fires on two-word messages too.
-var errStuckInTextReplies = errors.New("model kept replying in plain text without calling a tool")
+// ErrStuckInTextReplies is deliberately not a "too complex" failure: it fires on two-word messages too.
+var ErrStuckInTextReplies = errors.New("model kept replying in plain text without calling a tool")
+
+// stuckInTextError is ErrStuckInTextReplies carrying how many rounds the call used before giving up.
+type stuckInTextError struct{ rounds int }
+
+func (e *stuckInTextError) Error() string        { return ErrStuckInTextReplies.Error() }
+func (e *stuckInTextError) Is(target error) bool { return target == ErrStuckInTextReplies }
+
+// RoundsUsed reports how many tool-loop rounds a stuck-in-text failure used; ok is false for any other error.
+func RoundsUsed(err error) (rounds int, ok bool) {
+	var stuck *stuckInTextError
+	if errors.As(err, &stuck) {
+		return stuck.rounds, true
+	}
+	return 0, false
+}
+
+// ExhaustedSearch reports a result that ran out of tool-loop rounds without a proposal and fell back to asking.
+func (r *Result) ExhaustedSearch() bool {
+	return r != nil && r.NeedsClarification && r.Summary == ExhaustedSearchReply
+}
 
 // errMaxTokensTruncated: returned when StopReason==max_tokens to prevent parsing partial JSON.
 var errMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
@@ -803,6 +868,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}()
 	// Counts consecutive rounds with no tool call that text recovery also couldn't rescue; any real call resets it.
 	consecutiveTextOnly := 0
+	// The last propose_changes input that failed to decode; the same one sent again means handing it back isn't working.
+	var lastUndecodable json.RawMessage
 	explorationRounds := 0
 	normalToolChoice := g.normalToolChoice(entry)
 	idleAfterContent := g.idleAfterContent(entry)
@@ -865,7 +932,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			stream := client.Messages.NewStreaming(ctx, params, attemptOpts...)
 			message = anthropic.Message{}
 			callCost, callCostReported := 0.0, false
-			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, idleAfterContent, activity, func(d anthropic.MessageDeltaEvent) {
+			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, g.stallTimeout(), idleAfterContent, activity, func(d anthropic.MessageDeltaEvent) {
 				callCost, callCostReported = deltaCost(d)
 			}, onFirstProgress)
 			// Close immediately (timeouts may abandon mid-read).
@@ -995,11 +1062,26 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		// materializeFailureMsg: fed back as tool_result (isError: true) on failure; loop continues for correction.
 		var materializeFailureMsg string
+		var result Result
+		decoded := false
 		if proposeInput != nil {
-			result, err := decodeProposeInput(proposeInput)
-			if err != nil {
-				return nil, fmt.Errorf("could not parse propose_changes input: %w", err)
+			var decodeErr error
+			if result, decodeErr = decodeProposeInput(proposeInput); decodeErr != nil {
+				if bytes.Equal(proposeInput, lastUndecodable) {
+					slog.Warn("ai: model resent the same undecodable propose_changes input; stopping",
+						"iteration", iteration, "error", decodeErr.Error())
+					return nil, fmt.Errorf("model resent the same undecodable propose_changes input: %w", decodeErr)
+				}
+				lastUndecodable = proposeInput
+				// Handed back like a failed edit: one mistyped field shouldn't end a turn the model can fix itself.
+				slog.Warn("ai: propose_changes input didn't decode; asking the model to resend it",
+					"iteration", iteration, "recovered_from_text", recovered, "error", decodeErr.Error())
+				materializeFailureMsg = malformedProposeMessage(decodeErr)
+			} else {
+				decoded = true
 			}
+		}
+		if decoded {
 			// Register creates even if materialization fails (grounding for later edits).
 			for _, f := range result.Files {
 				if f.Action == "create" {
@@ -1043,7 +1125,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				"thinking_head", headRunes(blockText(message, true), 300))
 			if consecutiveTextOnly >= maxConsecutiveTextOnlyRounds {
 				slog.Warn("ai: model stuck replying in text, stopping", "iteration", iteration, "consecutive_text_rounds", consecutiveTextOnly)
-				return nil, errStuckInTextReplies
+				return nil, &stuckInTextError{rounds: iteration + 1}
 			}
 			nudge := textOnlyNudge(blockText(message, false))
 			slog.Warn("ai: tool-loop nudge fired (no tool call this round)", "iteration", iteration, "wrote_edit_as_text", nudge == textEditNudge)

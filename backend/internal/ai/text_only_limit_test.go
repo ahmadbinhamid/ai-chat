@@ -48,8 +48,8 @@ func TestGenerate_StopsAfterThreeConsecutiveTextRounds(t *testing.T) {
 	g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
 
 	result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "redesign home", nil, nil, nil, nil)
-	if !errors.Is(err, errStuckInTextReplies) {
-		t.Fatalf("expected errStuckInTextReplies, got %v", err)
+	if !errors.Is(err, ErrStuckInTextReplies) {
+		t.Fatalf("expected ErrStuckInTextReplies, got %v", err)
 	}
 	if *calls != maxConsecutiveTextOnlyRounds {
 		t.Errorf("expected exactly %d model calls, got %d", maxConsecutiveTextOnlyRounds, *calls)
@@ -82,7 +82,7 @@ func TestGenerate_RealToolCallResetsTextCount(t *testing.T) {
 }
 
 func TestSanitizeError_StuckInTextIsHonest(t *testing.T) {
-	msg := SanitizeError(fmt.Errorf("retry generation: %w", errStuckInTextReplies))
+	msg := SanitizeError(fmt.Errorf("retry generation: %w", ErrStuckInTextReplies))
 	if strings.Contains(msg, "too complex") || !strings.Contains(msg, "rephrase") {
 		t.Errorf("expected the honest rephrase message, got %q", msg)
 	}

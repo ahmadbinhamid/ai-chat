@@ -43,6 +43,8 @@ type Config struct {
 
 	// StreamIdleTimeout bounds how long a streaming attempt can go with no new event before retry.
 	StreamIdleTimeout time.Duration
+	// StreamStallTimeout bounds how long a started reply can go without new content, pings or not, before retry.
+	StreamStallTimeout time.Duration
 	// FirstTokenTimeout* bound time-to-first-byte per ai.GenerationMode.
 	FirstTokenTimeoutEdit  time.Duration
 	FirstTokenTimeoutBrand time.Duration
@@ -125,6 +127,7 @@ func Load() Config {
 		FakeAIDelay: time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
 		StreamIdleTimeout:      time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_SECONDS", 12)) * time.Second,
+		StreamStallTimeout:     time.Duration(getenvInt("AI_STREAM_STALL_TIMEOUT_SECONDS", 120)) * time.Second,
 		FirstTokenTimeoutEdit:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_SECONDS", 120)) * time.Second,
 		FirstTokenTimeoutBrand: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
 		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,

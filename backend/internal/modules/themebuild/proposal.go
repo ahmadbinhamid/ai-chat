@@ -2,12 +2,14 @@ package themebuild
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"ai-chat/internal/ai"
+	"ai-chat/internal/aicatalog"
 	"ai-chat/internal/pageintent"
 	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/themecheck"
@@ -154,7 +156,7 @@ func isUnexploredEmptyProposal(result *ai.Result) bool {
 // Retries up to maxThemeCheckRetries times on invalid reply; returns extended turns history.
 func (s *Service) generateValidProposal(
 	ctx context.Context,
-	tc ai.ThemeContext,
+	tc *ai.ThemeContext,
 	turns []ai.Turn,
 	prompt string,
 	toolExec ai.ToolExecutor,
@@ -172,9 +174,10 @@ func (s *Service) generateValidProposal(
 		chatID = emitter.chatID
 	}
 
+	escalated := false
 	// Counts total calls (maxThemeCheckRetries+1); shared budget for both invalid and empty retries.
 	for attempt := 1; ; attempt++ {
-		genTC, genPrompt := tc, promptWithAttachments(nextPrompt, in)
+		genTC, genPrompt := *tc, promptWithAttachments(nextPrompt, in)
 		if conversation != nil {
 			// The correction is the resumed turn's prompt; the attachment is already in the conversation.
 			genTC.Continue, genPrompt = conversation, continuePrompt
@@ -182,6 +185,21 @@ func (s *Service) generateValidProposal(
 		in.metrics.contextBuilt()
 		result, genErr := s.gen.Generate(ctx, genTC, turns, genPrompt, imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, readFile)
 		in.metrics.addGenerate(result)
+		if fix, reason, ok := s.autoEscalation(in, tc.Model, result, genErr); ok && !escalated {
+			escalated = true
+			slog.Warn("auto: design model got stuck; retrying the turn once on Auto's fix model",
+				"chat_id", chatID, "from_model", tc.Model.ModelID, "to_model", fix.ModelID,
+				"rounds_used", roundsUsed(result, genErr), "reason", reason)
+			emitter.emit(ctx, EventTypeEscalating, struct{}{})
+			in.metrics.setEscalated()
+			// tc too, so repairs after this stay on the fix model instead of going back to the one that got stuck.
+			tc.Model, tc.ThinkingOff = fix, false
+			// Flat path, not a resume: a resumed conversation keeps the model it started on.
+			genTC.Model, genTC.ThinkingOff, genTC.Continue = fix, false, nil
+			genPrompt = promptWithAttachments(nextPrompt, in)
+			result, genErr = s.gen.Generate(ctx, genTC, turns, genPrompt, imagesFromInput(in), toolProgressFor(ctx, emitter), toolExec, readFile)
+			in.metrics.addGenerate(result)
+		}
 		if genErr != nil {
 			// Hard API/transport error; handled by caller/reaper, not retried here.
 			return nil, turns, genErr
@@ -659,4 +677,36 @@ func addCost(a, b *float64) *float64 {
 	}
 	sum := *a + *b
 	return &sum
+}
+
+// autoEscalation reports whether this call's failure should be retried on Auto's fix model: only when the merchant
+// chose Auto, the call got stuck or ran out of rounds, and it wasn't already on the fix model.
+func (s *Service) autoEscalation(in GenerateInput, current aicatalog.Choice, result *ai.Result, err error) (aicatalog.Choice, string, bool) {
+	if !in.autoSelected || s.models == nil || s.models.Auto == nil {
+		return aicatalog.Choice{}, "", false
+	}
+	var reason string
+	switch {
+	case errors.Is(err, ai.ErrStuckInTextReplies):
+		reason = "stuck_in_text"
+	case err == nil && result.ExhaustedSearch():
+		reason = "exhausted_rounds"
+	default:
+		return aicatalog.Choice{}, "", false
+	}
+	fix := s.models.Resolve(aicatalog.Selection{ModelID: aicatalog.AutoID}, true)
+	if fix.ModelID == "" || fix.ModelID == current.ModelID {
+		return aicatalog.Choice{}, "", false
+	}
+	return fix, reason, true
+}
+
+func roundsUsed(result *ai.Result, err error) int {
+	if rounds, ok := ai.RoundsUsed(err); ok {
+		return rounds
+	}
+	if result != nil {
+		return result.Timings.Iterations
+	}
+	return 0
 }

@@ -220,9 +220,19 @@ func TestParse_OpenRouterCatalogue(t *testing.T) {
 	if !ok || p.APIKeyEnv != "AI_API_KEY" || p.BaseURL != "https://openrouter.ai/api" {
 		t.Fatalf("want the openrouter provider on AI_API_KEY, got %+v", c.Providers)
 	}
-	for _, id := range []string{"deepseek-pro", "deepseek-flash", "deepseek-flash-vision"} {
-		if m, ok := c.Model(id); !ok || m.Provider != "openrouter" {
-			t.Errorf("model %q should be served by openrouter, got %+v", id, m)
+	// DeepSeek gets its own OpenRouter entry on tool_choice auto: only DeepInfra and Azure (whose tool calls break)
+	// accept "any" for DeepSeek V4, so "any" left each model on a single host. Every other model keeps "any".
+	ds, ok := c.Provider("openrouter-deepseek")
+	if !ok || ds.APIKeyEnv != p.APIKeyEnv || ds.BaseURL != p.BaseURL || ds.ToolChoice != "auto" || p.ToolChoice != "any" {
+		t.Fatalf("want openrouter-deepseek on the same key and URL with tool_choice auto, and openrouter on any; got %+v", c.Providers)
+	}
+	for _, m := range c.Models {
+		want := "openrouter"
+		if strings.HasPrefix(m.Model, "deepseek/") {
+			want = "openrouter-deepseek"
+		}
+		if m.Provider != want {
+			t.Errorf("model %q is served by %q, want %q", m.ID, m.Provider, want)
 		}
 	}
 	if _, err := Parse(data, envWith(map[string]string{"OPENROUTER_API_KEY": "k"})); err == nil {

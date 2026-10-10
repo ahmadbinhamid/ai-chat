@@ -299,6 +299,8 @@ type GenerateInput struct {
 	model aicatalog.Choice
 	// thinkingOff: Auto's design route switched thinking off for this turn; stored with the generation like model.
 	thinkingOff bool
+	// autoSelected: the merchant chose Auto, the only case where a stuck turn may move to another model.
+	autoSelected bool
 	// Set by doGenerate; nil in tests that call generation helpers directly, which then place no images.
 	imageCatalog *imageCatalog
 	// Earlier pending turns' files, set by doGenerate; nil skips the draft-reversion check in checkAndRepair.
@@ -390,6 +392,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if in.model, in.thinkingOff, err = s.resolveModel(ctx, in, c, selection, len(previewErrorsJSON) > 0); err != nil {
 		return GenerateOutcome{}, err
 	}
+	in.autoSelected = selection.ModelID == aicatalog.AutoID
 
 	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt, in.Images, in.HTMLAttachmentFilename, in.HTMLAttachmentContent, previewErrorsJSON)
 	if err != nil {
@@ -410,6 +413,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		ModelID:       in.model.ModelID,
 		Effort:        in.model.Effort,
 		ThinkingOff:   in.thinkingOff,
+		AutoSelected:  in.autoSelected,
 		PreviewRoute:  in.PreviewRoute,
 		FocusFile:     in.FocusFile,
 	})
@@ -523,6 +527,7 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		UserMessageID: g.UserMessageID,
 		model:         aicatalog.Choice{ModelID: g.ModelID, Effort: g.Effort},
 		thinkingOff:   g.ThinkingOff,
+		autoSelected:  g.AutoSelected,
 		PreviewRoute:  g.PreviewRoute,
 		FocusFile:     g.FocusFile,
 		// Held by a restart, either queued or cut off mid-run and re-queued by the drain.
@@ -984,7 +989,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	if !deterministic {
 		var err error
-		result, turns, err = s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
+		result, turns, err = s.generateValidProposal(ctx, &tc, turns, in.Prompt, toolExec, readFile, emitter, in)
 		if err != nil {
 			return err
 		}

@@ -83,6 +83,7 @@ func main() {
 
 	streamTimeouts := ai.StreamTimeouts{
 		Idle:            cfg.StreamIdleTimeout,
+		Stall:           cfg.StreamStallTimeout,
 		FirstTokenEdit:  cfg.FirstTokenTimeoutEdit,
 		FirstTokenBrand: cfg.FirstTokenTimeoutBrand,
 		FirstTokenCopy:  cfg.FirstTokenTimeoutCopy,
