@@ -1,4 +1,5 @@
-// Package stockimages searches Pexels for licensed stock photos a design can hotlink, with the credit Pexels asks for.
+// Package stockimages searches Pixabay for licensed stock photos and downloads the ones a design uses. Pixabay forbids
+// permanent hotlinking, so a page only ever references the downloaded copy saved in the theme.
 package stockimages
 
 import (
@@ -16,25 +17,34 @@ import (
 	"unicode/utf8"
 )
 
-// Host is where every returned image lives; a page may hotlink it, so theme validation allows it.
-const Host = "images.pexels.com"
-
 const (
-	defaultBaseURL = "https://api.pexels.com"
+	defaultBaseURL = "https://pixabay.com"
 	MaxCount       = 6
 	defaultCount   = 4
-	minQueryLen    = 2
-	maxQueryLen    = 100
-	searchTimeout  = 8 * time.Second
-	maxBodyBytes   = 1 << 20
-	cacheMaxSize   = 512
-	cacheTTL       = 24 * time.Hour
+	// minPerPage is Pixabay's smallest per_page; a smaller count is trimmed after the call.
+	minPerPage    = 3
+	minQueryLen   = 2
+	maxQueryLen   = 100
+	searchTimeout = 8 * time.Second
+	// downloadTimeout bounds one photo's download; largeImageURL is at most 1280px, so a few hundred KB.
+	downloadTimeout = 15 * time.Second
+	maxBodyBytes    = 1 << 20
+	maxRedirects    = 3
+	// largeEdge is largeImageURL's longest side, which Width/Height are scaled to.
+	largeEdge = 1280
+	// cacheTTL is Pixabay's required 24-hour caching of search responses.
+	cacheMaxSize = 512
+	cacheTTL     = 24 * time.Hour
 )
+
+// downloadHosts are the only hosts a photo is downloaded from, redirects included.
+var downloadHosts = map[string]bool{"pixabay.com": true, "cdn.pixabay.com": true}
 
 var (
 	ErrInvalidInput = errors.New("invalid search_stock_images input")
 	ErrRateLimited  = errors.New("stock image search is rate limited right now")
 	ErrUnavailable  = errors.New("stock image search is unavailable right now")
+	ErrTooLarge     = errors.New("stock photo is over the size limit")
 )
 
 // Input is one search_stock_images call.
@@ -65,48 +75,50 @@ func ParseInput(raw json.RawMessage) (Input, error) {
 	return in, nil
 }
 
-// Image is one search result, ready to hotlink and credit.
-type Image struct {
-	URL             string `json:"url"`
-	URLSmall        string `json:"url_small"`
-	Alt             string `json:"alt"`
-	Width           int    `json:"width"`
-	Height          int    `json:"height"`
-	Photographer    string `json:"photographer"`
-	PhotographerURL string `json:"photographer_url"`
-	PageURL         string `json:"page_url"`
+// Photo is one search result. Its download URL is unexported, so marshalling a Photo for the model never reveals it.
+type Photo struct {
+	ID           int    `json:"id"`
+	Description  string `json:"description"`
+	Width        int    `json:"width"`
+	Height       int    `json:"height"`
+	Photographer string `json:"photographer"`
+	url          string
 }
 
-// Client searches Pexels. Safe for concurrent use.
+// Client searches and downloads from Pixabay. Safe for concurrent use.
 type Client struct {
 	apiKey  string
 	baseURL string
 	http    *http.Client
 	cache   *cache
+	// allowed reports whether a download may be fetched from a URL; tests point it at a fake server.
+	allowed func(raw string) bool
 }
 
-// New builds a Client; httpClient should be SSRF-guarded (urlfetch.NewGuardedClient).
+// New builds a Client; httpClient must be SSRF-guarded and must not follow redirects (urlfetch.NewGuardedClient).
 func New(apiKey string, httpClient *http.Client) *Client {
-	return &Client{apiKey: apiKey, baseURL: defaultBaseURL, http: httpClient, cache: newCache(cacheMaxSize, cacheTTL)}
+	return &Client{apiKey: apiKey, baseURL: defaultBaseURL, http: httpClient, cache: newCache(cacheMaxSize, cacheTTL), allowed: onDownloadHost}
 }
 
-// Search returns up to in.Count images for in.Query; results are cached per tenant and query.
-func (c *Client) Search(ctx context.Context, tenantID uint64, in Input) ([]Image, error) {
+// Search returns up to in.Count photos for in.Query; results are cached per tenant and query.
+func (c *Client) Search(ctx context.Context, tenantID uint64, in Input) ([]Photo, error) {
 	key := strconv.FormatUint(tenantID, 10) + "|" + strings.ToLower(in.Query) + "|" + strconv.Itoa(in.Count)
-	if imgs, ok := c.cache.get(key); ok {
-		return imgs, nil
+	if photos, ok := c.cache.get(key); ok {
+		return photos, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
-	q := url.Values{"query": {in.Query}, "per_page": {strconv.Itoa(in.Count)}}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/search?"+q.Encode(), nil)
-	if err != nil {
-		return nil, err
+	q := url.Values{
+		"key": {c.apiKey}, "q": {in.Query}, "image_type": {"photo"}, "safesearch": {"true"},
+		"per_page": {strconv.Itoa(max(in.Count, minPerPage))},
 	}
-	req.Header.Set("Authorization", c.apiKey)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/?"+q.Encode(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: build request", ErrUnavailable)
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", ErrUnavailable, withoutURL(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	switch {
@@ -117,53 +129,111 @@ func (c *Client) Search(ctx context.Context, tenantID uint64, in Input) ([]Image
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", ErrUnavailable, withoutURL(err))
 	}
-	imgs, err := mapResponse(body)
+	photos, err := mapResponse(body)
 	if err != nil {
 		return nil, err
 	}
-	c.cache.set(key, imgs)
-	return imgs, nil
+	if len(photos) > in.Count {
+		photos = photos[:in.Count]
+	}
+	c.cache.set(key, photos)
+	return photos, nil
 }
 
-type pexelsResponse struct {
-	Photos []struct {
-		Width           int    `json:"width"`
-		Height          int    `json:"height"`
-		URL             string `json:"url"`
-		Photographer    string `json:"photographer"`
-		PhotographerURL string `json:"photographer_url"`
-		Alt             string `json:"alt"`
-		Src             struct {
-			Large2x string `json:"large2x"`
-			Medium  string `json:"medium"`
-		} `json:"src"`
-	} `json:"photos"`
+// Download fetches p's image, refusing anything over maxBytes or served from outside Pixabay.
+func (c *Client) Download(ctx context.Context, p Photo, maxBytes int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, downloadTimeout)
+	defer cancel()
+	target := p.url
+	for hop := 0; ; hop++ {
+		if !c.allowed(target) {
+			return nil, fmt.Errorf("%w: photo %d is not served from Pixabay", ErrUnavailable, p.ID)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%w: build request", ErrUnavailable)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrUnavailable, withoutURL(err))
+		}
+		if loc := resp.Header.Get("Location"); resp.StatusCode >= 300 && resp.StatusCode < 400 && loc != "" {
+			_ = resp.Body.Close()
+			next, err := resp.Request.URL.Parse(loc)
+			if err != nil || hop+1 >= maxRedirects {
+				return nil, fmt.Errorf("%w: photo %d redirected too often", ErrUnavailable, p.ID)
+			}
+			target = next.String()
+			continue
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("%w: photo %d download status %d", ErrUnavailable, p.ID, resp.StatusCode)
+		}
+		data, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)+1))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrUnavailable, withoutURL(err))
+		}
+		if len(data) > maxBytes {
+			return nil, fmt.Errorf("%w: photo %d", ErrTooLarge, p.ID)
+		}
+		return data, nil
+	}
 }
 
-// mapResponse keeps only photos served from Host, so the model is never handed an arbitrary URL.
-func mapResponse(body []byte) ([]Image, error) {
-	var r pexelsResponse
+type pixabayResponse struct {
+	Hits []struct {
+		ID            int    `json:"id"`
+		Tags          string `json:"tags"`
+		LargeImageURL string `json:"largeImageURL"`
+		ImageWidth    int    `json:"imageWidth"`
+		ImageHeight   int    `json:"imageHeight"`
+		User          string `json:"user"`
+	} `json:"hits"`
+}
+
+// mapResponse keeps only photos downloadable from Pixabay's own hosts.
+func mapResponse(body []byte) ([]Photo, error) {
+	var r pixabayResponse
 	if err := json.Unmarshal(body, &r); err != nil {
 		return nil, fmt.Errorf("%w: bad response: %w", ErrUnavailable, err)
 	}
-	imgs := make([]Image, 0, len(r.Photos))
-	for _, p := range r.Photos {
-		if !onHost(p.Src.Large2x) || !onHost(p.Src.Medium) {
+	photos := make([]Photo, 0, len(r.Hits))
+	for _, h := range r.Hits {
+		if h.ID <= 0 || !onDownloadHost(h.LargeImageURL) {
 			continue
 		}
-		imgs = append(imgs, Image{
-			URL: p.Src.Large2x, URLSmall: p.Src.Medium, Alt: p.Alt, Width: p.Width, Height: p.Height,
-			Photographer: p.Photographer, PhotographerURL: p.PhotographerURL, PageURL: p.URL,
-		})
+		w, hgt := scaleToEdge(h.ImageWidth, h.ImageHeight, largeEdge)
+		photos = append(photos, Photo{ID: h.ID, Description: h.Tags, Width: w, Height: hgt, Photographer: h.User, url: h.LargeImageURL})
 	}
-	return imgs, nil
+	return photos, nil
 }
 
-func onHost(raw string) bool {
+// scaleToEdge is w×h shrunk so its longest side is at most edge, as Pixabay scales largeImageURL.
+func scaleToEdge(w, h, edge int) (int, int) {
+	if w <= 0 || h <= 0 || (w <= edge && h <= edge) {
+		return w, h
+	}
+	if w >= h {
+		return edge, h * edge / w
+	}
+	return w * edge / h, edge
+}
+
+func onDownloadHost(raw string) bool {
 	u, err := url.Parse(raw)
-	return err == nil && u.Scheme == "https" && u.Host == Host
+	return err == nil && u.Scheme == "https" && downloadHosts[u.Hostname()]
+}
+
+// withoutURL drops the request URL from a transport error: a search URL carries the API key.
+func withoutURL(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
 }
 
 // cache is capped: entries keyed by tenant and query would otherwise grow for the life of the process.
@@ -176,7 +246,7 @@ type cache struct {
 }
 
 type cacheEntry struct {
-	imgs    []Image
+	photos  []Photo
 	expires time.Time
 }
 
@@ -184,7 +254,7 @@ func newCache(max int, ttl time.Duration) *cache {
 	return &cache{max: max, ttl: ttl, now: time.Now, entries: make(map[string]cacheEntry)}
 }
 
-func (c *cache) get(key string) ([]Image, bool) {
+func (c *cache) get(key string) ([]Photo, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[key]
@@ -192,10 +262,10 @@ func (c *cache) get(key string) ([]Image, bool) {
 		delete(c.entries, key)
 		return nil, false
 	}
-	return e.imgs, true
+	return e.photos, true
 }
 
-func (c *cache) set(key string, imgs []Image) {
+func (c *cache) set(key string, photos []Photo) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.max {
@@ -204,5 +274,5 @@ func (c *cache) set(key string, imgs []Image) {
 			break
 		}
 	}
-	c.entries[key] = cacheEntry{imgs: imgs, expires: c.now().Add(c.ttl)}
+	c.entries[key] = cacheEntry{photos: photos, expires: c.now().Add(c.ttl)}
 }

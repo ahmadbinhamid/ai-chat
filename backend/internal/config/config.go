@@ -84,9 +84,9 @@ type Config struct {
 	LargeThemePages int
 	LargeThemeFiles int
 
-	// StockImagesAPIKey (Pexels) enables search_stock_images on redesign and create turns; empty leaves it off.
+	// StockImagesAPIKey (Pixabay) enables search_stock_images on redesign and create turns; empty leaves it off.
 	StockImagesAPIKey string
-	// PlatformImageHosts are extra hosts a proposed <img> may load from, beside FLOWPOS_API_BASE's and the stock host.
+	// PlatformImageHosts are extra hosts a proposed page may load an image from, beside FLOWPOS_API_BASE's.
 	PlatformImageHosts []string
 	// CORSAllowedOrigins is the browser origins allowed to call this API. Empty blocks all
 	// cross-origin requests (fails closed).
@@ -269,7 +269,7 @@ func (c Config) DSN() string {
 }
 
 // ImageHosts is every external host a proposed <img> may load from on the platform's side: FLOWPOS_API_BASE's host
-// plus PLATFORM_IMAGE_HOSTS. The stock provider's host is added only when stock images are enabled.
+// plus PLATFORM_IMAGE_HOSTS. Stock photos are saved into the theme, so the provider's host is never allowed.
 func (c Config) ImageHosts() []string {
 	hosts := append([]string(nil), c.PlatformImageHosts...)
 	if u, err := url.Parse(c.FlowposAPIBase); err == nil && u.Hostname() != "" {

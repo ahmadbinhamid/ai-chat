@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path"
 	"strings"
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/stockimages"
 	"ai-chat/internal/themecheck"
 	"ai-chat/internal/themefs"
 )
@@ -42,6 +44,10 @@ type imageCatalog struct {
 	loaded map[string][]byte
 	// maxBytes is checked here, at staging, so an oversized image goes to the repair round and never fails at Apply.
 	maxBytes int
+	// stock, downloadStock and saveStock are set only on a turn offered search_stock_images (enableStockPlacements).
+	stock         *stockPhotos
+	downloadStock func(ctx context.Context, p stockimages.Photo) ([]byte, error)
+	saveStock     func(ctx context.Context, filename, mediaType string, data []byte) (string, error)
 }
 
 // newImageCatalog numbers every image attachment in priorMessages, which must be oldest-first.
@@ -208,6 +214,9 @@ func (c *imageCatalog) checkOne(ctx context.Context, p ai.AttachmentPlacement, s
 	if err := themefs.ValidatePathSafety(p.Path); err != nil {
 		return err.Error()
 	}
+	if p.StockImage != 0 {
+		return c.checkStock(ctx, p, snap)
+	}
 	placement := imageplacement.Placement{Attachment: p.Attachment, Path: p.Path}
 	if err := imageplacement.CheckPath(p.Path); err != nil {
 		return err.Error()
@@ -229,13 +238,85 @@ func (c *imageCatalog) checkOne(ctx context.Context, p ai.AttachmentPlacement, s
 	return ""
 }
 
+// checkStock checks a stock_image placement: only a photo this turn's search returned, downloaded once, then the same
+// path, size and type rules as an attached image.
+func (c *imageCatalog) checkStock(ctx context.Context, p ai.AttachmentPlacement, snap themecheck.Snapshot) string {
+	if p.Attachment != 0 {
+		return fmt.Sprintf("%s sets both attachment and stock_image — set only one", p.Path)
+	}
+	if c.downloadStock == nil {
+		return fmt.Sprintf("%s: no stock photos are available this turn — remove the stock_image placement", p.Path)
+	}
+	photo, found := c.stock.get(p.StockImage)
+	var data []byte
+	if found {
+		var err error
+		if data, err = c.stockBytes(ctx, photo); err != nil {
+			slog.Warn("use_attachments: stock photo download failed", "stock_image", p.StockImage, "error", err)
+			if errors.Is(err, stockimages.ErrTooLarge) {
+				return fmt.Sprintf("stock photo %d is over the %s limit for theme images — choose another photo",
+					p.StockImage, imageplacement.FormatSize(c.maxBytes))
+			}
+			return fmt.Sprintf("stock photo %d couldn't be downloaded — choose another photo or use the theme's own images", p.StockImage)
+		}
+	}
+	if err := imageplacement.CheckStock(p.StockImage, p.Path, data, found, snap.HasPath(p.Path), c.maxBytes); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func (c *imageCatalog) stockBytes(ctx context.Context, photo stockimages.Photo) ([]byte, error) {
+	key := fmt.Sprintf("stock:%d", photo.ID)
+	if data, ok := c.loaded[key]; ok {
+		return data, nil
+	}
+	data, err := c.downloadStock(ctx, photo)
+	if err != nil {
+		return nil, err
+	}
+	c.loaded[key] = data
+	return data, nil
+}
+
+// saveStockPhoto stores an accepted stock placement's bytes as an attachment, so it stages like an attached image.
+func (c *imageCatalog) saveStockPhoto(ctx context.Context, p ai.AttachmentPlacement) (string, error) {
+	photo, ok := c.stock.get(p.StockImage)
+	if !ok || c.saveStock == nil {
+		return "", fmt.Errorf("place stock photo %d: not returned this turn", p.StockImage)
+	}
+	data, err := c.stockBytes(ctx, photo)
+	if err != nil {
+		return "", fmt.Errorf("place stock photo %d: %w", p.StockImage, err)
+	}
+	format, ok := imageplacement.Sniff(data)
+	if !ok {
+		return "", fmt.Errorf("place stock photo %d: not a PNG, JPEG or WebP image", p.StockImage)
+	}
+	id, err := c.saveStock(ctx, path.Base(p.Path), format.MediaType, data)
+	if err != nil {
+		return "", fmt.Errorf("save stock photo %d: %w", p.StockImage, err)
+	}
+	return id, nil
+}
+
 // planFiles turns accepted placements into create rows whose content is the attachment reference, never the bytes.
 func (c *imageCatalog) planFiles(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, placements []ai.AttachmentPlacement) ([]planFile, error) {
 	files := make([]planFile, 0, len(placements))
 	for _, p := range placements {
-		img, ok := c.byNumber(p.Attachment)
-		if !ok {
-			return nil, fmt.Errorf("place attached image %d: no such attachment", p.Attachment)
+		var attachmentID string
+		if p.StockImage != 0 {
+			id, err := c.saveStockPhoto(ctx, p)
+			if err != nil {
+				return nil, err
+			}
+			attachmentID = id
+		} else {
+			img, ok := c.byNumber(p.Attachment)
+			if !ok {
+				return nil, fmt.Errorf("place attached image %d: no such attachment", p.Attachment)
+			}
+			attachmentID = img.ID
 		}
 		previous, err := store.ReadFile(ctx, storeAuth, p.Path)
 		if err != nil {
@@ -246,8 +327,8 @@ func (c *imageCatalog) planFiles(ctx context.Context, store themefs.ThemeStore, 
 			previousPtr = &previous
 		}
 		files = append(files, planFile{
-			path: p.Path, action: FileActionCreate, content: imageplacement.Reference(img.ID),
-			previous: previousPtr, attachmentID: img.ID,
+			path: p.Path, action: FileActionCreate, content: imageplacement.Reference(attachmentID),
+			previous: previousPtr, attachmentID: attachmentID,
 		})
 	}
 	return files, nil

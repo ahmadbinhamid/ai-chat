@@ -563,6 +563,10 @@ func recapAssistantTurn(result *ai.Result) string {
 		fmt.Fprintf(&b, "### %s (%s)\n%s\n\n", f.Path, action, f.Content)
 	}
 	for _, p := range result.UseAttachments {
+		if p.StockImage != 0 {
+			fmt.Fprintf(&b, "### use_attachments: stock photo %d -> %s\n\n", p.StockImage, p.Path)
+			continue
+		}
 		fmt.Fprintf(&b, "### use_attachments: Attached image %d -> %s\n\n", p.Attachment, p.Path)
 	}
 	out := strings.TrimSpace(b.String())

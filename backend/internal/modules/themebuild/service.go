@@ -150,23 +150,20 @@ type Service struct {
 	resumePending atomic.Bool
 	// nil (no STOCK_IMAGES_API_KEY, or tests) never offers search_stock_images.
 	stock stockSearcher
-	// imageHosts are the external hosts a proposed <img> may load from; see SetImageHosts and SetStockImages.
+	// imageHosts are the platform hosts a proposed page may load an image from; see SetImageHosts.
 	imageHosts map[string]bool
 }
 
-// stockSearcher is stockimages.Client's search, behind an interface so tests never call the provider.
+// stockSearcher is stockimages.Client, behind an interface so tests never call the provider.
 type stockSearcher interface {
-	Search(ctx context.Context, tenantID uint64, in stockimages.Input) ([]stockimages.Image, error)
+	Search(ctx context.Context, tenantID uint64, in stockimages.Input) ([]stockimages.Photo, error)
+	Download(ctx context.Context, p stockimages.Photo, maxBytes int) ([]byte, error)
 }
 
-// SetStockImages offers search_stock_images on redesign and create turns and lets proposals hotlink host.
-// Call once before serving, after SetImageHosts.
-func (s *Service) SetStockImages(searcher stockSearcher, host string) {
+// SetStockImages offers search_stock_images on redesign and create turns. A photo the model uses is downloaded and
+// saved into the theme like an attached image, so pages never hotlink the provider. Call once before serving.
+func (s *Service) SetStockImages(searcher stockSearcher) {
 	s.stock = searcher
-	if s.imageHosts == nil {
-		s.imageHosts = map[string]bool{}
-	}
-	s.imageHosts[strings.ToLower(host)] = true
 }
 
 // stockImagesFor reports whether in's turn is offered search_stock_images: only a redesign or a new page needs photos.
@@ -1018,9 +1015,14 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		logPreload(c.ID, in.preload)
 		in.metrics.setPreload(len(in.preload.Files), in.preload.Bytes)
 		s.summariseLargeTheme(&tc, in.preload, draft)
+		var photos *stockPhotos
+		if tc.StockImages {
+			photos = newStockPhotos()
+			s.enableStockPlacements(in, photos)
+		}
 		toolExec = s.buildToolExecutorWithPreload(store, storeAuth, toolOptions{
 			preloaded: preloadedContents(in.preload), pagesJSONReadable: tc.Compact,
-			tenantID: in.TenantID, stockImages: tc.StockImages,
+			tenantID: in.TenantID, stockPhotos: photos,
 		})
 		readFile = s.buildFileReader(store, storeAuth)
 

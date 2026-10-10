@@ -245,6 +245,18 @@ func (s *Service) GetChatImageAttachment(ctx context.Context, chatID, attachment
 	return s.repo.GetChatImageAttachment(ctx, chatID, attachmentID)
 }
 
+// AddStockImage stores a downloaded stock photo on the turn's user message and returns its attachment ID, which a
+// placement references exactly like an attached image's.
+func (s *Service) AddStockImage(ctx context.Context, messageID string, tenantID uint64, filename, mediaType string, data []byte) (string, error) {
+	sum := sha256.Sum256(data)
+	id := uuid.NewString()
+	err := s.repo.AddStockImageAttachment(ctx, MessageAttachment{
+		ID: id, MessageID: messageID, TenantID: tenantID, Filename: filename, MediaType: mediaType,
+		SizeBytes: int64(len(data)), Checksum: hex.EncodeToString(sum[:]), Content: data, CreatedAt: time.Now().UTC(),
+	})
+	return id, err
+}
+
 // ListChatImageHeads returns the first n bytes of each of chatID's image attachments, keyed by attachment ID.
 func (s *Service) ListChatImageHeads(ctx context.Context, chatID string, n int) (map[string][]byte, error) {
 	return s.repo.ListChatImageHeads(ctx, chatID, n)

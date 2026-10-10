@@ -120,7 +120,7 @@ func New(cfg config.Config, conn *sql.DB, logger *slog.Logger) (*Server, error) 
 	buildSvc.SetLargeThemeLimits(ai.LargeThemeLimits{Pages: cfg.LargeThemePages, Files: cfg.LargeThemeFiles})
 	buildSvc.SetImageHosts(cfg.ImageHosts())
 	if cfg.StockImagesAPIKey != "" {
-		buildSvc.SetStockImages(stockimages.New(cfg.StockImagesAPIKey, urlfetch.NewGuardedClient(10*time.Second)), stockimages.Host)
+		buildSvc.SetStockImages(stockimages.New(cfg.StockImagesAPIKey, urlfetch.NewGuardedClient(20*time.Second)))
 	}
 	// Limits are per replica: N replicas allow N times as many concurrent generations.
 	logger.Info("generation concurrency limits (0 = unlimited)",

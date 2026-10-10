@@ -122,13 +122,13 @@ func searchStockImagesTool() anthropic.ToolUnionParam {
 	return anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
 		Name: ToolNameSearchStockImages,
 		Description: param.NewOpt(
-			"Searches licensed stock photos (Pexels) for hero and section imagery. Returns up to 6 images, each with " +
-				"url and url_small (hotlink exactly as returned), alt, width, height and the photographer. Use only " +
-				"URLs this tool returned — never invent or alter an image URL. Pick images that match the brand. On every " +
-				"<img>: alt text describing the image in context, width and height, srcset with url_small and url plus " +
-				"sizes, and loading=\"lazy\" except the hero. Credit each photo you use with a small visible line near it " +
-				"or in a credits line: Photo by <a href=\"photographer_url\">photographer</a> on " +
-				"<a href=\"https://www.pexels.com\">Pexels</a>.",
+			"Searches licensed stock photos (Pixabay) for hero and section imagery. Returns up to 6 photos, each with " +
+				"an id, a description, width and height (at most 1280px). To use one, add {\"stock_image\": <id>, " +
+				"\"path\": \"images/<new-name>.jpg\"} to use_attachments: the platform downloads it into the theme, and " +
+				"you reference it with {{ 'images/<new-name>.jpg' | asset_url }}. Never link a photo from anywhere else " +
+				"and never invent an id. Pick photos that match the brand and show no recognisable people, logos or " +
+				"brands. On every <img>: alt text describing the image in context, width and height, responsive sizing " +
+				"(sizes, max-width: 100%), and loading=\"lazy\" except the hero.",
 		),
 		InputSchema: anthropic.ToolInputSchemaParam{
 			Properties: map[string]any{

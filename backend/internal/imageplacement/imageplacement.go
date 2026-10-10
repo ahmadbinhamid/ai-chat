@@ -5,6 +5,7 @@ package imageplacement
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image/jpeg"
 	"path"
@@ -156,27 +157,43 @@ func CheckPath(p string) error {
 // Check reports why p can't be staged, or nil. found is false when no attachment has p's number; pathTaken when the
 // theme or draft already has a file at p.Path, which a placement must never overwrite.
 func Check(p Placement, data []byte, found, pathTaken bool, maxBytes int) error {
-	if err := CheckPath(p.Path); err != nil {
+	subject := fmt.Sprintf("attached image %d", p.Attachment)
+	return check(p.Path, subject, data, found, pathTaken, maxBytes,
+		fmt.Sprintf("there is no attached image %d in this chat — use a number from the attached images list", p.Attachment),
+		"tell the merchant to attach a smaller version")
+}
+
+// CheckStock is Check for a stock photo the platform downloaded; found is false when this turn's search never
+// returned id, so the model can only save a photo it was actually given.
+func CheckStock(id int, path string, data []byte, found, pathTaken bool, maxBytes int) error {
+	return check(path, fmt.Sprintf("stock photo %d", id), data, found, pathTaken, maxBytes,
+		fmt.Sprintf("stock photo %d wasn't returned by search_stock_images this turn — use an id from its results, never "+
+			"invent one", id),
+		"choose another photo")
+}
+
+func check(p, subject string, data []byte, found, pathTaken bool, maxBytes int, notFound, tooLargeAdvice string) error {
+	if err := CheckPath(p); err != nil {
 		return err
 	}
 	if !found {
-		return fmt.Errorf("there is no attached image %d in this chat — use a number from the attached images list", p.Attachment)
+		return errors.New(notFound)
 	}
 	if len(data) > maxBytes {
-		return fmt.Errorf("attached image %d is %s, over the %s limit for theme images — it can't be placed; tell the "+
-			"merchant to attach a smaller version", p.Attachment, FormatSize(len(data)), FormatSize(maxBytes))
+		return fmt.Errorf("%s is %s, over the %s limit for theme images — it can't be placed; %s",
+			subject, FormatSize(len(data)), FormatSize(maxBytes), tooLargeAdvice)
 	}
 	format, ok := Sniff(data)
 	if !ok {
-		return fmt.Errorf("attached image %d is not a PNG, JPEG or WebP image, so it can't be placed", p.Attachment)
+		return fmt.Errorf("%s is not a PNG, JPEG or WebP image, so it can't be placed", subject)
 	}
-	if strings.ToLower(path.Ext(p.Path)) != format.Ext {
-		return fmt.Errorf("attached image %d is really a %s file, so its path must end in %s, not %s",
-			p.Attachment, strings.TrimPrefix(format.Ext, "."), format.Ext, path.Ext(p.Path))
+	if strings.ToLower(path.Ext(p)) != format.Ext {
+		return fmt.Errorf("%s is really a %s file, so its path must end in %s, not %s",
+			subject, strings.TrimPrefix(format.Ext, "."), format.Ext, path.Ext(p))
 	}
 	if pathTaken {
 		return fmt.Errorf("%s already exists in the theme — pick a new file name under %s; an existing image is never overwritten",
-			p.Path, Dir)
+			p, Dir)
 	}
 	return nil
 }

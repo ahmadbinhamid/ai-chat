@@ -83,6 +83,9 @@ const (
 	AttachmentKindHTML  AttachmentKind = "html"
 	// AttachmentKindConsole holds browser errors captured from the preview, as JSON; used for its own turn only, never carried forward.
 	AttachmentKindConsole AttachmentKind = "console"
+	// AttachmentKindStockImage is a stock photo the platform downloaded for the turn; it is placed like an image
+	// attachment but is never listed in the transcript, numbered as "Attached image N" or sent to the model.
+	AttachmentKindStockImage AttachmentKind = "stock_image"
 )
 
 // known reports whether k is a kind this code understands; reads skip any other row rather than mis-handle it.

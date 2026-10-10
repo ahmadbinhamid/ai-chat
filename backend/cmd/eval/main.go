@@ -122,7 +122,7 @@ func main() {
 	buildSvc.SetLargeThemeLimits(ai.LargeThemeLimits{Pages: cfg.LargeThemePages, Files: cfg.LargeThemeFiles})
 	buildSvc.SetImageHosts(cfg.ImageHosts())
 	if cfg.StockImagesAPIKey != "" {
-		buildSvc.SetStockImages(stockimages.New(cfg.StockImagesAPIKey, urlfetch.NewGuardedClient(10*time.Second)), stockimages.Host)
+		buildSvc.SetStockImages(stockimages.New(cfg.StockImagesAPIKey, urlfetch.NewGuardedClient(20*time.Second)))
 	}
 	discardLeftoverDraft(context.Background(), buildSvc, chatSvc, tenantID)
 

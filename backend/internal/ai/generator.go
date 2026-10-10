@@ -57,8 +57,10 @@ type GeneratedFile struct {
 }
 
 // AttachmentPlacement puts "Attached image N" (1-based, numbered across the whole chat) at Path under images/.
+// StockImage, set instead of Attachment, is a search_stock_images id from this turn; the platform downloads that photo.
 type AttachmentPlacement struct {
-	Attachment int    `json:"attachment"`
+	Attachment int    `json:"attachment,omitempty"`
+	StockImage int    `json:"stock_image,omitempty"`
 	Path       string `json:"path"`
 }
 
@@ -473,18 +475,23 @@ var resultSchema = map[string]any{
 		// The platform copies the attachment's bytes on Apply; the model only names the image and where it goes.
 		"use_attachments": map[string]any{
 			"type": "array",
-			"description": "Merchant-attached images to place into the theme — only when the merchant asks to use, " +
-				"place, add or put an attached image, never for one sent as a look/style reference. The platform " +
-				"copies the real image file; you never write image bytes. Reference the placed image from your " +
-				"files with {{ 'images/<name>' | asset_url }}. Omit or [] when placing nothing.",
+			"description": "Images to save into the theme: a merchant-attached image (only when the merchant asks to " +
+				"use, place, add or put it, never one sent as a look/style reference), or a photo returned by " +
+				"search_stock_images this turn. The platform copies or downloads the real file; you never write image " +
+				"bytes or URLs. Reference the saved image from your files with {{ 'images/<name>' | asset_url }}. " +
+				"Omit or [] when placing nothing.",
 			"items": map[string]any{
 				"type":                 "object",
 				"additionalProperties": false,
-				"required":             []string{"attachment", "path"},
+				"required":             []string{"path"},
 				"properties": map[string]any{
 					"attachment": map[string]any{
 						"type":        "integer",
-						"description": "The N from \"Attached image N\" in the attached images list.",
+						"description": "The N from \"Attached image N\" in the attached images list. Set this or stock_image, not both.",
+					},
+					"stock_image": map[string]any{
+						"type":        "integer",
+						"description": "The id of a photo search_stock_images returned this turn. Set this or attachment, not both.",
 					},
 					"path": map[string]any{
 						"type": "string",

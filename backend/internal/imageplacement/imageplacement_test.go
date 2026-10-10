@@ -183,3 +183,43 @@ func TestDimensions(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckStock(t *testing.T) {
+	jpeg := append([]byte{0xFF, 0xD8, 0xFF, 0xE0}, make([]byte, 96)...)
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 92)...)
+	tests := []struct {
+		name    string
+		path    string
+		data    []byte
+		found   bool
+		taken   bool
+		wantErr string
+	}{
+		{"a returned JPEG", "images/hero-coffee.jpg", jpeg, true, false, ""},
+		{"not returned this turn", "images/hero.jpg", nil, false, false, "wasn't returned by search_stock_images this turn"},
+		{"over the limit", "images/hero.jpg", jpeg, true, false, "limit for theme images — it can't be placed; choose another photo"},
+		{"extension doesn't match", "images/hero.png", jpeg, true, false, "path must end in .jpg"},
+		{"a PNG saved as .png", "images/hero.png", png, true, false, ""},
+		{"not an image", "images/hero.jpg", []byte("<html>"), true, false, "not a PNG, JPEG or WebP"},
+		{"outside images/", "css/hero.jpg", jpeg, true, false, "must be a file under images/"},
+		{"path already taken", "images/hero.jpg", jpeg, true, true, "already exists"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			max := 1000
+			if tt.name == "over the limit" {
+				max = 50
+			}
+			err := CheckStock(42, tt.path, tt.data, tt.found, tt.taken, max)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("CheckStock = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("CheckStock = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}

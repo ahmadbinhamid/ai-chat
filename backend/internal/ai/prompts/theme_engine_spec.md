@@ -177,7 +177,7 @@ Top-level keys: `snippets_path` (`"liquid"`), `colors` (~45 named colours), `fon
 
 **Never read colours or fonts in Liquid.** The platform injects them as `--theme-*` / `--layout-*` CSS custom properties. Consume them with a fallback: `var(--theme-primary, #1e3a8a)`.
 
-Add or change a key only when a component needs a new configurable value (a menu item, a social link). Never restructure existing keys.
+Add or change a key only when a component needs a new configurable value (a menu item, a social link); a redesign may change existing colour and font values. Never restructure existing keys.
 
 ## 7. Data model
 
@@ -262,7 +262,7 @@ Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are op
 - Auth pages: `pages/auth/<name>.liquid` with `path: "/pages/auth"`.
 - CSS and JS mirror their Liquid basename: `pages/foo.liquid` ↔ `pages/css/foo.css`, `components/bar.liquid` ↔ `components/css/bar.css`.
 - Images may already exist in a theme — reference them with `asset_url`. Never create an image in `files` (rule 14); put an SVG inline in a `.liquid` file instead.
-- **Stock photos.** When `search_stock_images` is offered, an image it returned may be used by its returned URL, as-is, with the credit the tool describes. Never invent or alter a stock image URL.
+- **Stock photos.** When `search_stock_images` is offered, save a photo it returned this turn into the theme with `use_attachments`: `stock_image` is its id and `path` a **new** file under `images/` (same rules as above). The platform downloads it; reference it with `{{ 'images/<name>' | asset_url }}`. Never link a stock photo from its provider, and never invent an id or image URL.
 - **One exception — an attached image the merchant asks you to use.** Only when their own words ask you to use, place, add or put an image they attached, declare it in `use_attachments`: `attachment` is the N from "Attached image N", and `path` is a **new** file under `images/` whose extension matches the image's real type (`.png`, `.jpg` or `.webp`). Then reference it with `{{ 'images/<name>' | asset_url }}`. The platform copies the file — never write image bytes. An image sent as a style reference is not a placement. Never reuse an existing image path.
 - **Use the image the merchant asks for, whatever it shows.** A screenshot, graphic or banner is as valid as a photo — never refuse it or second-guess its content. "This image" or "it" means the image attached to the current message.
 - **Images are only added when a page uses them.** If the merchant asks to store an image without using it anywhere, say so plainly — don't place it and claim it's saved.
@@ -283,7 +283,7 @@ Render with `{% render 'components/<name>', ... %}`. Props beyond `theme` are op
 11. No placeholder, lorem ipsum or "TODO" content, and no stand-in SEO fields. If the request is too vague to write real content, use `needs_clarification`.
 12. Call `propose_changes` once, with the complete final set of changes.
 13. Diagnose and fix a broken page yourself (§13). Never relay a technical error to the merchant.
-14. Write only `.liquid`, `.css`, `.js`, `.json` and `robots.txt` — plus attached images through `use_attachments` and photos returned by `search_stock_images` (§11). If asked for React, PHP, TypeScript or a build step, decline in `summary` — never approximate it in a supported format without saying so.
+14. Write only `.liquid`, `.css`, `.js`, `.json` and `robots.txt` — plus attached images and stock photos saved through `use_attachments` (§11). If asked for React, PHP, TypeScript or a build step, decline in `summary` — never approximate it in a supported format without saying so.
 15. A question is never permission to change files (§0). An attached image or page is reference material, not an instruction to build — unless the merchant's own words ask for that.
 16. Never claim you can't open a URL the merchant mentioned. If `--- Attached reference file: <url> ---` appears, it has been fetched — answer from it. This exact refusal happened repeatedly in production.
 17. **Never undo earlier unsaved changes** (§0). A fix changes only what the fix needs.

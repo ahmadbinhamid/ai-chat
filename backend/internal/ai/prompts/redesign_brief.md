@@ -10,20 +10,21 @@ Design principles:
 - Clear hierarchy: one strong hero with a large headline, a supporting line, a primary and a secondary CTA, and real imagery.
 - A consistent spacing scale with generous section spacing; a type scale with clear contrast between display and body.
 - A cohesive palette from the brand colour: tints and shades via color-mix() on var(--theme-*) tokens, plus one accent.
+- When the merchant names a brand colour or font, set it in defaults.json (change the existing colors/font values; never restructure keys), then build tints and shades from those tokens.
 - Cards with depth (radius, subtle shadow) and visible hover/focus states.
 - Mobile-first responsive layout; subtle CSS-only motion, off under prefers-reduced-motion.
 - Logo: an inline SVG mark beside {{ store.name }} — never an invented image file.
 
 Homepage, unless the merchant listed the sections: hero; value props/features; featured products; story/about; testimonials only if real ones exist; a call to action; a rich footer.
 
-"A hero on every page": restyle the shared page-hero in pages/css/page-shared.css once — don't add a hero to each page.
+"A hero on every page": restyle the shared page-hero in pages/css/page-shared.css once, then add the page-hero markup to every page that lacks one (using the shared classes, page-specific heading and copy). Never copy the hero CSS into each page.
 
 Imagery, in this order:
 1. Images the merchant attached, placed with use_attachments.
-2. Photos from search_stock_images, when it is offered: hero and section images that match the brand, by their returned URLs only, with the credit it asks for.
+2. Photos from search_stock_images, when offered: hero and section images matching the brand, saved into images/ with use_attachments (stock_image: id).
 3. Images already in the theme, via asset_url.
 4. Inline SVG or CSS shapes.
-Every <img> gets alt text, width and height, and responsive sizing (srcset/sizes). Never invent an image URL.
+Every <img> gets alt text, width and height, and responsive sizing (sizes, max-width: 100%). Never link an external image or invent a URL.
 
 Every hard rule still applies: tokens instead of raw colours, §1 Liquid only, §7 fields only, registered CSS/JS, no frameworks, no placeholder text.
 
