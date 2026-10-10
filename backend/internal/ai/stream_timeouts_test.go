@@ -469,7 +469,7 @@ func TestConsumeStreamDeltas_IdleAfterContent(t *testing.T) {
 			defer ts.Close()
 			stream := newStreamingTestStream(ts)
 			var message anthropic.Message
-			err := consumeStreamDeltas(context.Background(), stream, &message, 50*time.Millisecond, 400*time.Millisecond, true, nil, nil)
+			err := consumeStreamDeltas(context.Background(), stream, &message, 50*time.Millisecond, 400*time.Millisecond, 0, true, nil, nil, nil)
 			_ = stream.Close()
 			if !errors.Is(err, tt.wantErr) && (tt.wantErr != nil || err != nil) {
 				t.Fatalf("err = %v, want %v", err, tt.wantErr)
@@ -535,5 +535,109 @@ func TestGenerate_PingsKeepAToolCallInProgressAlive(t *testing.T) {
 				t.Fatalf("want 300ms of true silence after output treated as a stall and retried, got %d call(s), err=%v", calls, err)
 			}
 		})
+	}
+}
+
+// A host that starts a reply, then only pings, must not hold the call open past the stall window: it's retried. A
+// reply that keeps producing content, however slowly, is never cut off by it.
+func TestGenerate_StallTimeout(t *testing.T) {
+	var start strings.Builder
+	sseEvent(&start, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
+			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
+		},
+	})
+	sseEvent(&start, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+	textDelta := func(s string) string {
+		var b strings.Builder
+		sseEvent(&b, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": s}})
+		return b.String()
+	}
+	var stop strings.Builder
+	sseEvent(&stop, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	full := toolUseSSEResponse("msg_1", "toolu_1", toolNameProposeChanges, emptyAnswer("done"), 10, 5)
+	_, rest, _ := strings.Cut(full, "event: content_block_start")
+	toolPart := strings.ReplaceAll("event: content_block_start"+rest, `"index":0`, `"index":1`)
+	ping := "event: ping\ndata: {\"type\": \"ping\"}\n\n"
+
+	wait := func(r *http.Request, d time.Duration) bool {
+		select {
+		case <-time.After(d):
+			return true
+		case <-r.Context().Done():
+			return false
+		}
+	}
+
+	t.Run("output then only pings is a stall and is retried", func(t *testing.T) {
+		calls := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.Header().Set("Content-Type", "text/event-stream")
+			flush(w, start.String()+textDelta("Working on it"))
+			if calls == 1 {
+				for wait(r, 20*time.Millisecond) {
+					flush(w, ping)
+				}
+				return
+			}
+			flush(w, stop.String()+toolPart)
+		}))
+		defer ts.Close()
+		g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
+		g.streamTimeouts.Idle = 100 * time.Millisecond
+		g.streamTimeouts.Stall = 250 * time.Millisecond
+		g.streamTimeouts.FirstTokenEdit = 2 * time.Second
+
+		started := time.Now()
+		result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, nil, nil)
+		if err != nil || result.Summary != "done" || calls != 2 {
+			t.Fatalf("want the pinging stall retried once and the retry to finish; calls=%d err=%v", calls, err)
+		}
+		// The stall window plus the usual pause before a retry; a pinging host would otherwise hold it until ctx ends.
+		if elapsed, limit := time.Since(started), g.streamTimeouts.Stall+streamAccumulateRetryDelay+2*time.Second; elapsed > limit {
+			t.Fatalf("stalled attempt held the call for %v, over %v; the stall window should have ended it", elapsed, limit)
+		}
+	})
+
+	t.Run("slow but steady output is never a stall", func(t *testing.T) {
+		calls := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.Header().Set("Content-Type", "text/event-stream")
+			flush(w, start.String())
+			// 600ms of output in total, well past the 250ms stall window, but never 250ms without new content.
+			for i := 0; i < 12; i++ {
+				if !wait(r, 50*time.Millisecond) {
+					return
+				}
+				flush(w, textDelta("."))
+			}
+			flush(w, stop.String()+toolPart)
+		}))
+		defer ts.Close()
+		g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
+		g.streamTimeouts.Idle = 200 * time.Millisecond
+		g.streamTimeouts.Stall = 250 * time.Millisecond
+		g.streamTimeouts.FirstTokenEdit = 2 * time.Second
+
+		result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, nil, nil)
+		if err != nil || result.Summary != "done" || calls != 1 {
+			t.Fatalf("want one uninterrupted attempt; calls=%d err=%v", calls, err)
+		}
+	})
+}
+
+func TestStallTimeoutDefault(t *testing.T) {
+	g := &Generator{}
+	if got := g.stallTimeout(); got != defaultStreamStallTimeout {
+		t.Fatalf("stallTimeout() = %v, want the default %v", got, defaultStreamStallTimeout)
+	}
+	g.streamTimeouts.Stall = 7 * time.Second
+	if got := g.stallTimeout(); got != 7*time.Second {
+		t.Fatalf("stallTimeout() = %v, want the configured 7s", got)
 	}
 }

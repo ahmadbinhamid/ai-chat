@@ -43,3 +43,38 @@ func TestSendMessageRequest_PreviewErrorsBinding(t *testing.T) {
 		})
 	}
 }
+
+// A bad preview context must never fail the send; the service drops it instead.
+func TestSendMessageRequest_PreviewContextNeverBlocksSending(t *testing.T) {
+	tests := []struct {
+		name      string
+		fields    string
+		wantRoute *string
+		wantFocus string
+	}{
+		{"absent", ``, nil, ""},
+		{"home route", `,"preview_route":""`, strPtrForTest(""), ""},
+		{"route and focus", `,"preview_route":"shop","focus_file":"components/header.liquid"`, strPtrForTest("shop"), "components/header.liquid"},
+		{"traversal focus still binds", `,"focus_file":"../../etc/passwd"`, nil, "../../etc/passwd"},
+		{"huge route still binds", `,"preview_route":"` + strings.Repeat("a", 5000) + `"`, strPtrForTest(strings.Repeat("a", 5000)), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req sendMessageRequest
+			if err := json.Unmarshal([]byte(`{"theme_slug":"shop","prompt":"fix the cart"`+tt.fields+`}`), &req); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if err := binding.Validator.ValidateStruct(&req); err != nil {
+				t.Fatalf("preview context failed validation: %v", err)
+			}
+			if (req.PreviewRoute == nil) != (tt.wantRoute == nil) || (req.PreviewRoute != nil && *req.PreviewRoute != *tt.wantRoute) {
+				t.Errorf("PreviewRoute = %v, want %v", req.PreviewRoute, tt.wantRoute)
+			}
+			if req.FocusFile != tt.wantFocus {
+				t.Errorf("FocusFile = %q, want %q", req.FocusFile, tt.wantFocus)
+			}
+		})
+	}
+}
+
+func strPtrForTest(s string) *string { return &s }

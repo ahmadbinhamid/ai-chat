@@ -63,7 +63,7 @@ func TestGenerationRepository_StartEndGetLifecycle(t *testing.T) {
 		t.Fatalf("unexpected generation state after start: %+v", g)
 	}
 
-	if err := repo.SetGenerationAttempts(ctx, chatID, 2); err != nil {
+	if err := repo.SetGenerationAttempts(ctx, chatID, genID, 2); err != nil {
 		t.Fatalf("SetGenerationAttempts failed: %v", err)
 	}
 	g, err = repo.GetGeneration(ctx, chatID)
@@ -74,7 +74,7 @@ func TestGenerationRepository_StartEndGetLifecycle(t *testing.T) {
 		t.Fatalf("expected attempts=2, got %d", g.Attempts)
 	}
 
-	if err := repo.EndGeneration(ctx, chatID, fmt.Errorf("boom")); err != nil {
+	if err := repo.EndGeneration(ctx, chatID, genID, fmt.Errorf("boom")); err != nil {
 		t.Fatalf("EndGeneration failed: %v", err)
 	}
 	g, err = repo.GetGeneration(ctx, chatID)
@@ -94,7 +94,8 @@ func TestGenerationRepository_StartGenerationRejectsSecondConcurrentRun(t *testi
 	ctx := context.Background()
 	chatID := uuid.NewString()
 
-	if err := repo.StartGeneration(ctx, uuid.NewString(), chatID, 1); err != nil {
+	firstID := uuid.NewString()
+	if err := repo.StartGeneration(ctx, firstID, chatID, 1); err != nil {
 		t.Fatalf("first StartGeneration failed: %v", err)
 	}
 	// The uniq_generations_running_chat virtual-column index — not
@@ -106,7 +107,7 @@ func TestGenerationRepository_StartGenerationRejectsSecondConcurrentRun(t *testi
 
 	// Once the first finishes, a new one is allowed again (running_chat_id
 	// goes back to NULL, which the unique index never constrains).
-	if err := repo.EndGeneration(ctx, chatID, nil); err != nil {
+	if err := repo.EndGeneration(ctx, chatID, firstID, nil); err != nil {
 		t.Fatalf("EndGeneration failed: %v", err)
 	}
 	if err := repo.StartGeneration(ctx, uuid.NewString(), chatID, 1); err != nil {
@@ -216,7 +217,8 @@ func TestService_GenerationStatus(t *testing.T) {
 		t.Fatalf("expected no generation yet, got generating=%v errMsg=%q", generating, errMsg)
 	}
 
-	if err := svc.repo.StartGeneration(ctx, uuid.NewString(), chatID, 1); err != nil {
+	genID := uuid.NewString()
+	if err := svc.repo.StartGeneration(ctx, genID, chatID, 1); err != nil {
 		t.Fatalf("StartGeneration failed: %v", err)
 	}
 	generating, errMsg = svc.GenerationStatus(ctx, chatID)
@@ -224,7 +226,7 @@ func TestService_GenerationStatus(t *testing.T) {
 		t.Fatalf("expected generating=true while running, got generating=%v errMsg=%q", generating, errMsg)
 	}
 
-	if err := svc.repo.EndGeneration(ctx, chatID, fmt.Errorf("something went wrong")); err != nil {
+	if err := svc.repo.EndGeneration(ctx, chatID, genID, fmt.Errorf("something went wrong")); err != nil {
 		t.Fatalf("EndGeneration failed: %v", err)
 	}
 	// EndGeneration sanitizes the error before storing it (see

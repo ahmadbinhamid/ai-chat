@@ -8,15 +8,24 @@
       "tool_choice": "any",
       "idle_after": "content",
       "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare"], "data_collection": "allow" } }
+    },
+    "openrouter-deepseek": {
+      "base_url": "https://openrouter.ai/api",
+      "api_key_env": "AI_API_KEY",
+      "models_url": "https://openrouter.ai/api/v1/models",
+      "session_header": "x-session-id",
+      "tool_choice": "auto",
+      "idle_after": "content",
+      "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare"], "data_collection": "allow" } }
     }
   },
   "models": [
-    {
+        {
       "id": "deepseek-pro",
       "label": "DeepSeek Pro",
-      "provider": "openrouter",
+      "provider": "openrouter-deepseek",
       "model": "deepseek/deepseek-v4-pro",
-      "options": { "provider": { "ignore": ["cloudflare", "wafer", "reka", "mancer"], "quantizations": ["int8", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"] } },
+      "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare", "wafer", "reka", "mancer", "azure"], "quantizations": ["int8", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"] } },
       "images": false,
       "thinking": true,
       "efforts": ["low"],
@@ -25,9 +34,9 @@
     {
       "id": "deepseek-flash",
       "label": "DeepSeek Flash",
-      "provider": "openrouter",
+      "provider": "openrouter-deepseek",
       "model": "deepseek/deepseek-v4-flash",
-      "options": { "provider": { "ignore": ["cloudflare", "wafer", "reka", "mancer"], "quantizations": ["int8", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"] } },
+      "options": { "provider": { "allow_fallbacks": true, "ignore": ["cloudflare", "wafer", "reka", "mancer", "azure"], "quantizations": ["fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"], "require_parameters": true } },
       "images": false,
       "thinking": true,
       "efforts": ["low"],
@@ -52,11 +61,33 @@
       "default_effort": "low"
     },
     {
+      "id": "gemini-pro",
+      "label": "Gemini Pro",
+      "provider": "openrouter",
+      "model": "google/gemini-3.1-pro-preview",
+      "options": { "provider": { "require_parameters": true } },
+      "images": true,
+      "thinking": true,
+      "efforts": ["low"],
+      "default_effort": "low"
+    },
+    {
+      "id": "gemini-flash",
+      "label": "Gemini Flash",
+      "provider": "openrouter",
+      "model": "google/gemini-3.7-flash",
+      "options": { "provider": { "require_parameters": true } },
+      "images": true,
+      "thinking": true,
+      "efforts": ["low"],
+      "default_effort": "low"
+    },
+    {
       "id": "deepseek-flash-vision",
       "label": "DeepSeek Flash Vision",
-      "provider": "openrouter",
+      "provider": "openrouter-deepseek",
       "model": "deepseek/deepseek-v4-flash-vision-exp",
-      "options": { "provider": { "ignore": ["cloudflare", "wafer", "reka", "mancer"], "quantizations": ["int8", "fp6", "fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"] } },
+      "options": { "provider": { "ignore": ["cloudflare", "wafer", "reka", "mancer", "azure"], "quantizations": ["fp8", "mxfp8", "fp16", "bf16", "fp32", "unknown"], "require_parameters": true } },
       "images": true,
       "thinking": true,
       "efforts": ["low"],
@@ -66,7 +97,7 @@
   ],
   "auto": {
     "label": "Auto",
-    "design_model": "deepseek-flash", "design_effort": "low", "design_thinking": false,
+    "design_model": "deepseek-flash", "design_effort": "low", "design_thinking": true,
     "fix_model": "deepseek-pro", "fix_effort": "low"
   },
   "default_model": "auto",

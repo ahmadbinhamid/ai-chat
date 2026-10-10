@@ -43,7 +43,7 @@ func SanitizeError(err error) string {
 
 func honestMessage(err error) (string, bool) {
 	switch {
-	case errors.Is(err, errStuckInTextReplies):
+	case errors.Is(err, ErrStuckInTextReplies):
 		return stuckInTextMessage, true
 	case errors.Is(err, ErrDraftReversionUnrepaired):
 		return draftReversionUnrepairedMessage, true

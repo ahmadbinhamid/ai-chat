@@ -90,7 +90,7 @@ func TestExecReadThemeFile_Basic(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"components/testimonials.liquid", "pages/offers.liquid"}})
-	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input, toolOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestExecReadThemeFile_MissingFile(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"pages/nope.liquid"}})
-	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input, toolOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestExecReadThemeFile_RejectsDisallowedExtension(t *testing.T) {
 	// pages.json is readable/writable but read_theme_file rejects it anyway: it's already
 	// supplied in context, so fetching it here is always a wasted round trip.
 	input, _ := json.Marshal(readThemeFileInput{Paths: []string{"pages.json"}})
-	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input, toolOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestExecReadThemeFile_CapsPathCount(t *testing.T) {
 	svc := &Service{store: themefs.NewStore(ts.URL)}
 
 	input, _ := json.Marshal(readThemeFileInput{Paths: paths})
-	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), svc.store, testStoreAuth(), input, toolOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

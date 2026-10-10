@@ -16,9 +16,11 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/aicatalog"
+	"ai-chat/internal/genlimit"
 	"ai-chat/internal/imageplacement"
 	"ai-chat/internal/modules/chat"
 	"ai-chat/internal/pageintent"
+	"ai-chat/internal/prefetch"
 	"ai-chat/internal/previewerrors"
 	"ai-chat/internal/safego"
 	"ai-chat/internal/themecheck"
@@ -137,6 +139,12 @@ type Service struct {
 	placedImageMaxBytes int
 	// Running generation loops, for Drain on shutdown; the zero value is ready to use.
 	runs runTracker
+	// Caps concurrent generations; nil (struct-literal tests, or never set) is unlimited.
+	limiter *genlimit.Limiter
+	// Chats with a loop waiting for capacity; the zero value is ready to use.
+	waiters chatSet
+	// Zero (struct-literal tests) means ai.DefaultLargeThemeLimits; see largeThemeLimits.
+	largeTheme ai.LargeThemeLimits
 	// True while a restart left generations waiting for their senders; gates the per-request ResumeForUser check.
 	resumePending atomic.Bool
 }
@@ -281,10 +289,18 @@ type GenerateInput struct {
 	// ModelID/Effort are the merchant's requested choice; empty uses the catalogue's default_model and its effort.
 	ModelID string
 	Effort  string
+	// PreviewRoute/FocusFile: the page in the merchant's preview and the file of the element they last selected.
+	// Generate drops invalid values; nil PreviewRoute is unknown, "" is the home page.
+	PreviewRoute *string
+	FocusFile    string
+	// preload is the files sent with this turn's prompt, set by doGenerate.
+	preload prefetch.Result
 	// model is the resolved choice: set by Generate at enqueue, rebuilt from the generation row on dequeue.
 	model aicatalog.Choice
 	// thinkingOff: Auto's design route switched thinking off for this turn; stored with the generation like model.
 	thinkingOff bool
+	// autoSelected: the merchant chose Auto, the only case where a stuck turn may move to another model.
+	autoSelected bool
 	// Set by doGenerate; nil in tests that call generation helpers directly, which then place no images.
 	imageCatalog *imageCatalog
 	// Earlier pending turns' files, set by doGenerate; nil skips the draft-reversion check in checkAndRepair.
@@ -293,6 +309,8 @@ type GenerateInput struct {
 	earlierPrompts []string
 	// resumedAfterUpdate: a restart held this turn until its sender came back; the reply says so.
 	resumedAfterUpdate bool
+	// metrics collects this turn's timings for generation_metrics; nil in tests that call doGenerate directly.
+	metrics *turnMetrics
 }
 
 // Synchronous result of accepting prompt; AssistantMessage/Files always nil.
@@ -358,6 +376,8 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		in.HTMLAttachmentContent = &sanitized
 	}
 
+	in.PreviewRoute, in.FocusFile = sanitizePreviewContext(in.PreviewRoute, in.FocusFile)
+
 	// Persisted, not just held in memory: generation runs later from the queue and re-reads it there.
 	var previewErrorsJSON []byte
 	if errs := previewerrors.Sanitize(in.PreviewErrors); len(errs) > 0 {
@@ -372,6 +392,7 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	if in.model, in.thinkingOff, err = s.resolveModel(ctx, in, c, selection, len(previewErrorsJSON) > 0); err != nil {
 		return GenerateOutcome{}, err
 	}
+	in.autoSelected = selection.ModelID == aicatalog.AutoID
 
 	userMsg, err := s.chats.RecordUserMessage(ctx, c, in.UserID, in.UserName, in.UserEmail, in.Prompt, in.Images, in.HTMLAttachmentFilename, in.HTMLAttachmentContent, previewErrorsJSON)
 	if err != nil {
@@ -392,6 +413,9 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 		ModelID:       in.model.ModelID,
 		Effort:        in.model.Effort,
 		ThinkingOff:   in.thinkingOff,
+		AutoSelected:  in.autoSelected,
+		PreviewRoute:  in.PreviewRoute,
+		FocusFile:     in.FocusFile,
 	})
 	if err != nil {
 		if errors.Is(err, ErrQueueFull) {
@@ -408,8 +432,8 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	_, err = s.startChatQueue(ctx, c)
 	switch {
 	case err == nil:
-	case errors.Is(err, ErrGenerationInProgress):
-		// Already running; its drain loop will dequeue this row when it finishes.
+	case errors.Is(err, ErrGenerationInProgress), errors.Is(err, errAwaitingCapacity):
+		// Already running, or waiting for capacity: this chat's loop dequeues the row when it gets a slot.
 		emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
 		emitter.emit(ctx, EventTypeQueued, map[string]any{
 			"position": position, "prompt_preview": PromptPreview(in.Prompt),
@@ -421,10 +445,14 @@ func (s *Service) Generate(ctx context.Context, in GenerateInput) (GenerateOutco
 	return GenerateOutcome{Chat: c, UserMessage: userMsg, QueuePosition: position, GenerationID: genID}, nil
 }
 
-// Drains chatID's queue one-at-a-time starting with g; continues on failure (visible chat message).
-func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) {
+// Drains chatID's queue one-at-a-time starting with g, which holds the capacity slot release frees; continues on
+// failure (visible chat message). The slot is freed between generations so other chats get a turn.
+func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation, release func()) {
+	defer func() { release() }()
 	for {
-		if !s.runOneQueuedGeneration(ctx, c, g) {
+		ok := s.runOneQueuedGeneration(ctx, c, g)
+		release()
+		if !ok {
 			return
 		}
 
@@ -432,17 +460,25 @@ func (s *Service) runGeneration(ctx context.Context, c chat.Chat, g Generation) 
 		if s.runs.isDraining() {
 			return
 		}
-		next, err := s.repo.DequeueNext(ctx, c.ID)
-		if errors.Is(err, ErrNotFound) {
-			return // queue drained
-		}
+		next, nextRelease, err := s.claimNext(ctx, c)
 		if err != nil {
-			// DB error (not ErrGenerationInProgress; this loop is only thing running for c.ID).
-			// Reaper's sweep will restart as orphaned.
-			slog.Error("failed to dequeue next generation; the reaper will restart this chat's queue", "chat_id", c.ID, "error", err)
+			s.logClaimEnd(c, err)
 			return
 		}
-		g = next
+		g, release = next, nextRelease
+	}
+}
+
+// logClaimEnd logs why a loop stopped claiming; only an unexpected error is logged as one.
+func (s *Service) logClaimEnd(c chat.Chat, err error) {
+	switch {
+	case errors.Is(err, ErrNotFound), errors.Is(err, errNothingQueued):
+		// Queue drained.
+	case errors.Is(err, ErrGenerationInProgress), errors.Is(err, errDrainingWait):
+		// Another loop owns the queue, or it stays queued for the next process.
+	default:
+		// The reaper's sweep restarts the queue as orphaned once its heartbeat goes stale.
+		slog.Error("failed to claim the next generation; the reaper will restart this chat's queue", "chat_id", c.ID, "error", err)
 	}
 }
 
@@ -470,11 +506,14 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		s.recordGenerationFailure(ctx, c, g.ID, failErr)
 		endCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := s.repo.EndGeneration(endCtx, c.ID, failErr); err != nil {
-			slog.Error("failed to record generation end", "chat_id", c.ID, "error", err)
+		endErr := s.repo.EndGeneration(endCtx, c.ID, g.ID, failErr)
+		s.logGenerationEnd(c.ID, g.ID, endErr)
+		if endErr == nil {
+			s.recordGenerationMetrics(metricsRow(nil, c, g, GenerationStatusFailed, 0))
 		}
 		return true
 	}
+	runStart := time.Now()
 	s.runs.track(g.ID, c)
 	defer s.runs.untrack(g.ID)
 
@@ -488,8 +527,12 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		UserMessageID: g.UserMessageID,
 		model:         aicatalog.Choice{ModelID: g.ModelID, Effort: g.Effort},
 		thinkingOff:   g.ThinkingOff,
+		autoSelected:  g.AutoSelected,
+		PreviewRoute:  g.PreviewRoute,
+		FocusFile:     g.FocusFile,
 		// Held by a restart, either queued or cut off mid-run and re-queued by the drain.
 		resumedAfterUpdate: g.AwaitingResumeSince != nil || g.ResumeCount > 0,
+		metrics:            &turnMetrics{},
 	}
 
 	// Fresh timeout per iteration, not shared across queue (prevents starvation).
@@ -594,19 +637,33 @@ func (s *Service) runOneQueuedGeneration(ctx context.Context, c chat.Chat, g Gen
 		slog.Info("generation ended", "chat_id", c.ID, "generation_id", g.ID,
 			"cancelled_by_user", cancelledByUser.Load(), "error", err.Error())
 	}
-	// Its row was finished, reaped or re-queued by someone else; EndGeneration selects by chat, so it must not run.
-	if errors.Is(err, ErrGenerationNotRunning) {
+	// err != nil gates cancelled: the flag can flip true after doGenerate committed success.
+	outcome, ours := generationOutcome(err, cancelledByUser.Load())
+	if !ours {
 		return true
 	}
-	// err != nil required: flag can flip true after doGenerate committed success.
-	if err != nil && cancelledByUser.Load() {
-		if endErr := s.repo.EndGenerationCancelled(endCtx, c.ID); endErr != nil {
-			slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
-		}
-	} else if endErr := s.repo.EndGeneration(endCtx, c.ID, err); endErr != nil {
-		slog.Error("failed to record generation end", "chat_id", c.ID, "error", endErr)
+	var endErr error
+	switch outcome {
+	case GenerationStatusCancelled:
+		endErr = s.repo.EndGenerationCancelled(endCtx, c.ID, g.ID)
+	case GenerationStatusFailed:
+		endErr = s.repo.EndGeneration(endCtx, c.ID, g.ID, err)
+	}
+	// Succeeded needs no end write: commitTurn marked the row in the turn's own transaction.
+	s.logGenerationEnd(c.ID, g.ID, endErr)
+	if endErr == nil {
+		s.recordGenerationMetrics(metricsRow(in.metrics, c, g, outcome, time.Since(runStart)))
 	}
 	return true
+}
+
+// A stale worker losing its row to the reaper or a cancel is expected, so that case is only a warning.
+func (s *Service) logGenerationEnd(chatID, genID string, err error) {
+	if errors.Is(err, ErrGenerationNotRunning) {
+		slog.Warn("generation stopped running before its end was recorded", "chat_id", chatID, "generation_id", genID)
+	} else if err != nil {
+		slog.Error("failed to record generation end", "chat_id", chatID, "generation_id", genID, "error", err)
+	}
 }
 
 // Queued generation failure when no bearer token available (see pendingTokens).
@@ -672,6 +729,7 @@ func looksTruncatedByStoredLength(filename string, contentLength int64) bool {
 // Calls AI provider for file changes; stages into draft overlay (ApplyDraft writes to real theme).
 // cancelledByUser nil from tests; only runOneQueuedGeneration passes real one.
 func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat, genID string, cancelledByUser *atomic.Bool) (retErr error) {
+	in.metrics.startContext()
 	emitter := newEventEmitter(ctx, s.repo, s.bus, genID, c.ID)
 	emitter.emit(ctx, EventTypeStarted, struct{}{})
 
@@ -713,10 +771,15 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 				// Token stale before queued generation's turn; model never called.
 				message = errSessionExpired.Error()
 			}
-			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
-			if _, err := s.chats.RecordAssistantMessageFromModel(emitCtx, c, message, chat.MessageStatusFailed, 0, 0, chat.ApplyStatusNotApplicable, in.model.ModelID, in.model.Effort); err != nil {
+			err := s.recordFailedTurn(emitCtx, c, genID, message, in.model)
+			if errors.Is(err, ErrGenerationNotRunning) {
+				slog.Warn("generation stopped running before its failure was recorded; discarding it", "chat_id", c.ID, "generation_id", genID)
+				return
+			}
+			if err != nil {
 				slog.Error("failed to record failed-generation chat message", "chat_id", c.ID, "error", err)
 			}
+			emitter.emit(emitCtx, EventTypeFailed, map[string]string{"message": message})
 		} else {
 			emitter.emit(emitCtx, EventTypeDone, map[string]string{"summary": summary})
 		}
@@ -903,7 +966,13 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 			return fmt.Errorf("build snapshot base: %w", err)
 		}
 
-		toolExec = s.buildToolExecutor(store, storeAuth)
+		in.preload = s.preloadFiles(ctx, in, tc, store, storeAuth)
+		logPreload(c.ID, in.preload)
+		in.metrics.setPreload(len(in.preload.Files), in.preload.Bytes)
+		s.summariseLargeTheme(&tc, in.preload, draft)
+		toolExec = s.buildToolExecutorWithPreload(store, storeAuth, toolOptions{
+			preloaded: preloadedContents(in.preload), pagesJSONReadable: tc.Compact,
+		})
 		readFile = s.buildFileReader(store, storeAuth)
 
 		// Fails open: the file-history line is a memory aid, never worth failing a generation over.
@@ -920,7 +989,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 
 	if !deterministic {
 		var err error
-		result, turns, err = s.generateValidProposal(ctx, tc, turns, in.Prompt, toolExec, readFile, emitter, in)
+		result, turns, err = s.generateValidProposal(ctx, &tc, turns, in.Prompt, toolExec, readFile, emitter, in)
 		if err != nil {
 			return err
 		}
@@ -936,7 +1005,7 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 		emitter.emit(ctx, EventTypeProposing, map[string]int{"file_count": len(result.Files)})
 
 		snap := s.buildSnapshot(ctx, store, storeAuth, snapBase, result)
-		result, warnings, err = s.checkAndRepair(ctx, in, c.ID, tc, turns, result, snap, toolExec, readFile, emitter)
+		result, warnings, err = s.checkAndRepair(ctx, in, c.ID, genID, tc, turns, result, snap, toolExec, readFile, emitter)
 		if err != nil {
 			return err
 		}
@@ -959,20 +1028,23 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	hasChanges = proposalHasChanges(result)
 
 	var staged []writtenFile
+	lockCtx := ctx
 	if hasChanges {
 		// Lock for buildWritePlan (reads layout files); concurrent generations could race.
-		unlock, err := s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
+		var unlock func()
+		var err error
+		lockCtx, unlock, err = s.themeLocks.Lock(ctx, themeLockKey(in.TenantID, in.ThemeSlug))
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
 		defer unlock()
 
 		// Computed entirely in memory; failure leaves draft untouched (not half-staged).
-		plan, err := s.buildWritePlan(ctx, store, storeAuth, result)
+		plan, err := s.buildWritePlan(lockCtx, store, storeAuth, result)
 		if err != nil {
 			return fmt.Errorf("stage theme changes: %w", err)
 		}
-		placed, err := in.imageCatalog.planFiles(ctx, store, storeAuth, result.UseAttachments)
+		placed, err := in.imageCatalog.planFiles(lockCtx, store, storeAuth, result.UseAttachments)
 		if err != nil {
 			return fmt.Errorf("stage attached images: %w", err)
 		}
@@ -1010,6 +1082,11 @@ func (s *Service) doGenerate(ctx context.Context, in GenerateInput, c chat.Chat,
 	}
 	summary = protectedPagesNote(summary, blockedPages)
 
+	// A lost lock means another holder may be staging this theme; committing now could interleave with it.
+	if errors.Is(context.Cause(lockCtx), errThemeLockLost) {
+		return fmt.Errorf("stage theme changes: %w", errThemeLockLost)
+	}
+
 	// Detached commitCtx: cancel can only stop BEFORE this point, never mid-commit.
 	commitCtx, commitCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer commitCancel()
@@ -1044,6 +1121,25 @@ func (s *Service) commitTurn(ctx context.Context, c chat.Chat, genID, summary st
 		return fmt.Errorf("commit turn: %w", err)
 	}
 	return nil
+}
+
+// recordFailedTurn saves the failed reply only while genID still runs: a reaped worker must not post into the chat
+// while the chat's next generation is running.
+func (s *Service) recordFailedTurn(ctx context.Context, c chat.Chat, genID, message string, model aicatalog.Choice) error {
+	tx, err := s.repo.BeginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin failed-turn record: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.repo.LockRunningGenerationTx(ctx, tx, genID); err != nil {
+		return err
+	}
+	if _, err := s.chats.RecordAssistantMessageInTx(ctx, tx, c, message, chat.MessageStatusFailed,
+		0, 0, chat.ApplyStatusNotApplicable, model.ModelID, model.Effort, nil); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Reports if chatID has running generation and error from most recent failure (cleared on next start).

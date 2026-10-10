@@ -45,7 +45,7 @@ func TestCommitTurn_IsAllOrNothing(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tt.finishFirst {
-				if err := repo.EndGeneration(ctx, c.ID, nil); err != nil {
+				if err := repo.EndGeneration(ctx, c.ID, genID, nil); err != nil {
 					t.Fatal(err)
 				}
 			}

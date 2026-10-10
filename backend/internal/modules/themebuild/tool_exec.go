@@ -17,7 +17,7 @@ import (
 const (
 	maxToolReadPaths    = 10
 	maxToolReadBytes    = 40_000
-	maxGrepMatches      = 200
+	maxGrepMatches      = 40
 	maxGrepFilesScanned = 500
 )
 
@@ -26,12 +26,23 @@ var grepThemeSearchableExt = map[string]bool{".liquid": true, ".css": true, ".js
 
 // Only place ai.Generate reaches themefs; ai never imports themefs directly.
 func (s *Service) buildToolExecutor(store themefs.ThemeStore, storeAuth themefs.RequestAuth) ai.ToolExecutor {
+	return s.buildToolExecutorWithPreload(store, storeAuth, toolOptions{})
+}
+
+type toolOptions struct {
+	// preloaded maps paths sent with the prompt to the content sent; a repeat read of one unchanged gets a short note.
+	preloaded map[string]string
+	// pagesJSONReadable: the prompt carried only a summary of pages.json, so reading it in full isn't a wasted trip.
+	pagesJSONReadable bool
+}
+
+func (s *Service) buildToolExecutorWithPreload(store themefs.ThemeStore, storeAuth themefs.RequestAuth, opts toolOptions) ai.ToolExecutor {
 	return func(ctx context.Context, name string, input json.RawMessage) (string, error) {
 		switch name {
 		case "list_theme_files":
 			return s.execListThemeFiles(ctx, store, storeAuth)
 		case "read_theme_file":
-			return s.execReadThemeFile(ctx, store, storeAuth, input)
+			return s.execReadThemeFile(ctx, store, storeAuth, input, opts)
 		case "grep_theme":
 			return s.execGrepTheme(ctx, store, storeAuth, input)
 		default:
@@ -79,7 +90,7 @@ type readThemeFileInput struct {
 
 // execReadThemeFile reads up to maxToolReadPaths files, capping total content at
 // maxToolReadBytes with an explicit truncation marker, not a silent cut-off.
-func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, input json.RawMessage) (string, error) {
+func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, input json.RawMessage, opts toolOptions) (string, error) {
 	var args readThemeFileInput
 	if err := json.Unmarshal(input, &args); err != nil {
 		return "", fmt.Errorf("invalid read_theme_file input: %w", err)
@@ -96,11 +107,12 @@ func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStor
 	for _, p := range args.Paths {
 		// pages.json/defaults.json are already supplied in this call's own context, so reading
 		// them here is always a wasted round trip, not a blocked one — unrelated to writability.
-		if p == pathPagesJSON || p == pathDefaultsJSON {
+		inContext := p == pathDefaultsJSON || (p == pathPagesJSON && !opts.pagesJSONReadable)
+		if inContext {
 			fmt.Fprintf(&b, "### %s\nERROR: %s is already in your context — do not read it via this tool.\n\n", p, p)
 			continue
 		}
-		if err := themefs.ValidateGeneratedFilePath(p); err != nil {
+		if err := themefs.ValidateGeneratedFilePath(p); p != pathPagesJSON && err != nil {
 			fmt.Fprintf(&b, "### %s\nERROR: %s\n\n", p, err.Error())
 			continue
 		}
@@ -113,6 +125,10 @@ func (s *Service) execReadThemeFile(ctx context.Context, store themefs.ThemeStor
 		}
 		if content == "" {
 			fmt.Fprintf(&b, "### %s\n(does not exist yet)\n\n", p)
+			continue
+		}
+		if sent, ok := opts.preloaded[p]; ok && sent == content {
+			b.WriteString(alreadyProvidedNote(p))
 			continue
 		}
 		if total+len(content) > maxToolReadBytes {
@@ -169,35 +185,42 @@ func (s *Service) execGrepTheme(ctx context.Context, store themefs.ThemeStore, s
 		candidates = append(candidates, p)
 	}
 	sort.Strings(candidates)
+	unscanned := 0
 	if len(candidates) > maxGrepFilesScanned {
+		unscanned = len(candidates) - maxGrepFilesScanned
 		candidates = candidates[:maxGrepFilesScanned]
 	}
 
 	var b strings.Builder
 	matches := 0
 	for _, p := range candidates {
-		if matches >= maxGrepMatches {
-			break
-		}
 		content, err := store.ReadFile(ctx, storeAuth, p)
 		if err != nil || content == "" {
 			continue
 		}
 		for i, line := range strings.Split(content, "\n") {
-			if matches >= maxGrepMatches {
-				break
+			if !re.MatchString(line) {
+				continue
 			}
-			if re.MatchString(line) {
+			// Counted past the cap so the model knows how much it isn't seeing.
+			if matches < maxGrepMatches {
 				fmt.Fprintf(&b, "%s:%d: %s\n", p, i+1, strings.TrimSpace(line))
-				matches++
 			}
+			matches++
 		}
 	}
 	if matches == 0 {
-		return "(no matches)", nil
+		b.WriteString("(no matches)\n")
 	}
-	if matches >= maxGrepMatches {
-		fmt.Fprintf(&b, "(stopped at %d matches — narrow your pattern/path_glob)\n", maxGrepMatches)
+	if extra := matches - maxGrepMatches; extra > 0 {
+		fmt.Fprintf(&b, "(%d more matches — narrow pattern or use path_glob)\n", extra)
+	}
+	if unscanned > 0 {
+		fmt.Fprintf(&b, "(searched only the first %d of %d matching files in path order; %d were not searched — narrow path_glob to search them)\n",
+			maxGrepFilesScanned, maxGrepFilesScanned+unscanned, unscanned)
+	}
+	if matches == 0 && unscanned == 0 {
+		return "(no matches)", nil
 	}
 	return b.String(), nil
 }

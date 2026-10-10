@@ -29,7 +29,7 @@ func TestCheckAndRepair_UnflaggedFilesSurviveRepair(t *testing.T) {
 	fg := &fakeGenerator{results: []*ai.Result{repair}}
 	svc := &Service{gen: fg}
 
-	got, _, err := svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", ai.ThemeContext{}, nil, original, testSnapshot(), nil, nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", "gen-1", ai.ThemeContext{}, nil, original, testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("checkAndRepair: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestCheckAndRepair_LayoutOnlyRepairKeepsTheFix(t *testing.T) {
 	}
 	svc := &Service{gen: &fakeGenerator{results: []*ai.Result{repair}}}
 
-	got, _, err := svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", ai.ThemeContext{}, nil, original, testSnapshot(), nil, nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", "gen-1", ai.ThemeContext{}, nil, original, testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("checkAndRepair: %v", err)
 	}

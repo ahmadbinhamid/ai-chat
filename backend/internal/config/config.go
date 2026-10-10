@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +15,9 @@ import (
 )
 
 type Config struct {
+	// AppEnv is APP_ENV, lower-cased; "production" requires AI_MODELS_CONFIG.
+	AppEnv string
+
 	// HTTP
 	Port string
 
@@ -39,6 +43,8 @@ type Config struct {
 
 	// StreamIdleTimeout bounds how long a streaming attempt can go with no new event before retry.
 	StreamIdleTimeout time.Duration
+	// StreamStallTimeout bounds how long a started reply can go without new content, pings or not, before retry.
+	StreamStallTimeout time.Duration
 	// FirstTokenTimeout* bound time-to-first-byte per ai.GenerationMode.
 	FirstTokenTimeoutEdit  time.Duration
 	FirstTokenTimeoutBrand time.Duration
@@ -70,6 +76,12 @@ type Config struct {
 
 	// GenerationRateLimitPerMinute caps /messages calls per tenant per minute.
 	GenerationRateLimitPerMinute int
+	// MaxConcurrentGenerations / MaxConcurrentGenerationsPerTenant cap generations running at once; 0 is unlimited.
+	MaxConcurrentGenerations          int
+	MaxConcurrentGenerationsPerTenant int
+	// LargeThemePages / LargeThemeFiles: above either, the prompt summarises the theme instead of listing it whole.
+	LargeThemePages int
+	LargeThemeFiles int
 
 	// CORSAllowedOrigins is the browser origins allowed to call this API. Empty blocks all
 	// cross-origin requests (fails closed).
@@ -78,6 +90,8 @@ type Config struct {
 	// RedisURL backs cross-replica generation-event pub/sub. Optional: empty means no
 	// cross-replica live delivery, not a startup failure.
 	RedisURL string
+	// SingleReplica (AI_CHAT_SINGLE_REPLICA) is the explicit opt-in to run production without Redis.
+	SingleReplica bool
 
 	// MaxRequestBodyBytes caps request bodies; sized for POST /chats/messages' worst case
 	// (base64 images + an HTML attachment).
@@ -92,6 +106,8 @@ func Load() Config {
 	}
 
 	return Config{
+		AppEnv: strings.ToLower(strings.TrimSpace(getenv("APP_ENV", "development"))),
+
 		Port: getenv("PORT", "8080"),
 
 		DBHost:     os.Getenv("DB_HOST"),
@@ -111,6 +127,7 @@ func Load() Config {
 		FakeAIDelay: time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
 		StreamIdleTimeout:      time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_SECONDS", 12)) * time.Second,
+		StreamStallTimeout:     time.Duration(getenvInt("AI_STREAM_STALL_TIMEOUT_SECONDS", 120)) * time.Second,
 		FirstTokenTimeoutEdit:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_SECONDS", 120)) * time.Second,
 		FirstTokenTimeoutBrand: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
 		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
@@ -129,9 +146,16 @@ func Load() Config {
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 
+		MaxConcurrentGenerations:          getenvNonNegativeInt("AI_MAX_CONCURRENT_GENERATIONS", 8),
+		MaxConcurrentGenerationsPerTenant: getenvNonNegativeInt("AI_MAX_CONCURRENT_GENERATIONS_PER_TENANT", 2),
+
+		LargeThemePages: getenvInt("AI_LARGE_THEME_PAGES", 40),
+		LargeThemeFiles: getenvInt("AI_LARGE_THEME_FILES", 250),
+
 		CORSAllowedOrigins: getenvList("CORS_ALLOWED_ORIGINS"),
 
-		RedisURL: os.Getenv("REDIS_URL"),
+		RedisURL:      os.Getenv("REDIS_URL"),
+		SingleReplica: getenvBool("AI_CHAT_SINGLE_REPLICA", false),
 
 		MaxRequestBodyBytes: int64(getenvInt("MAX_REQUEST_BODY_BYTES", 45*1024*1024)),
 	}
@@ -153,10 +177,27 @@ func getenvList(key string) []string {
 	return out
 }
 
+const AppEnvProduction = "production"
+
+// ValidateLockBackend refuses production without Redis unless single-replica is declared: the in-process theme lock
+// can't stop two replicas writing the same theme at once.
+func (c Config) ValidateLockBackend() error {
+	if c.AppEnv == AppEnvProduction && c.RedisURL == "" && !c.SingleReplica {
+		return errors.New("REDIS_URL is required when APP_ENV=production: without it theme writes are only locked " +
+			"within one process. Set REDIS_URL, or AI_CHAT_SINGLE_REPLICA=true if exactly one replica will ever run")
+	}
+	return nil
+}
+
 // ModelCatalog loads AI_MODELS_CONFIG, or without it the one-model catalogue from AI_API_KEY/AI_BASE_URL/AI_MODEL/
 // AI_EFFORT/AI_VISION_MODEL. Callers refuse to start on an error rather than fail on a merchant's request.
 func (c Config) ModelCatalog() (*aicatalog.Catalog, error) {
 	if c.ModelsConfig == "" {
+		// The env catalogue silently defaults to api.deepseek.com, so production must name its catalogue explicitly.
+		if c.AppEnv == AppEnvProduction {
+			return nil, errors.New("AI_MODELS_CONFIG is required when APP_ENV=production; refusing to fall back to " +
+				"the one-model AI_* env catalogue (set AI_MODELS_CONFIG, e.g. config/ai-models.json)")
+		}
 		return aicatalog.FromEnv(c.APIKey, c.BaseURL, c.Model, c.Effort, c.VisionModel)
 	}
 	data, err := os.ReadFile(c.ModelsConfig)
@@ -193,6 +234,20 @@ func getenvInt(key string, fallback int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
+		log.Printf("WARNING: invalid %s=%q, using default %d", key, v, fallback)
+		return fallback
+	}
+	return n
+}
+
+// getenvNonNegativeInt is getenvInt for settings where 0 is meaningful (unlimited).
+func getenvNonNegativeInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
 		log.Printf("WARNING: invalid %s=%q, using default %d", key, v, fallback)
 		return fallback
 	}

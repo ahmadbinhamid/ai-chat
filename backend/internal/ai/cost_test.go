@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 
@@ -137,5 +138,62 @@ func TestServedBy(t *testing.T) {
 				t.Errorf("servedBy = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// A provider that reports no cost (DeepSeek's own API) is priced from the catalogue; a reported cost always wins.
+func TestGenerate_PricesUnreportedCallsFromTheCatalogue(t *testing.T) {
+	// No peak block, so the result doesn't depend on the hour the test runs.
+	priced := func(raw map[string]any) {
+		for _, m := range raw["models"].([]any) {
+			if m.(map[string]any)["id"] == "deepseek-flash" {
+				m.(map[string]any)["pricing"] = map[string]any{"input": 0.15, "cache_hit_input": 0.003, "output": 0.6}
+			}
+		}
+	}
+	tests := []struct {
+		name  string
+		edit  func(map[string]any)
+		reply string
+		want  *float64
+	}{
+		{"unreported, priced from the catalogue", priced,
+			toolUseSSEResponse("m1", "t1", toolNameProposeChanges, emptyAnswer("Done."), 1000, 500),
+			ptrFloat((1000*0.15 + 500*0.6) / 1_000_000)},
+		{"a reported cost wins over catalogue prices", priced,
+			withCost(toolUseSSEResponse("m1", "t1", toolNameProposeChanges, emptyAnswer("Done."), 1000, 500), 0.0021),
+			ptrFloat(0.0021)},
+		{"unreported with no prices stays unknown, never free", nil,
+			toolUseSSEResponse("m1", "t1", toolNameProposeChanges, emptyAnswer("Done."), 1000, 500), nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, tt.reply)
+			}))
+			defer ts.Close()
+			g := catalogueGenerator(t, client(ts.URL), tt.edit)
+			result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "s", Model: aicatalog.Choice{ModelID: "deepseek-flash", Effort: "low"}}, nil, "x", nil, nil, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (result.CostUSD == nil) != (tt.want == nil) || (tt.want != nil && fmt.Sprintf("%.10f", *result.CostUSD) != fmt.Sprintf("%.10f", *tt.want)) {
+				t.Errorf("CostUSD = %v, want %v", deref(result.CostUSD), deref(tt.want))
+			}
+		})
+	}
+}
+
+func TestPricedCost_CountsCacheReadsAndWrites(t *testing.T) {
+	m := aicatalog.Model{Pricing: &aicatalog.Pricing{Input: 1, CacheHitInput: 0.1, Output: 2}}
+	u := anthropic.Usage{InputTokens: 1_000_000, CacheReadInputTokens: 2_000_000, CacheCreationInputTokens: 500_000, OutputTokens: 250_000}
+	got, ok := pricedCost(m, u, time.Now())
+	// Cache writes are billed like misses: (1M + 0.5M) * 1 + 2M * 0.1 + 0.25M * 2.
+	if want := 1.5 + 0.2 + 0.5; !ok || fmt.Sprintf("%.6f", got) != fmt.Sprintf("%.6f", want) {
+		t.Fatalf("pricedCost = %v (ok %v), want %v", got, ok, want)
+	}
+	if _, ok := pricedCost(aicatalog.Model{}, u, time.Now()); ok {
+		t.Fatal("a model without prices must not report a cost")
 	}
 }

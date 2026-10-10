@@ -69,7 +69,7 @@ func TestCheckAndRepair_AcceptsCleanProposalWithoutRetrying(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, goodResult(), testSnapshot(), nil, nil, nil)
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, goodResult(), testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestCheckAndRepair_RetriesOnceThenSucceeds(t *testing.T) {
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
 	bad := badResult()
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, bad, testSnapshot(), nil, nil, nil)
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, bad, testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestCheckAndRepair_ExhaustsRetriesAndFails(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
+	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected an error once retries are exhausted")
 	}
@@ -140,7 +140,7 @@ func TestCheckAndRepair_RetriesPastAnInvalidRepairReply(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("expected the generation to recover after the invalid reply, got error: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestCheckAndRepair_FailsWhenInvalidReplyExhaustsRetries(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
+	_, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, badResult(), testSnapshot(), nil, nil, nil)
 	if err == nil {
 		t.Fatal("expected an error once retries are exhausted on repeated invalid replies")
 	}
@@ -184,7 +184,7 @@ func TestCheckAndRepair_WarningsPassThroughOnAccept(t *testing.T) {
 	})
 	result.LayoutLinksToAdd = []string{"components/css/testimonials.css"}
 
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, result, testSnapshot(), nil, nil, nil)
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, result, testSnapshot(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestCheckAndRepair_PreExistingScriptDoesNotTriggerRepair(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, result, snap, nil, nil, nil)
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, result, snap, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -257,7 +257,7 @@ func TestCheckAndRepair_SameViolationInNewFileStillRepairs(t *testing.T) {
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, first, snap, nil, nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, first, snap, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip(t *testing.T)
 	svc := &Service{gen: fg}
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo"}
 
-	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", ai.ThemeContext{}, nil, result, snap, nil, nil, nil)
+	got, warnings, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", ai.ThemeContext{}, nil, result, snap, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

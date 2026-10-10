@@ -116,7 +116,7 @@ func TestGenerateValidProposal_InvalidProposalResumesToolLoop(t *testing.T) {
 	filename, attachment := "ref.html", "<p>ATTACHMENT-BODY</p>"
 	in := GenerateInput{TenantID: 1, ThemeSlug: "demo", HTMLAttachmentFilename: &filename, HTMLAttachmentContent: &attachment}
 
-	result, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{ThemeSlug: "demo"}, nil, "redesign", readOutputExec, nil, nil, in)
+	result, _, err := svc.generateValidProposal(context.Background(), &ai.ThemeContext{ThemeSlug: "demo"}, nil, "redesign", readOutputExec, nil, nil, in)
 	if err != nil {
 		t.Fatalf("generateValidProposal: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestGenerateValidProposal_EmptyProposalResumes(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{gen: realGenerator(t, ts.URL)}
 
-	if _, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{ThemeSlug: "demo"}, nil, "redesign", readOutputExec, nil, nil, GenerateInput{TenantID: 1, ThemeSlug: "demo"}); err != nil {
+	if _, _, err := svc.generateValidProposal(context.Background(), &ai.ThemeContext{ThemeSlug: "demo"}, nil, "redesign", readOutputExec, nil, nil, GenerateInput{TenantID: 1, ThemeSlug: "demo"}); err != nil {
 		t.Fatalf("generateValidProposal: %v", err)
 	}
 	retry := (*bodies)[1]
@@ -168,7 +168,7 @@ func TestGenerateValidProposal_SharedBudgetKeepsPairing(t *testing.T) {
 	defer ts.Close()
 	svc := &Service{gen: realGenerator(t, ts.URL)}
 
-	if _, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{ThemeSlug: "demo"}, nil, "redesign", readOutputExec, nil, nil, GenerateInput{TenantID: 1, ThemeSlug: "demo"}); err != nil {
+	if _, _, err := svc.generateValidProposal(context.Background(), &ai.ThemeContext{ThemeSlug: "demo"}, nil, "redesign", readOutputExec, nil, nil, GenerateInput{TenantID: 1, ThemeSlug: "demo"}); err != nil {
 		t.Fatalf("generateValidProposal: %v", err)
 	}
 	if len(*bodies) != maxThemeCheckRetries+1 {
@@ -189,7 +189,7 @@ func TestGenerateValidProposal_SharedBudgetKeepsPairing(t *testing.T) {
 // Fake mode produces no conversation, so retries take the flat path and still reach the honest fallback.
 func TestGenerateValidProposal_FakeModeUnaffected(t *testing.T) {
 	svc := &Service{gen: ai.NewFake(0)}
-	result, _, err := svc.generateValidProposal(context.Background(), ai.ThemeContext{}, nil, "hi", nil, nil, nil, GenerateInput{})
+	result, _, err := svc.generateValidProposal(context.Background(), &ai.ThemeContext{}, nil, "hi", nil, nil, nil, GenerateInput{})
 	if err != nil {
 		t.Fatalf("generateValidProposal: %v", err)
 	}

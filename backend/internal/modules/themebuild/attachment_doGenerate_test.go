@@ -198,8 +198,8 @@ func TestDoGenerate_ZeroAttachmentMessage_SkipsContentFetch(t *testing.T) {
 	if strings.Contains(gotPrompt, "Attached reference file") {
 		t.Errorf("expected no HTML-attachment framing in the prompt for a text-only turn, got: %s", gotPrompt)
 	}
-	if gotPrompt != "make the header blue" {
-		t.Errorf("expected the prompt to pass through unmodified, got: %s", gotPrompt)
+	if want := "make the header blue\n\n" + proposeInstruction; gotPrompt != want {
+		t.Errorf("expected only the request and the tool instruction, got: %s", gotPrompt)
 	}
 }
 

@@ -69,11 +69,11 @@ func TestCheckAndRepair_ResumesToolLoopConversation(t *testing.T) {
 	tc := ai.ThemeContext{ThemeSlug: "demo"}
 	toolExec := func(context.Context, string, json.RawMessage) (string, error) { return "READ-OUTPUT", nil }
 
-	first, err := gen.Generate(context.Background(), tc, nil, promptWithHTMLAttachment("build offers", in), nil, nil, toolExec, nil)
+	first, err := gen.Generate(context.Background(), tc, nil, promptWithAttachments("build offers", in), nil, nil, toolExec, nil)
 	if err != nil {
 		t.Fatalf("first Generate: %v", err)
 	}
-	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", tc, nil, first, testSnapshot(), toolExec, nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), in, "chat-1", "gen-1", tc, nil, first, testSnapshot(), toolExec, nil, nil)
 	if err != nil {
 		t.Fatalf("checkAndRepair: %v", err)
 	}

@@ -2,6 +2,7 @@
 package ai
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -81,9 +82,21 @@ type Result struct {
 	// CostUSD is what the provider charged across this result's calls; nil when it doesn't report cost.
 	CostUSD *float64 `json:"-"`
 	// ModelID/Effort: the catalogue model that produced this result, after any switch to the vision model.
-	ModelID      string `json:"-"`
-	Effort       string `json:"-"`
+	ModelID string `json:"-"`
+	Effort  string `json:"-"`
+	// Timings is this call's model/tool time; zero in fake mode.
+	Timings      Timings `json:"-"`
 	conversation *Conversation
+}
+
+// Timings is one Generate call's time split, from the counters its tool loop keeps for the summary log.
+type Timings struct {
+	Model time.Duration
+	Tool  time.Duration
+	// FirstToken is the first model request's wait for real output; 0 if none arrived.
+	FirstToken      time.Duration
+	Iterations      int
+	CacheReadTokens int64
 }
 
 // Conversation returns this result's resumable conversation, or nil (fake mode, or not produced by Generate).
@@ -120,6 +133,12 @@ type ThemeContext struct {
 	ThinkingOff bool
 	// SessionID groups a chat's calls so a provider with a session header keeps them on one host (and its cache).
 	SessionID string
+	// Compact summarises pages.json, the file tree and the manifest for a large theme (see IsLargeTheme).
+	Compact bool
+	// PreloadedPaths are files sent with the prompt; a compact tree still lists them, as it does DraftPaths.
+	PreloadedPaths []string
+	// RenderedComponents are what preloaded and draft files render; a compact manifest keeps only these.
+	RenderedComponents []string
 }
 
 // Generator calls Claude to produce theme file changes.
@@ -135,7 +154,9 @@ type Generator struct {
 
 // StreamTimeouts configures idle and first-token budgets for consumeStream.
 type StreamTimeouts struct {
-	Idle            time.Duration
+	Idle time.Duration
+	// Stall bounds how long a reply that has started can go without new content; keep-alive pings don't count.
+	Stall           time.Duration
 	FirstTokenEdit  time.Duration
 	FirstTokenBrand time.Duration
 	FirstTokenCopy  time.Duration
@@ -144,7 +165,9 @@ type StreamTimeouts struct {
 
 // Default stream timeouts, used when StreamTimeouts fields are zero.
 const (
-	defaultStreamIdleTimeout       = 12 * time.Second
+	defaultStreamIdleTimeout = 12 * time.Second
+	// Generous: some hosts compose a whole tool call before sending it, pinging meanwhile, so a big proposal is quiet.
+	defaultStreamStallTimeout      = 120 * time.Second
 	defaultFirstTokenTimeoutEdit   = 120 * time.Second
 	defaultFirstTokenTimeoutNarrow = 45 * time.Second
 	defaultFirstTokenTimeoutPages  = 150 * time.Second
@@ -155,6 +178,13 @@ func (g *Generator) idleTimeout() time.Duration {
 		return g.streamTimeouts.Idle
 	}
 	return defaultStreamIdleTimeout
+}
+
+func (g *Generator) stallTimeout() time.Duration {
+	if g.streamTimeouts.Stall > 0 {
+		return g.streamTimeouts.Stall
+	}
+	return defaultStreamStallTimeout
 }
 
 // firstTokenTimeoutFor picks the first-token budget for mode (ai.GenerationMode value).
@@ -526,12 +556,14 @@ var errStreamReaderPanicked = errors.New("provider stream reader panicked")
 var (
 	errStreamIdle       = errors.New("provider stream idle timeout")
 	errStreamFirstToken = errors.New("provider stream first-token timeout")
+	// errStreamStalled: output started, then no new content for the stall window while the host kept the stream open.
+	errStreamStalled = errors.New("provider stream stalled: no new output")
 )
 
 // isRetryableStreamErr reports if err is a provider hiccup (timeout or garbled), not a deadline/cancel.
 func isRetryableStreamErr(err error) bool {
 	return isRetryableAccumulateErr(err) || errors.Is(err, errStreamIdle) || errors.Is(err, errStreamFirstToken) ||
-		isRetryableProviderErr(err)
+		errors.Is(err, errStreamStalled) || isRetryableProviderErr(err)
 }
 
 // streamRetryReason labels err for retry warning log (diagnostic only).
@@ -541,6 +573,8 @@ func streamRetryReason(err error) string {
 		return "idle_timeout"
 	case errors.Is(err, errStreamFirstToken):
 		return "first_token_timeout"
+	case errors.Is(err, errStreamStalled):
+		return "stalled"
 	case isRetryableAccumulateErr(err):
 		return "truncated_stream"
 	case classifyProviderError(err) == providerErrRateLimited:
@@ -576,7 +610,7 @@ func consumeStream(
 	message *anthropic.Message,
 	idleTimeout, firstTokenTimeout time.Duration,
 ) error {
-	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, false, nil, nil)
+	return consumeStreamDeltas(ctx, stream, message, idleTimeout, firstTokenTimeout, 0, false, nil, nil, nil)
 }
 
 // consumeStreamDeltas is consumeStream that also hands each message_delta to onDelta: the accumulated message keeps
@@ -586,6 +620,8 @@ func consumeStreamDeltas(
 	stream *ssestream.Stream[anthropic.MessageStreamEventUnion],
 	message *anthropic.Message,
 	idleTimeout, firstTokenTimeout time.Duration,
+	// stallTimeout, when > 0, fails a reply whose content stops growing for that long, however many pings keep arriving.
+	stallTimeout time.Duration,
 	// idleAfterContent waits for real output, not just an event, before the idle rule applies: a router can send
 	// message_start before its upstream host has read the prompt, so the prefill silence that follows isn't a stall.
 	idleAfterContent bool,
@@ -593,6 +629,8 @@ func consumeStreamDeltas(
 	// resets the idle timer like an event does, so a host sending only pings isn't mistaken for a stall.
 	activity <-chan struct{},
 	onDelta func(anthropic.MessageDeltaEvent),
+	// onFirstProgress, when non-nil, runs once on this goroutine when the first real output arrives.
+	onFirstProgress func(),
 ) error {
 	sawProgress := false
 	sawEvent := false
@@ -604,6 +642,16 @@ func consumeStreamDeltas(
 	defer idleTimer.Stop()
 	firstTokenTimer := time.NewTimer(firstTokenTimeout)
 	defer firstTokenTimer.Stop()
+
+	// Armed by the first real output and pushed back only by more of it; nil channel until then never fires.
+	var stallTimer *time.Timer
+	var stallC <-chan time.Time
+	progressBytes := 0
+	defer func() {
+		if stallTimer != nil {
+			stallTimer.Stop()
+		}
+	}()
 
 	// Run stream.Next() in goroutine; select on: read completion, ctx deadline, idle/first-token timers.
 	type nextResult struct {
@@ -652,6 +700,8 @@ func consumeStreamDeltas(
 				return errStreamFirstToken
 			}
 			return errStreamIdle
+		case <-stallC:
+			return errStreamStalled
 		case <-firstTokenTimer.C:
 			if !sawProgress {
 				return errStreamFirstToken
@@ -672,9 +722,27 @@ func consumeStreamDeltas(
 			if onDelta != nil && event.Type == "message_delta" {
 				onDelta(event.AsMessageDelta())
 			}
+			if p := streamProgressBytes(*message); p > progressBytes && stallTimeout > 0 {
+				progressBytes = p
+				if stallTimer == nil {
+					stallTimer = time.NewTimer(stallTimeout)
+					stallC = stallTimer.C
+				} else {
+					if !stallTimer.Stop() {
+						select {
+						case <-stallTimer.C:
+						default:
+						}
+					}
+					stallTimer.Reset(stallTimeout)
+				}
+			}
 			if !sawProgress && streamProgressBytes(*message) > 0 {
 				sawProgress = true
 				firstTokenTimer.Stop()
+				if onFirstProgress != nil {
+					onFirstProgress()
+				}
 			}
 			resetIdle()
 			go readNext()
@@ -689,8 +757,28 @@ const defaultMaxTokens = 64000
 // and nudging on to maxToolIterations only burns minutes before failing anyway.
 const maxConsecutiveTextOnlyRounds = 3
 
-// errStuckInTextReplies is deliberately not a "too complex" failure: it fires on two-word messages too.
-var errStuckInTextReplies = errors.New("model kept replying in plain text without calling a tool")
+// ErrStuckInTextReplies is deliberately not a "too complex" failure: it fires on two-word messages too.
+var ErrStuckInTextReplies = errors.New("model kept replying in plain text without calling a tool")
+
+// stuckInTextError is ErrStuckInTextReplies carrying how many rounds the call used before giving up.
+type stuckInTextError struct{ rounds int }
+
+func (e *stuckInTextError) Error() string        { return ErrStuckInTextReplies.Error() }
+func (e *stuckInTextError) Is(target error) bool { return target == ErrStuckInTextReplies }
+
+// RoundsUsed reports how many tool-loop rounds a stuck-in-text failure used; ok is false for any other error.
+func RoundsUsed(err error) (rounds int, ok bool) {
+	var stuck *stuckInTextError
+	if errors.As(err, &stuck) {
+		return stuck.rounds, true
+	}
+	return 0, false
+}
+
+// ExhaustedSearch reports a result that ran out of tool-loop rounds without a proposal and fell back to asking.
+func (r *Result) ExhaustedSearch() bool {
+	return r != nil && r.NeedsClarification && r.Summary == ExhaustedSearchReply
+}
 
 // errMaxTokensTruncated: returned when StopReason==max_tokens to prevent parsing partial JSON.
 var errMaxTokensTruncated = errors.New("model response was truncated at the max_tokens limit before propose_changes could be parsed")
@@ -744,6 +832,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	// Dynamic block (pages.json, defaults.json, file tree, manifest): byte-identical across iterations/retries.
 	// Cache breakpoint saves ~10% cost; minimum prefix length checked silently by API.
 	dynamicBlock := anthropic.TextBlockParam{Text: dynamicSystemPrompt(tc)}
+	slog.Info("ai: dynamic prompt size", "dynamic_prompt_bytes", len(dynamicBlock.Text), "compact", tc.Compact)
 	dynamicCacheControl := anthropic.NewCacheControlEphemeralParam()
 	dynamicCacheControl.TTL = anthropic.CacheControlEphemeralTTLTTL1h
 	dynamicBlock.CacheControl = dynamicCacheControl
@@ -755,8 +844,12 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	explorationToolCalls := 0
 	// Diagnostics: generateStart, modelElapsed, toolElapsed, iterationsUsed (summary log on return).
 	generateStart := time.Now()
-	var totalModelElapsed, totalToolElapsed time.Duration
+	var totalModelElapsed, totalToolElapsed, firstTokenElapsed time.Duration
 	iterationsUsed := 0
+	timings := func() Timings {
+		return Timings{Model: totalModelElapsed, Tool: totalToolElapsed, FirstToken: firstTokenElapsed,
+			Iterations: iterationsUsed, CacheReadTokens: totalCacheReadTokens}
+	}
 	// totalReasoningTokens/reasoningTokensReported: theory 1 (reasoning tax) diagnostics.
 	var totalReasoningTokens int64
 	reasoningTokensReported := false
@@ -775,6 +868,8 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 	}()
 	// Counts consecutive rounds with no tool call that text recovery also couldn't rescue; any real call resets it.
 	consecutiveTextOnly := 0
+	// The last propose_changes input that failed to decode; the same one sent again means handing it back isn't working.
+	var lastUndecodable json.RawMessage
 	explorationRounds := 0
 	normalToolChoice := g.normalToolChoice(entry)
 	idleAfterContent := g.idleAfterContent(entry)
@@ -821,6 +916,14 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		var message anthropic.Message
 		// Track attempts separately to distinguish retried streams from slow inference.
 		modelCallStart := time.Now()
+		var onFirstProgress func()
+		if iteration == 0 {
+			onFirstProgress = func() {
+				if firstTokenElapsed == 0 {
+					firstTokenElapsed = time.Since(modelCallStart)
+				}
+			}
+		}
 		attemptsUsed := 0
 		for attempt := 1; attempt <= streamAccumulateMaxAttempts; attempt++ {
 			attemptsUsed = attempt
@@ -829,14 +932,17 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			stream := client.Messages.NewStreaming(ctx, params, attemptOpts...)
 			message = anthropic.Message{}
 			callCost, callCostReported := 0.0, false
-			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, idleAfterContent, activity, func(d anthropic.MessageDeltaEvent) {
+			streamErr := consumeStreamDeltas(ctx, stream, &message, g.idleTimeout(), firstTokenTimeout, g.stallTimeout(), idleAfterContent, activity, func(d anthropic.MessageDeltaEvent) {
 				callCost, callCostReported = deltaCost(d)
-			})
+			}, onFirstProgress)
 			// Close immediately (timeouts may abandon mid-read).
 			_ = stream.Close()
 			if streamErr == nil {
 				err := stream.Err()
 				if err == nil {
+					if !callCostReported {
+						callCost, callCostReported = pricedCost(entry, message.Usage, time.Now())
+					}
 					cost.add(callCost, callCostReported)
 					break
 				}
@@ -959,11 +1065,26 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 
 		// materializeFailureMsg: fed back as tool_result (isError: true) on failure; loop continues for correction.
 		var materializeFailureMsg string
+		var result Result
+		decoded := false
 		if proposeInput != nil {
-			result, err := decodeProposeInput(proposeInput)
-			if err != nil {
-				return nil, fmt.Errorf("could not parse propose_changes input: %w", err)
+			var decodeErr error
+			if result, decodeErr = decodeProposeInput(proposeInput); decodeErr != nil {
+				if bytes.Equal(proposeInput, lastUndecodable) {
+					slog.Warn("ai: model resent the same undecodable propose_changes input; stopping",
+						"iteration", iteration, "error", decodeErr.Error())
+					return nil, fmt.Errorf("model resent the same undecodable propose_changes input: %w", decodeErr)
+				}
+				lastUndecodable = proposeInput
+				// Handed back like a failed edit: one mistyped field shouldn't end a turn the model can fix itself.
+				slog.Warn("ai: propose_changes input didn't decode; asking the model to resend it",
+					"iteration", iteration, "recovered_from_text", recovered, "error", decodeErr.Error())
+				materializeFailureMsg = malformedProposeMessage(decodeErr)
+			} else {
+				decoded = true
 			}
+		}
+		if decoded {
 			// Register creates even if materialization fails (grounding for later edits).
 			for _, f := range result.Files {
 				if f.Action == "create" {
@@ -978,6 +1099,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 				result.CostUSD = cost.value()
 				result.ExplorationToolCalls = explorationToolCalls
 				result.ModelID, result.Effort = choice.ModelID, choice.Effort
+				result.Timings = timings()
 				// A recovered call has no tool_use ID to pair a resumed tool_result with, so repair uses the flat-recap fallback.
 				if !recovered {
 					result.conversation = newConversation(messages, message, proposeID, choice)
@@ -998,19 +1120,21 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 			// Never turn the text into an answer: that would need answered_question: true, which bypasses the
 			// fake-success guard, so a plain-text "Done!" would reach the merchant with nothing changed.
 			consecutiveTextOnly++
+			// Debug only, for diagnosing text-only rounds locally; the server logger runs at Info, so this never ships.
+			slog.Debug("ai: text-only round",
+				"iteration", iteration,
+				"block_types", contentBlockTypes(message),
+				"text_head", headRunes(blockText(message, false), 300),
+				"thinking_head", headRunes(blockText(message, true), 300))
 			if consecutiveTextOnly >= maxConsecutiveTextOnlyRounds {
 				slog.Warn("ai: model stuck replying in text, stopping", "iteration", iteration, "consecutive_text_rounds", consecutiveTextOnly)
-				return nil, errStuckInTextReplies
+				return nil, &stuckInTextError{rounds: iteration + 1}
 			}
-			slog.Warn("ai: tool-loop nudge fired (no tool call this round)", "iteration", iteration)
+			nudge := textOnlyNudge(blockText(message, false))
+			slog.Warn("ai: tool-loop nudge fired (no tool call this round)", "iteration", iteration, "wrote_edit_as_text", nudge == textEditNudge)
 			// DeepSeek does NOT honor ToolChoice: OfAny (Anthropic does). Nudge instead of failing.
 			messages = append(messages, message.ToParam())
-			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(
-				"You must call one of the available tools on every turn — propose_changes if you already have enough "+
-					"to finish (even for a simple greeting or question, propose_changes with no file changes, "+
-					"answered_question: true, and the reply in `summary` is correct), or a read/explore tool otherwise. "+
-					"A plain text reply with no tool call is not valid here.",
-			)))
+			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(nudge)))
 			continue
 		}
 
@@ -1075,6 +1199,7 @@ func (g *Generator) Generate(ctx context.Context, tc ThemeContext, history []Tur
 		ExplorationToolCalls: explorationToolCalls,
 		ModelID:              choice.ModelID,
 		Effort:               choice.Effort,
+		Timings:              timings(),
 	}, nil
 }
 
@@ -1309,6 +1434,23 @@ func dynamicSystemPrompt(tc ThemeContext) string {
 	if mode == "" {
 		mode = GenerationModeEdit
 	}
+	if tc.Compact {
+		if pages, ok := formatPagesCompact(pagesJSON); ok {
+			return fmt.Sprintf(`## Theme being edited
+- Theme slug: %s
+- MODE: %s%s
+- Current pages (slug — title; never register a slug that's already here; read_theme_file pages.json for full entries):
+%s
+- Current defaults.json (brand colors, fonts, menu, footer — match this, don't invent a different palette):
+%s
+- Current file tree:
+%s
+%s%s`, tc.ThemeSlug, mode, modeRestrictionNote(mode), pages, defaultsJSON,
+				formatFileTreeCompact(tc.FileTree, pathSet(tc.PreloadedPaths, tc.DraftPaths)),
+				formatManifestCompact(tc.Manifest, pathSet(tc.RenderedComponents)),
+				formatDraftPaths(tc.DraftPaths, tc.StagedImagePaths))
+		}
+	}
 
 	return fmt.Sprintf(`## Theme being edited
 - Theme slug: %s
@@ -1428,7 +1570,7 @@ func summarizeToolResult(name, output string, toolErr error) string {
 	}
 }
 
-// summarizeGrepResult: counts match lines (excludes "(no matches)" and "(stopped at ...)" notes).
+// summarizeGrepResult: counts match lines, skipping the tool's parenthesised notes ("(no matches)", truncation notes).
 func summarizeGrepResult(output string) string {
 	trimmed := strings.TrimSpace(output)
 	if trimmed == "(no matches)" {

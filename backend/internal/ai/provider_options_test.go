@@ -45,7 +45,10 @@ func openRouterGenerator(t *testing.T, edit func(map[string]any)) (*Generator, f
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatal(err)
 	}
-	raw["providers"].(map[string]any)["openrouter"].(map[string]any)["base_url"] = ts.URL
+	// Every provider, not just "openrouter": a model left on a real URL would call the live service from a test.
+	for _, p := range raw["providers"].(map[string]any) {
+		p.(map[string]any)["base_url"] = ts.URL
+	}
 	if edit != nil {
 		edit(raw)
 	}
@@ -118,7 +121,9 @@ func TestGenerate_SendsTheSessionHeader(t *testing.T) {
 
 func TestGenerate_NoOptionsSendsNoExtraFields(t *testing.T) {
 	g, bodies, _ := openRouterGenerator(t, func(raw map[string]any) {
-		delete(raw["providers"].(map[string]any)["openrouter"].(map[string]any), "options")
+		for _, p := range raw["providers"].(map[string]any) {
+			delete(p.(map[string]any), "options")
+		}
 		for _, m := range raw["models"].([]any) {
 			delete(m.(map[string]any), "options")
 		}

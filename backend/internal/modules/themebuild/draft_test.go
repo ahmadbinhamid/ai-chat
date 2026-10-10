@@ -71,7 +71,7 @@ func TestExecReadThemeFile_ReturnsDraftContentNotFlowposContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal input: %v", err)
 	}
-	out, err := svc.execReadThemeFile(context.Background(), overlay, testStoreAuth(), input)
+	out, err := svc.execReadThemeFile(context.Background(), overlay, testStoreAuth(), input, toolOptions{})
 	if err != nil {
 		t.Fatalf("execReadThemeFile failed: %v", err)
 	}
