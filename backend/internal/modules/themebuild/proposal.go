@@ -304,6 +304,7 @@ func (s *Service) checkAndRepair(
 
 		emitter.emit(ctx, EventTypeChecking, map[string]int{"attempt": attempt})
 		validationStart := time.Now()
+		dropRedundantPageRegistry(result, snap.PagesJSON())
 		findings := s.checkProposal(ctx, in, result, snap)
 		// Only raw error COUNT needed to gate auto-fixer; real findings computed after filtering below.
 		rawErrorFindings, _ := splitFindings(findings)
@@ -379,6 +380,8 @@ func (s *Service) checkAndRepair(
 		repair := repairPrompt(errorFindings)
 
 		repairTC := tc
+		// A repair fixes named lines; long reasoning over the whole proposal only slows it (8+ minutes seen on Pro).
+		repairTC.ThinkingOff = true
 		repairText := promptWithAttachments(repair, in)
 		if conversation != nil {
 			// Recap goes in the proposal's tool_result: auto-fixers may have changed content since the model's tool_use.
@@ -609,6 +612,9 @@ func repairPrompt(errorFindings []themecheck.Finding) string {
 		"read_theme_file again on any file named there. Only read a file if a finding above names one your last " +
 		"proposal did NOT already include. Do not explore, read, or touch anything else — no other files, no " +
 		"re-checking components you already used correctly, no improvements beyond what's listed above.")
+	// The merge keeps every file the repair leaves out; without saying so, "the complete final set" reads as resend everything.
+	b.WriteString("\n\nEvery other file in your last proposal is kept exactly as you proposed it. In this " +
+		"propose_changes include ONLY the files you fix — never your whole proposal again.")
 	return b.String()
 }
 

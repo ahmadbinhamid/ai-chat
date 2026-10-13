@@ -6,6 +6,7 @@ import (
 
 	"ai-chat/internal/ai"
 	"ai-chat/internal/themecheck"
+	"ai-chat/internal/themefs"
 )
 
 // Fake generator; multi-generate calls require fake, not httptest (SDK wraps client directly).
@@ -13,10 +14,12 @@ type fakeGenerator struct {
 	calls           int
 	results         []*ai.Result // returned in order; last repeats once exhausted
 	visionSupported bool         // set true only for vision-specific tests
+	thinkingOff     []bool       // each call's ThemeContext.ThinkingOff, in order
 }
 
-func (f *fakeGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []ai.Turn, _ string, _ []ai.Image, _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
+func (f *fakeGenerator) Generate(_ context.Context, tc ai.ThemeContext, _ []ai.Turn, _ string, _ []ai.Image, _ ai.ToolProgress, _ ai.ToolExecutor, _ ai.FileReader) (*ai.Result, error) {
 	f.calls++
+	f.thinkingOff = append(f.thinkingOff, tc.ThinkingOff)
 	idx := f.calls - 1
 	if idx >= len(f.results) {
 		idx = len(f.results) - 1
@@ -96,6 +99,9 @@ func TestCheckAndRepair_RetriesOnceThenSucceeds(t *testing.T) {
 	}
 	if fg.calls != 1 {
 		t.Errorf("expected exactly 1 retry Generate call, got %d", fg.calls)
+	}
+	if len(fg.thinkingOff) != 1 || !fg.thinkingOff[0] {
+		t.Errorf("a repair call must run with thinking off, got %v", fg.thinkingOff)
 	}
 	if len(warnings) != 0 {
 		t.Errorf("expected no warnings, got %+v", warnings)
@@ -314,5 +320,25 @@ func TestCheckAndRepair_HardcodedColorsAutoFixSkipsRepairRoundTrip(t *testing.T)
 `
 	if got.Files[0].Content != want {
 		t.Errorf("got %q, want %q", got.Files[0].Content, want)
+	}
+}
+
+// A redesign that re-registers the existing home route passes without a repair round; before, a repair that left the
+// entry out had it merged back and failed all three attempts.
+func TestCheckAndRepair_RedundantHomeRegistrationNeedsNoRepair(t *testing.T) {
+	fg := &fakeGenerator{results: []*ai.Result{goodResult()}}
+	svc := &Service{gen: fg}
+	snap := testSnapshot()
+	snap.Files = map[string]string{"pages.json": `[{"slug":"home","type":"home","path":"/pages","page":"home"}]`}
+	proposal := goodResult()
+	proposal.PageRegistryEntry = &themefs.PageEntry{Title: "Home", Slug: "home", Type: "home", Path: "/pages", Page: "home"}
+
+	got, _, err := svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", "gen-1",
+		ai.ThemeContext{}, nil, proposal, snap, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fg.calls != 0 || got.PageRegistryEntry != nil {
+		t.Fatalf("want no repair and the redundant entry dropped, got %d repairs and entry %+v", fg.calls, got.PageRegistryEntry)
 	}
 }

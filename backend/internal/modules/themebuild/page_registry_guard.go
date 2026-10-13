@@ -1,6 +1,8 @@
 package themebuild
 
 import (
+	"encoding/json"
+	"log/slog"
 	"regexp"
 	"strings"
 
@@ -161,4 +163,33 @@ func protectedPagesNote(summary string, blocked []string) string {
 		return note
 	}
 	return summary + "\n\n" + note
+}
+
+// dropRedundantPageRegistry removes a page_registry_entry that re-registers a route pages.json already has for the same
+// page file (a redesign re-registering home): it changes nothing, yet page-route rejects it, and a repair that leaves
+// it out can't remove it. A taken slug pointing at a different file is a real conflict and is kept for repair.
+func dropRedundantPageRegistry(result *ai.Result, pagesJSON string) {
+	if result == nil || result.PageRegistryEntry == nil {
+		return
+	}
+	var existing []themefs.PageEntry
+	if json.Unmarshal([]byte(pagesJSON), &existing) != nil {
+		return
+	}
+	entry := result.PageRegistryEntry
+	for i := range existing {
+		if existing[i].Slug == entry.Slug && pageFileOf(&existing[i]) == pageFileOf(entry) {
+			slog.Info("dropped a page_registry_entry that re-registers an existing route", "slug", entry.Slug, "page", entry.Page)
+			result.PageRegistryEntry = nil
+			return
+		}
+	}
+}
+
+// pageFileOf is the .liquid file a pages.json entry routes to (spec §5).
+func pageFileOf(e *themefs.PageEntry) string {
+	if e.Path == "/pages/auth" {
+		return "pages/auth/" + e.Page + ".liquid"
+	}
+	return "pages/" + e.Page + ".liquid"
 }
