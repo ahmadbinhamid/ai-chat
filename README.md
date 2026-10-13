@@ -62,7 +62,7 @@ DEEPSEEK_API_KEY=sk-...
 AI_MODELS_CONFIG=config/ai-models.byok.json
 ```
 
-Grok, Kimi, Gemini and DeepSeek Flash Vision stay on OpenRouter (`AI_API_KEY`).
+Grok, Kimi and DeepSeek Flash Vision stay on OpenRouter (`AI_API_KEY`).
 To go back, set `AI_MODELS_CONFIG=config/ai-models.json` and restart. While on
 the direct key there is **no failover to OpenRouter**: if DeepSeek's API is
 down or the balance runs out, DeepSeek turns fail until you switch back.

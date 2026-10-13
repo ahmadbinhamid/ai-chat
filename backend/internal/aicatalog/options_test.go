@@ -93,10 +93,8 @@ func TestParse_Options(t *testing.T) {
 	}
 }
 
-// No host order (it disables sticky routing), fallbacks on, Cloudflare skipped, a session header. Only Gemini Flash
-// names a host: Vertex buffers tool calls and OpenRouter aborts a host silent for ~35s; AI Studio streams.
+// No host order (it disables sticky routing), no host list, fallbacks on, Cloudflare skipped, a session header.
 func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
-	pinned := map[string]string{"gemini-flash": "[google-ai-studio]"}
 	data, err := os.ReadFile("../../config/ai-models.json")
 	if err != nil {
 		t.Fatal(err)
@@ -116,8 +114,8 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 		if _, sorted := p["sort"]; sorted {
 			t.Errorf("model %q: want no sort, got %v", m.ID, p["sort"])
 		}
-		if only, restricted := p["only"]; restricted != (pinned[m.ID] != "") || (restricted && fmt.Sprint(only) != pinned[m.ID]) {
-			t.Errorf("model %q: want host list %q, got %v", m.ID, pinned[m.ID], only)
+		if only, restricted := p["only"]; restricted {
+			t.Errorf("model %q: want no host list, got %v", m.ID, only)
 		}
 		ignore, _ := p["ignore"].([]any)
 		if _, ordered := p["order"]; ordered || p["allow_fallbacks"] != true || p["data_collection"] != "allow" || len(ignore) == 0 {
@@ -127,7 +125,7 @@ func TestOpenRouterCatalogue_RoutesStickily(t *testing.T) {
 }
 
 // Measured through OpenRouter for each model: whether it takes thinking settings, sees images, and whether effort changes
-// how much it thinks (DeepSeek: no, so one effort; Kimi: yes). Grok and Gemini Flash reason on their own and reject thinking: disabled.
+// how much it thinks (DeepSeek: no, so one effort; Kimi: yes). Grok reasons on its own and rejects thinking: disabled.
 func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 	data, err := os.ReadFile("../../config/ai-models.json")
 	if err != nil {
@@ -146,8 +144,6 @@ func TestOpenRouterCatalogue_Capabilities(t *testing.T) {
 		"deepseek-flash-vision": {thinking: true, images: true, efforts: 1},
 		"grok":                  {thinking: false, images: true, efforts: 0},
 		"kimi":                  {thinking: true, images: true, efforts: 3},
-		"gemini-pro":            {thinking: true, images: true, efforts: 1},
-		"gemini-flash":          {thinking: false, images: true, efforts: 0},
 	}
 	if len(c.Models) != len(want) {
 		t.Fatalf("want %d models, got %d", len(want), len(c.Models))

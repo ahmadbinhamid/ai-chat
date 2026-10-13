@@ -62,26 +62,6 @@
       "default_effort": "low"
     },
     {
-      "id": "gemini-pro",
-      "label": "Gemini Pro",
-      "provider": "openrouter",
-      "model": "google/gemini-3.1-pro-preview",
-      "options": { "provider": { "require_parameters": true } },
-      "images": true,
-      "thinking": true,
-      "efforts": ["low"],
-      "default_effort": "low"
-    },
-    {
-      "id": "gemini-flash",
-      "label": "Gemini Flash",
-      "provider": "openrouter",
-      "model": "google/gemini-3.7-flash",
-      "options": { "provider": { "require_parameters": true, "only": ["google-ai-studio"] } },
-      "images": true,
-      "thinking": false
-    },
-    {
       "id": "deepseek-flash-vision",
       "label": "DeepSeek Flash Vision",
       "provider": "openrouter-deepseek",
