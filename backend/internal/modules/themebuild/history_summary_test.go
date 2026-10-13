@@ -19,7 +19,7 @@ type summarizingFakeGenerator struct {
 	summarizeErr   error
 }
 
-func (f *summarizingFakeGenerator) Summarize(_ context.Context, turns []ai.Turn) (string, error) {
+func (f *summarizingFakeGenerator) Summarize(_ context.Context, _ string, turns []ai.Turn) (string, error) {
 	f.summarizeCalls++
 	if f.summarizeErr != nil {
 		return "", f.summarizeErr
@@ -408,11 +408,13 @@ func TestToTurns_DiscardedMessagesStillReplayed(t *testing.T) {
 // recordingSummarizer records every Summarize input so tests can assert on exactly what was sent.
 type recordingSummarizer struct {
 	fakeGenerator
-	inputs [][]ai.Turn
+	inputs     [][]ai.Turn
+	sessionIDs []string
 }
 
-func (r *recordingSummarizer) Summarize(_ context.Context, turns []ai.Turn) (string, error) {
+func (r *recordingSummarizer) Summarize(_ context.Context, sessionID string, turns []ai.Turn) (string, error) {
 	r.inputs = append(r.inputs, append([]ai.Turn(nil), turns...))
+	r.sessionIDs = append(r.sessionIDs, sessionID)
 	return fmt.Sprintf("summary of %d turns", len(turns)), nil
 }
 
@@ -547,6 +549,9 @@ func TestSummarizeOldTurnsCached_BelowCapUnchanged(t *testing.T) {
 	olderCount := bucketedOlderCount(len(turns))
 
 	got := svc.summarizeOldTurnsCached(context.Background(), "chat-small", turns)
+	if len(rec.sessionIDs) != 1 || rec.sessionIDs[0] != "chat-small" {
+		t.Errorf("want Summarize sent the chat ID as its session, got %q", rec.sessionIDs)
+	}
 
 	if len(rec.inputs) != 1 || len(rec.inputs[0]) != olderCount {
 		t.Fatalf("expected all %d older turns summarized, got %+v", olderCount, rec.inputs)

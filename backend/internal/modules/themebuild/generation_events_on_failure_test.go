@@ -21,7 +21,7 @@ func (alwaysFailGenerator) Generate(context.Context, ai.ThemeContext, []ai.Turn,
 	return nil, context.Canceled
 }
 
-func (alwaysFailGenerator) Summarize(context.Context, []ai.Turn) (string, error) {
+func (alwaysFailGenerator) Summarize(context.Context, string, []ai.Turn) (string, error) {
 	return "", nil
 }
 

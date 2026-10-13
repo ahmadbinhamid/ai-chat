@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"ai-chat/internal/ai"
+
 	"github.com/google/uuid"
 )
 
@@ -140,5 +142,27 @@ func TestToolProgressEmitter_ToolFinished_EmitsEvenOnError(t *testing.T) {
 	}
 	if failurePayload.Summary != "failed: boom" {
 		t.Errorf("expected the error summary to be emitted, got %q", failurePayload.Summary)
+	}
+}
+
+// The stock photo search never reaches the merchant's step feed; the theme tools around it still do.
+func TestToolProgressEmitter_HidesStockImageSearch(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	ctx := context.Background()
+	chatID := uuid.NewString()
+	genID := seedGeneration(t, repo, chatID)
+	tp := toolProgressFor(ctx, newEventEmitter(ctx, repo, nil, genID, chatID))
+
+	tp.ToolStarted(ai.ToolNameSearchStockImages, json.RawMessage(`{"query":"coffee beans"}`))
+	tp.ToolFinished(ai.ToolNameSearchStockImages, "3 photos", nil)
+	tp.ToolStarted("read_theme_file", json.RawMessage(`{"paths":["pages/home.liquid"]}`))
+
+	events, err := repo.GetEventsSince(ctx, chatID, 0)
+	if err != nil {
+		t.Fatalf("GetEventsSince failed: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != EventTypeToolCall {
+		t.Fatalf("want only the theme read in the feed, got %+v", events)
 	}
 }

@@ -14,10 +14,10 @@ func envWith(vars map[string]string) func(string) (string, bool) {
 
 var withKey = envWith(map[string]string{"AI_API_KEY": "k"})
 
-// validCatalogue returns the committed catalogue as a map, so each case can break exactly one thing.
+// validCatalogue returns the DeepSeek rollback catalogue as a map, so each case can break exactly one thing.
 func validCatalogue(t *testing.T) map[string]any {
 	t.Helper()
-	data, err := os.ReadFile("../../config/ai-models.json")
+	data, err := os.ReadFile("../../config/ai-models.deepseek.json")
 	if err != nil {
 		t.Fatalf("read committed catalogue: %v", err)
 	}
@@ -66,6 +66,13 @@ func TestParse_RefusesInvalidCatalogues(t *testing.T) {
 		{name: "summary model not in list", mutate: func(m map[string]any) { m["summary_model"] = "nope" }, wantErr: `summary_model "nope" is not in the model list`},
 		{name: "auto fix model not in list", mutate: func(m map[string]any) { m["auto"].(map[string]any)["fix_model"] = "nope" }, wantErr: `auto fix_model "nope"`},
 		{name: "auto effort not offered", mutate: func(m map[string]any) { m["auto"].(map[string]any)["design_effort"] = "max" }, wantErr: `auto design_effort "max"`},
+		{name: "auto redesign model not in list", mutate: func(m map[string]any) { m["auto"].(map[string]any)["redesign_model"] = "nope" }, wantErr: `auto redesign_model "nope"`},
+		{name: "auto redesign effort not offered", mutate: func(m map[string]any) {
+			m["auto"].(map[string]any)["redesign_model"] = "deepseek-flash-vision"
+			m["auto"].(map[string]any)["redesign_effort"] = "high"
+		}, wantErr: `auto redesign_effort "high"`},
+		{name: "auto redesign effort without a model", mutate: func(m map[string]any) { m["auto"].(map[string]any)["redesign_effort"] = "low" }, wantErr: "need a redesign_model"},
+		{name: "auto redesign thinking without a model", mutate: func(m map[string]any) { m["auto"].(map[string]any)["redesign_thinking"] = true }, wantErr: "need a redesign_model"},
 		{name: "default model not selectable", mutate: func(m map[string]any) { m["default_model"] = "deepseek-flash-vision" }, wantErr: "is not a selectable model"},
 		{name: "reserved id", mutate: func(m map[string]any) { model(m, 0)["id"] = "auto" }, wantErr: "is reserved"},
 		{name: "efforts without thinking", mutate: func(m map[string]any) { model(m, 0)["thinking"] = false }, wantErr: `efforts need "thinking": true`},
@@ -203,5 +210,39 @@ func TestPublic_HidesProviderDetails(t *testing.T) {
 		if strings.Contains(string(raw), secret) {
 			t.Errorf("GET /models must not expose %q: %s", secret, raw)
 		}
+	}
+}
+
+// The active catalogue is OpenRouter, keyed by AI_API_KEY like the DeepSeek one, with the same model ids.
+func TestParse_OpenRouterCatalogue(t *testing.T) {
+	data, err := os.ReadFile("../../config/ai-models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data, withKey)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	p, ok := c.Provider("openrouter")
+	if !ok || p.APIKeyEnv != "AI_API_KEY" || p.BaseURL != "https://openrouter.ai/api" {
+		t.Fatalf("want the openrouter provider on AI_API_KEY, got %+v", c.Providers)
+	}
+	// DeepSeek gets its own OpenRouter entry on tool_choice auto: only DeepInfra and Azure (whose tool calls break)
+	// accept "any" for DeepSeek V4, so "any" left each model on a single host. Every other model keeps "any".
+	ds, ok := c.Provider("openrouter-deepseek")
+	if !ok || ds.APIKeyEnv != p.APIKeyEnv || ds.BaseURL != p.BaseURL || ds.ToolChoice != "auto" || p.ToolChoice != "any" {
+		t.Fatalf("want openrouter-deepseek on the same key and URL with tool_choice auto, and openrouter on any; got %+v", c.Providers)
+	}
+	for _, m := range c.Models {
+		want := "openrouter"
+		if strings.HasPrefix(m.Model, "deepseek/") {
+			want = "openrouter-deepseek"
+		}
+		if m.Provider != want {
+			t.Errorf("model %q is served by %q, want %q", m.ID, m.Provider, want)
+		}
+	}
+	if _, err := Parse(data, envWith(map[string]string{"OPENROUTER_API_KEY": "k"})); err == nil {
+		t.Error("want an error when AI_API_KEY is unset")
 	}
 }

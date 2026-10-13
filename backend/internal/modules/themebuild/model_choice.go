@@ -7,6 +7,7 @@ import (
 
 	"ai-chat/internal/aicatalog"
 	"ai-chat/internal/modules/chat"
+	"ai-chat/internal/pageintent"
 	"ai-chat/internal/previewerrors"
 )
 
@@ -41,20 +42,30 @@ func (s *Service) selectModel(in GenerateInput) (aicatalog.Selection, error) {
 	return sel, nil
 }
 
-// resolveModel picks this turn's concrete model; auto needs the chat's earlier prompts to spot a fix follow-up.
-func (s *Service) resolveModel(ctx context.Context, in GenerateInput, c chat.Chat, sel aicatalog.Selection, hasPreviewErrors bool) (aicatalog.Choice, error) {
-	if s.models == nil {
-		return aicatalog.Choice{}, nil
-	}
-	if sel.ModelID != aicatalog.AutoID {
-		return s.models.Resolve(sel, false), nil
-	}
+// classifyTurn reports whether a turn is a fix (spotted with the chat's earlier prompts, for a bare follow-up) or a
+// redesign, never both. A merchant's words reporting a bug make it a fix; captured preview errors alone don't override
+// words asking for a redesign, since the dashboard attaches them to nearly every message.
+func (s *Service) classifyTurn(ctx context.Context, in GenerateInput, c chat.Chat, hasPreviewErrors, hasReference bool) (fixTurn, redesign bool, err error) {
 	prior, err := s.chats.ListMessages(ctx, in.TenantID, c.ID)
 	if err != nil {
-		return aicatalog.Choice{}, fmt.Errorf("load chat history for model routing: %w", err)
+		return false, false, fmt.Errorf("load chat history for turn routing: %w", err)
 	}
-	fixTurn := previewerrors.IsFixTurn(in.Prompt, earlierUserPrompts(prior, ""), hasPreviewErrors)
-	choice := s.models.Resolve(sel, fixTurn)
-	slog.Info("ai: auto routed turn", "chat_id", c.ID, "fix_turn", fixTurn, "model_id", choice.ModelID, "effort", choice.Effort)
-	return choice, nil
+	earlier := earlierUserPrompts(prior, "")
+	if pageintent.DetectRedesign(in.Prompt, hasReference) && !previewerrors.IsFixTurn(in.Prompt, earlier, false) {
+		return false, true, nil
+	}
+	return previewerrors.IsFixTurn(in.Prompt, earlier, hasPreviewErrors), false, nil
+}
+
+// resolveModel picks this turn's concrete model, and whether thinking is off for it.
+func (s *Service) resolveModel(c chat.Chat, sel aicatalog.Selection, fixTurn, redesign bool) (aicatalog.Choice, bool) {
+	if s.models == nil {
+		return aicatalog.Choice{}, false
+	}
+	choice, thinkingOff := s.models.ResolveTurn(sel, fixTurn, redesign)
+	if sel.ModelID == aicatalog.AutoID {
+		slog.Info("ai: auto routed turn", "chat_id", c.ID, "fix_turn", fixTurn, "redesign", redesign, "model_id", choice.ModelID,
+			"effort", choice.Effort, "thinking_off", thinkingOff)
+	}
+	return choice, thinkingOff
 }

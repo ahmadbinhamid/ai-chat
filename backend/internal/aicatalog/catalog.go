@@ -13,6 +13,22 @@ import (
 // AutoID is the reserved choice that routes each turn to the design or fix model.
 const AutoID = "auto"
 
+// validIdleAfter are a provider's allowed idle_after values; "" means "event".
+var validIdleAfter = []string{"", IdleAfterEvent, IdleAfterContent}
+
+const (
+	IdleAfterEvent   = "event"
+	IdleAfterContent = "content"
+)
+
+// validToolChoices are a provider's allowed tool_choice values; "" means "any".
+var validToolChoices = []string{"", ToolChoiceAny, ToolChoiceAuto}
+
+const (
+	ToolChoiceAny  = "any"
+	ToolChoiceAuto = "auto"
+)
+
 // validEfforts are the output_config.effort values the provider API accepts.
 var validEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 
@@ -21,8 +37,20 @@ var validEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 type Provider struct {
 	BaseURL   string `json:"base_url"`
 	APIKeyEnv string `json:"api_key_env"`
-	// Options is reserved for provider-specific settings (e.g. OpenRouter routing); passed through untouched.
+	// Options are extra request-body fields sent with every model of this provider (e.g. OpenRouter routing).
 	Options json.RawMessage `json:"options,omitempty"`
+	// ToolChoice is what normal tool-loop rounds require: "any" (the default) or "auto". "auto" lets a router use hosts
+	// that don't honour a required tool call; the loop already copes with a text reply. Forced rounds always name one tool.
+	ToolChoice string `json:"tool_choice,omitempty"`
+	// IdleAfter is when the stream idle timeout starts: "event" (the default, the first stream event) or "content" (the
+	// first text, reasoning or tool output). A router that sends message_start before its host has read the prompt
+	// needs "content", or the prefill silence after it is mistaken for a stall.
+	IdleAfter string `json:"idle_after,omitempty"`
+	// SessionHeader, when set, is the request header the generator puts each chat's ID in, so the provider can keep a
+	// chat's calls on one host (e.g. OpenRouter's sticky routing, which keeps that host's prompt cache warm).
+	SessionHeader string `json:"session_header,omitempty"`
+	// ModelsURL, when set, is a model list ({"data":[{"id":...}]}) every model name is checked against at startup.
+	ModelsURL string `json:"models_url,omitempty"`
 }
 
 // Model is one catalogue entry. ID is what the dashboard sends and sees; Model is the provider's own name, never exposed.
@@ -37,9 +65,16 @@ type Model struct {
 	DefaultEffort string   `json:"default_effort"`
 	// Selectable defaults to true; internal-only models (vision, a separate summary model) set it false.
 	Selectable *bool `json:"selectable,omitempty"`
-	// Options is reserved for provider-specific per-model settings; passed through untouched.
+	// Options are extra request-body fields for this model, deep-merged over its provider's.
 	Options json.RawMessage `json:"options,omitempty"`
+	// Preload defaults to true; false sends this model no preloaded theme files with its first prompt.
+	Preload *bool `json:"preload,omitempty"`
+	// Pricing prices a call whose provider doesn't report its cost; nil leaves such calls' cost unknown.
+	Pricing *Pricing `json:"pricing,omitempty"`
 }
+
+// PreloadEnabled reports whether turns on this model get likely-needed files with their first prompt.
+func (m Model) PreloadEnabled() bool { return m.Preload == nil || *m.Preload }
 
 // IsSelectable reports whether the model appears in the merchant's picker.
 func (m Model) IsSelectable() bool { return m.Selectable == nil || *m.Selectable }
@@ -54,6 +89,13 @@ type Auto struct {
 	DesignEffort string `json:"design_effort"`
 	FixModel     string `json:"fix_model"`
 	FixEffort    string `json:"fix_effort"`
+	// DesignThinking false switches thinking off on the design route (unset keeps the model's own setting): a design
+	// change rarely needs long reasoning, and on a slow host that reasoning is most of the turn. Fix turns keep it.
+	DesignThinking *bool `json:"design_thinking,omitempty"`
+	// Redesign* route redesign turns; an empty RedesignModel sends them down the design route instead.
+	RedesignModel    string `json:"redesign_model,omitempty"`
+	RedesignEffort   string `json:"redesign_effort,omitempty"`
+	RedesignThinking *bool  `json:"redesign_thinking,omitempty"`
 }
 
 // Catalog is a validated catalogue; build it with Parse or FromEnv, never by hand.
@@ -65,7 +107,8 @@ type Catalog struct {
 	VisionModel  string              `json:"vision_model,omitempty"`
 	SummaryModel string              `json:"summary_model"`
 
-	byID map[string]Model
+	byID   map[string]Model
+	fields map[string]map[string]any
 }
 
 // Choice is a resolved pick: a concrete catalogue model id (never AutoID) and an effort it allows ("" when it has none).
@@ -133,6 +176,12 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 		if key, ok := lookupEnv(p.APIKeyEnv); !ok || key == "" {
 			return fmt.Errorf("provider %q: environment variable %s is not set", name, p.APIKeyEnv)
 		}
+		if !slices.Contains(validIdleAfter, p.IdleAfter) {
+			return fmt.Errorf("provider %q: idle_after must be \"event\" or \"content\", got %q", name, p.IdleAfter)
+		}
+		if !slices.Contains(validToolChoices, p.ToolChoice) {
+			return fmt.Errorf("provider %q: tool_choice must be \"any\" or \"auto\", got %q", name, p.ToolChoice)
+		}
 	}
 	if len(c.Models) == 0 {
 		return errors.New("no models")
@@ -162,6 +211,21 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 		if err := c.validateAutoTarget("fix", c.Auto.FixModel, c.Auto.FixEffort); err != nil {
 			return err
 		}
+		if c.Auto.DesignThinking != nil && !*c.Auto.DesignThinking && !c.byID[c.Auto.DesignModel].Thinking {
+			return fmt.Errorf("auto design_thinking false needs a design_model with \"thinking\": true")
+		}
+		if c.Auto.RedesignModel == "" {
+			if c.Auto.RedesignEffort != "" || c.Auto.RedesignThinking != nil {
+				return errors.New("auto redesign_effort and redesign_thinking need a redesign_model")
+			}
+		} else {
+			if err := c.validateAutoTarget("redesign", c.Auto.RedesignModel, c.Auto.RedesignEffort); err != nil {
+				return err
+			}
+			if c.Auto.RedesignThinking != nil && !c.byID[c.Auto.RedesignModel].Thinking {
+				return fmt.Errorf("auto redesign_thinking needs a redesign_model with \"thinking\": true")
+			}
+		}
 	}
 	if c.VisionModel != "" {
 		m, ok := c.byID[c.VisionModel]
@@ -175,7 +239,7 @@ func (c *Catalog) validate(lookupEnv func(string) (string, bool)) error {
 	if _, ok := c.byID[c.SummaryModel]; !ok {
 		return fmt.Errorf("summary_model %q is not in the model list", c.SummaryModel)
 	}
-	return nil
+	return c.buildRequestFields()
 }
 
 func validateModel(m Model, providers map[string]Provider) error {
@@ -191,6 +255,11 @@ func validateModel(m Model, providers map[string]Provider) error {
 	}
 	if _, ok := providers[m.Provider]; !ok {
 		return fmt.Errorf("model %q: unknown provider %q", m.ID, m.Provider)
+	}
+	if m.Pricing != nil {
+		if err := m.Pricing.validate(); err != nil {
+			return fmt.Errorf("model %q: pricing: %w", m.ID, err)
+		}
 	}
 	// Effort is a thinking control, so a model without thinking gets neither parameter.
 	if !m.Thinking {

@@ -81,7 +81,7 @@ func TestSend_ChosenModelAndEffortReachTheProviderCall(t *testing.T) {
 	}))
 	defer provider.Close()
 
-	data, err := os.ReadFile("../../../config/ai-models.json")
+	data, err := os.ReadFile("../../../config/ai-models.deepseek.json")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -70,9 +70,9 @@ func touchChatUsage(ctx context.Context, e execer, chatID string, inputTokens, o
 
 func createMessage(ctx context.Context, e execer, m Message) error {
 	_, err := e.ExecContext(ctx, `
-		INSERT INTO chat_messages (id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, model_id, effort, apply_status, applied_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, m.ID, m.ChatID, m.TenantID, m.Role, m.UserID, m.UserName, m.UserEmail, m.Content, m.Status, m.InputTokens, m.OutputTokens, m.ModelID, m.Effort, m.ApplyStatus, m.AppliedAt, m.CreatedAt, m.CreatedAt)
+		INSERT INTO chat_messages (id, chat_id, tenant_id, role, user_id, user_name, user_email, content, status, input_tokens, output_tokens, model_id, effort, cost_usd, apply_status, applied_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, m.ID, m.ChatID, m.TenantID, m.Role, m.UserID, m.UserName, m.UserEmail, m.Content, m.Status, m.InputTokens, m.OutputTokens, m.ModelID, m.Effort, m.CostUSD, m.ApplyStatus, m.AppliedAt, m.CreatedAt, m.CreatedAt)
 	return err
 }
 
@@ -89,6 +89,18 @@ func createAttachments(ctx context.Context, e execer, attachments []MessageAttac
 		}
 	}
 	return nil
+}
+
+// AddStockImageAttachment stores a downloaded stock photo on messageID at the next free stock_image position.
+func (r *Repository) AddStockImageAttachment(ctx context.Context, a MessageAttachment) error {
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO chat_message_attachments (id, message_id, tenant_id, kind, filename, media_type, size_bytes, checksum, position, content, created_at, updated_at)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(position) + 1, 0), ?, ?, ?
+		FROM chat_message_attachments
+		WHERE message_id = ? AND kind = ?
+	`, a.ID, a.MessageID, a.TenantID, string(AttachmentKindStockImage), a.Filename, a.MediaType, a.SizeBytes, a.Checksum,
+		a.Content, a.CreatedAt, a.CreatedAt, a.MessageID, string(AttachmentKindStockImage))
+	return err
 }
 
 // UpsertHTMLAttachment replaces any existing row at the same (message_id, kind, position).
@@ -188,9 +200,10 @@ func (r *Repository) listAttachmentMetadata(ctx context.Context, messageIDs []st
 	query := fmt.Sprintf(`
 		SELECT id, message_id, tenant_id, kind, filename, media_type, size_bytes, checksum, position, storage_key, created_at
 		FROM chat_message_attachments
-		WHERE message_id IN (%s)
+		WHERE message_id IN (%s) AND kind <> ?
 		ORDER BY message_id, kind, position
 	`, strings.Join(placeholders, ","))
+	args = append(args, string(AttachmentKindStockImage))
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -223,9 +236,9 @@ func (r *Repository) GetAttachmentsContent(ctx context.Context, messageID string
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, message_id, tenant_id, kind, filename, media_type, size_bytes, checksum, position, content, storage_key, created_at
 		FROM chat_message_attachments
-		WHERE message_id = ?
+		WHERE message_id = ? AND kind <> ?
 		ORDER BY kind, position
-	`, messageID)
+	`, messageID, string(AttachmentKindStockImage))
 	if err != nil {
 		return nil, err
 	}
@@ -261,8 +274,8 @@ func (r *Repository) GetChatImageAttachment(ctx context.Context, chatID, attachm
 		SELECT a.id, a.message_id, a.tenant_id, a.filename, a.media_type, a.size_bytes, a.checksum, a.position, a.content, a.storage_key, a.created_at
 		FROM chat_message_attachments a
 		JOIN chat_messages m ON m.id = a.message_id
-		WHERE a.id = ? AND m.chat_id = ? AND a.kind = ?
-	`, attachmentID, chatID, string(AttachmentKindImage))
+		WHERE a.id = ? AND m.chat_id = ? AND a.kind IN (?, ?)
+	`, attachmentID, chatID, string(AttachmentKindImage), string(AttachmentKindStockImage))
 	var a MessageAttachment
 	err := row.Scan(&a.ID, &a.MessageID, &a.TenantID, &a.Filename, &a.MediaType, &a.SizeBytes, &a.Checksum,
 		&a.Position, &a.Content, &a.StorageKey, &a.CreatedAt)

@@ -38,7 +38,7 @@ func (g *capturingGenerator) Generate(_ context.Context, _ ai.ThemeContext, _ []
 
 func (g *capturingGenerator) SupportsVision() bool { return g.visionSupported }
 
-func (g *capturingGenerator) Summarize(_ context.Context, _ []ai.Turn) (string, error) {
+func (g *capturingGenerator) Summarize(_ context.Context, _ string, _ []ai.Turn) (string, error) {
 	return "", nil
 }
 
@@ -64,7 +64,7 @@ func (g *allCallsCapturingGenerator) Generate(_ context.Context, _ ai.ThemeConte
 
 func (g *allCallsCapturingGenerator) SupportsVision() bool { return false }
 
-func (g *allCallsCapturingGenerator) Summarize(_ context.Context, _ []ai.Turn) (string, error) {
+func (g *allCallsCapturingGenerator) Summarize(_ context.Context, _ string, _ []ai.Turn) (string, error) {
 	return "", nil
 }
 
@@ -198,8 +198,8 @@ func TestDoGenerate_ZeroAttachmentMessage_SkipsContentFetch(t *testing.T) {
 	if strings.Contains(gotPrompt, "Attached reference file") {
 		t.Errorf("expected no HTML-attachment framing in the prompt for a text-only turn, got: %s", gotPrompt)
 	}
-	if gotPrompt != "make the header blue" {
-		t.Errorf("expected the prompt to pass through unmodified, got: %s", gotPrompt)
+	if want := "make the header blue\n\n" + proposeInstruction; gotPrompt != want {
+		t.Errorf("expected only the request and the tool instruction, got: %s", gotPrompt)
 	}
 }
 

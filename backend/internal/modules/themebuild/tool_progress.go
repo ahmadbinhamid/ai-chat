@@ -22,6 +22,9 @@ type toolProgressEmitter struct {
 // ToolStarted emits EventTypeToolCall with the tool name plus "path"/"pattern" when worth
 // narrating. Unmarshal failures fall back to {"tool": name}; toolExec surfaces the error itself.
 func (p toolProgressEmitter) ToolStarted(name string, input json.RawMessage) {
+	if hiddenFromProgress(name) {
+		return
+	}
 	payload := map[string]any{"tool": name}
 	switch name {
 	case "read_theme_file":
@@ -42,9 +45,16 @@ func (p toolProgressEmitter) ToolStarted(name string, input json.RawMessage) {
 
 // ToolFinished emits EventTypeToolResult with summary always, even on error — a failed call
 // is still an outcome to show. err is omitted since summary already encodes failure text.
-func (p toolProgressEmitter) ToolFinished(_ string, summary string, _ error) {
+func (p toolProgressEmitter) ToolFinished(name string, summary string, _ error) {
+	if hiddenFromProgress(name) {
+		return
+	}
 	p.emitter.emit(p.ctx, EventTypeToolResult, map[string]string{"summary": summary})
 }
+
+// hiddenFromProgress keeps the stock photo search out of the merchant's step feed: it names the provider and is an
+// implementation detail, not a step they need to see.
+func hiddenFromProgress(name string) bool { return name == ai.ToolNameSearchStockImages }
 
 // toolProgressFor builds a toolProgressEmitter for one Generate call.
 func toolProgressFor(ctx context.Context, emitter *eventEmitter) ai.ToolProgress {

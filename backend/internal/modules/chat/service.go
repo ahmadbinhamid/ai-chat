@@ -245,6 +245,18 @@ func (s *Service) GetChatImageAttachment(ctx context.Context, chatID, attachment
 	return s.repo.GetChatImageAttachment(ctx, chatID, attachmentID)
 }
 
+// AddStockImage stores a downloaded stock photo on the turn's user message and returns its attachment ID, which a
+// placement references exactly like an attached image's.
+func (s *Service) AddStockImage(ctx context.Context, messageID string, tenantID uint64, filename, mediaType string, data []byte) (string, error) {
+	sum := sha256.Sum256(data)
+	id := uuid.NewString()
+	err := s.repo.AddStockImageAttachment(ctx, MessageAttachment{
+		ID: id, MessageID: messageID, TenantID: tenantID, Filename: filename, MediaType: mediaType,
+		SizeBytes: int64(len(data)), Checksum: hex.EncodeToString(sum[:]), Content: data, CreatedAt: time.Now().UTC(),
+	})
+	return id, err
+}
+
 // ListChatImageHeads returns the first n bytes of each of chatID's image attachments, keyed by attachment ID.
 func (s *Service) ListChatImageHeads(ctx context.Context, chatID string, n int) (map[string][]byte, error) {
 	return s.repo.ListChatImageHeads(ctx, chatID, n)
@@ -299,7 +311,7 @@ func (s *Service) RecordAssistantMessage(ctx context.Context, c Chat, content st
 // RecordAssistantMessageFromModel is RecordAssistantMessage plus the catalogue model and effort that answered; empty
 // values store NULL.
 func (s *Service) RecordAssistantMessageFromModel(ctx context.Context, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) (Message, error) {
-	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort)
+	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort, nil)
 	if err := s.repo.CreateMessageAndTouchUsage(ctx, m, nil, inputTokens, outputTokens, m.CreatedAt); err != nil {
 		return Message{}, err
 	}
@@ -307,15 +319,16 @@ func (s *Service) RecordAssistantMessageFromModel(ctx context.Context, c Chat, c
 }
 
 // RecordAssistantMessageInTx records the reply inside the caller's transaction; nothing is written until it commits.
-func (s *Service) RecordAssistantMessageInTx(ctx context.Context, tx *sql.Tx, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) (Message, error) {
-	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort)
+// costUSD is nil when the provider doesn't report cost.
+func (s *Service) RecordAssistantMessageInTx(ctx context.Context, tx *sql.Tx, c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string, costUSD *float64) (Message, error) {
+	m := assistantMessage(c, content, status, inputTokens, outputTokens, applyStatus, modelID, effort, costUSD)
 	if err := s.repo.CreateMessageAndTouchUsageTx(ctx, tx, m, inputTokens, outputTokens, m.CreatedAt); err != nil {
 		return Message{}, err
 	}
 	return m, nil
 }
 
-func assistantMessage(c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string) Message {
+func assistantMessage(c Chat, content string, status MessageStatus, inputTokens, outputTokens int64, applyStatus ApplyStatus, modelID, effort string, costUSD *float64) Message {
 	now := time.Now().UTC()
 	m := Message{
 		ID:           uuid.NewString(),
@@ -330,6 +343,7 @@ func assistantMessage(c Chat, content string, status MessageStatus, inputTokens,
 		CreatedAt:    now,
 		ModelID:      nonEmpty(modelID),
 		Effort:       nonEmpty(effort),
+		CostUSD:      costUSD,
 	}
 	if applyStatus == ApplyStatusApplied {
 		m.AppliedAt = &now

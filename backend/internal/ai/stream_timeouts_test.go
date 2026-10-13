@@ -95,6 +95,62 @@ func TestConsumeStream_FirstTokenTimeoutFiresWhenNothingEverArrives(t *testing.T
 	}
 }
 
+// TestConsumeStream_SlowFirstEventWithinFirstTokenBudgetSucceeds checks a stream whose first event arrives after
+// longer than idleTimeout, but within firstTokenTimeout, isn't killed as idle: a router sends only SSE comments
+// (dropped by the SDK) while the upstream host queues and prefills.
+func TestConsumeStream_SlowFirstEventWithinFirstTokenBudgetSucceeds(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flush(w, ": OPENROUTER PROCESSING\n\n")
+		select {
+		case <-time.After(150 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		flush(w, toolUseSSEResponse("msg_1", "toolu_1", "propose_changes", emptyAnswer("Done."), 10, 5))
+	}))
+	defer ts.Close()
+
+	stream := newStreamingTestStream(ts)
+	var message anthropic.Message
+
+	err := consumeStream(context.Background(), stream, &message, 50*time.Millisecond, time.Second)
+	_ = stream.Close()
+
+	if err != nil {
+		t.Fatalf("expected the slow first event to be waited for, got %v", err)
+	}
+	if message.StopReason != anthropic.StopReasonToolUse || len(message.Content) != 1 {
+		t.Fatalf("expected the full message once events flowed, got %+v", message)
+	}
+}
+
+// TestConsumeStream_NothingAtAllFailsOnFirstTokenNotIdle checks a stream that never sends an event fails on the
+// first-token budget even when idleTimeout is shorter: the idle rule only applies once events have started.
+func TestConsumeStream_NothingAtAllFailsOnFirstTokenNotIdle(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flush(w, "")
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	stream := newStreamingTestStream(ts)
+	var message anthropic.Message
+
+	start := time.Now()
+	err := consumeStream(context.Background(), stream, &message, 50*time.Millisecond, 200*time.Millisecond)
+	elapsed := time.Since(start)
+	_ = stream.Close()
+
+	if !errors.Is(err, errStreamFirstToken) {
+		t.Fatalf("expected errStreamFirstToken, got %v", err)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("failed after %v, before the 200ms first-token budget", elapsed)
+	}
+}
+
 // TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress checks tool_use-only streaming
 func TestConsumeStream_ToolUseBytesCountAsFirstTokenProgress(t *testing.T) {
 	var b strings.Builder
@@ -345,5 +401,243 @@ func TestGenerator_FirstTokenTimeoutFor_DefaultsWhenZero(t *testing.T) {
 	}
 	if got := g.idleTimeout(); got != defaultStreamIdleTimeout {
 		t.Errorf("idle: got %v, want default %v", got, defaultStreamIdleTimeout)
+	}
+}
+
+// messageStartOnly is the event a router can send before its upstream host has read the prompt.
+func messageStartOnly() string {
+	var b strings.Builder
+	sseEvent(&b, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
+			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
+		},
+	})
+	return b.String()
+}
+
+// With idleAfterContent, silence between message_start and the first real output is prefill, not a stall, so only the
+// first-token budget applies to it; once output flows the idle rule applies as usual.
+func TestConsumeStreamDeltas_IdleAfterContent(t *testing.T) {
+	full := toolUseSSEResponse("msg_1", "toolu_1", "propose_changes", emptyAnswer("Done."), 10, 5)
+	start := messageStartOnly()
+	tests := []struct {
+		name    string
+		serve   func(w http.ResponseWriter, r *http.Request)
+		wantErr error
+	}{
+		{
+			name: "prefill silence after message_start is waited for",
+			serve: func(w http.ResponseWriter, r *http.Request) {
+				flush(w, start)
+				select {
+				case <-time.After(200 * time.Millisecond):
+				case <-r.Context().Done():
+					return
+				}
+				flush(w, strings.TrimPrefix(full, start))
+			},
+		},
+		{
+			name: "message_start then nothing fails on the first-token budget",
+			serve: func(w http.ResponseWriter, r *http.Request) {
+				flush(w, start)
+				<-r.Context().Done()
+			},
+			wantErr: errStreamFirstToken,
+		},
+		{
+			name: "silence after real output is still a stall",
+			serve: func(w http.ResponseWriter, r *http.Request) {
+				var b strings.Builder
+				sseEvent(&b, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+				sseEvent(&b, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "Working"}})
+				flush(w, start+b.String())
+				<-r.Context().Done()
+			},
+			wantErr: errStreamIdle,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				tt.serve(w, r)
+			}))
+			defer ts.Close()
+			stream := newStreamingTestStream(ts)
+			var message anthropic.Message
+			err := consumeStreamDeltas(context.Background(), stream, &message, 50*time.Millisecond, 400*time.Millisecond, 0, true, nil, nil, nil)
+			_ = stream.Close()
+			if !errors.Is(err, tt.wantErr) && (tt.wantErr != nil || err != nil) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// A host that writes a tool call whole sends only ping events meanwhile, which the SDK drops; the bytes still prove
+// the connection is alive, so the call must complete on its first attempt. The same silence without pings is a stall.
+func TestGenerate_PingsKeepAToolCallInProgressAlive(t *testing.T) {
+	var start strings.Builder
+	sseEvent(&start, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
+			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
+		},
+	})
+	sseEvent(&start, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+	sseEvent(&start, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": "Writing it now."}})
+	sseEvent(&start, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	full := toolUseSSEResponse("msg_1", "toolu_1", toolNameProposeChanges, emptyAnswer("done"), 10, 5)
+	_, rest, ok := strings.Cut(full, "event: content_block_start")
+	if !ok {
+		t.Fatal("fixture has no content_block_start")
+	}
+	toolPart := strings.ReplaceAll("event: content_block_start"+rest, `"index":0`, `"index":1`)
+
+	for _, pings := range []bool{true, false} {
+		t.Run(fmt.Sprintf("pings=%v", pings), func(t *testing.T) {
+			calls := 0
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Content-Type", "text/event-stream")
+				flush(w, start.String())
+				for i := 0; i < 10; i++ {
+					select {
+					case <-time.After(30 * time.Millisecond):
+					case <-r.Context().Done():
+						return
+					}
+					if pings {
+						flush(w, "event: ping\ndata: {\"type\": \"ping\"}\n\n")
+					}
+				}
+				flush(w, toolPart)
+			}))
+			defer ts.Close()
+			g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
+			g.streamTimeouts.Idle = 100 * time.Millisecond
+			g.streamTimeouts.FirstTokenEdit = 2 * time.Second
+
+			result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, nil, nil)
+			if pings {
+				if err != nil || calls != 1 || result.Summary != "done" {
+					t.Fatalf("want one attempt that completes, got calls=%d err=%v", calls, err)
+				}
+				return
+			}
+			if calls < 2 {
+				t.Fatalf("want 300ms of true silence after output treated as a stall and retried, got %d call(s), err=%v", calls, err)
+			}
+		})
+	}
+}
+
+// A host that starts a reply, then only pings, must not hold the call open past the stall window: it's retried. A
+// reply that keeps producing content, however slowly, is never cut off by it.
+func TestGenerate_StallTimeout(t *testing.T) {
+	var start strings.Builder
+	sseEvent(&start, "message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
+			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 10, "output_tokens": 0},
+		},
+	})
+	sseEvent(&start, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+	textDelta := func(s string) string {
+		var b strings.Builder
+		sseEvent(&b, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": s}})
+		return b.String()
+	}
+	var stop strings.Builder
+	sseEvent(&stop, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	full := toolUseSSEResponse("msg_1", "toolu_1", toolNameProposeChanges, emptyAnswer("done"), 10, 5)
+	_, rest, _ := strings.Cut(full, "event: content_block_start")
+	toolPart := strings.ReplaceAll("event: content_block_start"+rest, `"index":0`, `"index":1`)
+	ping := "event: ping\ndata: {\"type\": \"ping\"}\n\n"
+
+	wait := func(r *http.Request, d time.Duration) bool {
+		select {
+		case <-time.After(d):
+			return true
+		case <-r.Context().Done():
+			return false
+		}
+	}
+
+	t.Run("output then only pings is a stall and is retried", func(t *testing.T) {
+		calls := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.Header().Set("Content-Type", "text/event-stream")
+			flush(w, start.String()+textDelta("Working on it"))
+			if calls == 1 {
+				for wait(r, 20*time.Millisecond) {
+					flush(w, ping)
+				}
+				return
+			}
+			flush(w, stop.String()+toolPart)
+		}))
+		defer ts.Close()
+		g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
+		g.streamTimeouts.Idle = 100 * time.Millisecond
+		g.streamTimeouts.Stall = 250 * time.Millisecond
+		g.streamTimeouts.FirstTokenEdit = 2 * time.Second
+
+		started := time.Now()
+		result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, nil, nil)
+		if err != nil || result.Summary != "done" || calls != 2 {
+			t.Fatalf("want the pinging stall retried once and the retry to finish; calls=%d err=%v", calls, err)
+		}
+		// The stall window plus the usual pause before a retry; a pinging host would otherwise hold it until ctx ends.
+		if elapsed, limit := time.Since(started), g.streamTimeouts.Stall+streamAccumulateRetryDelay+2*time.Second; elapsed > limit {
+			t.Fatalf("stalled attempt held the call for %v, over %v; the stall window should have ended it", elapsed, limit)
+		}
+	})
+
+	t.Run("slow but steady output is never a stall", func(t *testing.T) {
+		calls := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.Header().Set("Content-Type", "text/event-stream")
+			flush(w, start.String())
+			// 600ms of output in total, well past the 250ms stall window, but never 250ms without new content.
+			for i := 0; i < 12; i++ {
+				if !wait(r, 50*time.Millisecond) {
+					return
+				}
+				flush(w, textDelta("."))
+			}
+			flush(w, stop.String()+toolPart)
+		}))
+		defer ts.Close()
+		g := newTestGenerator(anthropic.NewClient(option.WithBaseURL(ts.URL), option.WithAPIKey("k")))
+		g.streamTimeouts.Idle = 200 * time.Millisecond
+		g.streamTimeouts.Stall = 250 * time.Millisecond
+		g.streamTimeouts.FirstTokenEdit = 2 * time.Second
+
+		result, err := g.Generate(context.Background(), ThemeContext{ThemeSlug: "demo"}, nil, "hello", nil, nil, nil, nil)
+		if err != nil || result.Summary != "done" || calls != 1 {
+			t.Fatalf("want one uninterrupted attempt; calls=%d err=%v", calls, err)
+		}
+	})
+}
+
+func TestStallTimeoutDefault(t *testing.T) {
+	g := &Generator{}
+	if got := g.stallTimeout(); got != defaultStreamStallTimeout {
+		t.Fatalf("stallTimeout() = %v, want the default %v", got, defaultStreamStallTimeout)
+	}
+	g.streamTimeouts.Stall = 7 * time.Second
+	if got := g.stallTimeout(); got != 7*time.Second {
+		t.Fatalf("stallTimeout() = %v, want the configured 7s", got)
 	}
 }

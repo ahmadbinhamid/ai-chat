@@ -119,7 +119,7 @@ func TestNewEventEmitter_SeqContinuesAcrossGenerationsOnSameChat(t *testing.T) {
 
 	// StartGeneration only allows one in-flight generation per chat (see
 	// ErrGenerationInProgress) — end the first before seeding the second.
-	if err := repo.EndGeneration(ctx, chatID, nil); err != nil {
+	if err := repo.EndGeneration(ctx, chatID, gen1, nil); err != nil {
 		t.Fatalf("failed to end the first generation: %v", err)
 	}
 	gen2 := seedGeneration(t, repo, chatID)

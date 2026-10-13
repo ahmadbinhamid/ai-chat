@@ -196,6 +196,7 @@ func TestRepairPrompt(t *testing.T) {
 		"do not call read_theme_file again on any file named there",
 		"Do not explore, read, or touch anything else",
 		"an earlier attempt in THIS conversation already failed to apply an \"edit\" to this same file",
+		"include ONLY the files you fix — never your whole proposal again",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected repair prompt to constrain scope with %q, got: %s", want, got)

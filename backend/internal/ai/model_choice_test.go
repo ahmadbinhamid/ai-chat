@@ -16,10 +16,10 @@ import (
 	"ai-chat/internal/aicatalog"
 )
 
-// catalogueGenerator serves the committed catalogue (optionally edited) through client for its "deepseek" provider.
+// catalogueGenerator serves the DeepSeek rollback catalogue (optionally edited) through client for its "deepseek" provider.
 func catalogueGenerator(t *testing.T, client anthropic.Client, edit func(map[string]any)) *Generator {
 	t.Helper()
-	data, err := os.ReadFile("../../config/ai-models.json")
+	data, err := os.ReadFile("../../config/ai-models.deepseek.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestSummarize_UsesTheSummaryModel(t *testing.T) {
 	defer ts.Close()
 	g := catalogueGenerator(t, client(ts.URL), nil)
 
-	if _, err := g.Summarize(context.Background(), []Turn{{Role: "user", Content: "hi"}}); err != nil {
+	if _, err := g.Summarize(context.Background(), "", []Turn{{Role: "user", Content: "hi"}}); err != nil {
 		t.Fatalf("Summarize: %v", err)
 	}
 	if body["model"] != "deepseek-v4-flash" {

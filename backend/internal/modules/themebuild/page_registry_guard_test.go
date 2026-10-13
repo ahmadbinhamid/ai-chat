@@ -208,3 +208,35 @@ func TestProtectedPagesNote(t *testing.T) {
 		t.Errorf("expected a note mentioning the protected page, got %q", got)
 	}
 }
+
+func TestDropRedundantPageRegistry(t *testing.T) {
+	pagesJSON := `[{"slug":"home","type":"home","path":"/pages","page":"home"},
+		{"slug":"about","type":"custom","path":"/pages","page":"about"},
+		{"slug":"login","type":"login","path":"/pages/auth","page":"login"}]`
+	tests := []struct {
+		name     string
+		entry    *themefs.PageEntry
+		wantKept bool
+	}{
+		{"re-registers home", &themefs.PageEntry{Slug: "home", Type: "home", Path: "/pages", Page: "home"}, false},
+		{"re-registers a custom page", &themefs.PageEntry{Slug: "about", Type: "custom", Path: "/pages", Page: "about"}, false},
+		{"re-registers an auth page", &themefs.PageEntry{Slug: "login", Type: "login", Path: "/pages/auth", Page: "login"}, false},
+		{"a new page", &themefs.PageEntry{Slug: "faq", Type: "custom", Path: "/pages", Page: "faq"}, true},
+		{"a taken slug on a different file", &themefs.PageEntry{Slug: "about", Type: "custom", Path: "/pages", Page: "about-us"}, true},
+		{"home slug on another file", &themefs.PageEntry{Slug: "home", Type: "home", Path: "/pages", Page: "landing"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &ai.Result{PageRegistryEntry: tt.entry}
+			dropRedundantPageRegistry(r, pagesJSON)
+			if kept := r.PageRegistryEntry != nil; kept != tt.wantKept {
+				t.Errorf("entry kept = %v, want %v", kept, tt.wantKept)
+			}
+		})
+	}
+	r := &ai.Result{PageRegistryEntry: &themefs.PageEntry{Slug: "home", Page: "home"}}
+	dropRedundantPageRegistry(r, `not json`)
+	if r.PageRegistryEntry == nil {
+		t.Error("an unreadable pages.json must leave the entry for themecheck to judge")
+	}
+}

@@ -5,19 +5,18 @@ import (
 	"testing"
 )
 
-func TestPromptWithHTMLAttachment(t *testing.T) {
+func TestHTMLAttachmentBlock(t *testing.T) {
 	filename := "reference.html"
 	content := "<h1>Hello</h1>"
 
-	t.Run("no attachment returns prompt unchanged", func(t *testing.T) {
-		got := promptWithHTMLAttachment("hi", GenerateInput{})
-		if got != "hi" {
-			t.Errorf("expected prompt unchanged, got %q", got)
+	t.Run("no attachment adds nothing", func(t *testing.T) {
+		if got := htmlAttachmentBlock(GenerateInput{}); got != "" {
+			t.Errorf("expected no block, got %q", got)
 		}
 	})
 
 	t.Run("uploaded file gets the generic untrusted-content framing, not the external-link framing", func(t *testing.T) {
-		got := promptWithHTMLAttachment("read this", GenerateInput{
+		got := htmlAttachmentBlock(GenerateInput{
 			HTMLAttachmentFilename: &filename, HTMLAttachmentContent: &content,
 		})
 		if !strings.Contains(got, "UNTRUSTED content the merchant attached") {
@@ -30,7 +29,7 @@ func TestPromptWithHTMLAttachment(t *testing.T) {
 
 	t.Run("link-fetched content gets the external-site call-out", func(t *testing.T) {
 		url := "https://example.com"
-		got := promptWithHTMLAttachment("can you access this link?", GenerateInput{
+		got := htmlAttachmentBlock(GenerateInput{
 			HTMLAttachmentFilename: &url, HTMLAttachmentContent: &content, HTMLAttachmentIsExternalLink: true,
 		})
 		for _, want := range []string{
@@ -46,7 +45,7 @@ func TestPromptWithHTMLAttachment(t *testing.T) {
 	})
 
 	t.Run("carried-forward upload gets the earlier-turn note on top of the generic framing", func(t *testing.T) {
-		got := promptWithHTMLAttachment("build it like that", GenerateInput{
+		got := htmlAttachmentBlock(GenerateInput{
 			HTMLAttachmentFilename: &filename, HTMLAttachmentContent: &content, HTMLAttachmentCarriedForward: true,
 		})
 		for _, want := range []string{
@@ -65,7 +64,7 @@ func TestPromptWithHTMLAttachment(t *testing.T) {
 
 	t.Run("carried-forward link gets both the earlier-turn note and the external-link framing", func(t *testing.T) {
 		url := "https://example.com"
-		got := promptWithHTMLAttachment("build it like that", GenerateInput{
+		got := htmlAttachmentBlock(GenerateInput{
 			HTMLAttachmentFilename: &url, HTMLAttachmentContent: &content,
 			HTMLAttachmentIsExternalLink: true, HTMLAttachmentCarriedForward: true,
 		})

@@ -89,11 +89,22 @@ func isBareFollowUp(text string) bool {
 	return followUpRe.MatchString(text) && isFunctionalityRequest(text) && !stylingRe.MatchString(text)
 }
 
-// IsFixTurn reports whether a turn is fixing broken behaviour rather than designing: it carries preview errors, reports
-// a malfunction or asks for a fix (not a styling fix), or is a bare follow-up to such a turn. earlier holds the earlier
-// user messages, newest first; the walk is the same as FeatureNotes'.
+// editRequestRe is a message that opens by asking for a change; the dashboard attaches preview errors to nearly every
+// message, so they must not turn such a request into a fix.
+var editRequestRe = regexp.MustCompile(`(?i)^\s*(?:(?:please|pls|can you|could you|would you|i want to|i'?d like to|let'?s)\s+)?` +
+	`(?:make|change|add|remove|delete|update|create|build|design|redesign|revamp|restyle|move|replace|set|use|put|show|` +
+	`hide|rename|rewrite|reword|increase|decrease|give|turn|swap)\b`)
+
+// visualRequestRe is a narrower stylingRe for the same purpose: words only a visual change uses ("look" and "text" also
+// appear in "can you look at this error").
+var visualRequestRe = regexp.MustCompile(`(?i)\b(?:bigger|smaller|larger|colou?rs?|fonts?|restyle|redesign|revamp|` +
+	`layout|spacing|padding|margin|rounded|bold|background|border|darker|lighter|modern|premium)\b`)
+
+// IsFixTurn reports whether a turn is fixing broken behaviour rather than designing: it reports a malfunction or asks
+// for a fix (not a styling fix), is a bare follow-up to such a turn, or carries preview errors without asking for a
+// design change itself. earlier holds the earlier user messages, newest first; the walk is the same as FeatureNotes'.
 func IsFixTurn(prompt string, earlier []string, hasPreviewErrors bool) bool {
-	if hasPreviewErrors {
+	if hasPreviewErrors && !editRequestRe.MatchString(prompt) && !visualRequestRe.MatchString(prompt) {
 		return true
 	}
 	// A bare follow-up takes its kind from the turn it follows; its own words count only with nothing earlier.

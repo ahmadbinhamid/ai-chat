@@ -54,7 +54,7 @@ func TestRepository_DequeueNext_OrdersByQueuedAt(t *testing.T) {
 
 	// End the first before dequeuing again — DequeueNext is blocked by a
 	// running row (see TestRepository_DequeueNext_WhileRunning below).
-	if err := repo.EndGeneration(ctx, chatID, nil); err != nil {
+	if err := repo.EndGeneration(ctx, chatID, got.ID, nil); err != nil {
 		t.Fatalf("EndGeneration failed: %v", err)
 	}
 
@@ -215,7 +215,7 @@ func TestRepository_EndGenerationCancelled(t *testing.T) {
 		t.Fatalf("StartGeneration failed: %v", err)
 	}
 
-	if err := repo.EndGenerationCancelled(ctx, chatID); err != nil {
+	if err := repo.EndGenerationCancelled(ctx, chatID, runningID); err != nil {
 		t.Fatalf("EndGenerationCancelled failed: %v", err)
 	}
 

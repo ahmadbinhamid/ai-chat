@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -12,10 +13,59 @@ import (
 // decodeProposeInput is the one decoder for propose_changes input, shared by real tool_use calls and text-recovered ones.
 func decodeProposeInput(raw json.RawMessage) (Result, error) {
 	var result Result
-	if err := json.Unmarshal(raw, &result); err != nil {
+	if err := json.Unmarshal(normalizeStringEncodedFields(raw), &result); err != nil {
 		return Result{}, err
 	}
 	return result, nil
+}
+
+// structuredProposeFields are typed as objects or arrays; some models send them as strings instead: "" for none, or
+// the JSON itself encoded as text.
+var structuredProposeFields = []string{"files", "page_registry_entry", "layout_links_to_add", "layout_scripts_to_add", "use_attachments"}
+
+// normalizeStringEncodedFields turns those string forms back into what they stand for; anything else is left for
+// Unmarshal to reject, so a genuinely wrong value still fails.
+func normalizeStringEncodedFields(raw json.RawMessage) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return raw
+	}
+	changed := false
+	for _, key := range structuredProposeFields {
+		var s string
+		if v, ok := obj[key]; !ok || json.Unmarshal(v, &s) != nil {
+			continue
+		}
+		t := strings.TrimSpace(s)
+		switch {
+		case t == "" || t == "null":
+			obj[key] = json.RawMessage("null")
+			changed = true
+		case (strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[")) && json.Valid([]byte(t)):
+			obj[key] = json.RawMessage(t)
+			changed = true
+		case key == "page_registry_entry":
+			// Safe to drop: a created page with no entry gets one synthesized (synthesizeMissingPageRegistry).
+			slog.Warn("ai: dropped an unreadable page_registry_entry string", "value_head", headRunes(t, 120))
+			obj[key] = json.RawMessage("null")
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// malformedProposeMessage goes back to the model as the propose_changes tool result, so it can resend the call.
+func malformedProposeMessage(err error) string {
+	return fmt.Sprintf("Your propose_changes input could not be read: %s. Call propose_changes again with the same "+
+		"changes and the documented types: files and use_attachments are arrays, page_registry_entry is an object or "+
+		"null, and none of them is ever a string.", err)
 }
 
 // recoverProposeFromText recovers a propose_changes call DeepSeek wrote as text. Strict: only the first tool-call-shaped

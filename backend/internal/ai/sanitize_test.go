@@ -138,7 +138,7 @@ func TestSanitizeError_HonestMessagesHaveNoPrefix(t *testing.T) {
 		want string
 	}{
 		{"tool-loop iterations exhausted", errors.New("model did not call propose_changes within 28 tool-loop iterations"), ExhaustedSearchReply},
-		{"stuck in text", fmt.Errorf("retry generation: %w", errStuckInTextReplies), stuckInTextMessage},
+		{"stuck in text", fmt.Errorf("retry generation: %w", ErrStuckInTextReplies), stuckInTextMessage},
 		{"unrepaired draft reversion", fmt.Errorf("%w after 3 attempts", ErrDraftReversionUnrepaired), draftReversionUnrepairedMessage},
 	}
 	for _, tt := range tests {

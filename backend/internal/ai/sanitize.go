@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -42,7 +43,7 @@ func SanitizeError(err error) string {
 
 func honestMessage(err error) (string, bool) {
 	switch {
-	case errors.Is(err, errStuckInTextReplies):
+	case errors.Is(err, ErrStuckInTextReplies):
 		return stuckInTextMessage, true
 	case errors.Is(err, ErrDraftReversionUnrepaired):
 		return draftReversionUnrepairedMessage, true
@@ -52,8 +53,91 @@ func honestMessage(err error) (string, bool) {
 	return "", false
 }
 
+// serviceUnavailableMessage is for failures only ai-chat's operator can fix (credits, configuration); the merchant can
+// only wait.
+const serviceUnavailableMessage = "the AI service is temporarily unavailable — please try again later"
+
+// providerErrorKind classifies a provider failure for its merchant message, retry and alerting.
+type providerErrorKind int
+
+const (
+	providerErrOther providerErrorKind = iota
+	providerErrOutOfCredits
+	providerErrRateLimited
+	providerErrUpstream
+	providerErrUnknownModel
+	providerErrNoHost
+	providerErrNoAccess
+)
+
+// classifyProviderError recognises OpenRouter's failures, whether returned as the HTTP status or as a mid-stream
+// error event (which the SDK reports with status 200 and the event's error type).
+func classifyProviderError(err error) providerErrorKind {
+	var apiErr *anthropic.Error
+	if !errors.As(err, &apiErr) {
+		return providerErrOther
+	}
+	lower := strings.ToLower(err.Error())
+	switch {
+	// OpenRouter's wording; Anthropic's and DeepSeek's credit errors keep their own "out of credits" message.
+	case strings.Contains(lower, "insufficient credits") || strings.Contains(lower, "requires more credits") ||
+		strings.Contains(lower, "openrouter.ai/settings/credits"):
+		return providerErrOutOfCredits
+	case strings.Contains(lower, "is not a valid model id"):
+		return providerErrUnknownModel
+	case apiErr.StatusCode == http.StatusNotFound && strings.Contains(lower, "no endpoints found"):
+		return providerErrNoHost
+	// e.g. a model gated behind an account setting (OpenRouter's 18+ confirmation).
+	case apiErr.StatusCode == http.StatusForbidden || apiErr.Type() == shared.ErrorTypePermissionError:
+		return providerErrNoAccess
+	case apiErr.StatusCode == http.StatusTooManyRequests || apiErr.Type() == shared.ErrorTypeRateLimitError:
+		return providerErrRateLimited
+	case apiErr.StatusCode == http.StatusBadGateway || apiErr.StatusCode == http.StatusServiceUnavailable ||
+		apiErr.StatusCode == http.StatusGatewayTimeout || (apiErr.StatusCode >= 520 && apiErr.StatusCode <= 524) ||
+		apiErr.Type() == shared.ErrorTypeOverloadedError || apiErr.Type() == shared.ErrorTypeAPIError ||
+		apiErr.Type() == shared.ErrorTypeTimeoutError:
+		return providerErrUpstream
+	}
+	return providerErrOther
+}
+
+// isRetryableProviderErr: a rate limit or a failed upstream host may well succeed on the next attempt, which
+// OpenRouter can route to another host.
+func isRetryableProviderErr(err error) bool {
+	switch classifyProviderError(err) {
+	case providerErrRateLimited, providerErrUpstream:
+		return true
+	}
+	return false
+}
+
+// alertProviderError logs at Error the failures the operator must act on, since the merchant only sees "unavailable".
+func alertProviderError(err error, model string) {
+	switch classifyProviderError(err) {
+	case providerErrOutOfCredits:
+		slog.Error("ai: provider account is out of credits — every generation will fail until it is topped up",
+			"model", model, "error", err)
+	case providerErrUnknownModel:
+		slog.Error("ai: provider doesn't know a catalogue model — check config", "model", model, "error", err)
+	case providerErrNoHost:
+		slog.Error("ai: provider has no host that can serve this model's requests — check its routing options",
+			"model", model, "error", err)
+	case providerErrNoAccess:
+		slog.Error("ai: provider account isn't allowed to use this model — check the provider's account settings",
+			"model", model, "error", err)
+	}
+}
+
 // categorizeError maps err to a short, actionable, provider-neutral reason. A typed
 func categorizeError(err error) string {
+	switch classifyProviderError(err) {
+	case providerErrOutOfCredits, providerErrUnknownModel, providerErrNoHost, providerErrNoAccess:
+		return serviceUnavailableMessage
+	case providerErrRateLimited:
+		return "too many requests right now — please try again shortly"
+	case providerErrUpstream:
+		return "temporarily unavailable — please try again shortly"
+	}
 	var apiErr *anthropic.Error
 	if errors.As(err, &apiErr) {
 		switch {

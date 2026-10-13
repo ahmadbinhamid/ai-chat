@@ -3,8 +3,10 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +16,9 @@ import (
 )
 
 type Config struct {
+	// AppEnv is APP_ENV, lower-cased; "production" requires AI_MODELS_CONFIG.
+	AppEnv string
+
 	// HTTP
 	Port string
 
@@ -39,6 +44,8 @@ type Config struct {
 
 	// StreamIdleTimeout bounds how long a streaming attempt can go with no new event before retry.
 	StreamIdleTimeout time.Duration
+	// StreamStallTimeout bounds how long a started reply can go without new content, pings or not, before retry.
+	StreamStallTimeout time.Duration
 	// FirstTokenTimeout* bound time-to-first-byte per ai.GenerationMode.
 	FirstTokenTimeoutEdit  time.Duration
 	FirstTokenTimeoutBrand time.Duration
@@ -70,7 +77,17 @@ type Config struct {
 
 	// GenerationRateLimitPerMinute caps /messages calls per tenant per minute.
 	GenerationRateLimitPerMinute int
+	// MaxConcurrentGenerations / MaxConcurrentGenerationsPerTenant cap generations running at once; 0 is unlimited.
+	MaxConcurrentGenerations          int
+	MaxConcurrentGenerationsPerTenant int
+	// LargeThemePages / LargeThemeFiles: above either, the prompt summarises the theme instead of listing it whole.
+	LargeThemePages int
+	LargeThemeFiles int
 
+	// StockImagesAPIKey (Pixabay) enables search_stock_images on redesign and create turns; empty leaves it off.
+	StockImagesAPIKey string
+	// PlatformImageHosts are extra hosts a proposed page may load an image from, beside FLOWPOS_API_BASE's.
+	PlatformImageHosts []string
 	// CORSAllowedOrigins is the browser origins allowed to call this API. Empty blocks all
 	// cross-origin requests (fails closed).
 	CORSAllowedOrigins []string
@@ -78,6 +95,8 @@ type Config struct {
 	// RedisURL backs cross-replica generation-event pub/sub. Optional: empty means no
 	// cross-replica live delivery, not a startup failure.
 	RedisURL string
+	// SingleReplica (AI_CHAT_SINGLE_REPLICA) is the explicit opt-in to run production without Redis.
+	SingleReplica bool
 
 	// MaxRequestBodyBytes caps request bodies; sized for POST /chats/messages' worst case
 	// (base64 images + an HTML attachment).
@@ -92,6 +111,8 @@ func Load() Config {
 	}
 
 	return Config{
+		AppEnv: strings.ToLower(strings.TrimSpace(getenv("APP_ENV", "development"))),
+
 		Port: getenv("PORT", "8080"),
 
 		DBHost:     os.Getenv("DB_HOST"),
@@ -110,7 +131,8 @@ func Load() Config {
 		FakeAIMode:  getenvBool("AI_CHAT_FAKE_MODE", false),
 		FakeAIDelay: time.Duration(getenvInt("AI_CHAT_FAKE_DELAY_SECONDS", 5)) * time.Second,
 
-		StreamIdleTimeout:      time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_SECONDS", 12)) * time.Second,
+		StreamIdleTimeout:      time.Duration(getenvInt("AI_STREAM_IDLE_TIMEOUT_SECONDS", 60)) * time.Second,
+		StreamStallTimeout:     time.Duration(getenvInt("AI_STREAM_STALL_TIMEOUT_SECONDS", 300)) * time.Second,
 		FirstTokenTimeoutEdit:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_SECONDS", 120)) * time.Second,
 		FirstTokenTimeoutBrand: time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
 		FirstTokenTimeoutCopy:  time.Duration(getenvInt("AI_FIRST_TOKEN_TIMEOUT_NARROW_SECONDS", 45)) * time.Second,
@@ -129,9 +151,18 @@ func Load() Config {
 
 		GenerationRateLimitPerMinute: getenvInt("GENERATION_RATE_LIMIT_PER_MINUTE", 10),
 
-		CORSAllowedOrigins: getenvList("CORS_ALLOWED_ORIGINS"),
+		MaxConcurrentGenerations:          getenvNonNegativeInt("AI_MAX_CONCURRENT_GENERATIONS", 8),
+		MaxConcurrentGenerationsPerTenant: getenvNonNegativeInt("AI_MAX_CONCURRENT_GENERATIONS_PER_TENANT", 2),
 
-		RedisURL: os.Getenv("REDIS_URL"),
+		LargeThemePages: getenvInt("AI_LARGE_THEME_PAGES", 40),
+		LargeThemeFiles: getenvInt("AI_LARGE_THEME_FILES", 250),
+
+		CORSAllowedOrigins: getenvList("CORS_ALLOWED_ORIGINS"),
+		StockImagesAPIKey:  os.Getenv("STOCK_IMAGES_API_KEY"),
+		PlatformImageHosts: getenvList("PLATFORM_IMAGE_HOSTS"),
+
+		RedisURL:      os.Getenv("REDIS_URL"),
+		SingleReplica: getenvBool("AI_CHAT_SINGLE_REPLICA", false),
 
 		MaxRequestBodyBytes: int64(getenvInt("MAX_REQUEST_BODY_BYTES", 45*1024*1024)),
 	}
@@ -153,10 +184,27 @@ func getenvList(key string) []string {
 	return out
 }
 
+const AppEnvProduction = "production"
+
+// ValidateLockBackend refuses production without Redis unless single-replica is declared: the in-process theme lock
+// can't stop two replicas writing the same theme at once.
+func (c Config) ValidateLockBackend() error {
+	if c.AppEnv == AppEnvProduction && c.RedisURL == "" && !c.SingleReplica {
+		return errors.New("REDIS_URL is required when APP_ENV=production: without it theme writes are only locked " +
+			"within one process. Set REDIS_URL, or AI_CHAT_SINGLE_REPLICA=true if exactly one replica will ever run")
+	}
+	return nil
+}
+
 // ModelCatalog loads AI_MODELS_CONFIG, or without it the one-model catalogue from AI_API_KEY/AI_BASE_URL/AI_MODEL/
 // AI_EFFORT/AI_VISION_MODEL. Callers refuse to start on an error rather than fail on a merchant's request.
 func (c Config) ModelCatalog() (*aicatalog.Catalog, error) {
 	if c.ModelsConfig == "" {
+		// The env catalogue silently defaults to api.deepseek.com, so production must name its catalogue explicitly.
+		if c.AppEnv == AppEnvProduction {
+			return nil, errors.New("AI_MODELS_CONFIG is required when APP_ENV=production; refusing to fall back to " +
+				"the one-model AI_* env catalogue (set AI_MODELS_CONFIG, e.g. config/ai-models.json)")
+		}
 		return aicatalog.FromEnv(c.APIKey, c.BaseURL, c.Model, c.Effort, c.VisionModel)
 	}
 	data, err := os.ReadFile(c.ModelsConfig)
@@ -199,9 +247,33 @@ func getenvInt(key string, fallback int) int {
 	return n
 }
 
+// getenvNonNegativeInt is getenvInt for settings where 0 is meaningful (unlimited).
+func getenvNonNegativeInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Printf("WARNING: invalid %s=%q, using default %d", key, v, fallback)
+		return fallback
+	}
+	return n
+}
+
 // DSN builds the MySQL data source name. clientFoundRows=true makes affected-row count mean
 // "rows matched" not "rows changed" — otherwise a no-op UPDATE misreports the row as not found.
 func (c Config) DSN() string {
 	return c.DBUsername + ":" + c.DBPassword + "@tcp(" + c.DBHost + ":" + c.DBPort + ")/" + c.DBDatabase +
 		"?parseTime=true&charset=utf8mb4&loc=UTC&clientFoundRows=true"
+}
+
+// ImageHosts is every external host a proposed <img> may load from on the platform's side: FLOWPOS_API_BASE's host
+// plus PLATFORM_IMAGE_HOSTS. Stock photos are saved into the theme, so the provider's host is never allowed.
+func (c Config) ImageHosts() []string {
+	hosts := append([]string(nil), c.PlatformImageHosts...)
+	if u, err := url.Parse(c.FlowposAPIBase); err == nil && u.Hostname() != "" {
+		hosts = append(hosts, u.Hostname())
+	}
+	return hosts
 }

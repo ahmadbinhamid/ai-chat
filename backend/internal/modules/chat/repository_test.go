@@ -445,3 +445,59 @@ func TestService_GetChat_OtherTenantsChatReturnsErrNotFound(t *testing.T) {
 		t.Fatalf("expected the owning tenant to fetch its own chat, got %v", err)
 	}
 }
+
+// A stock photo is stored like an image attachment but never shown in the transcript, sent to the model as one of the
+// merchant's images, or listed among their image heads; it is still loadable by ID for staging, preview and Apply.
+func TestService_AddStockImage_HiddenButLoadable(t *testing.T) {
+	conn := openTestDB(t)
+	repo := NewRepository(conn)
+	svc := NewService(repo)
+	ctx := context.Background()
+
+	c := seedChat(t, repo, "builder-"+uuid.NewString())
+	userID := uint64(42)
+	images := []MessageImage{{Base64: "aGVsbG8=", MediaType: "image/png"}}
+	msg, err := svc.RecordUserMessage(ctx, c, &userID, "", "", "redesign the homepage", images, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := svc.AddStockImage(ctx, msg.ID, c.TenantID, "hero.jpg", "image/jpeg", []byte("jpeg-one"))
+	if err != nil {
+		t.Fatalf("AddStockImage: %v", err)
+	}
+	second, err := svc.AddStockImage(ctx, msg.ID, c.TenantID, "beans.jpg", "image/jpeg", []byte("jpeg-two"))
+	if err != nil {
+		t.Fatalf("a second stock photo on the same message must get its own position: %v", err)
+	}
+
+	messages, err := repo.ListMessagesByChat(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messages[0].Attachments; len(got) != 1 || got[0].Kind != AttachmentKindImage {
+		t.Errorf("transcript must list only the merchant's own image, got %+v", got)
+	}
+	content, err := repo.GetAttachmentsContent(ctx, msg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(content) != 1 || content[0].Kind != AttachmentKindImage {
+		t.Errorf("the model's view of the message must not include stock photos, got %d attachments", len(content))
+	}
+	heads, err := svc.ListChatImageHeads(ctx, c.ID, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, listed := heads[first]; listed || len(heads) != 1 {
+		t.Errorf("stock photos must not be listed with the merchant's images, got %v", heads)
+	}
+	for id, want := range map[string]string{first: "jpeg-one", second: "jpeg-two"} {
+		a, err := svc.GetChatImageAttachment(ctx, c.ID, id)
+		if err != nil || string(a.Content) != want || a.MediaType != "image/jpeg" {
+			t.Errorf("GetChatImageAttachment(%s) = %q %q, %v; want %q", id, a.Content, a.MediaType, err, want)
+		}
+	}
+	if _, err := svc.GetChatImageAttachment(ctx, "another-chat", first); err == nil {
+		t.Error("a stock photo must only load within its own chat")
+	}
+}

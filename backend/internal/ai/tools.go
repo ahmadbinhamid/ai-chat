@@ -24,6 +24,8 @@ const (
 	toolNameReadThemeFile  = "read_theme_file"
 	toolNameGrepTheme      = "grep_theme"
 	toolNameProposeChanges = "propose_changes"
+	// ToolNameSearchStockImages is offered only on redesign and create turns, when a stock provider is configured.
+	ToolNameSearchStockImages = "search_stock_images"
 )
 
 func listThemeFilesTool() anthropic.ToolUnionParam {
@@ -106,9 +108,40 @@ func proposeChangesTool() anthropic.ToolUnionParam {
 
 // toolsForMode returns the tool set for a GenerationMode. Brand mode offers only
 // propose_changes, so the model can't wander off editing files beyond defaults.json.
-func toolsForMode(mode string) []anthropic.ToolUnionParam {
+func toolsForMode(mode string, stockImages bool) []anthropic.ToolUnionParam {
 	if mode == GenerationModeBrand {
 		return []anthropic.ToolUnionParam{proposeChangesTool()}
 	}
+	if stockImages && mode != GenerationModeCopy {
+		return []anthropic.ToolUnionParam{listThemeFilesTool(), readThemeFileTool(), grepThemeTool(), searchStockImagesTool(), proposeChangesTool()}
+	}
 	return []anthropic.ToolUnionParam{listThemeFilesTool(), readThemeFileTool(), grepThemeTool(), proposeChangesTool()}
+}
+
+func searchStockImagesTool() anthropic.ToolUnionParam {
+	return anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
+		Name: ToolNameSearchStockImages,
+		Description: param.NewOpt(
+			"Searches licensed stock photos (Pixabay) for hero and section imagery. Returns up to 6 photos, each with " +
+				"an id, a description, width and height (at most 1280px). To use one, add {\"stock_image\": <id>, " +
+				"\"path\": \"images/<new-name>.jpg\"} to use_attachments: the platform downloads it into the theme, and " +
+				"you reference it with {{ 'images/<new-name>.jpg' | asset_url }}. Never link a photo from anywhere else " +
+				"and never invent an id. Pick photos that match the brand and show no recognisable people, logos or " +
+				"brands. On every <img>: alt text describing the image in context, width and height, responsive sizing " +
+				"(sizes, max-width: 100%), and loading=\"lazy\" except the hero.",
+		),
+		InputSchema: anthropic.ToolInputSchemaParam{
+			Properties: map[string]any{
+				"query": map[string]any{
+					"type":        "string",
+					"description": "A short search phrase, e.g. 'espresso being poured' or 'cozy cafe interior'.",
+				},
+				"count": map[string]any{
+					"type":        "integer",
+					"description": "How many images to return, 1-6 (default 4).",
+				},
+			},
+			Required: []string{"query"},
+		},
+	}}
 }

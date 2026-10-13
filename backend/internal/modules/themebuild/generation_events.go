@@ -60,6 +60,8 @@ const (
 	// EventTypeThinking is EPHEMERAL — see emitLive. Never pass to emit(): it would durably
 	// persist every chunk and burn a seq number per chunk, breaking the replay window.
 	EventTypeThinking = "thinking"
+	// EventTypeEscalating: Auto's design model got stuck and the turn is being retried on Auto's fix model. No payload.
+	EventTypeEscalating = "escalating"
 )
 
 // maxPromptPreviewChars bounds EventTypeQueued's prompt_preview field; the full prompt is

@@ -72,7 +72,7 @@ func TestCheckAndRepair_RecoveredProposalUsesFlatFallback(t *testing.T) {
 	if first.Conversation() != nil {
 		t.Fatal("expected a recovered proposal to carry no conversation")
 	}
-	got, _, err := svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", tc, nil, first, testSnapshot(), readOutputExec, nil, nil)
+	got, _, err := svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", "gen-1", tc, nil, first, testSnapshot(), readOutputExec, nil, nil)
 	if err != nil {
 		t.Fatalf("checkAndRepair: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestCheckAndRepair_RepairStuckInTextFailsFast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Generate: %v", err)
 	}
-	_, _, err = svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", tc, nil, first, testSnapshot(), readOutputExec, nil, nil)
+	_, _, err = svc.checkAndRepair(context.Background(), GenerateInput{TenantID: 1, ThemeSlug: "demo"}, "chat-1", "gen-1", tc, nil, first, testSnapshot(), readOutputExec, nil, nil)
 	if err == nil {
 		t.Fatal("expected the stuck repair to fail")
 	}

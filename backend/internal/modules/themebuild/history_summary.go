@@ -67,7 +67,7 @@ func summarizeOlderTurns(ctx context.Context, gen generator, turns []ai.Turn) (s
 	older := turns[:len(turns)-summarizeHistoryThreshold]
 	window := summaryWindow(older)
 	logSummaryCap("", len(older), len(window))
-	summary, err = gen.Summarize(ctx, window)
+	summary, err = gen.Summarize(ctx, "", window)
 	return summary, len(window), err
 }
 
@@ -171,7 +171,7 @@ func (s *Service) summarizeOldTurnsCached(ctx context.Context, chatID string, tu
 
 	logSummaryCap(chatID, olderCount, len(window))
 	start := time.Now()
-	summary, err := s.gen.Summarize(ctx, window)
+	summary, err := s.gen.Summarize(ctx, chatID, window)
 	elapsed := time.Since(start)
 	if err != nil {
 		slog.Warn("history summarization failed; falling back to full unsummarized history",
