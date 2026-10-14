@@ -179,11 +179,35 @@ func TestRender_UnsupportedTagReportsErrorButContinues(t *testing.T) {
 	tpl := "before{% schema %}after"
 	files := map[string]string{"pages/home.liquid": tpl}
 	html, errs := render(t, files, "pages/home.liquid", map[string]any{})
-	if len(errs) != 1 || !strings.Contains(errs[0], "schema") {
+	if len(errs) != 1 || !strings.Contains(errs[0], "schema") || !strings.Contains(errs[0], "unsupported tag") {
 		t.Fatalf("expected 1 unsupported-tag error, got %v", errs)
 	}
 	if html != "beforeafter" {
 		t.Errorf("expected rendering to continue around the bad tag, got %q", html)
+	}
+}
+
+func TestRender_PlatformTagsRenderNothing(t *testing.T) {
+	tests := []struct {
+		name string
+		tag  string
+	}{
+		{"content_for_header", "{% content_for_header %}"},
+		{"content_for_body", "{% content_for_body %}"},
+		{"content_for_footer", "{%- content_for_footer -%}"},
+		{"pay_later with args", `{% pay_later class: "btn", label: "Pay on collection" %}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			files := map[string]string{"pages/home.liquid": "before" + tt.tag + "after"}
+			html, errs := render(t, files, "pages/home.liquid", map[string]any{})
+			if len(errs) != 0 {
+				t.Fatalf("unexpected errors: %v", errs)
+			}
+			if html != "beforeafter" {
+				t.Errorf("got %q", html)
+			}
+		})
 	}
 }
 

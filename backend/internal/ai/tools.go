@@ -45,7 +45,7 @@ func readThemeFileTool() anthropic.ToolUnionParam {
 	return anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
 		Name: toolNameReadThemeFile,
 		Description: param.NewOpt(
-			"Reads one or more existing theme files by their theme-relative path (e.g. 'components/testimonials.liquid'). " +
+			"Reads one or more existing theme files by their theme-relative path (e.g. 'components/header.liquid'). " +
 				"Max 10 paths per call. Returns each file's real current content — read a file before you propose changing " +
 				"it, never guess its current contents.",
 		),
@@ -54,7 +54,7 @@ func readThemeFileTool() anthropic.ToolUnionParam {
 				"paths": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Theme-relative file paths to read, e.g. ['pages/home.liquid', 'components/testimonials.liquid']. Max 10.",
+					"description": "Theme-relative file paths to read, e.g. ['pages/home.liquid', 'components/header.liquid']. Max 10.",
 				},
 			},
 			Required: []string{"paths"},
@@ -75,7 +75,7 @@ func grepThemeTool() anthropic.ToolUnionParam {
 			Properties: map[string]any{
 				"pattern": map[string]any{
 					"type":        "string",
-					"description": "RE2 regular expression to search for, e.g. \"render 'components/testimonials'\".",
+					"description": "RE2 regular expression to search for, e.g. \"render 'components/header'\".",
 				},
 				"path_glob": map[string]any{
 					"type":        "string",
