@@ -18,8 +18,18 @@ func NewDraftHandler(builder *themebuild.Service) *DraftHandler {
 	return &DraftHandler{builder: builder}
 }
 
-// Files handles GET /chats/:chatId/draft.
+// Files handles GET /chats/:chatId/draft. With ?entry=<page .liquid path> it returns themebuild.PageFiles, just that
+// page's files; without it, the whole flat file map, unchanged for clients that don't send entry.
 func (h *DraftHandler) Files(c *gin.Context) {
+	if entry := c.Query("entry"); entry != "" {
+		page, err := h.builder.DraftPageFiles(c.Request.Context(), auth.TenantID(c), auth.Token(c), c.Param("chatId"), entry)
+		if err != nil {
+			respondErr(c, err)
+			return
+		}
+		httpresponse.OK(c, page)
+		return
+	}
 	files, err := h.builder.DraftFiles(c.Request.Context(), auth.TenantID(c), auth.Token(c), c.Param("chatId"))
 	if err != nil {
 		respondErr(c, err)

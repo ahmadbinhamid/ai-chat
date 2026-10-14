@@ -1676,19 +1676,23 @@ func (s *Service) LoadThemeFiles(ctx context.Context, store themefs.ThemeStore, 
 
 	var wanted []string
 	for path := range paths {
-		if strings.HasSuffix(path, ".liquid") {
-			wanted = append(wanted, path)
-			continue
-		}
-		if includeAssets && (strings.HasSuffix(path, ".css") || strings.HasSuffix(path, ".js")) {
+		if isRenderFile(path, includeAssets) {
 			wanted = append(wanted, path)
 		}
 	}
-	// pages.json unconditionally (slug ≠ liquid filename; needed for URL→entry resolution).
-	if paths[pathPagesJSON] {
-		wanted = append(wanted, pathPagesJSON)
-	}
+	return readThemeFiles(ctx, store, storeAuth, wanted)
+}
 
+// isRenderFile is LoadThemeFiles' file filter. pages.json is always included: a slug isn't always its liquid
+// filename, so URL→entry resolution needs it.
+func isRenderFile(path string, includeAssets bool) bool {
+	if strings.HasSuffix(path, ".liquid") || path == pathPagesJSON {
+		return true
+	}
+	return includeAssets && (strings.HasSuffix(path, ".css") || strings.HasSuffix(path, ".js"))
+}
+
+func readThemeFiles(ctx context.Context, store themefs.ThemeStore, storeAuth themefs.RequestAuth, wanted []string) (map[string]string, error) {
 	files := make(map[string]string, len(wanted))
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
