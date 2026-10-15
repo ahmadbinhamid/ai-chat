@@ -28,7 +28,7 @@ var errCategoryNotFound = errors.New("category not found")
 // storefront would filter it. Each lookup keeps its fixture on any error, so a FlowPOS outage never blanks the preview.
 func buildPageContext(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, fetchTimeout time.Duration, page storefrontquery.Request) map[string]any {
 	fixture := themefs.FixtureContext()
-	overlayStoreAndMenu(ctx, builder, storeAuth, fixture)
+	applyStoreAndMenu := startStoreAndMenu(ctx, builder, storeAuth, fetchTimeout)
 	fixture["filters"] = page.Filters.Echo(previewProductsPerPage)
 
 	var (
@@ -104,6 +104,7 @@ func buildPageContext(ctx context.Context, builder *themebuild.Service, storeAut
 		})
 	}
 	wg.Wait()
+	applyStoreAndMenu(fixture)
 
 	if categoriesErr == nil {
 		fixture["categories"] = previewCategoryList(categories)

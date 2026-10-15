@@ -10,12 +10,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ai-chat/internal/auth"
 	"ai-chat/internal/httpresponse"
 	"ai-chat/internal/liquidrender"
 	"ai-chat/internal/modules/themebuild"
+	"ai-chat/internal/safego"
 	"ai-chat/internal/storefrontquery"
 	"ai-chat/internal/themefs"
 
@@ -29,15 +31,20 @@ const defaultProductsFetchTimeout = 2 * time.Second
 // buildPreviewContext overlays real store name/menu/products on the fixture; category/basket/custom...
 func buildPreviewContext(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, productsFetchTimeout time.Duration) map[string]any {
 	fixture := themefs.FixtureContext()
-	overlayStoreAndMenu(ctx, builder, storeAuth, fixture)
+	applyStoreAndMenu := startStoreAndMenu(ctx, builder, storeAuth, productsFetchTimeout)
+	overlayPreviewProducts(ctx, builder, storeAuth, productsFetchTimeout, fixture)
+	applyStoreAndMenu(fixture)
+	return fixture
+}
 
+func overlayPreviewProducts(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, productsFetchTimeout time.Duration, fixture map[string]any) {
 	fetchCtx, cancel := context.WithTimeout(ctx, productsFetchTimeout)
 	defer cancel()
 	page, err := builder.FetchPreviewProducts(fetchCtx, storeAuth, previewProductLimit)
 	if err != nil || len(page.Items) == 0 {
 		// Covers fetch error, timeout, and a genuinely empty catalogue alike — keep the fixture rather than a blank shop page.
 		slog.Info("preview: products source", "source", "fixture", "error", err)
-		return fixture
+		return
 	}
 	fixture["products"] = map[string]any{
 		"items":      previewProductItems(page.Items),
@@ -51,20 +58,48 @@ func buildPreviewContext(ctx context.Context, builder *themebuild.Service, store
 	detail, err := builder.FetchPreviewProductDetail(detailCtx, storeAuth, page.Items[0].Slug)
 	if err != nil {
 		slog.Info("preview: product detail source", "source", "fixture", "error", err)
-		return fixture
+		return
 	}
 	fixture["product"] = previewProductDetail(detail)
 	slog.Info("preview: product detail source", "source", "real", "slug", detail.Slug)
-
-	return fixture
 }
 
-func overlayStoreAndMenu(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, fixture map[string]any) {
-	if settings, err := builder.FetchStoreSettings(ctx, storeAuth); err == nil && settings.Name != "" {
-		fixture["store"] = map[string]any{"name": settings.Name}
-	}
-	if menu, err := builder.FetchThemeMenu(ctx, storeAuth); err == nil {
-		fixture["menu"] = menu
+// startStoreAndMenu fetches both concurrently, each under its own timeout. The returned func waits for them and must
+// be the only writer of fixture at that point — the goroutines never touch it.
+func startStoreAndMenu(ctx context.Context, builder *themebuild.Service, storeAuth themefs.RequestAuth, timeout time.Duration) func(fixture map[string]any) {
+	var (
+		wg        sync.WaitGroup
+		storeName string
+		menu      map[string]any
+		menuErr   error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		defer safego.Recover("preview.storeSettings")
+		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		if settings, err := builder.FetchStoreSettings(fetchCtx, storeAuth); err == nil {
+			storeName = settings.Name
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		defer safego.Recover("preview.menu")
+		// Set first so a recovered panic leaves the fixture menu in place rather than a nil one.
+		menuErr = errors.New("menu fetch did not finish")
+		fetchCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		menu, menuErr = builder.FetchThemeMenu(fetchCtx, storeAuth)
+	}()
+	return func(fixture map[string]any) {
+		wg.Wait()
+		if storeName != "" {
+			fixture["store"] = map[string]any{"name": storeName}
+		}
+		if menuErr == nil {
+			fixture["menu"] = menu
+		}
 	}
 }
 

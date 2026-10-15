@@ -86,6 +86,9 @@ func (r *Renderer) execBlock(toks []token, pos *int, vars scope, b *strings.Buil
 			case "render":
 				*pos++
 				r.execRender(t.raw, vars, b, errs, depth)
+			case "content_for_header", "content_for_body", "content_for_footer", "pay_later":
+				// FlowPOS platform tags: the live storefront injects analytics/forms; a preview outputs nothing.
+				*pos++
 			default:
 				*errs = append(*errs, fmt.Sprintf("line %d: unsupported tag %q", t.line, t.text))
 				*pos++
